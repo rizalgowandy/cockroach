@@ -1,7 +1,3 @@
-# Disable automatic stats to avoid flakiness.
-statement ok
-SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
-
 # Test default table-level permissions.
 # Default user is root.
 statement ok
@@ -37,10 +33,10 @@ INSERT INTO t VALUES (1, 1), (2, 2)
 statement ok
 SELECT * from t
 
-statement ok
+statement count 2
 DELETE FROM t
 
-statement ok
+statement count 0
 DELETE FROM t where k = 1
 
 statement ok
@@ -50,7 +46,13 @@ statement ok
 UPDATE t SET v = 2 WHERE k = 2
 
 statement ok
+ALTER TABLE t SET (schema_locked=false)
+
+statement ok
 TRUNCATE t
+
+statement ok
+ALTER TABLE t RESET (schema_locked)
 
 statement ok
 DROP TABLE t
@@ -80,10 +82,10 @@ SELECT r FROM t
 statement error pq: user testuser does not have SELECT privilege on relation t
 SELECT * from [$t_id as num_ref]
 
-statement error user testuser does not have GRANT privilege on relation t
+statement error user testuser does not have ALL privilege on relation t
 GRANT ALL ON t TO bar
 
-statement error user testuser does not have GRANT privilege on relation t
+statement error user testuser does not have ALL privilege on relation t
 REVOKE ALL ON t FROM bar
 
 statement error user testuser does not have INSERT privilege on relation t
@@ -107,7 +109,7 @@ UPDATE t SET v = 0
 statement error user testuser does not have UPDATE privilege on relation t
 UPDATE t SET v = 2 WHERE k = 2
 
-statement error user testuser does not have DROP privilege on relation t
+statement error user testuser does not have DROP or TRUNCATE privilege on relation t
 TRUNCATE t
 
 statement error user testuser does not have DROP privilege on relation t
@@ -121,16 +123,16 @@ GRANT SELECT ON t TO testuser WITH GRANT OPTION
 
 user testuser
 
-query TTBTTTB
+query TTBTTTB rowsort
 SHOW COLUMNS FROM t
 ----
 k  INT8  false  NULL  ·  {t_pkey}  false
 v  INT8  true   NULL  ·  {t_pkey}  false
 
-statement error user testuser does not have GRANT privilege on relation t
+statement error user testuser does not have ALL privilege on relation t
 GRANT ALL ON t TO bar
 
-statement error user testuser does not have GRANT privilege on relation t
+statement error user testuser does not have ALL privilege on relation t
 REVOKE ALL ON t FROM bar
 
 statement error user testuser does not have INSERT privilege on relation t
@@ -157,7 +159,7 @@ UPDATE t SET v = 0
 statement error user testuser does not have UPDATE privilege on relation t
 UPDATE t SET v = 2 WHERE k = 2
 
-statement error user testuser does not have DROP privilege on relation t
+statement error user testuser does not have DROP or TRUNCATE privilege on relation t
 TRUNCATE t
 
 statement error user testuser does not have DROP privilege on relation t
@@ -208,7 +210,13 @@ statement error user testuser does not have SELECT privilege on relation t
 UPDATE t SET v = 2 WHERE k = 2
 
 statement ok
+ALTER TABLE t SET (schema_locked=false)
+
+statement ok
 TRUNCATE t
+
+statement ok
+ALTER TABLE t RESET (schema_locked)
 
 statement ok
 DROP TABLE t
@@ -239,10 +247,10 @@ SELECT * FROM t
 statement ok
 SELECT 1
 
-statement ok
+statement count 2
 DELETE FROM t
 
-statement ok
+statement count 0
 DELETE FROM t where k = 1
 
 statement ok
@@ -252,7 +260,13 @@ statement ok
 UPDATE t SET v = 2 WHERE k = 2
 
 statement ok
+ALTER TABLE t SET (schema_locked=false)
+
+statement ok
 TRUNCATE t
+
+statement ok
+ALTER TABLE t RESET (schema_locked)
 
 statement ok
 DROP TABLE t

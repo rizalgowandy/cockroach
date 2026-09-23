@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvclientutils
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -32,6 +28,11 @@ const (
 	// ExpectPusheeTxnRecordNotFound means we're expecting the push to not find the
 	// pushee txn record.
 	ExpectPusheeTxnRecordNotFound
+	// ExpectNoTxnRecovery means we're expecting the push to NOT perform
+	// transaction recovery. This is weaker than ExpectPusheeTxnRecordNotFound: it
+	// tolerates a PENDING txn record (e.g. written by the heartbeat loop) but
+	// verifies no STAGING record was found and recovered.
+	ExpectNoTxnRecovery
 	// DontExpectAnything means we're not going to check the state in which the
 	// pusher found the pushee's txn record.
 	DontExpectAnything
@@ -62,18 +63,18 @@ func CheckPushResult(
 	expResolution ExpectedTxnResolution,
 	pushExpectation PushExpectation,
 ) error {
-	pushReq := roachpb.PushTxnRequest{
-		RequestHeader: roachpb.RequestHeader{
+	pushReq := kvpb.PushTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
 			Key: txn.Key,
 		},
 		PusheeTxn: txn.TxnMeta,
 		PushTo:    hlc.Timestamp{},
-		PushType:  roachpb.PUSH_ABORT,
+		PushType:  kvpb.PUSH_ABORT,
 		// We're going to Force the push in order to not wait for the pushee to
 		// expire.
 		Force: true,
 	}
-	ba := roachpb.BatchRequest{}
+	ba := &kvpb.BatchRequest{}
 	ba.Add(&pushReq)
 
 	recCtx, collectRecAndFinish := tracing.ContextWithRecordingSpan(ctx, tr, "test trace")
@@ -117,6 +118,13 @@ func CheckPushResult(
 			resolutionErr = errors.Errorf(
 				"push didn't run as expected (missing \"%s\"). recording: %s",
 				expMsg, recording)
+		}
+	case ExpectNoTxnRecovery:
+		unexpectedMsg := fmt.Sprintf("recovered txn %s", txn.ID.Short())
+		if _, ok := recording.FindLogMessage(unexpectedMsg); ok {
+			resolutionErr = errors.Errorf(
+				"push unexpectedly performed txn recovery (found \"%s\"). recording: %s",
+				unexpectedMsg, recording)
 		}
 	case DontExpectAnything:
 	}

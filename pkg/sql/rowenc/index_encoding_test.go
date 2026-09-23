@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowenc_test
 
@@ -14,32 +9,41 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math"
-	"reflect"
+	"sort"
 	"testing"
-	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	. "github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecencoding"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/trigram"
+	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,12 +53,14 @@ type indexKeyTest struct {
 	secondaryValues []tree.Datum
 }
 
-func makeTableDescForTest(test indexKeyTest) (catalog.TableDescriptor, catalog.TableColMap) {
+func makeTableDescForTest(
+	test indexKeyTest, isSecondaryIndexForward bool,
+) (catalog.TableDescriptor, catalog.TableColMap) {
 	primaryColumnIDs := make([]descpb.ColumnID, len(test.primaryValues))
 	secondaryColumnIDs := make([]descpb.ColumnID, len(test.secondaryValues))
 	columns := make([]descpb.ColumnDescriptor, len(test.primaryValues)+len(test.secondaryValues))
 	var colMap catalog.TableColMap
-	secondaryType := descpb.IndexDescriptor_FORWARD
+	secondaryType := idxtype.FORWARD
 	for i := range columns {
 		columns[i] = descpb.ColumnDescriptor{
 			ID: descpb.ColumnID(i + 1),
@@ -66,7 +72,10 @@ func makeTableDescForTest(test indexKeyTest) (catalog.TableDescriptor, catalog.T
 		} else {
 			columns[i].Type = test.secondaryValues[i-len(test.primaryValues)].ResolvedType()
 			if colinfo.ColumnTypeIsInvertedIndexable(columns[i].Type) {
-				secondaryType = descpb.IndexDescriptor_INVERTED
+				secondaryType = idxtype.INVERTED
+			}
+			if isSecondaryIndexForward && columns[i].Type.Family() == types.JsonFamily {
+				secondaryType = idxtype.FORWARD
 			}
 			secondaryColumnIDs[i-len(test.primaryValues)] = columns[i].ID
 		}
@@ -78,14 +87,14 @@ func makeTableDescForTest(test indexKeyTest) (catalog.TableDescriptor, catalog.T
 		PrimaryIndex: descpb.IndexDescriptor{
 			ID:                  1,
 			KeyColumnIDs:        primaryColumnIDs,
-			KeyColumnDirections: make([]descpb.IndexDescriptor_Direction, len(primaryColumnIDs)),
+			KeyColumnDirections: make([]catenumpb.IndexColumn_Direction, len(primaryColumnIDs)),
 		},
 		Indexes: []descpb.IndexDescriptor{{
 			ID:                  2,
 			KeyColumnIDs:        secondaryColumnIDs,
 			KeySuffixColumnIDs:  primaryColumnIDs,
 			Unique:              true,
-			KeyColumnDirections: make([]descpb.IndexDescriptor_Direction, len(secondaryColumnIDs)),
+			KeyColumnDirections: make([]catenumpb.IndexColumn_Direction, len(secondaryColumnIDs)),
 			Type:                secondaryType,
 		}},
 	}
@@ -95,22 +104,18 @@ func makeTableDescForTest(test indexKeyTest) (catalog.TableDescriptor, catalog.T
 func decodeIndex(
 	codec keys.SQLCodec, tableDesc catalog.TableDescriptor, index catalog.Index, key []byte,
 ) ([]tree.Datum, error) {
-	types, err := colinfo.GetColumnTypes(tableDesc, index.IndexDesc().KeyColumnIDs, nil)
+	types, err := getColumnTypes(tableDesc.IndexKeyColumns(index))
 	if err != nil {
 		return nil, err
 	}
 	values := make([]EncDatum, index.NumKeyColumns())
 	colDirs := index.IndexDesc().KeyColumnDirections
-	_, ok, _, err := DecodeIndexKey(codec, types, values, colDirs, key)
-	if err != nil {
+	if _, err := DecodeIndexKey(codec, values, colDirs, key); err != nil {
 		return nil, err
-	}
-	if !ok {
-		return nil, errors.Errorf("key did not match descriptor")
 	}
 
 	decodedValues := make([]tree.Datum, len(values))
-	var da DatumAlloc
+	var da tree.DatumAlloc
 	for i, value := range values {
 		err := value.EnsureDecoded(types[i], &da)
 		if err != nil {
@@ -123,8 +128,16 @@ func decodeIndex(
 }
 
 func TestIndexKey(t *testing.T) {
+	parseJSON := func(s string) *tree.DJSON {
+		j, err := json.ParseJSON(s)
+		if err != nil {
+			t.Fatalf("Failed to parse %s: %v", s, err)
+		}
+		return tree.NewDJSON(j)
+	}
+
 	rng, _ := randutil.NewTestRand()
-	var a DatumAlloc
+	var a tree.DatumAlloc
 
 	tests := []indexKeyTest{
 		{
@@ -162,6 +175,82 @@ func TestIndexKey(t *testing.T) {
 			[]tree.Datum{tree.NewDInt(10), tree.NewDInt(11), tree.NewDInt(12)},
 			[]tree.Datum{tree.NewDInt(20), tree.NewDInt(21), tree.NewDInt(22)},
 		},
+		// Testing JSON in primary indexes.
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`"a"`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`1`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`"a"`), parseJSON(`[1, 2, 3]`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`{"a": "b"}`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`{"a": "b", "c": "d"}`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`[1, "a", {"a": "b"}]`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		{
+			tableID: 50,
+			primaryValues: []tree.Datum{parseJSON(`null`), parseJSON(`[]`), parseJSON(`{}`),
+				parseJSON(`""`)},
+			secondaryValues: []tree.Datum{tree.NewDInt(20)},
+		},
+		// Testing JSON in secondary indexes.
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20)},
+			secondaryValues: []tree.Datum{parseJSON(`{"a": "b"}`)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`{"a": "b"}`), parseJSON(`[1, "a", {"a": "b"}]`)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`1`)},
+		},
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`"b"`)},
+		},
+		{
+			tableID:       50,
+			primaryValues: []tree.Datum{tree.NewDInt(20), tree.NewDInt(50)},
+			secondaryValues: []tree.Datum{parseJSON(`null`), parseJSON(`[]`), parseJSON(`{}`),
+				parseJSON(`""`)},
+		},
+		// Testing JSON in both primary and secondary indexes.
+		{
+			tableID:         50,
+			primaryValues:   []tree.Datum{parseJSON(`"a"`)},
+			secondaryValues: []tree.Datum{parseJSON(`"b"`)},
+		},
+		{
+			tableID:       50,
+			primaryValues: []tree.Datum{parseJSON(`{"a": "b"}`), parseJSON(`[1, "a", {"a": "b"}]`)},
+			secondaryValues: []tree.Datum{parseJSON(`null`), parseJSON(`[]`), parseJSON(`{}`),
+				parseJSON(`""`)},
+		},
 	}
 
 	for i := 0; i < 1000; i++ {
@@ -183,9 +272,10 @@ func TestIndexKey(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-		defer evalCtx.Stop(context.Background())
-		tableDesc, colMap := makeTableDescForTest(test)
+		ctx := context.Background()
+		evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+		defer evalCtx.Stop(ctx)
+		tableDesc, colMap := makeTableDescForTest(test, true /* isSecondaryIndexForward */)
 		// Add the default family to each test, since secondary indexes support column families.
 		var (
 			colNames []string
@@ -206,7 +296,7 @@ func TestIndexKey(t *testing.T) {
 		testValues := append(test.primaryValues, test.secondaryValues...)
 
 		codec := keys.SystemSQLCodec
-		primaryKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, tableDesc.GetPrimaryIndexID())
+		primaryKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), tableDesc.GetPrimaryIndexID())
 		primaryKey, _, err := EncodeIndexKey(tableDesc, tableDesc.GetPrimaryIndex(), colMap, testValues, primaryKeyPrefix)
 		if err != nil {
 			t.Fatal(err)
@@ -214,8 +304,11 @@ func TestIndexKey(t *testing.T) {
 		primaryValue := roachpb.MakeValueFromBytes(nil)
 		primaryIndexKV := kv.KeyValue{Key: primaryKey, Value: &primaryValue}
 
+		var vh VectorIndexEncodingHelper
 		secondaryIndexEntry, err := EncodeSecondaryIndex(
-			codec, tableDesc, tableDesc.PublicNonPrimaryIndexes()[0], colMap, testValues, true /* includeEmpty */)
+			ctx, codec, tableDesc, tableDesc.PublicNonPrimaryIndexes()[0],
+			colMap, testValues, vh, true, /* includeEmpty */
+		)
 		if len(secondaryIndexEntry) != 1 {
 			t.Fatalf("expected 1 index entry, got %d. got %#v", len(secondaryIndexEntry), secondaryIndexEntry)
 		}
@@ -235,12 +328,14 @@ func TestIndexKey(t *testing.T) {
 
 			for j, value := range values {
 				testValue := testValues[colMap.GetDefault(index.GetKeyColumnID(j))]
-				if value.Compare(evalCtx, testValue) != 0 {
+				if cmp, err := value.Compare(ctx, evalCtx, testValue); err != nil {
+					t.Fatal(err)
+				} else if cmp != 0 {
 					t.Fatalf("%d: value %d got %q but expected %q", i, j, value, testValue)
 				}
 			}
 
-			indexID, _, err := DecodeIndexKeyPrefix(codec, tableDesc, entry.Key)
+			indexID, _, err := DecodeIndexKeyPrefix(codec, tableDesc.GetID(), entry.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -277,34 +372,22 @@ func TestInvertedIndexKey(t *testing.T) {
 		expectedKeysExcludingEmptyArray int
 	}{
 		{
-			value: &tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{},
-			},
+			value:                           tree.NewDArrayFromDatums(types.Int, tree.Datums{}),
 			expectedKeys:                    1,
 			expectedKeysExcludingEmptyArray: 0,
 		},
 		{
-			value: &tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.NewDInt(1)},
-			},
+			value:                           tree.NewDArrayFromDatums(types.Int, tree.Datums{tree.NewDInt(1)}),
 			expectedKeys:                    1,
 			expectedKeysExcludingEmptyArray: 1,
 		},
 		{
-			value: &tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.NewDString("foo")},
-			},
+			value:                           tree.NewDArrayFromDatums(types.String, tree.Datums{tree.NewDString("foo")}),
 			expectedKeys:                    1,
 			expectedKeysExcludingEmptyArray: 1,
 		},
 		{
-			value: &tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.NewDInt(1), tree.NewDInt(2), tree.NewDInt(1)},
-			},
+			value: tree.NewDArrayFromDatums(types.Int, tree.Datums{tree.NewDInt(1), tree.NewDInt(2), tree.NewDInt(1)}),
 			// The keys should be deduplicated.
 			expectedKeys:                    2,
 			expectedKeysExcludingEmptyArray: 2,
@@ -355,7 +438,8 @@ func TestInvertedIndexKey(t *testing.T) {
 	runTest := func(value tree.Datum, expectedKeys int, version descpb.IndexDescriptorVersion) {
 		primaryValues := []tree.Datum{tree.NewDInt(10)}
 		secondaryValues := []tree.Datum{value}
-		tableDesc, colMap := makeTableDescForTest(indexKeyTest{50, primaryValues, secondaryValues})
+		tableDesc, colMap := makeTableDescForTest(indexKeyTest{50, primaryValues, secondaryValues},
+			false /* isSecondaryIndexForward */)
 		for _, idx := range tableDesc.PublicNonPrimaryIndexes() {
 			idx.IndexDesc().Version = version
 		}
@@ -364,8 +448,11 @@ func TestInvertedIndexKey(t *testing.T) {
 
 		codec := keys.SystemSQLCodec
 
+		var vh VectorIndexEncodingHelper
 		secondaryIndexEntries, err := EncodeSecondaryIndex(
-			codec, tableDesc, tableDesc.PublicNonPrimaryIndexes()[0], colMap, testValues, true /* includeEmpty */)
+			context.Background(), codec, tableDesc, tableDesc.PublicNonPrimaryIndexes()[0],
+			colMap, testValues, vh, true, /* includeEmpty */
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -419,7 +506,7 @@ func TestEncodeContainingArrayInvertedIndexSpans(t *testing.T) {
 		{`{2, NULL}`, `{NULL}`, false, true},
 	}
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	parseArray := func(s string) tree.Datum {
 		arr, _, err := tree.ParseDArrayFromString(&evalCtx, s, types.Int)
 		if err != nil {
@@ -429,10 +516,10 @@ func TestEncodeContainingArrayInvertedIndexSpans(t *testing.T) {
 	}
 
 	runTest := func(left, right tree.Datum, expected, expectUnique bool) {
-		keys, err := EncodeInvertedIndexTableKeys(left, nil, descpb.StrictIndexColumnIDGuaranteesVersion)
+		keys, err := EncodeInvertedIndexTableKeys(left, nil, descpb.LatestIndexDescriptorVersion)
 		require.NoError(t, err)
 
-		invertedExpr, err := EncodeContainingInvertedIndexSpans(&evalCtx, right)
+		invertedExpr, err := EncodeContainingInvertedIndexSpans(context.Background(), &evalCtx, right)
 		require.NoError(t, err)
 
 		spanExpr, ok := invertedExpr.(*inverted.SpanExpression)
@@ -467,7 +554,7 @@ func TestEncodeContainingArrayInvertedIndexSpans(t *testing.T) {
 
 		// First check that evaluating `indexedValue @> value` matches the expected
 		// result.
-		res, err := tree.ArrayContains(&evalCtx, indexedValue.(*tree.DArray), value.(*tree.DArray))
+		res, err := tree.ArrayContains(context.Background(), &evalCtx, indexedValue.(*tree.DArray), value.(*tree.DArray))
 		require.NoError(t, err)
 		if bool(*res) != c.expected {
 			t.Fatalf(
@@ -485,11 +572,16 @@ func TestEncodeContainingArrayInvertedIndexSpans(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		typ := randgen.RandArrayType(rng)
 
+		// We don't allow jsonpath indices.
+		if typ.ArrayContents().Family() == types.JsonpathFamily {
+			continue
+		}
+
 		// Generate two random arrays and evaluate the result of `left @> right`.
 		left := randgen.RandArray(rng, typ, 0 /* nullChance */)
 		right := randgen.RandArray(rng, typ, 0 /* nullChance */)
 
-		res, err := tree.ArrayContains(&evalCtx, left.(*tree.DArray), right.(*tree.DArray))
+		res, err := tree.ArrayContains(context.Background(), &evalCtx, left.(*tree.DArray), right.(*tree.DArray))
 		require.NoError(t, err)
 
 		// The spans should not have duplicate values if there is at least one
@@ -554,7 +646,7 @@ func TestEncodeContainedArrayInvertedIndexSpans(t *testing.T) {
 		{`{2, NULL}`, `{1, NULL}`, false, false, false},
 	}
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	parseArray := func(s string) tree.Datum {
 		arr, _, err := tree.ParseDArrayFromString(&evalCtx, s, types.Int)
 		if err != nil {
@@ -564,10 +656,10 @@ func TestEncodeContainedArrayInvertedIndexSpans(t *testing.T) {
 	}
 
 	runTest := func(indexedValue, value tree.Datum, expectContainsKeys, expected, expectUnique bool) {
-		keys, err := EncodeInvertedIndexTableKeys(indexedValue, nil, descpb.StrictIndexColumnIDGuaranteesVersion)
+		keys, err := EncodeInvertedIndexTableKeys(indexedValue, nil, descpb.LatestIndexDescriptorVersion)
 		require.NoError(t, err)
 
-		invertedExpr, err := EncodeContainedInvertedIndexSpans(&evalCtx, value)
+		invertedExpr, err := EncodeContainedInvertedIndexSpans(context.Background(), &evalCtx, value)
 		require.NoError(t, err)
 
 		spanExpr, ok := invertedExpr.(*inverted.SpanExpression)
@@ -604,7 +696,7 @@ func TestEncodeContainedArrayInvertedIndexSpans(t *testing.T) {
 
 		// Since the spans are never tight, apply an additional filter to determine
 		// if the result is contained.
-		actual, err := tree.ArrayContains(&evalCtx, value.(*tree.DArray), indexedValue.(*tree.DArray))
+		actual, err := tree.ArrayContains(context.Background(), &evalCtx, value.(*tree.DArray), indexedValue.(*tree.DArray))
 		require.NoError(t, err)
 		if bool(*actual) != expected {
 			if expected {
@@ -632,7 +724,7 @@ func TestEncodeContainedArrayInvertedIndexSpans(t *testing.T) {
 
 		// We cannot check for false positives with these tests (due to the fact that
 		// the spans are not tight), so we will only test for false negatives.
-		isContained, err := tree.ArrayContains(&evalCtx, right.(*tree.DArray), left.(*tree.DArray))
+		isContained, err := tree.ArrayContains(context.Background(), &evalCtx, right.(*tree.DArray), left.(*tree.DArray))
 		require.NoError(t, err)
 		if !*isContained {
 			continue
@@ -650,327 +742,14 @@ func TestEncodeContainedArrayInvertedIndexSpans(t *testing.T) {
 	}
 }
 
-type arrayEncodingTest struct {
-	name     string
-	datum    tree.DArray
-	encoding []byte
-}
-
-func TestArrayEncoding(t *testing.T) {
-	tests := []arrayEncodingTest{
-		{
-			"empty int array",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{},
-			},
-			[]byte{1, 3, 0},
-		}, {
-			"single int array",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.NewDInt(1)},
-			},
-			[]byte{1, 3, 1, 2},
-		}, {
-			"multiple int array",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.NewDInt(1), tree.NewDInt(2), tree.NewDInt(3)},
-			},
-			[]byte{1, 3, 3, 2, 4, 6},
-		}, {
-			"string array",
-			tree.DArray{
-				ParamTyp: types.String,
-				Array:    tree.Datums{tree.NewDString("foo"), tree.NewDString("bar"), tree.NewDString("baz")},
-			},
-			[]byte{1, 6, 3, 3, 102, 111, 111, 3, 98, 97, 114, 3, 98, 97, 122},
-		}, {
-			"name array",
-			tree.DArray{
-				ParamTyp: types.Name,
-				Array:    tree.Datums{tree.NewDName("foo"), tree.NewDName("bar"), tree.NewDName("baz")},
-			},
-			[]byte{1, 6, 3, 3, 102, 111, 111, 3, 98, 97, 114, 3, 98, 97, 122},
-		},
-		{
-			"bool array",
-			tree.DArray{
-				ParamTyp: types.Bool,
-				Array:    tree.Datums{tree.MakeDBool(true), tree.MakeDBool(false)},
-			},
-			[]byte{1, 10, 2, 10, 11},
-		}, {
-			"array containing a single null",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.DNull},
-				HasNulls: true,
-			},
-			[]byte{17, 3, 1, 1},
-		}, {
-			"array containing multiple nulls",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array:    tree.Datums{tree.NewDInt(1), tree.DNull, tree.DNull},
-				HasNulls: true,
-			},
-			[]byte{17, 3, 3, 6, 2},
-		}, {
-			"array whose NULL bitmap spans exactly one byte",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array: tree.Datums{
-					tree.NewDInt(1), tree.DNull, tree.DNull, tree.NewDInt(2), tree.NewDInt(3),
-					tree.NewDInt(4), tree.NewDInt(5), tree.NewDInt(6),
-				},
-				HasNulls: true,
-			},
-			[]byte{17, 3, 8, 6, 2, 4, 6, 8, 10, 12},
-		}, {
-			"array whose NULL bitmap spans more than one byte",
-			tree.DArray{
-				ParamTyp: types.Int,
-				Array: tree.Datums{
-					tree.NewDInt(1), tree.DNull, tree.DNull, tree.NewDInt(2), tree.NewDInt(3),
-					tree.NewDInt(4), tree.NewDInt(5), tree.NewDInt(6), tree.DNull,
-				},
-				HasNulls: true,
-			},
-			[]byte{17, 3, 9, 6, 1, 2, 4, 6, 8, 10, 12},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run("encode "+test.name, func(t *testing.T) {
-			enc, err := EncodeArray(&test.datum, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(enc, test.encoding) {
-				t.Fatalf("expected %s to encode to %v, got %v", test.datum.String(), test.encoding, enc)
-			}
-		})
-
-		t.Run("decode "+test.name, func(t *testing.T) {
-			enc := make([]byte, 0)
-			enc = append(enc, byte(len(test.encoding)))
-			enc = append(enc, test.encoding...)
-			d, _, err := DecodeArray(&DatumAlloc{}, test.datum.ParamTyp, enc)
-			hasNulls := d.(*tree.DArray).HasNulls
-			if test.datum.HasNulls != hasNulls {
-				t.Fatalf("expected %v to have HasNulls=%t, got %t", enc, test.datum.HasNulls, hasNulls)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			evalContext := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-			if d.Compare(evalContext, &test.datum) != 0 {
-				t.Fatalf("expected %v to decode to %s, got %s", enc, test.datum.String(), d.String())
-			}
-		})
-	}
-}
-
-func BenchmarkArrayEncoding(b *testing.B) {
-	ary := tree.DArray{ParamTyp: types.Int, Array: tree.Datums{}}
-	for i := 0; i < 10000; i++ {
-		_ = ary.Append(tree.NewDInt(1))
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = EncodeArray(&ary, nil)
-	}
-}
-
-func TestMarshalColumnValue(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-
-	tests := []struct {
-		typ   *types.T
-		datum tree.Datum
-		exp   roachpb.Value
-	}{
-		{
-			typ:   types.Bool,
-			datum: tree.MakeDBool(true),
-			exp:   func() (v roachpb.Value) { v.SetBool(true); return }(),
-		},
-		{
-			typ:   types.Bool,
-			datum: tree.MakeDBool(false),
-			exp:   func() (v roachpb.Value) { v.SetBool(false); return }(),
-		},
-		{
-			typ:   types.Int,
-			datum: tree.NewDInt(314159),
-			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
-		},
-		{
-			typ:   types.Float,
-			datum: tree.NewDFloat(3.14159),
-			exp:   func() (v roachpb.Value) { v.SetFloat(3.14159); return }(),
-		},
-		{
-			typ: types.Decimal,
-			datum: func() (v tree.Datum) {
-				v, err := tree.ParseDDecimal("1234567890.123456890")
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				return
-			}(),
-			exp: func() (v roachpb.Value) {
-				dDecimal, err := tree.ParseDDecimal("1234567890.123456890")
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				err = v.SetDecimal(&dDecimal.Decimal)
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				return
-			}(),
-		},
-		{
-			typ:   types.Date,
-			datum: tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(314159)),
-			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
-		},
-		{
-			typ:   types.Date,
-			datum: tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(math.MinInt64)),
-			exp:   func() (v roachpb.Value) { v.SetInt(math.MinInt64); return }(),
-		},
-		{
-			typ:   types.Date,
-			datum: tree.NewDDate(pgdate.MakeCompatibleDateFromDisk(math.MaxInt64)),
-			exp:   func() (v roachpb.Value) { v.SetInt(math.MaxInt64); return }(),
-		},
-		{
-			typ:   types.Time,
-			datum: tree.MakeDTime(timeofday.FromInt(314159)),
-			exp:   func() (v roachpb.Value) { v.SetInt(314159); return }(),
-		},
-		{
-			typ:   types.Timestamp,
-			datum: tree.MustMakeDTimestamp(timeutil.Unix(314159, 1000), time.Microsecond),
-			exp:   func() (v roachpb.Value) { v.SetTime(timeutil.Unix(314159, 1000)); return }(),
-		},
-		{
-			typ:   types.TimestampTZ,
-			datum: tree.MustMakeDTimestampTZ(timeutil.Unix(314159, 1000), time.Microsecond),
-			exp:   func() (v roachpb.Value) { v.SetTime(timeutil.Unix(314159, 1000)); return }(),
-		},
-		{
-			typ:   types.String,
-			datum: tree.NewDString("testing123"),
-			exp:   func() (v roachpb.Value) { v.SetString("testing123"); return }(),
-		},
-		{
-			typ:   types.Name,
-			datum: tree.NewDName("testingname123"),
-			exp:   func() (v roachpb.Value) { v.SetString("testingname123"); return }(),
-		},
-		{
-			typ:   types.Bytes,
-			datum: tree.NewDBytes(tree.DBytes([]byte{0x31, 0x41, 0x59})),
-			exp:   func() (v roachpb.Value) { v.SetBytes([]byte{0x31, 0x41, 0x59}); return }(),
-		},
-		{
-			typ: types.Uuid,
-			datum: func() (v tree.Datum) {
-				v, err := tree.ParseDUuidFromString("63616665-6630-3064-6465-616462656562")
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				return
-			}(),
-			exp: func() (v roachpb.Value) {
-				dUUID, err := tree.ParseDUuidFromString("63616665-6630-3064-6465-616462656562")
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				v.SetBytes(dUUID.GetBytes())
-				return
-			}(),
-		},
-		{
-			typ: types.INet,
-			datum: func() (v tree.Datum) {
-				v, err := tree.ParseDIPAddrFromINetString("192.168.0.1")
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				return
-			}(),
-			exp: func() (v roachpb.Value) {
-				ipAddr, err := tree.ParseDIPAddrFromINetString("192.168.0.1")
-				if err != nil {
-					t.Fatalf("Unexpected error while creating expected value: %s", err)
-				}
-				data := ipAddr.ToBuffer(nil)
-				v.SetBytes(data)
-				return
-			}(),
-		},
-	}
-
-	for i, testCase := range tests {
-		typ := testCase.typ
-		if actual, err := MarshalColumnTypeValue("testcol", typ, testCase.datum); err != nil {
-			t.Errorf("%d: unexpected error with column type %v: %v", i, typ, err)
-		} else if !reflect.DeepEqual(actual, testCase.exp) {
-			t.Errorf("%d: MarshalColumnValue() got %v, expected %v", i, actual, testCase.exp)
-		}
-	}
-}
-
-func TestDecodeTableValue(t *testing.T) {
-	a := &DatumAlloc{}
-	for _, tc := range []struct {
-		in  tree.Datum
-		typ *types.T
-		err string
-	}{
-		// These test cases are not intended to be exhaustive, but rather exercise
-		// the special casing and error handling of DecodeTableValue.
-		{tree.DNull, types.Bool, ""},
-		{tree.DBoolTrue, types.Bool, ""},
-		{tree.NewDInt(tree.DInt(4)), types.Bool, "value type is not True or False: Int"},
-		{tree.DNull, types.Int, ""},
-		{tree.NewDInt(tree.DInt(4)), types.Int, ""},
-		{tree.DBoolTrue, types.Int, "decoding failed"},
-	} {
-		t.Run("", func(t *testing.T) {
-			var prefix, scratch []byte
-			buf, err := EncodeTableValue(prefix, 0 /* colID */, tc.in, scratch)
-			if err != nil {
-				t.Fatal(err)
-			}
-			d, _, err := DecodeTableValue(a, tc.typ, buf)
-			if !testutils.IsError(err, tc.err) {
-				t.Fatalf("expected error %q, but got %v", tc.err, err)
-			} else if err != nil {
-				return
-			}
-			if tc.in.Compare(tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), d) != 0 {
-				t.Fatalf("decoded datum %[1]v (%[1]T) does not match encoded datum %[2]v (%[2]T)", d, tc.in)
-			}
-		})
-	}
-}
-
 // ExtractIndexKey constructs the index (primary) key for a row from any index
 // key/value entry, including secondary indexes.
 //
 // Don't use this function in the scan "hot path".
 func ExtractIndexKey(
-	a *DatumAlloc, codec keys.SQLCodec, tableDesc catalog.TableDescriptor, entry kv.KeyValue,
+	a *tree.DatumAlloc, codec keys.SQLCodec, tableDesc catalog.TableDescriptor, entry kv.KeyValue,
 ) (roachpb.Key, error) {
-	indexID, key, err := DecodeIndexKeyPrefix(codec, tableDesc, entry.Key)
+	indexID, key, err := DecodeIndexKeyPrefix(codec, tableDesc.GetID(), entry.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -978,33 +757,33 @@ func ExtractIndexKey(
 		return entry.Key, nil
 	}
 
-	index, err := tableDesc.FindIndexWithID(indexID)
+	index, err := catalog.MustFindIndexByID(tableDesc, indexID)
 	if err != nil {
 		return nil, err
 	}
 
 	// Extract the values for index.KeyColumnIDs.
-	indexTypes, err := colinfo.GetColumnTypes(tableDesc, index.IndexDesc().KeyColumnIDs, nil)
+	indexTypes, err := getColumnTypes(tableDesc.IndexKeyColumns(index))
 	if err != nil {
 		return nil, err
 	}
 	values := make([]EncDatum, index.NumKeyColumns())
 	dirs := index.IndexDesc().KeyColumnDirections
-	key, _, err = DecodeKeyVals(indexTypes, values, dirs, key)
+	key, _, err = DecodeKeyVals(values, dirs, key)
 	if err != nil {
 		return nil, err
 	}
 
 	// Extract the values for index.KeySuffixColumnIDs
-	extraTypes, err := colinfo.GetColumnTypes(tableDesc, index.IndexDesc().KeySuffixColumnIDs, nil)
+	extraTypes, err := getColumnTypes(tableDesc.IndexKeySuffixColumns(index))
 	if err != nil {
 		return nil, err
 	}
 	extraValues := make([]EncDatum, index.NumKeySuffixColumns())
-	dirs = make([]descpb.IndexDescriptor_Direction, index.NumKeySuffixColumns())
+	dirs = make([]catenumpb.IndexColumn_Direction, index.NumKeySuffixColumns())
 	for i := 0; i < index.NumKeySuffixColumns(); i++ {
 		// Implicit columns are always encoded Ascending.
-		dirs[i] = descpb.IndexDescriptor_ASC
+		dirs[i] = catenumpb.IndexColumn_ASC
 	}
 	extraKey := key
 	if index.IsUnique() {
@@ -1013,7 +792,7 @@ func ExtractIndexKey(
 			return nil, err
 		}
 	}
-	_, _, err = DecodeKeyVals(extraTypes, extraValues, dirs, extraKey)
+	_, _, err = DecodeKeyVals(extraValues, dirs, extraKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1028,7 +807,7 @@ func ExtractIndexKey(
 		columnID := index.GetKeySuffixColumnID(i)
 		colMap.Set(columnID, i+index.NumKeyColumns())
 	}
-	indexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc, tableDesc.GetPrimaryIndexID())
+	indexKeyPrefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), tableDesc.GetPrimaryIndexID())
 
 	decodedValues := make([]tree.Datum, len(values)+len(extraValues))
 	for i, value := range values {
@@ -1048,4 +827,658 @@ func ExtractIndexKey(
 	indexKey, _, err := EncodeIndexKey(
 		tableDesc, tableDesc.GetPrimaryIndex(), colMap, decodedValues, indexKeyPrefix)
 	return indexKey, err
+}
+
+func getColumnTypes(columns []catalog.Column) ([]*types.T, error) {
+	outTypes := make([]*types.T, len(columns))
+	for i, col := range columns {
+		if !col.Public() {
+			return nil, fmt.Errorf("column-id \"%d\" does not exist", col.GetID())
+		}
+		outTypes[i] = col.GetType()
+	}
+	return outTypes, nil
+}
+
+func TestEncodeOverlapsArrayInvertedIndexSpans(t *testing.T) {
+	testCases := []struct {
+		indexedValue string
+		value        string
+		ok           bool
+		expected     bool
+		unique       bool
+	}{
+
+		// This test uses EncodeInvertedIndexTableKeys and EncodeOverlapsInvertedIndexSpans
+		// to determine if the spans produced from the second Array value will
+		// correctly overlap or be distinct from the first value.
+
+		// The expression is a union of spans, so unique will be true IFF the value array
+		// only contains one or more entries of the same non-null element (e.g. A && [1]).
+
+		// First we test that the spans will include expected value.
+		{`{1}`, `{1}`, true, true, true},
+		{`{1, 2}`, `{1}`, true, true, true},
+		{`{2}`, `{1, 2}`, true, true, false},
+		{`{2,3}`, `{2,2,2}`, true, true, true},
+		{`{2, NULL}`, `{1, 2}`, true, true, false},
+		{`{1, 2}`, `{1, 2}`, true, true, false},
+		{`{1, 3}`, `{1, 2}`, true, true, false},
+		{`{2}`, `{2, 2}`, true, true, true},
+		{`{1, 2}`, `{1, 2, 1}`, true, true, false},
+		{`{1, 1, 2, 3}`, `{1, 2, 1}`, true, true, false},
+		{`{1, 2, 4}`, `{1, 2, 3}`, true, true, false},
+		{`{2}`, `{2, NULL}`, true, true, true},
+		{`{2, 3}`, `{2, NULL}`, true, true, true},
+		{`{1, NULL}`, `{1, 2, NULL}`, true, true, false},
+
+		// Then we test that the spans exclude results that should be excluded.
+		{`{}`, `{}`, false, false, false},
+		{`NULL`, `NULL`, false, false, false},
+		{`NULL`, `{1, 2}`, true, false, false},
+		{`{1, 2}`, `NULL`, false, false, false},
+		{`{}`, `{1}`, true, false, true},
+		{`{1}`, `{}`, false, false, false},
+		{`{}`, `{1, 2}`, true, false, false},
+		{`{NULL}`, `{}`, false, false, false},
+		{`{}`, `{NULL}`, false, false, false},
+		{`{}`, `{NULL, NULL}`, false, false, false},
+		{`{2}`, `{1}`, true, false, true},
+		{`{4, 3}`, `{2, 1}`, true, false, false},
+		{`{5}`, `{1, 2, 1}`, true, false, false},
+		{`{NULL, 3}`, `{1, 2, 1}`, true, false, false},
+		{`{NULL}`, `{NULL}`, false, false, false},
+		{`{NULL}`, `{1, NULL}`, true, false, true},
+		{`{1,NULL}`, `{NULL}`, false, false, false},
+		{`{2, NULL}`, `{1, NULL}`, true, false, true},
+	}
+
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	parseArray := func(s string) tree.Datum {
+		if s == "NULL" {
+			return tree.DNull
+		}
+		arr, _, err := tree.ParseDArrayFromString(&evalCtx, s, types.Int)
+		if err != nil {
+			t.Fatalf("Failed to parse array %s: %v", s, err)
+		}
+		return arr
+	}
+
+	runTest := func(indexedValue, value tree.Datum, expected, ok, unique bool) {
+		keys, err := EncodeInvertedIndexTableKeys(indexedValue, nil, descpb.PrimaryIndexWithStoredColumnsVersion)
+		require.NoError(t, err)
+
+		invertedExpr, err := EncodeOverlapsInvertedIndexSpans(context.Background(), &evalCtx, value)
+		require.NoError(t, err)
+
+		spanExpr, conversionOk := invertedExpr.(*inverted.SpanExpression)
+		if ok && !conversionOk {
+			t.Fatalf("For (%s, %s), Expr %v is not an InvertedExpression contrary to expectation", indexedValue, value, invertedExpr)
+		} else if !ok && conversionOk {
+			t.Fatalf("For (%s, %s), Expr %v is an InvertedExpression contrary to expectation", indexedValue, value, invertedExpr)
+		} else if !ok && !conversionOk {
+			return
+		}
+
+		// Array spans for && are always tight.
+		if spanExpr.Tight != true {
+			t.Errorf("For (%s, %s), expected tight=true, but got false", indexedValue, value)
+		}
+
+		// Array spans for && are unique only when the value
+		// array contains one or more entries of the same non-null element.
+		// e.g. A && [1, 1].
+		if spanExpr.Unique != unique {
+			t.Errorf("For (%s, %s), expected unique=%t, but got %t", indexedValue, value, unique, spanExpr.Unique)
+		}
+
+		// Check if the indexedValue is included by the spans (i.e. Overlaps).
+		overlaps, err := spanExpr.ContainsKeys(keys)
+		require.NoError(t, err)
+
+		if overlaps != expected {
+			if expected {
+				t.Errorf("Expected spans of %s to overlap with %s but they did not", value, indexedValue)
+			} else {
+				t.Errorf("Expected spans of %s to not overlap with %s but they did", value, indexedValue)
+			}
+		}
+	}
+
+	// Run pre-defined test cases from above.
+	for _, c := range testCases {
+		indexedValue, value := parseArray(c.indexedValue), parseArray(c.value)
+		runTest(indexedValue, value, c.expected, c.ok, c.unique)
+	}
+
+	// Run a set of randomly generated test cases.
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 100; i++ {
+		typ := randgen.RandArrayType(rng)
+
+		// We don't allow jsonpath indices.
+		if typ.ArrayContents().Family() == types.JsonpathFamily {
+			continue
+		}
+
+		// Generate two random arrays and evaluate the result of `left && right`.
+		// Using 1/9th as the Null Chance to generate arrays with a small
+		// number of NULLs added in between.
+		left := randgen.RandArray(rng, typ, 9 /* nullChance */)
+		right := randgen.RandArray(rng, typ, 9 /* nullChance */)
+
+		overlaps, err := tree.ArrayOverlaps(ctx, &evalCtx, right.(*tree.DArray), left.(*tree.DArray))
+		require.NoError(t, err)
+
+		rightArr, _ := right.(*tree.DArray)
+		// An inverted expression can only be generated if the value array is
+		// non-empty or contains at least one non-NULL element.
+		ok := rightArr.Len() > 0 && rightArr.HasNonNulls()
+		// A unique span expression can be guaranteed when the input is of
+		// the form:
+		// Array A && Array containing one or more entries of same non-null
+		// element e.g. A && [1, 1].
+		unique, err := containsNonNullUniqueElement(ctx, &evalCtx, rightArr)
+		require.NoError(t, err)
+
+		// Now check that we get the same result with the inverted index spans.
+		runTest(left, right, bool(*overlaps), ok, unique)
+	}
+}
+
+// Determines if the input array contains only one or more entries of the
+// same non-null element. NULL entries are not considered.
+func containsNonNullUniqueElement(
+	ctx context.Context, evalCtx *eval.Context, valArr *tree.DArray,
+) (bool, error) {
+	var lastVal tree.Datum = tree.DNull
+	for _, val := range valArr.Array {
+		if val != tree.DNull {
+			if lastVal == tree.DNull {
+				lastVal = val
+				continue
+			}
+			if cmp, err := lastVal.Compare(ctx, evalCtx, val); err != nil {
+				return false, err
+			} else if cmp != 0 {
+				return false, nil
+			}
+		}
+	}
+	return lastVal != tree.DNull, nil
+}
+
+type trigramSearchType int
+
+const (
+	like trigramSearchType = iota
+	similar
+	eq
+)
+
+func TestEncodeTrigramInvertedIndexSpans(t *testing.T) {
+	testCases := []struct {
+		// The value that's being indexed in the trigram index.
+		indexedValue string
+		// The value that's being turned into spans to search with.
+		value string
+		// Whether we're using LIKE or % operator for the search.
+		searchType trigramSearchType
+		// Whether we expect that the spans should contain the keys produced by
+		// indexing the indexedValue. If the searchType is similar, then the
+		// spans should contain at least one of the indexed keys, otherwise the
+		// spans should contain all the indexed keys.
+		containsKeys bool
+		// Whether we expect that the indexed value should evaluate as matching
+		// the LIKE or % expression that we're testing.
+		expected bool
+		unique   bool
+	}{
+
+		// This test uses EncodeInvertedIndexTableKeys and EncodeTrigramSpans
+		// to determine if the spans produced from the second string value will
+		// correctly include or exclude the first value.
+
+		{`foobarbaz`, `%oob%baz`, like, true, true, false},
+		{`foobarbaz`, `%oob%`, like, true, true, true},
+		// Test that the order of the trigrams doesn't matter for containment, but
+		// does matter for evaluation.
+		{`staticcheck`, `%check%static%`, like, true, false, false},
+		// Make sure that we can satisfy a query that includes a chunk that is too
+		// short to produce any trigrams at all.
+		{`test`, `%a%bar`, like, false, false, true},
+
+		// "Reverse order" trigrams shouldn't match.
+		{`test`, `tse`, like, false, false, true},
+
+		// Similarity (%) queries.
+		{`staticcheck`, `staricheck`, similar, true, true, false},
+		{`staticcheck`, `blevicchlrk`, similar, true, false, false},
+		{`staticcheck`, `che`, similar, true, false, false},
+		{`staticcheck`, `xxx`, similar, false, false, false},
+		{`staticcheck`, `xxxyyy`, similar, false, false, false},
+		{`aaaaaa`, `aab`, similar, true, true, false},
+
+		// Equality queries.
+		{`staticcheck`, `staticcheck`, eq, true, true, false},
+		{`staticcheck`, `staticcheckz`, eq, false, false, false},
+		{`staticcheck`, `zstaticcheck`, eq, false, false, false},
+		{`baba`, `abab`, eq, true, false, false},
+		{`foo`, `foo`, eq, true, true, true},
+		{`foo`, `bar`, eq, false, false, true},
+
+		{`eabc`, `eabd`, eq, false, false, false},
+	}
+
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx.SessionData().TrigramSimilarityThreshold = .3
+
+	runTest := func(indexedValue, value string, searchType trigramSearchType,
+		expectContainsKeys, expected, expectUnique bool) {
+		keys, err := EncodeInvertedIndexTableKeys(tree.NewDString(indexedValue), nil, descpb.LatestIndexDescriptorVersion)
+		require.NoError(t, err)
+
+		typedExpr := makeTrigramBinOp(t, indexedValue, value, searchType)
+		invertedExpr, err := EncodeTrigramSpans(value, searchType != similar)
+		require.NoError(t, err)
+
+		spanExpr, ok := invertedExpr.(*inverted.SpanExpression)
+		if !ok {
+			t.Fatalf("invertedExpr %v is not a SpanExpression", invertedExpr)
+		}
+
+		if spanExpr.Tight {
+			// We never expect the inverted expressions for trigrams to be tight.
+			t.Fatalf("unexpectedly found a tight expression")
+		}
+		require.Equal(t, expectUnique, spanExpr.Unique, "%s, %s: unexpected unique attribute", indexedValue, value)
+
+		// Check if the indexedValue is included by the spans. If the search is
+		// a similarity search, the spans should contain at least one key.
+		// Otherwise, the spans should contain all the keys.
+		var containsKeys bool
+		if searchType == similar {
+			for i := range keys {
+				containsKey, err := spanExpr.ContainsKeys([][]byte{keys[i]})
+				require.NoError(t, err)
+				if containsKey {
+					containsKeys = true
+					break
+				}
+			}
+		} else {
+			containsKeys, err = spanExpr.ContainsKeys(keys)
+			require.NoError(t, err)
+		}
+		require.Equal(t, expectContainsKeys, containsKeys, "%s, %s: expected containsKeys", indexedValue, value)
+
+		// Since the spans are never tight, apply an additional filter to determine
+		// if the result is contained.
+		datum, err := eval.Expr(context.Background(), &evalCtx, typedExpr)
+		require.NoError(t, err)
+		actual := bool(*datum.(*tree.DBool))
+		require.Equal(t, expected, actual, "%s, %s: expected evaluation result to match", indexedValue, value)
+	}
+
+	// Run pre-defined test cases from above.
+	for _, c := range testCases {
+		runTest(c.indexedValue, c.value, c.searchType, c.containsKeys, c.expected, c.unique)
+	}
+
+	// Run some random test cases.
+
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 100; i++ {
+		const alphabet = "abcdefg"
+
+		// Generate two random strings and evaluate left % right, left LIKE right,
+		// and left = right both via eval and via the span comparisons.
+		left := util.RandString(rng, 15, alphabet)
+		length := 3 + rng.Intn(5)
+		right := util.RandString(rng, length, alphabet+"%")
+
+		for _, searchType := range []trigramSearchType{like, eq, similar} {
+			expr := makeTrigramBinOp(t, left, right, searchType)
+			lTrigrams := trigram.MakeTrigrams(left, searchType == similar /* pad */)
+			// Check for intersection. We're looking for a non-zero intersection
+			// for similar, and complete containment of the right trigrams in the left
+			// for eq and like.
+			any := false
+			all := true
+			rTrigrams := trigram.MakeTrigrams(right, searchType == similar /* pad */)
+			for _, trigram := range rTrigrams {
+				idx := sort.Search(len(lTrigrams), func(i int) bool {
+					return lTrigrams[i] >= trigram
+				})
+				if idx < len(lTrigrams) && lTrigrams[idx] == trigram {
+					any = true
+				} else {
+					all = false
+				}
+			}
+			var expectedContainsKeys bool
+			if searchType == similar {
+				expectedContainsKeys = any
+			} else {
+				expectedContainsKeys = all
+			}
+
+			d, err := eval.Expr(context.Background(), &evalCtx, expr)
+			require.NoError(t, err)
+			expected := bool(*d.(*tree.DBool))
+			trigrams := trigram.MakeTrigrams(right, searchType == similar /* pad */)
+			nTrigrams := len(trigrams)
+			valid := nTrigrams > 0
+			unique := nTrigrams == 1
+			if !valid {
+				_, err := EncodeTrigramSpans(right, searchType != similar /* allMustMatch */)
+				require.Error(t, err)
+				continue
+			}
+			runTest(left, right, searchType, expectedContainsKeys, expected, unique)
+		}
+	}
+}
+
+func makeTrigramBinOp(
+	t *testing.T, indexedValue string, value string, searchType trigramSearchType,
+) (typedExpr tree.TypedExpr) {
+	var opstr string
+	switch searchType {
+	case like:
+		opstr = "LIKE"
+	case eq:
+		opstr = "="
+	case similar:
+		opstr = "%"
+	default:
+		panic("no such searchtype")
+	}
+	expr, err := parser.ParseExpr(fmt.Sprintf("'%s' %s '%s'", indexedValue, opstr, value))
+	require.NoError(t, err)
+
+	semaContext := tree.MakeSemaContext(nil /* resolver */)
+	typedExpr, err = tree.TypeCheck(context.Background(), expr, &semaContext, types.Bool)
+	require.NoError(t, err)
+	return typedExpr
+}
+
+func TestEncodeTrigramInvertedIndexSpansError(t *testing.T) {
+	// Make sure that any input with a chunk with fewer than 3 characters returns
+	// an error, since we can't produce trigrams from strings that don't meet a
+	// minimum of 3 characters.
+	testCases := []struct {
+		input           string
+		allMustMatchErr bool
+		anyMustMatchErr bool
+	}{
+		{"fo", true, false},
+		{"a", true, false},
+		{"", true, true},
+		// Non-alpha characters don't count against the limit.
+		{"fo ", true, false},
+		{"%fo%", true, false},
+		{"#$(*)", true, true},
+	}
+	for _, tc := range testCases {
+		_, err := EncodeTrigramSpans(tc.input, true /* allMustMatch */)
+		if tc.allMustMatchErr {
+			require.Error(t, err)
+		} else {
+			require.NoError(t, err)
+		}
+		_, err = EncodeTrigramSpans(tc.input, false /* allMustMatch */)
+		if tc.anyMustMatchErr {
+			require.Error(t, err)
+		} else {
+			require.NoError(t, err)
+		}
+	}
+}
+
+func TestDecodeKeyVals(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testCases := []struct {
+		desc                 string
+		key                  []byte
+		vals                 []EncDatum
+		expectedRemainingKey []byte
+		expectedNumVals      int
+	}{
+		{
+			desc:                 "vals_eq_bytes",
+			key:                  []byte{1},
+			vals:                 make([]EncDatum, 1),
+			expectedRemainingKey: []byte{},
+			expectedNumVals:      1,
+		},
+		{
+			desc:                 "vals_lt_bytes",
+			key:                  []byte{1, 1},
+			vals:                 make([]EncDatum, 1),
+			expectedRemainingKey: []byte{1},
+			expectedNumVals:      1,
+		},
+		{
+			desc:                 "vals_gt_bytes",
+			key:                  []byte{1},
+			vals:                 make([]EncDatum, 2),
+			expectedRemainingKey: []byte{},
+			expectedNumVals:      1,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			actualRemainingKey, actualNumVals, err := DecodeKeyVals(tc.vals, nil, tc.key)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedRemainingKey, actualRemainingKey)
+			require.Equal(t, tc.expectedNumVals, actualNumVals)
+		})
+	}
+}
+
+// See comment at the top of pkg/sql/vecindex/vecstore/encoding.go for more
+// details on the encoding format for vector indexes. The index encoder can only
+// write leaf keys, so that's what's tested here.
+func TestVectorEncoding(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	codec := srv.ApplicationLayer().Codec()
+	runner := sqlutils.MakeSQLRunner(sqlDB)
+	defer srv.Stopper().Stop(ctx)
+
+	runner.Exec(t, `CREATE TABLE prefix_cols (
+  a INT PRIMARY KEY,
+  b INT,
+  c INT,
+  vec1 VECTOR(3),
+	VECTOR INDEX simple_idx (vec1),  
+	VECTOR INDEX prefix_idx (c, b, vec1),
+  FAMILY (a, b, c, vec1)
+)`)
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "defaultdb", "prefix_cols")
+
+	testVector := vector.T{1, 2, 4}
+	encodedVector := vecencoding.EncodeUnquantizerVector([]byte{}, testVector)
+
+	vh := VectorIndexEncodingHelper{
+		PartitionKeys: make(map[descpb.IndexID]tree.Datum),
+		QuantizedVecs: make(map[descpb.IndexID]tree.Datum),
+	}
+	for _, idx := range tableDesc.PublicNonPrimaryIndexes() {
+		vh.PartitionKeys[idx.GetID()] = tree.NewDInt(8311)
+		vh.QuantizedVecs[idx.GetID()] = tree.NewDBytes(tree.DBytes(encodedVector))
+	}
+
+	var colMap catalog.TableColMap
+	for _, c := range tableDesc.PublicColumns() {
+		colMap.Set(c.GetID(), c.Ordinal())
+	}
+
+	testDatums := []tree.Datum{
+		tree.NewDInt(1),
+		tree.NewDInt(2),
+		tree.NewDInt(3),
+		tree.NewDPGVector(testVector),
+	}
+
+	expectedKeyMap := map[string][]uint64{
+		// Partition key (8311), leaf level (1), suffix key column (1), first
+		// byte of primary key (0).
+		"simple_idx": {8311, 1, 1, 0},
+		// Same as above, prefixed by column c value (3) and column b value (2).
+		"prefix_idx": {3, 2, 8311, 1, 1, 0},
+	}
+
+	for _, idx := range tableDesc.PublicNonPrimaryIndexes() {
+		// Encode the secondary index key.
+		secondaryIndexEntry, err := EncodeSecondaryIndex(
+			ctx,
+			codec,
+			tableDesc,
+			idx,
+			colMap,
+			testDatums,
+			vh,
+			true /* includeEmpty */)
+		require.NoError(t, err)
+		require.Equal(t, 1, len(secondaryIndexEntry))
+
+		// Decode the index key to ensure that the vector bytes are correctly encoded.
+		prefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), idx.GetID())
+		require.Equal(t, roachpb.Key(prefix), secondaryIndexEntry[0].Key[:len(prefix)])
+
+		keyBytes := secondaryIndexEntry[0].Key[len(prefix):]
+		expectedKey, ok := expectedKeyMap[idx.GetName()]
+		require.True(t, ok)
+		for _, expected := range expectedKey {
+			var decoded uint64
+			keyBytes, decoded, err = encoding.DecodeUvarintAscending(keyBytes)
+			require.NoError(t, err)
+			require.Equal(t, expected, decoded)
+		}
+		require.Equal(t, 0, len(keyBytes))
+
+		// Decode the value to ensure that the vector bytes are returned correctly. At
+		// this layer, the data here is opaque, so we don't attempt to turn it back into
+		// a vector. We just check that the bytes are correct.
+		val, err := secondaryIndexEntry[0].Value.GetBytes()
+		require.NoError(t, err)
+		require.Equal(t, tree.DBytes(encodedVector), tree.DBytes(val))
+	}
+}
+
+func TestVectorCompositeEncoding(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	codec := srv.ApplicationLayer().Codec()
+	runner := sqlutils.MakeSQLRunner(sqlDB)
+	defer srv.Stopper().Stop(ctx)
+
+	runner.Exec(t, `CREATE TABLE prefix_cols (
+  a INT PRIMARY KEY,
+  s STRING COLLATE en_US_u_ks_level2,
+  vec1 VECTOR(3),
+	VECTOR INDEX prefix_idx (s, vec1),
+  FAMILY (a, s, vec1)
+)`)
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, codec, "defaultdb", "prefix_cols")
+
+	testVector := vector.T{1, 2, 4}
+	encodedVector := vecencoding.EncodeUnquantizerVector([]byte{}, testVector)
+
+	vh := VectorIndexEncodingHelper{
+		PartitionKeys: make(map[descpb.IndexID]tree.Datum),
+		QuantizedVecs: make(map[descpb.IndexID]tree.Datum),
+	}
+	for _, idx := range tableDesc.PublicNonPrimaryIndexes() {
+		vh.PartitionKeys[idx.GetID()] = tree.NewDInt(8311)
+		vh.QuantizedVecs[idx.GetID()] = tree.NewDBytes(tree.DBytes(encodedVector))
+	}
+
+	var collatedColumnType *types.T
+	var colMap catalog.TableColMap
+	for _, c := range tableDesc.PublicColumns() {
+		colMap.Set(c.GetID(), c.Ordinal())
+		if c.GetName() == "s" {
+			collatedColumnType = c.GetType()
+		}
+	}
+
+	collatedString, err := tree.NewDCollatedString("42", collatedColumnType.Locale(), &tree.CollationEnvironment{})
+	require.NoError(t, err)
+
+	testDatums := []tree.Datum{
+		tree.NewDInt(54),
+		collatedString,
+		tree.NewDPGVector(testVector),
+	}
+
+	idx := tableDesc.PublicNonPrimaryIndexes()[0]
+	// Encode the secondary index key.
+	secondaryIndexEntry, err := EncodeSecondaryIndex(
+		ctx,
+		codec,
+		tableDesc,
+		idx,
+		colMap,
+		testDatums,
+		vh,
+		true /* includeEmpty */)
+	require.NoError(t, err)
+	require.Equal(t, 1, len(secondaryIndexEntry))
+
+	// Decode the index key to ensure that the vector bytes are correctly encoded.
+	prefix := MakeIndexKeyPrefix(codec, tableDesc.GetID(), idx.GetID())
+	require.Equal(t, roachpb.Key(prefix), secondaryIndexEntry[0].Key[:len(prefix)])
+
+	keyBytes := secondaryIndexEntry[0].Key[len(prefix):]
+
+	// Skip the magic collated string bytes
+	_, keyBytes, err = keyside.Decode(&tree.DatumAlloc{}, collatedColumnType, keyBytes, encoding.Ascending)
+	require.NoError(t, err)
+
+	// Decode the partition ID and ensure that it is correct.
+	keyBytes, decodedPartitionID, err := encoding.DecodeUvarintAscending(keyBytes)
+	require.NoError(t, err)
+	require.Equal(t, uint64(8311), decodedPartitionID)
+
+	// Decode the partition Level and ensure that it is correct.
+	keyBytes, decodedPartitionLevel, err := encoding.DecodeUvarintAscending(keyBytes)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), decodedPartitionLevel)
+
+	// Decode the primary key and ensure that it is correct.
+	pkValue, keyBytes, err := keyside.Decode(&tree.DatumAlloc{}, types.Int, keyBytes, encoding.Ascending)
+	require.NoError(t, err)
+	require.Equal(t, int64(54), int64(*pkValue.(*tree.DInt)))
+
+	// Decode the family and ensure that it is correct.
+	familyValue, keyBytes, err := keyside.Decode(&tree.DatumAlloc{}, types.Int, keyBytes, encoding.Ascending)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), int64(*familyValue.(*tree.DInt)))
+
+	// Ensure that there is no trailing garbage.
+	require.Equal(t, 0, len(keyBytes))
+
+	// Decode the value to ensure that the vector bytes are returned correctly. At
+	// this layer, the data here is opaque, so we don't attempt to turn it back into
+	// a vector. We just check that the bytes are correct.
+	val, err := secondaryIndexEntry[0].Value.GetBytes()
+	require.NoError(t, err)
+	require.Equal(t, tree.DBytes(encodedVector), tree.DBytes(val[:len(encodedVector)]))
+
+	decodedStr, val, err := valueside.Decode(&tree.DatumAlloc{}, collatedColumnType, val[len(encodedVector):])
+	require.NoError(t, err)
+	require.Equal(t, collatedString, decodedStr)
+	require.Equal(t, 0, len(val))
 }

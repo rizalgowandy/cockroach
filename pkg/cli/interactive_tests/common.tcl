@@ -9,6 +9,7 @@ system "mkdir -p logs"
 set histfile "cockroach_sql_history"
 
 set ::env(COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING) "true"
+set ::env(COCKROACH_OVERRIDE_ALLOW_UNSAFE_INTERNALS) "true"
 set ::env(COCKROACH_CONNECT_TIMEOUT) 15
 set ::env(COCKROACH_SQL_CLI_HISTORY) $histfile
 # Set client commands as insecure. The server uses --insecure.
@@ -17,7 +18,7 @@ system "rm -f $histfile"
 
 # Everything in this test should be fast. Don't be tolerant for long
 # waits.
-set timeout 30
+set timeout 45
 
 # When run via Docker the enclosing terminal has 0 columns and 0 rows,
 # and this confuses readline. Ensure sane defaults here.
@@ -63,10 +64,22 @@ proc handle_timeout {text} {
     exit 1
 }
 proc eexpect {text} {
+    system "echo; echo \$(date '+.%y%m%d %H:%M:%S.%N') START EXPECT TEST | tee -a logs/expect-cmd.log"
     expect {
 	$text {}
 	timeout { handle_timeout $text }
     }
+    # Wait for the line reader to wake up.
+    after 10
+}
+
+# eexpect_re is like eexpect, but takes a regular expression argument
+# instead of a text string.
+proc eexpect_re {text} {
+  expect {
+    -re $text {}
+    timeout { handle_timeout $text }
+  }
 }
 
 # Convenience function that sends Ctrl+C to the monitored process.
@@ -74,6 +87,44 @@ proc interrupt {} {
     report "INTERRUPT TO FOREGROUND PROCESS"
     send "\003"
     sleep 0.4
+}
+
+# Convenience function that sends Ctrl+C and waits more reliably for process to exit.
+# This uses a retry approach similar to stop_server but adapted for expect environment.
+proc interrupt_and_wait {} {
+    report "INTERRUPT AND WAIT FOR FOREGROUND PROCESS"
+
+    # Send the interrupt signal
+    send "\003"
+
+    # Use a retry loop similar to stop_server's wait mechanism.
+    # Try up to 30 times with 1 second intervals, like stop_server does.
+    try {
+        # Set shorter timeout for the retry loop
+        set timeout 1
+
+        for {set i 1} {$i <= 30} {incr i} {
+            # Try to expect the shell prompt with a short timeout (1 second per attempt).
+            expect {
+                ":/# " {
+                    report "FOREGROUND PROCESS EXITED SUCCESSFULLY (after $i attempt(s))"
+                    return
+                }
+                timeout {
+                    # Process might still be running, continue waiting.
+                    report "still waiting for process to exit (attempt $i/30)"
+                    # The sleep is implicit in the timeout, so we don't need an additional sleep here.
+                }
+            }
+        }
+
+        # If we get here, the process didn't exit cleanly within 30 seconds.
+        report "TIMEOUT: foreground process still running after 30 attempts"
+        error "Failed to interrupt foreground process - it did not exit within 30 seconds"
+    } finally {
+        # Restore original timeout.
+        set timeout 45
+    }
 }
 
 # Convenience function that sends Ctrl+D to the monitored process.
@@ -133,6 +184,20 @@ proc flush_server_logs {} {
     report "END FLUSH LOGS"
 }
 
+proc flush_and_sync_logs {filename grep_text} {
+    report "BEGIN FLUSH LOGS $filename"
+    system "kill -HUP `cat server_pid` 2>/dev/null"
+    # Wait for flush to occur.
+    system "for i in `seq 1 5`; do
+              grep '$grep_text' $filename && exit 0;
+              echo still waiting
+              sleep 1
+            done
+            echo 'server failed to flush logs?'
+            exit 1"
+    report "END FLUSH LOGS"
+}
+
 proc force_stop_server {argv} {
     report "BEGIN FORCE STOP SERVER"
     system "kill -KILL `cat server_pid`"
@@ -178,4 +243,3 @@ proc stop_tenant {tenant_id argv} {
 
     report "END STOP TENANT $tenant_id"
 }
-

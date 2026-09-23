@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -75,6 +70,30 @@ var (
 	// the system.
 	OverrideMultiRegionTableZoneConfigurationSystem = telemetry.GetCounterOnce(
 		"sql.multiregion.zone_configuration.override.system.table",
+	)
+
+	// AlterDatabaseAddSuperRegionCounter is to be incremented when a super
+	// region is added to a database.
+	AlterDatabaseAddSuperRegionCounter = telemetry.GetCounterOnce(
+		"sql.multiregion.add_super_region",
+	)
+
+	// AlterDatabaseDropSuperRegionCounter is to be incremented when a super
+	// region is dropped from a database.
+	AlterDatabaseDropSuperRegionCounter = telemetry.GetCounterOnce(
+		"sql.multiregion.drop_super_region",
+	)
+
+	// AlterDatabaseAlterSuperRegionCounter is to be incremented when a super
+	// region's regions are altered.
+	AlterDatabaseAlterSuperRegionCounter = telemetry.GetCounterOnce(
+		"sql.multiregion.alter_super_region",
+	)
+
+	// AlterDatabaseAlterSuperRegionSurvivalGoalCounter is to be incremented
+	// when a super region's survival goal is altered.
+	AlterDatabaseAlterSuperRegionSurvivalGoalCounter = telemetry.GetCounterOnce(
+		"sql.multiregion.alter_super_region.survival_goal",
 	)
 )
 

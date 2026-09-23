@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props
 
@@ -18,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/olekukonko/tablewriter"
 )
 
@@ -32,7 +28,7 @@ import (
 // lazily, and only as needed to determine the row count for the current
 // expression or a parent expression. For example:
 //
-//   SELECT y FROM a WHERE x=1
+//	SELECT y FROM a WHERE x=1
 //
 // The only column that affects the row count of this query is x, since the
 // distribution of values in x is what determines the selectivity of the
@@ -53,24 +49,61 @@ type Statistics struct {
 	// the row counts can be unpredictable; thus, a row count of 0.001 should be
 	// considered 1000 times better than a row count of 1, even though if this was
 	// a true row count they would be pretty much the same thing.
+	//
+	// For expressions with Cardinality.Max = 0, RowCount will be 0. For
+	// expressions with Cardinality.Max > 0, RowCount will be >= epsilon.
 	RowCount float64
+
+	// minRowCount, if greater than zero, limits the lower bound of RowCount
+	// when it is updated by ApplySelectivity. See Init for more details.
+	minRowCount float64
+
+	// VirtualCols is the set of virtual computed columns produced by our input
+	// that we have statistics on. Any of these could appear in ColStats. This set
+	// is maintained separately from OutputCols to allow lookup of statistics on
+	// virtual columns for expressions that synthesize virtual columns.
+	VirtualCols opt.ColSet
 
 	// ColStats is a collection of statistics that pertain to columns in an
 	// expression or table. It is keyed by a set of one or more columns over which
 	// the statistic is defined.
 	ColStats ColStatsMap
 
-	// Selectivity is a value between 0 and 1 representing the estimated
-	// reduction in number of rows for the top-level operator in this
-	// expression.
+	// Selectivity is a value between 0 and 1 representing the estimated reduction
+	// in number of rows for the top-level operator in this expression, relative
+	// to some input. The input depends on the expression, e.g. for semi joins the
+	// input is the left child, for inner joins the input is the left child times
+	// the right child, for constrained scans the input is a full table scan, etc.
+	//
+	// Selectivity is used to calculate column statistics after the corresponding
+	// expression statistics have been derived.
+	//
+	// For expressions with Cardinality.Max = 0, selectivity will be 0. For
+	// expressions with Cardinality.Max > 0, selectivity will be in the range
+	// [epsilon, 1.0].
 	Selectivity Selectivity
+
+	// AvgColSizes contains the estimated average size of columns that
+	// originates from a table. The i-th element of the slice is the average
+	// size of the column with ordinal i in its table. AvgSize is only non-nil
+	// when the statistics are built from a table.
+	AvgColSizes []uint64
 }
 
 // Init initializes the data members of Statistics.
-func (s *Statistics) Init(relProps *Relational) (zeroCardinality bool) {
+//
+// minRowCount, if greater than zero, limits the lower bound of RowCount when it
+// is updated by ApplySelectivity. If minRowCount is zero, then there is no
+// lower bound (however, in practice there is some lower bound due to
+// Selectivity being at least epsilon). Note that if minRowCount is non-zero,
+// RowCount can still be zero if the cardinality of the expression is zero,
+// e.g., for a contradictory filter.
+func (s *Statistics) Init(relProps *Relational, minRowCount float64) (zeroCardinality bool) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Reusing fields must be done explicitly.
-	*s = Statistics{}
+	*s = Statistics{
+		minRowCount: minRowCount,
+	}
 	if relProps.Cardinality.IsZero() {
 		s.RowCount = 0
 		s.Selectivity = ZeroSelectivity
@@ -94,6 +127,7 @@ func (s *Statistics) RowCountIfAvailable() float64 {
 func (s *Statistics) CopyFrom(other *Statistics) {
 	s.Available = other.Available
 	s.RowCount = other.RowCount
+	s.VirtualCols = other.VirtualCols.Copy()
 	s.ColStats.CopyFrom(&other.ColStats)
 	s.Selectivity = other.Selectivity
 }
@@ -104,39 +138,15 @@ func (s *Statistics) CopyFrom(other *Statistics) {
 // See ColumnStatistic.ApplySelectivity for updating distinct counts, null
 // counts, and histograms.
 func (s *Statistics) ApplySelectivity(selectivity Selectivity) {
-	s.RowCount *= selectivity.AsFloat()
-	s.Selectivity.Multiply(selectivity)
-}
-
-// ApplySelectivityRatio multiplies the statistics by the given numerator, and
-// divides by the denominator. RowCount and Selectivity are updated. Note that
-// DistinctCounts, NullCounts, and Histograms are not updated.
-func (s *Statistics) ApplySelectivityRatio(numerator, denominator Selectivity) {
-	ratio := numerator.AsFloat() / denominator.AsFloat()
-
-	// Make sure that we don't increase the row count to something larger than it
-	// was at the beginning. Selectivity will never exceed 1, so use that fact to
-	// update the RowCount.
-	if ratio > 1 {
-		oldSelectivity := s.Selectivity
-		// MakeSelectivity ensures that newSelectivity is <= 1.
-		newSelectivity := MakeSelectivity(oldSelectivity.AsFloat() * ratio)
-		s.RowCount *= newSelectivity.AsFloat() / oldSelectivity.AsFloat()
-		s.Selectivity = newSelectivity
+	if selectivity == ZeroSelectivity {
+		s.Selectivity = ZeroSelectivity
+		s.RowCount = 0
+	} else if r := s.RowCount * selectivity.AsFloat(); r < s.minRowCount {
+		s.Selectivity.Multiply(MakeSelectivityFromFraction(s.minRowCount, s.RowCount))
+		s.RowCount = s.minRowCount
 	} else {
-		s.RowCount *= ratio
-		s.Selectivity = MakeSelectivity(s.Selectivity.AsFloat() * ratio)
-	}
-}
-
-// LimitSelectivity limits the Selectivity to the given max selectivity.
-// RowCount and Selectivity are updated. Note that DistinctCounts, NullCounts,
-// and Histograms are not updated.
-func (s *Statistics) LimitSelectivity(maxSelectivity Selectivity) {
-	if s.Selectivity.selectivity > maxSelectivity.selectivity {
-		adjustedSelectivity := maxSelectivity
-		adjustedSelectivity.Divide(s.Selectivity)
-		s.ApplySelectivity(adjustedSelectivity)
+		s.Selectivity.Multiply(selectivity)
+		s.RowCount = r
 	}
 }
 
@@ -147,7 +157,10 @@ func (s *Statistics) LimitSelectivity(maxSelectivity Selectivity) {
 func (s *Statistics) UnionWith(other *Statistics) {
 	s.Available = s.Available && other.Available
 	s.RowCount += other.RowCount
-	s.Selectivity.Add(other.Selectivity)
+	s.Selectivity.UnsafeAdd(other.Selectivity)
+	if s.Selectivity.AsFloat() > 1.0 {
+		s.Selectivity = OneSelectivity
+	}
 }
 
 // String returns a string representation of the statistics.
@@ -164,15 +177,15 @@ func (s *Statistics) StringWithoutHistograms() string {
 func (s *Statistics) stringImpl(includeHistograms bool) string {
 	var buf bytes.Buffer
 
-	fmt.Fprintf(&buf, "[rows=%.9g", s.RowCount)
+	fmt.Fprintf(&buf, "[rows=%.6g", s.RowCount)
 	colStats := make(ColumnStatistics, s.ColStats.Count())
 	for i := 0; i < s.ColStats.Count(); i++ {
 		colStats[i] = s.ColStats.Get(i)
 	}
 	sort.Sort(colStats)
 	for _, col := range colStats {
-		fmt.Fprintf(&buf, ", distinct%s=%.9g", col.Cols.String(), col.DistinctCount)
-		fmt.Fprintf(&buf, ", null%s=%.9g", col.Cols.String(), col.NullCount)
+		fmt.Fprintf(&buf, ", distinct%s=%.6g", col.Cols.String(), col.DistinctCount)
+		fmt.Fprintf(&buf, ", null%s=%.6g", col.Cols.String(), col.NullCount)
 	}
 	buf.WriteString("]")
 	if includeHistograms {
@@ -190,6 +203,9 @@ func (s *Statistics) stringImpl(includeHistograms bool) string {
 				}
 			}
 		}
+	}
+	if !s.VirtualCols.Empty() {
+		fmt.Fprintf(&buf, "\nvirtcolstats: %v", s.VirtualCols)
 	}
 
 	return buf.String()
@@ -258,7 +274,19 @@ func (c *ColumnStatistic) ApplySelectivity(selectivity Selectivity, inputRows fl
 		// non-zero).
 		c.DistinctCount = epsilon
 	}
+}
 
+// CopyFromOther copies all fields of the other ColumnStatistic except Cols,
+// including the Histogram, into the receiver.
+func (c *ColumnStatistic) CopyFromOther(other *ColumnStatistic, evalCtx *eval.Context) {
+	c.DistinctCount = other.DistinctCount
+	c.NullCount = other.NullCount
+	if other.Histogram != nil && c.Cols.Len() == 1 {
+		c.Histogram = &Histogram{}
+		c.Histogram.Init(
+			evalCtx, c.Cols.SingleColumn(), other.Histogram.buckets, other.Histogram.resolution,
+		)
+	}
 }
 
 // ColumnStatistics is a slice of pointers to ColumnStatistic values.

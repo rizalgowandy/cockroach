@@ -1,16 +1,10 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for ordered_synchronizer.eg.go. It's
@@ -33,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -56,19 +51,30 @@ const _TYPE_WIDTH = 0
 // stream are assumed to be ordered according to the same set of columns.
 type OrderedSynchronizer struct {
 	colexecop.InitHelper
-	span *tracing.Span
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
+	span        *tracing.Span
 
 	accountingHelper      colmem.SetAccountingHelper
-	memoryLimit           int64
 	inputs                []colexecargs.OpWithMetaInfo
 	ordering              colinfo.ColumnOrdering
 	typs                  []*types.T
 	canonicalTypeFamilies []types.Family
+	// tuplesToMerge (when positive) tracks the number of tuples that are still
+	// to be merged by synchronizer.
+	tuplesToMerge int64
 
+	// heapInitalized, if set, indicates that we've fetched a batch from each
+	// input and initialized the heap over batches' first rows.
+	heapInitialized bool
 	// inputBatches stores the current batch for each input.
 	inputBatches []coldata.Batch
 	// inputIndices stores the current index into each input batch.
 	inputIndices []int
+	// advanceMinBatch, if true, indicates that the minimum input (according to
+	// heap) needs to be advanced by one row. This advancement is delayed in
+	// order to not fetch the next batch from the input too eagerly.
+	advanceMinBatch bool
 	// heap is a min heap which stores indices into inputBatches. The "current
 	// value" of ith input batch is the tuple at inputIndices[i] position of
 	// inputBatches[i] batch. If an input is fully exhausted, it will be removed
@@ -76,12 +82,16 @@ type OrderedSynchronizer struct {
 	heap []int
 	// comparators stores one comparator per ordering column.
 	comparators []vecComparator
-	// maxCapacity if non-zero indicates the target capacity of the output
-	// batch. It is set when, after setting a row, we realize that the output
-	// batch has exceeded the memory limit.
-	maxCapacity int
 	output      coldata.Batch
 	outVecs     coldata.TypedVecs
+	// outputIdx tracks the next tuple to be added to the output batch.
+	outputIdx int
+	// continueBatch, if set, indicates that the current output batch should be
+	// continued.
+	continueBatch bool
+	// tempBufferedMeta contains temporarily buffered metadata until the next
+	// input batch from the minimum input is fetched.
+	tempBufferedMeta []execinfrapb.ProducerMetadata
 }
 
 var (
@@ -95,49 +105,124 @@ func (o *OrderedSynchronizer) ChildCount(verbose bool) int {
 }
 
 // Child implements the execinfrapb.OpNode interface.
-func (o *OrderedSynchronizer) Child(nth int, verbose bool) execinfra.OpNode {
+func (o *OrderedSynchronizer) Child(nth int, verbose bool) execopnode.OpNode {
 	return o.inputs[nth].Root
 }
 
 // NewOrderedSynchronizer creates a new OrderedSynchronizer.
 // - memoryLimit will limit the size of batches produced by the synchronizer.
+// - tuplesToMerge, if positive, indicates the total number of tuples that will
+// be emitted by all inputs, use 0 if unknown.
 func NewOrderedSynchronizer(
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	allocator *colmem.Allocator,
 	memoryLimit int64,
 	inputs []colexecargs.OpWithMetaInfo,
 	typs []*types.T,
 	ordering colinfo.ColumnOrdering,
+	tuplesToMerge int64,
 ) *OrderedSynchronizer {
 	os := &OrderedSynchronizer{
-		memoryLimit:           memoryLimit,
+		flowCtx:               flowCtx,
+		processorID:           processorID,
 		inputs:                inputs,
 		ordering:              ordering,
 		typs:                  typs,
 		canonicalTypeFamilies: typeconv.ToCanonicalTypeFamilies(typs),
+		tuplesToMerge:         tuplesToMerge,
+		inputBatches:          make([]coldata.Batch, len(inputs)),
+		heap:                  make([]int, 0, len(inputs)),
 	}
-	os.accountingHelper.Init(allocator, typs)
+	os.accountingHelper.Init(allocator, memoryLimit, typs, false /* alwaysReallocate */)
 	return os
 }
 
+// maybeEmitMeta checks whether the synchronizer has temporarily buffered any
+// metadata and returns one object if so.
+func (o *OrderedSynchronizer) maybeEmitMeta() *execinfrapb.ProducerMetadata {
+	if len(o.tempBufferedMeta) == 0 {
+		return nil
+	}
+	meta := o.tempBufferedMeta[0]
+	o.tempBufferedMeta[0] = execinfrapb.ProducerMetadata{}
+	o.tempBufferedMeta = o.tempBufferedMeta[1:]
+	return &meta
+}
+
 // Next is part of the Operator interface.
-func (o *OrderedSynchronizer) Next() coldata.Batch {
-	if o.inputBatches == nil {
-		o.inputBatches = make([]coldata.Batch, len(o.inputs))
-		o.heap = make([]int, 0, len(o.inputs))
+func (o *OrderedSynchronizer) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	if meta := o.maybeEmitMeta(); meta != nil {
+		return nil, meta
+	}
+	if !o.heapInitialized {
 		for i := range o.inputs {
-			o.inputBatches[i] = o.inputs[i].Root.Next()
+			if o.inputBatches[i] != nil {
+				// Already fetched from this input.
+				continue
+			}
+			var meta *execinfrapb.ProducerMetadata
+			o.inputBatches[i], meta = o.inputs[i].Root.Next()
+			if meta != nil {
+				return nil, meta
+			}
 			o.updateComparators(i)
 			if o.inputBatches[i].Length() > 0 {
 				o.heap = append(o.heap, i)
 			}
 		}
 		heap.Init(o)
+		o.heapInitialized = true
 	}
-	o.resetOutput()
-	outputIdx := 0
-	for outputIdx < o.output.Capacity() && (o.maxCapacity == 0 || outputIdx < o.maxCapacity) {
+	if !o.continueBatch {
+		var reallocated bool
+		o.output, reallocated = o.accountingHelper.ResetMaybeReallocate(
+			o.typs, o.output, int(o.tuplesToMerge), /* tuplesToBeSet */
+		)
+		if reallocated {
+			o.outVecs.SetBatch(o.output)
+		}
+		o.outputIdx = 0
+	}
+	o.continueBatch = false
+	for batchDone := false; !batchDone; {
+		if meta := o.maybeEmitMeta(); meta != nil {
+			o.continueBatch = true
+			return nil, meta
+		}
+		if o.advanceMinBatch {
+			// Advance the minimum input batch, fetching a new batch if
+			// necessary.
+			minBatch := o.heap[0]
+			if o.inputIndices[minBatch]+1 < o.inputBatches[minBatch].Length() {
+				o.inputIndices[minBatch]++
+			} else {
+				// We're in the middle of updating the heap, so we need to fetch
+				// the next batch and update the comparators before we can emit
+				// any metadata. Thus, we'll temporarily buffer all meta and
+				// emit it at a convenient point in time.
+				for {
+					batch, meta := o.inputs[minBatch].Root.Next()
+					if meta != nil {
+						o.tempBufferedMeta = append(o.tempBufferedMeta, *meta)
+						continue
+					}
+					o.inputBatches[minBatch] = batch
+					break
+				}
+				o.inputIndices[minBatch] = 0
+				o.updateComparators(minBatch)
+			}
+			if o.inputBatches[minBatch].Length() == 0 {
+				heap.Remove(o, 0)
+			} else {
+				heap.Fix(o, 0)
+			}
+		}
+
 		if o.Len() == 0 {
 			// All inputs exhausted.
+			o.advanceMinBatch = false
 			break
 		}
 
@@ -151,7 +236,7 @@ func (o *OrderedSynchronizer) Next() coldata.Batch {
 		for i := range o.typs {
 			vec := batch.ColVec(i)
 			if vec.Nulls().MaybeHasNulls() && vec.Nulls().NullAt(srcRowIdx) {
-				o.outVecs.Nulls[i].SetNull(outputIdx)
+				o.outVecs.Nulls[i].SetNull(o.outputIdx)
 			} else {
 				switch o.canonicalTypeFamilies[i] {
 				// {{range .}}
@@ -161,8 +246,12 @@ func (o *OrderedSynchronizer) Next() coldata.Batch {
 					case _TYPE_WIDTH:
 						srcCol := vec._TYPE()
 						outCol := o.outVecs._TYPECols[o.outVecs.ColsMap[i]]
+						// {{if .IsBytesLike}}
+						outCol.Copy(srcCol, o.outputIdx, srcRowIdx)
+						// {{else}}
 						v := srcCol.Get(srcRowIdx)
-						outCol.Set(outputIdx, v)
+						outCol.Set(o.outputIdx, v)
+						// {{end}}
 						// {{end}}
 					}
 					// {{end}}
@@ -172,40 +261,20 @@ func (o *OrderedSynchronizer) Next() coldata.Batch {
 			}
 		}
 
-		// Advance the input batch, fetching a new batch if necessary.
-		if o.inputIndices[minBatch]+1 < o.inputBatches[minBatch].Length() {
-			o.inputIndices[minBatch]++
-		} else {
-			o.inputBatches[minBatch] = o.inputs[minBatch].Root.Next()
-			o.inputIndices[minBatch] = 0
-			o.updateComparators(minBatch)
-		}
-		if o.inputBatches[minBatch].Length() == 0 {
-			heap.Remove(o, 0)
-		} else {
-			heap.Fix(o, 0)
-		}
+		// Delay the advancement of the min input batch until the next row is
+		// needed.
+		o.advanceMinBatch = true
 
 		// Account for the memory of the row we have just set.
-		o.accountingHelper.AccountForSet(outputIdx)
-		outputIdx++
-		if o.maxCapacity == 0 && o.accountingHelper.Allocator.Used() >= o.memoryLimit {
-			o.maxCapacity = outputIdx
-		}
+		batchDone = o.accountingHelper.AccountForSet(o.outputIdx)
+		o.outputIdx++
 	}
 
-	o.output.SetLength(outputIdx)
-	return o.output
-}
-
-func (o *OrderedSynchronizer) resetOutput() {
-	var reallocated bool
-	o.output, reallocated = o.accountingHelper.ResetMaybeReallocate(
-		o.typs, o.output, 1 /* minDesiredCapacity */, o.memoryLimit,
-	)
-	if reallocated {
-		o.outVecs.SetBatch(o.output)
-	}
+	o.output.SetLength(o.outputIdx)
+	// Note that it's ok if this number becomes negative - the accounting helper
+	// will ignore it.
+	o.tuplesToMerge -= int64(o.outputIdx)
+	return o.output, nil
 }
 
 // Init is part of the Operator interface.
@@ -213,7 +282,7 @@ func (o *OrderedSynchronizer) Init(ctx context.Context) {
 	if !o.InitHelper.Init(ctx) {
 		return
 	}
-	o.Ctx, o.span = execinfra.ProcessorSpan(o.Ctx, "ordered sync")
+	o.Ctx, o.span = execinfra.ProcessorSpan(o.Ctx, o.flowCtx, "ordered sync", o.processorID)
 	o.inputIndices = make([]int, len(o.inputs))
 	for i := range o.inputs {
 		o.inputs[i].Root.Init(o.Ctx)
@@ -226,14 +295,18 @@ func (o *OrderedSynchronizer) Init(ctx context.Context) {
 }
 
 func (o *OrderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata {
-	var bufferedMeta []execinfrapb.ProducerMetadata
+	// We generally don't expect any temporarily buffered metadata here, but in
+	// some edge cases it's possible - guarantee that it's emitted at least
+	// during DrainMeta.
+	bufferedMeta := o.tempBufferedMeta
+	o.tempBufferedMeta = nil
 	if o.span != nil {
 		for i := range o.inputs {
 			for _, stats := range o.inputs[i].StatsCollectors {
 				o.span.RecordStructured(stats.GetStats())
 			}
 		}
-		if meta := execinfra.GetTraceDataAsMetadata(o.span); meta != nil {
+		if meta := execinfra.GetTraceDataAsMetadata(o.flowCtx, o.span); meta != nil {
 			bufferedMeta = append(bufferedMeta, *meta)
 		}
 	}
@@ -243,11 +316,8 @@ func (o *OrderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata {
 	return bufferedMeta
 }
 
-func (o *OrderedSynchronizer) Close() error {
+func (o *OrderedSynchronizer) Close(context.Context) error {
 	o.accountingHelper.Release()
-	for _, input := range o.inputs {
-		input.ToClose.CloseAndLogOnErr(o.EnsureCtx(), "ordered synchronizer")
-	}
 	if o.span != nil {
 		o.span.Finish()
 	}

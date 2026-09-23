@@ -1,29 +1,25 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -36,23 +32,21 @@ import (
 
 func TestWindowerAccountingForResults(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	monitor := mon.NewMonitorWithLimit(
-		"test-monitor",
-		mon.MemoryResource,
-		100000,        /* limit */
-		nil,           /* curCount */
-		nil,           /* maxHist */
-		5000,          /* increment */
-		math.MaxInt64, /* noteworthy */
-		st,
-	)
-	evalCtx := tree.MakeTestingEvalContextWithMon(st, monitor)
+	monitor := mon.NewMonitor(mon.Options{
+		Name:      mon.MakeName("test-monitor"),
+		Limit:     100000,
+		Increment: 5000,
+		Settings:  st,
+	})
+	evalCtx := eval.MakeTestingEvalContextWithMon(keys.SystemSQLCodec, st, monitor)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +54,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -93,11 +88,11 @@ func TestWindowerAccountingForResults(t *testing.T) {
 		types.OneIntCol, nil, distsqlutils.RowBufferArgs{},
 	)
 
-	d, err := newWindower(flowCtx, 0 /* processorID */, &spec, input, post, output)
+	d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.Run(ctx)
+	d.Run(ctx, output)
 	for {
 		row, meta := output.Next()
 		if row != nil {
@@ -200,13 +195,14 @@ func BenchmarkWindower(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -252,11 +248,11 @@ func BenchmarkWindower(b *testing.B) {
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					d, err := newWindower(flowCtx, 0 /* processorID */, &spec, input, post, disposer)
+					d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post)
 					if err != nil {
 						b.Fatal(err)
 					}
-					d.Run(context.Background())
+					d.Run(ctx, disposer)
 					input.Reset()
 				}
 				b.StopTimer()

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sidetransport
 
@@ -16,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -80,8 +76,23 @@ func NewReceiver(
 	return r
 }
 
+func (s *Receiver) AsDRPCServer() ctpb.DRPCSideTransportServer {
+	return (*drpcReceiver)(s)
+}
+
+type drpcReceiver Receiver
+
+// PushUpdates is the streaming RPC handler.
+func (s *drpcReceiver) PushUpdates(stream ctpb.DRPCSideTransport_PushUpdatesStream) error {
+	return (*Receiver)(s).pushUpdates(stream)
+}
+
 // PushUpdates is the streaming RPC handler.
 func (s *Receiver) PushUpdates(stream ctpb.SideTransport_PushUpdatesServer) error {
+	return s.pushUpdates(stream)
+}
+
+func (s *Receiver) pushUpdates(stream ctpb.RPCSideTransport_PushUpdatesStream) error {
 	// Create a steam to service this connection. The stream will call back into
 	// the Receiver through onFirstMsg to register itself once it finds out the
 	// sender's node id.
@@ -98,7 +109,7 @@ func (s *Receiver) PushUpdates(stream ctpb.SideTransport_PushUpdatesServer) erro
 // for closed timestamp info about this range.
 func (s *Receiver) GetClosedTimestamp(
 	ctx context.Context, rangeID roachpb.RangeID, leaseholderNode roachpb.NodeID,
-) (hlc.Timestamp, ctpb.LAI) {
+) (hlc.Timestamp, kvpb.LeaseAppliedIndex) {
 	s.mu.RLock()
 	conn, ok := s.mu.conns[leaseholderNode]
 	s.mu.RUnlock()
@@ -136,7 +147,7 @@ func (s *Receiver) onRecvErr(ctx context.Context, nodeID roachpb.NodeID, err err
 	defer s.mu.Unlock()
 
 	if err != io.EOF {
-		log.Warningf(ctx, "closed timestamps side-transport connection dropped from node: %d", nodeID)
+		log.KvExec.Warningf(ctx, "closed timestamps side-transport connection dropped from node: %d (%s)", nodeID, err)
 	} else {
 		log.VEventf(ctx, 2, "closed timestamps side-transport connection dropped from node: %d (%s)", nodeID, err)
 	}
@@ -164,6 +175,7 @@ func (s *Receiver) onRecvErr(ctx context.Context, nodeID roachpb.NodeID, err err
 // timestamp information. It maintains the latest closed timestamps communicated
 // by the sender node.
 type incomingStream struct {
+	log.AmbientContext
 	// The server that created this stream.
 	server       *Receiver
 	stores       Stores
@@ -190,7 +202,7 @@ type Stores interface {
 	// ForwardSideTransportClosedTimestampForRange forwards the side-transport
 	// closed timestamp for the local replica(s) of the given range.
 	ForwardSideTransportClosedTimestampForRange(
-		ctx context.Context, rangeID roachpb.RangeID, closedTS hlc.Timestamp, lai ctpb.LAI)
+		ctx context.Context, rangeID roachpb.RangeID, closedTS hlc.Timestamp, lai kvpb.LeaseAppliedIndex)
 }
 
 func newIncomingStream(s *Receiver, stores Stores) *incomingStream {
@@ -208,7 +220,7 @@ func newIncomingStream(s *Receiver, stores Stores) *incomingStream {
 // does not have state for the range.
 func (r *incomingStream) GetClosedTimestamp(
 	ctx context.Context, rangeID roachpb.RangeID,
-) (hlc.Timestamp, ctpb.LAI) {
+) (hlc.Timestamp, kvpb.LeaseAppliedIndex) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	info, ok := r.mu.tracked[rangeID]
@@ -224,11 +236,11 @@ func (r *incomingStream) processUpdate(ctx context.Context, msg *ctpb.Update) {
 	log.VEventf(ctx, 4, "received side-transport update: %v", msg)
 
 	if msg.NodeID == 0 {
-		log.Fatalf(ctx, "missing NodeID in message: %s", msg)
+		log.KvExec.Fatalf(ctx, "missing NodeID in message: %s", msg)
 	}
 
 	if msg.NodeID != r.nodeID {
-		log.Fatalf(ctx, "wrong NodeID; expected %d, got %d", r.nodeID, msg.NodeID)
+		log.KvExec.Fatalf(ctx, "wrong NodeID; expected %d, got %d", r.nodeID, msg.NodeID)
 	}
 
 	// Handle the removed ranges. In order to not lose closed ts info, before we
@@ -247,10 +259,13 @@ func (r *incomingStream) processUpdate(ctx context.Context, msg *ctpb.Update) {
 		for _, rangeID := range msg.Removed {
 			info, ok := r.mu.tracked[rangeID]
 			if !ok {
-				log.Fatalf(ctx, "attempting to unregister a missing range: r%d", rangeID)
+				log.KvExec.Fatalf(ctx, "attempting to unregister a missing range: r%d", rangeID)
 			}
-			r.stores.ForwardSideTransportClosedTimestampForRange(
-				ctx, rangeID, r.mu.lastClosed[info.policy], info.lai)
+			ts, ok := r.mu.lastClosed[info.policy]
+			if !ok {
+				log.KvExec.Fatalf(ctx, "missing closed timestamp policy %v for range r%d", info.policy, rangeID)
+			}
+			r.stores.ForwardSideTransportClosedTimestampForRange(ctx, rangeID, ts, info.lai)
 		}
 		r.mu.RUnlock()
 	}
@@ -261,12 +276,10 @@ func (r *incomingStream) processUpdate(ctx context.Context, msg *ctpb.Update) {
 
 	// Reset all the state on snapshots.
 	if msg.Snapshot {
-		for i := range r.mu.lastClosed {
-			r.mu.lastClosed[i] = hlc.Timestamp{}
-		}
+		r.mu.lastClosed = make(map[ctpb.RangeClosedTimestampPolicy]hlc.Timestamp, len(r.mu.lastClosed))
 		r.mu.tracked = make(map[roachpb.RangeID]trackedRange, len(r.mu.tracked))
 	} else if msg.SeqNum != r.mu.lastSeqNum+1 {
-		log.Fatalf(ctx, "expected closed timestamp side-transport message with sequence number "+
+		log.KvExec.Fatalf(ctx, "expected closed timestamp side-transport message with sequence number "+
 			"%d, got %d", r.mu.lastSeqNum+1, msg.SeqNum)
 	}
 	r.mu.lastSeqNum = msg.SeqNum
@@ -290,7 +303,7 @@ func (r *incomingStream) Run(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	// The gRPC stream with incoming messages.
-	stream ctpb.SideTransport_PushUpdatesServer,
+	stream ctpb.RPCSideTransport_PushUpdatesStream,
 ) error {
 	// We have to do the stream processing on a separate goroutine because Recv()
 	// is blocking, with no way to interrupt it other than returning from the RPC
@@ -315,14 +328,16 @@ func (r *incomingStream) Run(
 				r.nodeID = msg.NodeID
 
 				if err := r.server.onFirstMsg(ctx, r, r.nodeID); err != nil {
-					log.Warningf(ctx, "%s", err.Error())
+					log.KvExec.Warningf(ctx, "%s", err.Error())
 					return
 				} else if ch := r.testingKnobs.onFirstMsg; ch != nil {
 					ch <- struct{}{}
 				}
 				if !msg.Snapshot {
-					log.Fatal(ctx, "expected the first message to be a snapshot")
+					log.KvExec.Fatal(ctx, "expected the first message to be a snapshot")
 				}
+				r.AddLogTag("remote", r.nodeID)
+				ctx = r.AnnotateCtx(ctx)
 			}
 
 			r.processUpdate(ctx, msg)

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -14,11 +9,13 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -29,30 +26,30 @@ import (
 // provide updated values are projected for each of the SET expressions, as well
 // as for any computed columns. For example:
 //
-//   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
-//   UPDATE abc SET b=1 WHERE a=2
+//	CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+//	UPDATE abc SET b=1 WHERE a=2
 //
 // This would create an input expression similar to this SQL:
 //
-//   SELECT a AS oa, b AS ob, c AS oc, 1 AS nb FROM abc WHERE a=2
+//	SELECT a AS oa, b AS ob, c AS oc, 1 AS nb FROM abc WHERE a=2
 //
 // The execution engine evaluates this relational expression and uses the
 // resulting values to form the KV keys and values.
 //
 // Tuple SET expressions are decomposed into individual columns:
 //
-//   UPDATE abc SET (b, c)=(1, 2) WHERE a=3
-//   =>
-//   SELECT a AS oa, b AS ob, c AS oc, 1 AS nb, 2 AS nc FROM abc WHERE a=3
+//	UPDATE abc SET (b, c)=(1, 2) WHERE a=3
+//	=>
+//	SELECT a AS oa, b AS ob, c AS oc, 1 AS nb, 2 AS nc FROM abc WHERE a=3
 //
 // Subqueries become correlated left outer joins:
 //
-//   UPDATE abc SET b=(SELECT y FROM xyz WHERE x=a)
-//   =>
-//   SELECT a AS oa, b AS ob, c AS oc, y AS nb
-//   FROM abc
-//   LEFT JOIN LATERAL (SELECT y FROM xyz WHERE x=a)
-//   ON True
+//	UPDATE abc SET b=(SELECT y FROM xyz WHERE x=a)
+//	=>
+//	SELECT a AS oa, b AS ob, c AS oc, y AS nb
+//	FROM abc
+//	LEFT JOIN LATERAL (SELECT y FROM xyz WHERE x=a)
+//	ON True
 //
 // Computed columns result in an additional wrapper projection that can depend
 // on input columns.
@@ -69,12 +66,18 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	}
 
 	// UX friendliness safeguard.
-	if upd.Where == nil && b.evalCtx.SessionData().SafeUpdates {
-		panic(pgerror.DangerousStatementf("UPDATE without WHERE clause"))
+	if upd.Where == nil && upd.Limit == nil && b.evalCtx.SessionData().SafeUpdates {
+		panic(pgerror.DangerousStatementf("UPDATE without WHERE or LIMIT clause"))
 	}
 
 	// Find which table we're working on, check the permissions.
 	tab, depName, alias, refColumns := b.resolveTableForMutation(upd.Table, privilege.UPDATE)
+
+	if tab.IsVirtualTable() {
+		panic(pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
+			"cannot update view \"%s\"", tab.Name(),
+		))
+	}
 
 	if refColumns != nil {
 		panic(pgerror.Newf(pgcode.Syntax,
@@ -85,10 +88,16 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	b.checkPrivilege(depName, tab, privilege.SELECT)
 
 	// Check if this table has already been mutated in another subquery.
-	b.checkMultipleMutations(tab, false /* simpleInsert */)
+	b.checkMultipleMutations(tab, generalMutation)
 
 	var mb mutationBuilder
 	mb.init(b, "update", tab, alias)
+
+	// exprColRefs tracks the columns referenced by expressions in the
+	// SET and WHERE clauses.
+	// TODO(144951): Extend to also track columns referenced by expressions
+	// in the RETURNING clause.
+	var exprColRefs opt.ColSet
 
 	// Build the input expression that selects the rows that will be updated:
 	//
@@ -97,20 +106,25 @@ func (b *Builder) buildUpdate(upd *tree.Update, inScope *scope) (outScope *scope
 	//   ORDER BY <order-by> LIMIT <limit>
 	//
 	// All columns from the update table will be projected.
-	mb.buildInputForUpdate(inScope, upd.Table, upd.From, upd.Where, upd.Limit, upd.OrderBy)
+	mb.buildInputForUpdate(inScope, upd.Table, upd.From, upd.Where, &exprColRefs, upd.Limit, upd.OrderBy)
 
 	// Derive the columns that will be updated from the SET expressions.
 	mb.addTargetColsForUpdate(upd.Exprs)
 
 	// Build each of the SET expressions.
-	mb.addUpdateCols(upd.Exprs)
+	mb.addUpdateCols(upd.Exprs, &exprColRefs)
+
+	// Project row-level BEFORE triggers for UPDATE.
+	mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate, false /* cascade */)
 
 	// Build the final update statement, including any returned expressions.
+	var returningExpr *tree.ReturningExprs
 	if resultsNeeded(upd.Returning) {
-		mb.buildUpdate(*upd.Returning.(*tree.ReturningExprs))
-	} else {
-		mb.buildUpdate(nil /* returning */)
+		returningExpr = upd.Returning.(*tree.ReturningExprs)
 	}
+	mb.buildUpdate(returningExpr, cat.PolicyScopeUpdate, &exprColRefs)
+
+	mb.trackTargetColDeps()
 
 	return mb.outScope
 }
@@ -141,7 +155,7 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 				for i := range desiredTypes {
 					desiredTypes[i] = mb.md.ColumnMeta(mb.targetColList[targetIdx+i]).Type
 				}
-				outScope := mb.b.buildSelectStmt(t.Select, noRowLocking, desiredTypes, mb.outScope)
+				outScope := mb.b.buildSelectStmt(t.Select, noLocking, desiredTypes, mb.outScope)
 				mb.subqueries = append(mb.subqueries, outScope)
 				n = len(outScope.cols)
 
@@ -164,22 +178,26 @@ func (mb *mutationBuilder) addTargetColsForUpdate(exprs tree.UpdateExprs) {
 // addUpdateCols builds nested Project and LeftOuterJoin expressions that
 // correspond to the given SET expressions:
 //
-//   SET a=1 (single-column SET)
-//     Add as synthesized Project column:
-//       SELECT <fetch-cols>, 1 FROM <input>
+//	SET a=1 (single-column SET)
+//	  Add as synthesized Project column:
+//	    SELECT <fetch-cols>, 1 FROM <input>
 //
-//   SET (a, b)=(1, 2) (tuple SET)
-//     Add as multiple Project columns:
-//       SELECT <fetch-cols>, 1, 2 FROM <input>
+//	SET (a, b)=(1, 2) (tuple SET)
+//	  Add as multiple Project columns:
+//	    SELECT <fetch-cols>, 1, 2 FROM <input>
 //
-//   SET (a, b)=(SELECT 1, 2) (subquery)
-//     Wrap input in Max1Row + LeftJoinApply expressions:
-//       SELECT * FROM <fetch-cols> LEFT JOIN LATERAL (SELECT 1, 2) ON True
+//	SET (a, b)=(SELECT 1, 2) (subquery)
+//	  Wrap input in Max1Row + LeftJoinApply expressions:
+//	    SELECT * FROM <fetch-cols> LEFT JOIN LATERAL (SELECT 1, 2) ON True
 //
 // Multiple subqueries result in multiple left joins successively wrapping the
 // input. A final Project operator is built if any single-column or tuple SET
 // expressions are present.
-func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
+//
+// colRefs is an optional output parameter that, if provided, is populated
+// with the columns referenced in the SET expressions. Pass nil if the
+// referenced columns are not needed.
+func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs, colRefs *opt.ColSet) {
 	// SET expressions should reject aggregates, generators, etc.
 	scalarProps := &mb.b.semaCtx.Properties
 	defer scalarProps.Restore(*scalarProps)
@@ -193,42 +211,35 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	projectionsScope := mb.outScope.replace()
 	projectionsScope.appendColumnsFromScope(mb.outScope)
 
-	checkCol := func(sourceCol *scopeColumn, targetColID opt.ColumnID) {
-		// Type check the input expression against the corresponding table column.
+	addCol := func(expr tree.Expr, targetColID opt.ColumnID) {
 		ord := mb.tabID.ColumnOrdinal(targetColID)
 		targetCol := mb.tab.Column(ord)
-		checkDatumTypeFitsColumnType(targetCol, sourceCol.typ)
 
-		for _, expr := range exprs {
-			// Compatibility check the input expression against the corresponding
-			// table column.
-			if len(expr.Names) == 1 && expr.Names[0] == targetCol.ColName() {
-				checkUpdateExpression(targetCol, expr)
-			}
-		}
-
-		// Add source column ID to the list of columns to update.
-		mb.updateColIDs[ord] = sourceCol.id
-	}
-
-	addCol := func(expr tree.Expr, targetColID opt.ColumnID) {
 		// Allow right side of SET to be DEFAULT.
 		if _, ok := expr.(tree.DefaultVal); ok {
 			expr = mb.parseDefaultExpr(targetColID)
+		} else {
+			// GENERATED ALWAYS AS IDENTITY columns are not allowed to be
+			// explicitly written to.
+			//
+			// TODO(janexing): Implement the OVERRIDING SYSTEM VALUE syntax for
+			// INSERT which allows a GENERATED ALWAYS AS IDENTITY column to be
+			// overwritten.
+			// See https://github.com/cockroachdb/cockroach/issues/68201.
+			if targetCol.IsGeneratedAlwaysAsIdentity() {
+				panic(sqlerrors.NewGeneratedAlwaysAsIdentityColumnUpdateError(string(targetCol.ColName())))
+			}
 		}
 
 		// Add new column to the projections scope.
-		// TODO(mgartner): Perform an assignment cast if necessary.
-		targetColMeta := mb.md.ColumnMeta(targetColID)
-		desiredType := targetColMeta.Type
-		texpr := inScope.resolveType(expr, desiredType)
-		colName := scopeColName(tree.Name(targetColMeta.Alias)).WithMetadataName(
-			targetColMeta.Alias + "_new",
-		)
+		texpr := inScope.resolveType(expr, targetCol.DatumType())
+		targetColName := targetCol.ColName()
+		colName := scopeColName(targetColName).WithMetadataName(string(targetColName) + "_new")
 		scopeCol := projectionsScope.addColumn(colName, texpr)
-		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, nil)
+		mb.b.buildScalar(texpr, inScope, projectionsScope, scopeCol, colRefs)
 
-		checkCol(scopeCol, targetColID)
+		// Add the column ID to the list of columns to update.
+		mb.updateColIDs[ord] = scopeCol.id
 	}
 
 	n := 0
@@ -243,9 +254,12 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 
 				// Type check and rename columns.
 				for i := range subqueryScope.cols {
-					checkCol(&subqueryScope.cols[i], mb.targetColList[n])
 					ord := mb.tabID.ColumnOrdinal(mb.targetColList[n])
-					subqueryScope.cols[i].name = scopeColName(mb.tab.Column(ord).ColName())
+					targetCol := mb.tab.Column(ord)
+					subqueryScope.cols[i].name = scopeColName(targetCol.ColName())
+
+					// Add the column ID to the list of columns to update.
+					mb.updateColIDs[ord] = subqueryScope.cols[i].id
 					n++
 				}
 
@@ -283,6 +297,13 @@ func (mb *mutationBuilder) addUpdateCols(exprs tree.UpdateExprs) {
 	mb.b.constructProjectForScope(mb.outScope, projectionsScope)
 	mb.outScope = projectionsScope
 
+	// Track whether the region column is being explicitly updated. This is a
+	// no-op if the table isn't regional-by-row.
+	mb.setRegionColExplicitlyMutated(mb.updateColIDs)
+
+	// Add assignment casts for update columns.
+	mb.addAssignmentCasts(mb.updateColIDs)
+
 	// Add additional columns for computed expressions that may depend on the
 	// updated columns.
 	mb.addSynthesizedColsForUpdate()
@@ -310,31 +331,72 @@ func (mb *mutationBuilder) addSynthesizedColsForUpdate() {
 		true,  /* applyOnUpdate */
 	)
 
-	// Possibly round DECIMAL-related columns containing update values. Do
-	// this before evaluating computed expressions, since those may depend on
-	// the inserted columns.
-	mb.roundDecimalValues(mb.updateColIDs, false /* roundComputedCols */)
+	// Add assignment casts for default column values.
+	mb.addAssignmentCasts(mb.updateColIDs)
 
 	// Disambiguate names so that references in the computed expression refer to
 	// the correct columns.
 	mb.disambiguateColumns()
 
 	// Add all computed columns in case their values have changed.
-	mb.addSynthesizedComputedCols(mb.updateColIDs, true /* restrict */)
+	mb.addSynthesizedComputedCols(mb.updateColIDs,
+		&mb.targetColList, &mb.targetColSet, true /* restrict */)
 
-	// Possibly round DECIMAL-related computed columns.
-	mb.roundDecimalValues(mb.updateColIDs, true /* roundComputedCols */)
+	// Add assignment casts for computed column values.
+	mb.addAssignmentCasts(mb.updateColIDs)
 }
 
 // buildUpdate constructs an Update operator, possibly wrapped by a Project
-// operator that corresponds to the given RETURNING clause.
-func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
+// operator that corresponds to the given RETURNING clause. The colRefs
+// is an optional parameter that indicates all of the column references in the
+// expressions of the SET and WHERE clauses. It is required if applying RLS
+// policies as it controls whether SELECT policies will be applied with the
+// UPDATE check constraint.
+func (mb *mutationBuilder) buildUpdate(
+	returning *tree.ReturningExprs, policyScopeCmd cat.PolicyCommandScope, colRefs *opt.ColSet,
+) {
+	mb.maybeAddRegionColLookup(opt.UpdateOp)
+
 	// Disambiguate names so that references in any expressions, such as a
 	// check constraint, refer to the correct columns.
 	mb.disambiguateColumns()
 
+	// Build the scopes for the RETURNING clause early (if present). The
+	// returning expression is built later on, but for RLS we need to build the
+	// scopes and collect column references in order to determine whether SELECT
+	// policies should be applied as check constraints, which are built prior to
+	// the returning expression. RLS SELECT policies are applied as check
+	// constraints if the RETURNING clause references columns in the target
+	// table.
+	returningInScope, returningOutScope := mb.buildReturningScopes(returning, colRefs)
+
+	// Apply SELECT policies if any referenced columns are read during row fetches.
+	// This includes:
+	// - Columns needed for the initial fetch (SET/WHERE).
+	// - Columns read post-mutation (e.g., for RETURNING).
+	//
+	// These checks only matter if the target table has RLS enabled, so we gate
+	// the logic behind that for performance reasons.
+	includeSelectPolicies := false
+	if mb.tab.IsRowLevelSecurityEnabled() && colRefs != nil {
+		for _, colID := range mb.fetchColIDs {
+			if colID != 0 && colRefs.Contains(colID) {
+				includeSelectPolicies = true
+				break
+			}
+		}
+		if !includeSelectPolicies && returningInScope != nil {
+			for i, n := 0, mb.tab.ColumnCount(); i < n; i++ {
+				if colRefs.Contains(mb.tabID.ColumnID(i)) {
+					includeSelectPolicies = true
+					break
+				}
+			}
+		}
+	}
+
 	// Add any check constraint boolean columns to the input.
-	mb.addCheckConstraintCols(true /* isUpdate */)
+	mb.addCheckConstraintCols(true /* isUpdate */, policyScopeCmd, includeSelectPolicies)
 
 	// Add the partial index predicate expressions to the table metadata.
 	// These expressions are used to prune fetch columns during
@@ -344,11 +406,16 @@ func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
 	// Project partial index PUT and DEL boolean columns.
 	mb.projectPartialIndexPutAndDelCols()
 
+	// Project vector index PUT and DEL columns.
+	mb.projectVectorIndexColsForUpdate()
+
 	mb.buildUniqueChecksForUpdate()
 
 	mb.buildFKChecksForUpdate()
 
-	private := mb.makeMutationPrivate(returning != nil)
+	mb.buildRowLevelAfterTriggers(opt.UpdateOp)
+
+	private := mb.makeMutationPrivate(returning != nil, false /* vectorInsert */)
 	for _, col := range mb.extraAccessibleCols {
 		if col.id != 0 {
 			private.PassthroughCols = append(private.PassthroughCols, col.id)
@@ -357,5 +424,5 @@ func (mb *mutationBuilder) buildUpdate(returning tree.ReturningExprs) {
 	mb.outScope.expr = mb.b.factory.ConstructUpdate(
 		mb.outScope.expr, mb.uniqueChecks, mb.fkChecks, private,
 	)
-	mb.buildReturning(returning)
+	mb.buildReturning(returning, returningInScope, returningOutScope)
 }

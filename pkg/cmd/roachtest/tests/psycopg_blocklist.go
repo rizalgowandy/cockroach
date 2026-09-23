@@ -1,21 +1,9 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
-
-var psycopgBlocklists = blocklistsForVersion{
-	{"v20.2", "psycopgBlockList20_2", psycopgBlockList20_2, "psycopgIgnoreList20_2", psycopgIgnoreList20_2},
-	{"v21.1", "psycopgBlockList21_1", psycopgBlockList21_1, "psycopgIgnoreList21_1", psycopgIgnoreList21_1},
-	{"v21.2", "psycopgBlockList21_2", psycopgBlockList21_2, "psycopgIgnoreList21_2", psycopgIgnoreList21_2},
-	{"v22.1", "psycopgBlockList22_1", psycopgBlockList22_1, "psycopgIgnoreList22_1", psycopgIgnoreList22_1},
-}
 
 // These are lists of known psycopg test errors and failures.
 // When the psycopg test suite is run, the results are compared to this list.
@@ -28,33 +16,50 @@ var psycopgBlocklists = blocklistsForVersion{
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blocklist should be available
 // in the test log.
-var psycopgBlockList22_1 = psycopgBlockList21_2
+var psycopgBlockList = blocklist{}
 
-var psycopgBlockList21_2 = blocklist{
-	"tests.test_async_keyword.CancelTests.test_async_cancel": "41335",
-	// The following two items can be removed once there is a new psycopg2 release.
-	"tests.test_connection.TestEncryptPassword.test_encrypt_server": "42519",
-	"tests.test_module.ExceptionsTestCase.test_9_6_diagnostics":     "58035",
-}
-
-var psycopgBlockList21_1 = blocklist{
-	"tests.test_async_keyword.CancelTests.test_async_cancel": "41335",
-	// The following two items can be removed once there is a new psycopg2 release.
-	"tests.test_module.ExceptionsTestCase.test_9_6_diagnostics": "58035",
-}
-
-var psycopgBlockList20_2 = blocklist{
-	"tests.test_async_keyword.CancelTests.test_async_cancel": "41335",
-}
-
-var psycopgIgnoreList22_1 = psycopgIgnoreList21_2
-
-var psycopgIgnoreList21_2 = psycopgIgnoreList21_1
-
-var psycopgIgnoreList21_1 = psycopgIgnoreList20_2
-
-var psycopgIgnoreList20_2 = blocklist{
-	"tests.test_async.AsyncTests.test_flush_on_write":           "44709",
-	"tests.test_green.GreenTestCase.test_flush_on_write":        "flakey",
-	"tests.test_connection.TestConnectionInfo.test_backend_pid": "we return -1 for pg_backend_pid()",
+var psycopgIgnoreList = blocklist{
+	`tests.test_dns_srv.test_srv[host=_pg._tcp.bar.com-host=db1.example.com,db4.example.com,db3.example.com,db2.example.com port=5432,5432,5433,5432-None]`:               "flaky; see #151379",
+	`tests.test_dns_srv.test_srv_async[asyncio-host=_pg._tcp.bar.com-host=db1.example.com,db4.example.com,db3.example.com,db2.example.com port=5432,5432,5433,5432-None]`: "flaky; see #151379",
+	`tests.pool.test_pool.test_connect_check_timeout`:                                                "requires insecure mode",
+	`tests.pool.test_pool.test_reconnect`:                                                            "requires insecure mode",
+	`tests.pool.test_pool.test_reconnect_after_grow_failed`:                                          "requires insecure mode",
+	`tests.pool.test_pool.test_reconnect_failure[False]`:                                             "requires insecure mode",
+	`tests.pool.test_pool.test_refill_on_check`:                                                      "requires insecure mode",
+	`tests.pool.test_pool.test_shrink`:                                                               "flaky; see #146895",
+	`tests.pool.test_pool.test_stats_connect`:                                                        "requires insecure mode",
+	`tests.pool.test_pool.test_uniform_use`:                                                          "flaky timing; see #168667",
+	`tests.pool.test_pool_async.test_check[asyncio]`:                                                 "flaky timing; see #168667",
+	`tests.pool.test_pool_async.test_connect_check_timeout[asyncio]`:                                 "requires insecure mode",
+	`tests.pool.test_pool_async.test_reconnect[asyncio]`:                                             "requires insecure mode",
+	`tests.pool.test_pool_async.test_reconnect_after_grow_failed[asyncio]`:                           "requires insecure mode",
+	`tests.pool.test_pool_async.test_reconnect_failure[asyncio-False]`:                               "requires insecure mode",
+	`tests.pool.test_pool_async.test_reconnect_failure[asyncio-True]`:                                "requires insecure mode",
+	`tests.pool.test_pool_async.test_refill_on_check[asyncio]`:                                       "requires insecure mode",
+	`tests.pool.test_pool_async.test_shrink[asyncio]`:                                                "see https://github.com/cockroachdb/cockroach/issues/144532",
+	`tests.pool.test_pool_async.test_spike[asyncio]`:                                                 "flaky timing; see #168667",
+	`tests.pool.test_pool_async.test_stats_connect[asyncio]`:                                         "requires insecure mode",
+	`tests.pool.test_pool_async.test_uniform_use[asyncio]`:                                           "flaky timing; see #168667",
+	`tests.pool.test_pool_async_noasyncio.test_working_created_before_loop`:                          "flaky timing; see #168667",
+	`tests.pool.test_pool_common.test_queue[NullConnectionPool]`:                                     "test is timing dependent, see https://github.com/cockroachdb/cockroach/issues/143491",
+	`tests.pool.test_pool_common.test_queue_timeout_override`:                                        "see https://github.com/cockroachdb/cockroach/issues/144532",
+	`tests.pool.test_pool_common.test_setup_no_timeout[ConnectionPool]`:                              "requires insecure mode",
+	`tests.pool.test_pool_common.test_setup_no_timeout[NullConnectionPool]`:                          "requires insecure mode",
+	`tests.pool.test_pool_common.test_stats_usage[NullConnectionPool]`:                               "test is timing dependent, see https://github.com/cockroachdb/cockroach/issues/143491",
+	`tests.pool.test_pool_common_async.test_queue[asyncio-AsyncNullConnectionPool]`:                  "requires insecure mode",
+	`tests.pool.test_pool_common_async.test_queue_timeout[asyncio-AsyncNullConnectionPool]`:          "see https://github.com/cockroachdb/cockroach/issues/144532",
+	`tests.pool.test_pool_common_async.test_queue_timeout_override[asyncio-AsyncNullConnectionPool]`: "see https://github.com/cockroachdb/cockroach/issues/144532",
+	`tests.pool.test_pool_common_async.test_setup_no_timeout[asyncio-AsyncConnectionPool]`:           "requires insecure mode",
+	`tests.pool.test_pool_common_async.test_setup_no_timeout[asyncio-AsyncNullConnectionPool]`:       "requires insecure mode",
+	`tests.pool.test_pool_common_async.test_stats_measures[asyncio-AsyncNullConnectionPool]`:         "see https://github.com/cockroachdb/cockroach/issues/144532",
+	`tests.pool.test_pool_common_async.test_stats_usage[asyncio-AsyncNullConnectionPool]`:            "requires insecure mode",
+	`tests.pool.test_pool_null.test_stats_connect`:                                                   "requires insecure mode",
+	`tests.pool.test_pool_null_async.test_stats_connect[asyncio]`:                                    "requires insecure mode",
+	`tests.pool.test_pool.test_check`:                                                                "flaky; see #164635",
+	`tests.test_concurrency.test_concurrent_execution`:                                               "flaky timing; see #168667",
+	`tests.test_concurrency_async.test_concurrent_execution[asyncio]`:                                "flaky timing; see #168667",
+	`tests.test_connection.test_cancel_safe_error`:                                                   "requires insecure mode",
+	`tests.test_connection_async.test_cancel_safe_error[asyncio]`:                                    "requires insecure mode",
+	`tests.test_generators.test_connect_operationalerror_pgconn`:                                     "requires insecure mode",
+	"tests.test_connection.TestConnectionInfo.test_backend_pid":                                      "we return -1 for pg_backend_pid()",
 }

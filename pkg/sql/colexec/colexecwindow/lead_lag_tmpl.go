@@ -1,16 +1,10 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for lag.eg.go and lead.eg.go. It's
@@ -49,7 +43,7 @@ const _TYPE_WIDTH = 0
 // should put its output (if there is no such column, a new column is appended).
 func New_UPPERCASE_NAMEOperator(
 	args *WindowArgs, argIdx int, offsetIdx int, defaultIdx int,
-) (colexecop.Operator, error) {
+) (colexecop.ClosableOperator, error) {
 	// Allow the direct-access buffer 10% of the available memory. The rest will
 	// be given to the bufferedWindowOp queue. While it is somewhat more important
 	// for the direct-access buffer tuples to be kept in-memory, it only has to
@@ -58,8 +52,9 @@ func New_UPPERCASE_NAMEOperator(
 	bufferMemLimit := int64(float64(args.MemoryLimit) * 0.10)
 	mainMemLimit := args.MemoryLimit - bufferMemLimit
 	buffer := colexecutils.NewSpillingBuffer(
-		args.BufferAllocator, bufferMemLimit, args.QueueCfg,
-		args.FdSemaphore, args.InputTypes, args.DiskAcc, argIdx)
+		args.BufferAllocator, bufferMemLimit, args.QueueCfg, args.FdSemaphore,
+		args.InputTypes, args.DiskAcc, args.DiskQueueMemAcc, argIdx,
+	)
 	base := _OP_NAMEBase{
 		partitionSeekerBase: partitionSeekerBase{
 			buffer:          buffer,
@@ -83,7 +78,7 @@ func New_UPPERCASE_NAMEOperator(
 		}
 		// {{end}}
 	}
-	return nil, errors.Errorf("unsupported _OP_NAME window operator type %s", argType.Name())
+	return nil, errors.AssertionFailedf("unsupported _OP_NAME window operator type %s", argType.Name())
 }
 
 // _OP_NAMEBase extracts common fields and methods of the _OP_NAME windower
@@ -174,11 +169,11 @@ func (b *_OP_NAMEBase) Init(ctx context.Context) {
 	}
 }
 
-func (b *_OP_NAMEBase) Close() {
+func (b *_OP_NAMEBase) Close(ctx context.Context) {
 	if !b.CloserHelper.Close() {
 		return
 	}
-	b.buffer.Close(b.EnsureCtx())
+	b.buffer.Close(ctx)
 }
 
 // {{/*
@@ -209,6 +204,9 @@ func _PROCESS_BATCH(_OFFSET_HAS_NULLS bool, _DEFAULT_HAS_NULLS bool) { // */}}
 				continue
 			}
 			// {{end}}
+			// {{if .IsBytesLike}}
+			leadLagCol.Copy(defaultCol, i, i)
+			// {{else}}
 			// {{if .Sliceable}}
 			//gcassert:bce
 			// {{end}}
@@ -217,6 +215,7 @@ func _PROCESS_BATCH(_OFFSET_HAS_NULLS bool, _DEFAULT_HAS_NULLS bool) { // */}}
 			//gcassert:bce
 			// {{end}}
 			leadLagCol.Set(i, val)
+			// {{end}}
 			continue
 		}
 		vec, idx, _ := w.buffer.GetVecWithTuple(w.Ctx, 0 /* colIdx */, requestedIdx)
@@ -225,11 +224,15 @@ func _PROCESS_BATCH(_OFFSET_HAS_NULLS bool, _DEFAULT_HAS_NULLS bool) { // */}}
 			continue
 		}
 		col := vec.TemplateType()
+		// {{if .IsBytesLike}}
+		leadLagCol.Copy(col, i, idx)
+		// {{else}}
 		val := col.Get(idx)
 		// {{if .Sliceable}}
 		//gcassert:bce
 		// {{end}}
 		leadLagCol.Set(i, val)
+		// {{end}}
 	}
 	// {{end}}
 	// {{/*

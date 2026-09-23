@@ -62,6 +62,17 @@ SELECT p, j, k FROM test_upsert ORDER BY p
 pk1  val2  regress
 pk2  val3  def
 
+# If there are no explicit target columns, UPSERT sets all columns to their
+# DEFAULT value. Therefore, the ON UPDATE value is not used. See #73984.
+statement ok
+UPSERT INTO test_upsert VALUES ('pk1', 'val20'), ('pk2', 'val30')
+
+query TTT
+SELECT p, j, k FROM test_upsert ORDER BY p
+----
+pk1  val20  def
+pk2  val30  def
+
 # ON UPDATE usage by running ALTER TABLE
 subtest OnUpdateAlterTable
 
@@ -156,7 +167,7 @@ CREATE TABLE test_fk_invalid (p STRING PRIMARY KEY, j STRING ON UPDATE 'test', C
 statement ok
 CREATE TABLE alter_fk (p STRING PRIMARY KEY, j STRING REFERENCES test_fk_base (j) ON UPDATE CASCADE)
 
-statement error pq: column j\(2\) cannot have both an ON UPDATE expression and a foreign key ON UPDATE action
+statement error cannot specify both ON UPDATE expression and a foreign key ON UPDATE action for column "j"
 ALTER TABLE alter_fk ALTER COLUMN j SET ON UPDATE 'failure'
 
 statement ok
@@ -177,16 +188,29 @@ CREATE TABLE test_show_default (
   FAMILY fam_1_k (k)
 )
 
+onlyif config schema-locked-disabled
 query TT
 SHOW CREATE TABLE test_show_default
 ----
 test_show_default  CREATE TABLE public.test_show_default (
-                   p STRING NOT NULL,
-                   k STRING NULL DEFAULT 'def':::STRING ON UPDATE 'regress':::STRING,
-                   CONSTRAINT "primary" PRIMARY KEY (p ASC),
-                   FAMILY fam_0_p (p),
-                   FAMILY fam_1_k (k)
-)
+                     p STRING NOT NULL,
+                     k STRING NULL DEFAULT 'def':::STRING ON UPDATE 'regress':::STRING,
+                     CONSTRAINT "primary" PRIMARY KEY (p ASC),
+                     FAMILY fam_0_p (p),
+                     FAMILY fam_1_k (k)
+                   );
+
+skipif config schema-locked-disabled
+query TT
+SHOW CREATE TABLE test_show_default
+----
+test_show_default  CREATE TABLE public.test_show_default (
+                     p STRING NOT NULL,
+                     k STRING NULL DEFAULT 'def':::STRING ON UPDATE 'regress':::STRING,
+                     CONSTRAINT "primary" PRIMARY KEY (p ASC),
+                     FAMILY fam_0_p (p),
+                     FAMILY fam_1_k (k)
+                   ) WITH (schema_locked = true);
 
 statement ok
 CREATE TABLE test_show_fk (
@@ -198,19 +222,35 @@ CREATE TABLE test_show_fk (
   FAMILY fam_2_k (k)
 )
 
+onlyif config schema-locked-disabled
 query TT
 SHOW CREATE TABLE test_show_fk
 ----
 test_show_fk  CREATE TABLE public.test_show_fk (
-              p STRING NOT NULL,
-              j STRING NULL,
-              k STRING NULL ON UPDATE 'regress':::STRING,
-              CONSTRAINT test_show_fk_pkey PRIMARY KEY (p ASC),
-              CONSTRAINT test_show_fk_j_fkey FOREIGN KEY (j) REFERENCES public.test_fk_base(j) ON UPDATE CASCADE,
-              FAMILY fam_0_p (p),
-              FAMILY fam_1_j (j),
-              FAMILY fam_2_k (k)
-)
+                p STRING NOT NULL,
+                j STRING NULL,
+                k STRING NULL ON UPDATE 'regress':::STRING,
+                CONSTRAINT test_show_fk_pkey PRIMARY KEY (p ASC),
+                CONSTRAINT test_show_fk_j_fkey FOREIGN KEY (j) REFERENCES public.test_fk_base(j) ON UPDATE CASCADE,
+                FAMILY fam_0_p (p),
+                FAMILY fam_1_j (j),
+                FAMILY fam_2_k (k)
+              );
+
+skipif config schema-locked-disabled
+query TT
+SHOW CREATE TABLE test_show_fk
+----
+test_show_fk  CREATE TABLE public.test_show_fk (
+                p STRING NOT NULL,
+                j STRING NULL,
+                k STRING NULL ON UPDATE 'regress':::STRING,
+                CONSTRAINT test_show_fk_pkey PRIMARY KEY (p ASC),
+                CONSTRAINT test_show_fk_j_fkey FOREIGN KEY (j) REFERENCES public.test_fk_base(j) ON UPDATE CASCADE,
+                FAMILY fam_0_p (p),
+                FAMILY fam_1_j (j),
+                FAMILY fam_2_k (k)
+              ) WITH (schema_locked = true);
 
 # Sequence tests
 subtest SequenceDependencies
@@ -292,6 +332,8 @@ DROP SEQUENCE seq_72116
 
 statement ok
 DROP TABLE table_72116;
+
+statement ok
 CREATE TABLE table_72116 (a INT DEFAULT nextval('seq_72116') ON UPDATE NULL)
 
 statement error pq: cannot drop sequence seq_72116 because other objects depend on it
@@ -299,7 +341,11 @@ DROP SEQUENCE seq_72116
 
 statement ok
 DROP TABLE table_72116;
+
+statement ok
 CREATE TABLE table_72116 (a INT);
+
+statement ok
 ALTER TABLE table_72116 ADD COLUMN b INT DEFAULT (1) ON UPDATE nextval('seq_72116')
 
 statement error pq: cannot drop sequence seq_72116 because other objects depend on it
@@ -364,7 +410,7 @@ pk3  z
 statement ok
 ALTER TABLE test_table_enum ALTER COLUMN k DROP ON UPDATE
 
-statement ok
+statement count 1
 DELETE FROM test_table_enum WHERE p = 'pk2'
 
 statement ok
@@ -394,3 +440,67 @@ ALTER TYPE test_enum DROP VALUE 'x'
 
 statement error pq: could not remove enum value "y" as it is being used in an ON UPDATE expression of "test_array_enum"
 ALTER TYPE test_enum DROP VALUE 'y'
+
+# Tests adding/dropping new columns will not trigger the ON UPDATE clause.
+subtest test_on_update_backfill
+
+statement ok
+CREATE TABLE test_backfill (x INT, y INT DEFAULT 100 ON UPDATE 50)
+
+statement ok
+INSERT INTO test_backfill VALUES (1), (2), (3)
+
+query II
+SELECT * FROM test_backfill ORDER BY x
+----
+1  100
+2  100
+3  100
+
+statement ok
+ALTER TABLE test_backfill ADD COLUMN z INT DEFAULT 20
+
+query III
+SELECT * FROM test_backfill ORDER BY x
+----
+1  100  20
+2  100  20
+3  100  20
+
+statement ok
+SET sql_safe_updates = false
+
+statement ok
+ALTER TABLE test_backfill DROP COLUMN z
+
+query II
+SELECT * FROM test_backfill ORDER BY x
+----
+1  100
+2  100
+3  100
+
+statement ok
+SET sql_safe_updates = true
+
+statement ok
+DROP TABLE test_backfill
+
+# Verify that ON UPDATE expressions are blocked if the result does not
+# fit into the column type.
+subtest on_update_too_long
+
+statement ok
+CREATE TABLE t81698 (i INT PRIMARY KEY);
+
+statement ok
+INSERT INTO t81698 VALUES (1);
+
+# The DEFAULT expression is small enough, so this ALTER succeeds.
+statement ok
+ALTER TABLE t81698 ADD COLUMN v VARCHAR(2) NOT NULL DEFAULT 'd' ON UPDATE 'on_update';
+
+statement error pgcode 22001 value too long for type VARCHAR\(2\)
+UPDATE t81698 SET i = 2 where i = 1;
+
+subtest end

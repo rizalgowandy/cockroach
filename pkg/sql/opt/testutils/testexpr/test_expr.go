@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testexpr
 
@@ -21,11 +16,10 @@ import (
 // extracted via that interface. It can be initialized with whatever subset of
 // fields are required for the particular test; for example:
 //
-//   e := &testexpr.Instance{
-//     Rel: &props.Relational{...},
-//     Provided: &physical.Provided{...},
-//   }
-//
+//	e := &testexpr.Instance{
+//	  Rel: &props.Relational{...},
+//	  Provided: &physical.Provided{...},
+//	}
 type Instance struct {
 	Rel      *props.Relational
 	Required *physical.Required
@@ -67,9 +61,6 @@ func (e *Instance) ChildCount() int { panic("not implemented") }
 
 // Child is part of the RelExpr interface.
 func (e *Instance) Child(nth int) opt.Expr { panic("not implemented") }
-
-// String is part of the RelExpr interface.
-func (e *Instance) String() string { panic("not implemented") }
 
 // SetChild is part of the RelExpr interface.
 func (e *Instance) SetChild(nth int, child opt.Expr) { panic("not implemented") }

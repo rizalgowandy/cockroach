@@ -1,16 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessionphase
 
-import "time"
+import (
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/crlib/crtime"
+)
 
 // SQL execution is separated in 3+ phases:
 // - parse/prepare
@@ -27,14 +27,10 @@ import "time"
 type SessionPhase int
 
 const (
-	// SessionInit is the SessionPhase the session is created (pgwire). It is used
-	// to compute the session age.
-	SessionInit SessionPhase = iota
-
 	// Executor phases.
 
 	// SessionQueryReceived is the SessionPhase when a query is received.
-	SessionQueryReceived
+	SessionQueryReceived = iota
 
 	// SessionStartParse is the SessionPhase when parsing starts.
 	SessionStartParse
@@ -48,6 +44,15 @@ const (
 	// PlannerEndLogicalPlan is the SessionPhase when planning ends.
 	PlannerEndLogicalPlan
 
+	// PlannerFirstStartExecStmt is the SessionPhase when execution starts for the
+	// first time. Will only be set if using read committed isolation.
+	PlannerFirstStartExecStmt
+
+	// PlannerMostRecentStartExecStmt is the SessionPhase when execution starts
+	// for the most recent time. Will only be set if using read committed
+	// isolation.
+	PlannerMostRecentStartExecStmt
+
 	// PlannerStartExecStmt is the SessionPhase when execution starts.
 	PlannerStartExecStmt
 
@@ -59,9 +64,9 @@ const (
 	// have no execution, like SHOW TRANSACTION STATUS.
 	SessionQueryServiced
 
-	// SessionTransactionReceived is the SessionPhase when a transaction is
-	// received.
-	SessionTransactionReceived
+	// SessionTransactionStarted is the SessionPhase when a transaction is
+	// started.
+	SessionTransactionStarted
 
 	// SessionFirstStartExecTransaction is the SessionPhase when a transaction
 	// is started for the first time.
@@ -99,22 +104,32 @@ const (
 // Times is the data structure that keep tracks of the time for each
 // SessionPhase.
 type Times struct {
-	times [SessionNumPhases]time.Time
+	initTime time.Time
+	times    [SessionNumPhases]crtime.Mono
 }
 
 // NewTimes create a new instance of the Times.
 func NewTimes() *Times {
-	return &Times{}
+	return &Times{initTime: timeutil.Now()}
 }
 
 // SetSessionPhaseTime sets the time for a given SessionPhase.
-func (t *Times) SetSessionPhaseTime(sp SessionPhase, time time.Time) {
+// TODO(alyshan): Session Phase Times are set throughout the conn executor, it is
+// a tedious process to track when and where these times are set.
+// Found a bug again? Consider refactoring.
+func (t *Times) SetSessionPhaseTime(sp SessionPhase, time crtime.Mono) {
 	t.times[sp] = time
 }
 
 // GetSessionPhaseTime retrieves the time for a given SessionPhase.
-func (t *Times) GetSessionPhaseTime(sp SessionPhase) time.Time {
+func (t *Times) GetSessionPhaseTime(sp SessionPhase) crtime.Mono {
 	return t.times[sp]
+}
+
+// InitTime is the time when this Times instance was created (which should
+// coincide with the time the session was initialized).
+func (t *Times) InitTime() time.Time {
+	return t.initTime
 }
 
 // Clone returns a copy of the current PhaseTimes.
@@ -139,8 +154,8 @@ func (t *Times) GetServiceLatencyNoOverhead() time.Duration {
 	// zero, so subtracting the actual time at which the query was received will
 	// produce a negative value which doesn't make sense. Therefore, we "fake"
 	// the received time to be the parsing start time.
-	var queryReceivedTime time.Time
-	if t.times[SessionEndParse].IsZero() {
+	var queryReceivedTime crtime.Mono
+	if t.times[SessionEndParse] == 0 {
 		queryReceivedTime = t.times[SessionStartParse]
 	} else {
 		queryReceivedTime = t.times[SessionQueryReceived]
@@ -149,8 +164,8 @@ func (t *Times) GetServiceLatencyNoOverhead() time.Duration {
 	// If we encounter an error during the logical planning, the
 	// PlannerEndExecStmt phase will not be set, so we need to use the end of
 	// planning phase in the computation of planAndExecuteLatency.
-	var queryEndExecTime time.Time
-	if t.times[PlannerEndExecStmt].IsZero() {
+	var queryEndExecTime crtime.Mono
+	if t.times[PlannerEndExecStmt] == 0 {
 		queryEndExecTime = t.times[PlannerEndLogicalPlan]
 	} else {
 		queryEndExecTime = t.times[PlannerEndExecStmt]
@@ -164,6 +179,13 @@ func (t *Times) GetServiceLatencyNoOverhead() time.Duration {
 // NOTE: SessionQueryServiced phase must have been set.
 func (t *Times) GetServiceLatencyTotal() time.Duration {
 	return t.times[SessionQueryServiced].Sub(t.times[SessionQueryReceived])
+}
+
+// GetStatementRetryLatency returns the time that was spent retrying the
+// statement. (This is only applicable to Read Committed isolation, and will
+// always be zero under stronger isolation levels.)
+func (t *Times) GetStatementRetryLatency() time.Duration {
+	return t.times[PlannerMostRecentStartExecStmt].Sub(t.times[PlannerFirstStartExecStmt])
 }
 
 // GetRunLatency returns the time between a query execution starting and
@@ -197,7 +219,7 @@ func (t *Times) GetTransactionRetryLatency() time.Duration {
 // GetTransactionServiceLatency returns the total time to service the
 // transaction.
 func (t *Times) GetTransactionServiceLatency() time.Duration {
-	return t.times[SessionEndExecTransaction].Sub(t.times[SessionTransactionReceived])
+	return t.times[SessionEndExecTransaction].Sub(t.times[SessionTransactionStarted])
 }
 
 // GetCommitLatency returns the total time spent for the transaction to
@@ -208,5 +230,51 @@ func (t *Times) GetCommitLatency() time.Duration {
 
 // GetSessionAge returns the age of the current session since initialization.
 func (t *Times) GetSessionAge() time.Duration {
-	return t.times[PlannerEndExecStmt].Sub(t.times[SessionInit])
+	return t.times[PlannerEndExecStmt].Sub(crtime.MonoFromTime(t.InitTime()))
+}
+
+// GetIdleLatency deduces the rough amount of time spent waiting for the client
+// while the transaction is open. (For implicit transactions, this value is 0.)
+func (t *Times) GetIdleLatency(previous *Times) time.Duration {
+	queryReceived := t.times[SessionQueryReceived]
+
+	var previousQueryReceived crtime.Mono
+	var previousQueryServiced crtime.Mono
+	if previous != nil {
+		previousQueryReceived = previous.times[SessionQueryReceived]
+		previousQueryServiced = previous.times[SessionQueryServiced]
+	}
+
+	// If we were received at the same time as the previous execution
+	// (i.e., as part of a compound statement), we didn't have to wait
+	// for the client at all.
+	if queryReceived == previousQueryReceived {
+		return 0
+	}
+
+	// In general, we have been waiting for the client since the end
+	// of the previous execution.
+	waitingSince := previousQueryServiced
+
+	transactionStarted := t.times[SessionTransactionStarted]
+	// Transaction started is not set. Assume it's an implicit
+	// transaction so there is no idle time.
+	if transactionStarted == 0 {
+		return 0
+	}
+
+	// Although we really only want to measure idle latency *within*
+	// an open transaction. So if we're in a new transaction, measure
+	// from its start time instead.
+	if transactionStarted > waitingSince {
+		waitingSince = transactionStarted
+	}
+
+	// And if we were received before we started waiting for the client,
+	// then there is no idle latency at all.
+	if waitingSince > queryReceived {
+		return 0
+	}
+
+	return queryReceived.Sub(waitingSince)
 }

@@ -1,133 +1,153 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
-import React from "react";
-import { Helmet } from "react-helmet";
-import { connect } from "react-redux";
-import { RouteComponentProps, withRouter } from "react-router-dom";
-import { createSelector } from "reselect";
-
-import { refreshMetricMetadata, refreshNodes } from "src/redux/apiReducers";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
-import { AdminUIState } from "src/redux/state";
-import { LineGraph } from "src/views/cluster/components/linegraph";
-import TimeScaleDropdown from "src/views/cluster/containers/timescale";
-import { DropdownOption } from "src/views/shared/components/dropdown";
-import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 import {
-  Metric,
-  Axis,
   AxisUnits,
-} from "src/views/shared/components/metricQuery";
+  NodesSummary,
+  TimeScale,
+  useMetricMetadata,
+  useNodesSummary,
+  useTenants,
+} from "@cockroachlabs/cluster-ui";
+import flatMap from "lodash/flatMap";
+import flow from "lodash/flow";
+import isEmpty from "lodash/isEmpty";
+import keys from "lodash/keys";
+import map from "lodash/map";
+import sortBy from "lodash/sortBy";
+import startsWith from "lodash/startsWith";
+import React, { useMemo } from "react";
+import { Helmet } from "react-helmet";
+import { useSelector, useDispatch } from "react-redux";
+import { RouteComponentProps, withRouter } from "react-router-dom";
+
+import TimeScaleDropdown from "oss/src/views/cluster/containers/timeScaleDropdownWithSearchParams";
+import { getCookieValue } from "src/redux/cookies";
+import { MetricsMetadata } from "src/redux/metricMetadata";
+import { AdminUIState, AppDispatch } from "src/redux/state";
+import {
+  TimeWindow,
+  setMetricsFixedWindow,
+  selectTimeScale,
+  setTimeScale,
+} from "src/redux/timeScale";
+import { INodeStatus } from "src/util/proto";
+import { queryByName } from "src/util/query";
+import LineGraph from "src/views/cluster/components/linegraph";
+import { BackToAdvanceDebug } from "src/views/reports/containers/util";
+import { DropdownOption } from "src/views/shared/components/dropdown";
+import { Metric, Axis } from "src/views/shared/components/metricQuery";
 import {
   PageConfig,
   PageConfigItem,
 } from "src/views/shared/components/pageconfig";
-import {
-  MetricsMetadata,
-  metricsMetadataSelector,
-} from "src/redux/metricMetadata";
-import { INodeStatus } from "src/util/proto";
+import { MetricsDataProvider } from "src/views/shared/containers/metricDataProvider";
 
-import { CustomChartState, CustomChartTable } from "./customMetric";
-import "./customChart.styl";
-import { queryByName } from "src/util/query";
-import { PayloadAction } from "src/interfaces/action";
 import {
-  TimeWindow,
-  TimeScale,
-  setTimeRange,
-  setTimeScale,
-} from "src/redux/timewindow";
+  CustomChartState,
+  CustomChartTable,
+  CustomMetricState,
+} from "./customMetric";
+import "./customChart.scss";
 
-export interface CustomChartProps {
-  refreshNodes: typeof refreshNodes;
-  nodesQueryValid: boolean;
-  nodesSummary: NodesSummary;
-  refreshMetricMetadata: typeof refreshMetricMetadata;
-  metricsMetadata: MetricsMetadata;
-  setTimeRange: (tw: TimeWindow) => PayloadAction<TimeWindow>;
-  setTimeScale: (ts: TimeScale) => PayloadAction<TimeScale>;
-}
+export type CustomChartProps = RouteComponentProps;
 
 interface UrlState {
   charts: string;
 }
 
-export class CustomChart extends React.Component<
-  CustomChartProps & RouteComponentProps
-> {
-  // Selector which computes dropdown options based on the nodes available on
-  // the cluster.
-  private nodeOptions = createSelector(
-    (summary: NodesSummary) => summary.nodeStatuses,
-    (summary: NodesSummary) => summary.nodeDisplayNameByID,
-    (nodeStatuses, nodeDisplayNameByID): DropdownOption[] => {
-      const base = [{ value: "", label: "Cluster" }];
-      return base.concat(
-        _.chain(nodeStatuses)
-          .map(ns => {
-            return {
-              value: ns.desc.node_id.toString(),
-              label: nodeDisplayNameByID[ns.desc.node_id],
-            };
-          })
-          .sortBy(value => _.startsWith(value.label, "[decommissioned]"))
-          .value(),
-      );
-    },
+export const getSources = (
+  nodesSummary: NodesSummary,
+  metricState: CustomMetricState,
+  metricsMetadata: MetricsMetadata,
+): string[] => {
+  if (!(nodesSummary?.nodeStatuses?.length > 0)) {
+    return [];
+  }
+  // If we have no nodeSource, and we're not asking for perSource metrics,
+  // then the user is asking for cluster-wide metrics. We can return an empty
+  // source list.
+  if (metricState.nodeSource === "" && !metricState.perSource) {
+    return [];
+  }
+  if (isStoreMetric(metricsMetadata.recordedNames, metricState.metric)) {
+    // If a specific node is selected, return the storeIDs associated with that node.
+    // Otherwise, we're at the cluster level, so we grab each store ID.
+    const storeIDs = metricState.nodeSource
+      ? nodesSummary.storeIDsByNodeID[metricState.nodeSource]
+      : Object.values(nodesSummary.storeIDsByNodeID).flatMap(s => s);
+    // Sort store IDs to ensure consistent ordering
+    return storeIDs.sort();
+  } else {
+    // If it's not a store metric, and a specific nodeSource is chosen, just return that.
+    // Otherwise, return all known node IDs.
+    return metricState.nodeSource
+      ? [metricState.nodeSource]
+      : nodesSummary.nodeIDs;
+  }
+};
+
+export function CustomChart({
+  location,
+  history,
+}: CustomChartProps): React.ReactElement {
+  const dispatch = useDispatch<AppDispatch>();
+  const nodesSummary = useNodesSummary();
+  const { data: metricsMetadata } = useMetricMetadata();
+  const timeScale = useSelector((state: AdminUIState) =>
+    selectTimeScale(state),
   );
+  const { tenants } = useTenants();
+  const tenantOptions: DropdownOption[] = useMemo(() => {
+    const options: DropdownOption[] = [{ label: "All", value: "" }];
+    tenants?.forEach(tenant =>
+      options.push({
+        label: tenant.tenant_name,
+        value: tenant.tenant_id?.id?.toString(),
+      }),
+    );
+    return options;
+  }, [tenants]);
+  const currentTenant = getCookieValue("tenant");
 
-  // Selector which computes dropdown options based on the metrics which are
-  // currently being stored on the cluster.
-  private metricOptions = createSelector(
-    (summary: NodesSummary) => summary.nodeStatuses,
-    (_summary: NodesSummary, metricsMetadata: MetricsMetadata) =>
-      metricsMetadata,
-    (nodeStatuses, metadata = {}): DropdownOption[] => {
-      if (_.isEmpty(nodeStatuses)) {
-        return [];
-      }
+  const setMetricsFixedWindowAction = (tw: TimeWindow) =>
+    dispatch(setMetricsFixedWindow(tw));
+  const setTimeScaleAction = (ts: TimeScale) => dispatch(setTimeScale(ts));
+  // Dropdown options computed from cluster node statuses.
+  const nodeOptions = useMemo((): DropdownOption[] => {
+    const base = [{ value: "", label: "Cluster" }];
+    return base.concat(
+      flow(
+        (statuses: INodeStatus[]) =>
+          map(statuses, ns => ({
+            value: ns.desc.node_id.toString(),
+            label: nodesSummary.nodeDisplayNameByID[ns.desc.node_id],
+          })),
+        values =>
+          sortBy(values, value => startsWith(value.label, "[decommissioned]")),
+      )(nodesSummary.nodeStatuses),
+    );
+  }, [nodesSummary.nodeStatuses, nodesSummary.nodeDisplayNameByID]);
 
-      return _.keys(nodeStatuses[0].metrics).map(k => {
-        const fullMetricName = isStoreMetric(nodeStatuses[0], k)
-          ? "cr.store." + k
-          : "cr.node." + k;
-
-        return {
-          value: fullMetricName,
-          label: k,
-          description: metadata[k] && metadata[k].help,
-        };
-      });
-    },
-  );
-
-  refresh(props = this.props) {
-    if (!props.nodesQueryValid) {
-      props.refreshNodes();
+  // Dropdown options computed from the metrics currently stored on the cluster.
+  const metricOptions = useMemo((): DropdownOption[] => {
+    if (isEmpty(metricsMetadata?.metadata)) {
+      return [];
     }
-  }
 
-  componentDidMount() {
-    this.refresh();
-    this.props.refreshMetricMetadata();
-  }
+    return keys(metricsMetadata.recordedNames).map(k => {
+      const fullMetricName = metricsMetadata.recordedNames[k];
+      return {
+        value: fullMetricName,
+        label: k,
+        description: metricsMetadata.metadata[k]?.help,
+      };
+    });
+  }, [metricsMetadata]);
 
-  componentDidUpdate() {
-    this.refresh(this.props);
-  }
-
-  currentCharts(): CustomChartState[] {
-    const { location } = this.props;
+  const currentCharts = (): CustomChartState[] => {
     const metrics = queryByName(location, "metrics");
     const charts = queryByName(location, "charts");
 
@@ -153,10 +173,9 @@ export class CustomChart extends React.Component<
     }
 
     return [new CustomChartState()];
-  }
+  };
 
-  updateUrl(newState: Partial<UrlState>) {
-    const { location, history } = this.props;
+  const updateUrl = (newState: Partial<UrlState>) => {
     const { pathname, search } = location;
     const urlParams = new URLSearchParams(search);
 
@@ -169,173 +188,212 @@ export class CustomChart extends React.Component<
       search: urlParams.toString(),
       state: newState,
     });
-  }
+  };
 
-  updateUrlCharts(newState: CustomChartState[]) {
+  const updateUrlCharts = (newState: CustomChartState[]) => {
     const charts = JSON.stringify(newState);
-    this.updateUrl({
-      charts,
-    });
-  }
+    updateUrl({ charts });
+  };
 
-  updateChartRow = (index: number, newState: CustomChartState) => {
-    const arr = this.currentCharts().slice();
+  const updateChartRow = (index: number, newState: CustomChartState) => {
+    const arr = currentCharts().slice();
     arr[index] = newState;
-    this.updateUrlCharts(arr);
+    updateUrlCharts(arr);
   };
 
-  addChart = () => {
-    this.updateUrlCharts([...this.currentCharts(), new CustomChartState()]);
+  const addChart = () => {
+    updateUrlCharts([...currentCharts(), new CustomChartState()]);
   };
 
-  removeChart = (index: number) => {
-    const charts = this.currentCharts();
-    this.updateUrlCharts(
-      charts.slice(0, index).concat(charts.slice(index + 1)),
-    );
+  const removeChart = (index: number) => {
+    const charts = currentCharts();
+    updateUrlCharts(charts.slice(0, index).concat(charts.slice(index + 1)));
+  };
+
+  // This function handles the logic related to creating Metric components
+  // based on perNode and perTenant flags.
+  const renderMetricComponents = (
+    metrics: CustomMetricState[],
+    index: number,
+  ) => {
+    // We require nodes information to determine sources (storeIDs/nodeIDs) down below.
+    if (!(nodesSummary?.nodeStatuses?.length > 0)) {
+      return;
+    }
+    const tenants = tenantOptions.length > 1 ? tenantOptions.slice(1) : [];
+    return metrics.map((m, i) => {
+      if (m.metric === "") {
+        return "";
+      }
+      const sources = getSources(nodesSummary, m, metricsMetadata);
+      if (m.perSource && m.perTenant) {
+        return flatMap(sources, source => {
+          return tenants.map(tenant => (
+            <Metric
+              key={`${index}${i}${source}${tenant.value}`}
+              title={`${source}-${tenant.value}: ${m.metric} (${i})`}
+              name={m.metric}
+              aggregator={m.aggregator}
+              downsampler={m.downsampler}
+              derivative={m.derivative}
+              sources={[source]}
+              tenantSource={tenant.value}
+            />
+          ));
+        });
+      } else if (m.perSource) {
+        return map(sources, source => (
+          <Metric
+            key={`${index}${i}${source}`}
+            title={`${source}: ${m.metric} (${i})`}
+            name={m.metric}
+            aggregator={m.aggregator}
+            downsampler={m.downsampler}
+            derivative={m.derivative}
+            sources={[source]}
+            tenantSource={m.tenantSource}
+          />
+        ));
+      } else if (m.perTenant) {
+        return tenants.map(tenant => (
+          <Metric
+            key={`${index}${i}${tenant.value}`}
+            title={`${tenant.value}: ${m.metric} (${i})`}
+            name={m.metric}
+            aggregator={m.aggregator}
+            downsampler={m.downsampler}
+            derivative={m.derivative}
+            sources={sources}
+            tenantSource={tenant.value}
+          />
+        ));
+      } else {
+        return (
+          <Metric
+            key={`${index}${i}`}
+            title={`${m.metric} (${i}) `}
+            name={m.metric}
+            aggregator={m.aggregator}
+            downsampler={m.downsampler}
+            derivative={m.derivative}
+            sources={sources}
+            tenantSource={m.tenantSource}
+          />
+        );
+      }
+    });
   };
 
   // Render a chart of the currently selected metrics.
-  renderChart = (chart: CustomChartState, index: number) => {
+  const renderChart = (chart: CustomChartState, index: number) => {
     const metrics = chart.metrics;
     const units = chart.axisUnits;
-    const { nodesSummary } = this.props;
-
     return (
       <MetricsDataProvider
         id={`debug-custom-chart.${index}`}
-        key={index}
-        setTimeRange={this.props.setTimeRange}
-        setTimeScale={this.props.setTimeScale}
-        history={this.props.history}
+        key={`${index}-${units}`}
+        setMetricsFixedWindow={setMetricsFixedWindowAction}
+        setTimeScale={setTimeScaleAction}
+        history={history}
       >
-        <LineGraph>
+        <LineGraph title={metrics.map(m => m.metric).join(", ")}>
           <Axis units={units} label={AxisUnits[units]}>
-            {metrics.map((m, i) => {
-              if (m.metric !== "") {
-                if (m.perNode) {
-                  return _.map(nodesSummary.nodeIDs, nodeID => (
-                    <Metric
-                      key={`${index}${i}${nodeID}`}
-                      title={`${nodeID}: ${m.metric} (${i})`}
-                      name={m.metric}
-                      aggregator={m.aggregator}
-                      downsampler={m.downsampler}
-                      derivative={m.derivative}
-                      sources={
-                        isStoreMetric(nodesSummary.nodeStatuses[0], m.metric)
-                          ? _.map(
-                              nodesSummary.storeIDsByNodeID[nodeID] || [],
-                              n => n.toString(),
-                            )
-                          : [nodeID]
-                      }
-                    />
-                  ));
-                } else {
-                  return (
-                    <Metric
-                      key={`${index}${i}`}
-                      title={`${m.metric} (${i}) `}
-                      name={m.metric}
-                      aggregator={m.aggregator}
-                      downsampler={m.downsampler}
-                      derivative={m.derivative}
-                      sources={m.source === "" ? [] : [m.source]}
-                    />
-                  );
-                }
-              }
-              return "";
-            })}
+            {renderMetricComponents(metrics, index)}
           </Axis>
         </LineGraph>
       </MetricsDataProvider>
     );
   };
 
-  renderCharts() {
-    const charts = this.currentCharts();
+  const renderCharts = () => {
+    const charts = currentCharts();
 
-    if (_.isEmpty(charts)) {
+    if (isEmpty(charts)) {
       return <h3>Click "Add Chart" to add a chart to the custom dashboard.</h3>;
     }
 
-    return charts.map(this.renderChart);
-  }
+    return charts.map(renderChart);
+  };
 
   // Render a table containing all of the currently added metrics, with editing
   // inputs for each metric.
-  renderChartTables() {
-    const { nodesSummary, metricsMetadata } = this.props;
-    const charts = this.currentCharts();
+  const renderChartTables = () => {
+    const charts = currentCharts();
 
     return (
       <>
         {charts.map((chart, i) => (
           <CustomChartTable
-            metricOptions={this.metricOptions(nodesSummary, metricsMetadata)}
-            nodeOptions={this.nodeOptions(nodesSummary)}
+            metricOptions={metricOptions}
+            nodeOptions={nodeOptions}
+            tenantOptions={tenantOptions}
+            currentTenant={currentTenant}
             index={i}
             key={i}
             chartState={chart}
-            onChange={this.updateChartRow}
-            onDelete={this.removeChart}
+            onChange={updateChartRow}
+            onDelete={removeChart}
           />
         ))}
       </>
     );
-  }
+  };
 
-  render() {
-    return (
-      <>
-        <Helmet title="Custom Chart | Debug" />
-        <section className="section">
-          <h1 className="base-heading">Custom Chart</h1>
-        </section>
-        <PageConfig>
-          <PageConfigItem>
-            <TimeScaleDropdown />
-          </PageConfigItem>
-          <button
-            className="edit-button chart-edit-button chart-edit-button--add"
-            onClick={this.addChart}
-          >
-            Add Chart
-          </button>
-        </PageConfig>
-        <section className="section">
-          <div className="l-columns">
-            <div className="chart-group l-columns__left">
-              {this.renderCharts()}
-            </div>
-            <div className="l-columns__right"></div>
-          </div>
-        </section>
-        <section className="section">{this.renderChartTables()}</section>
-      </>
-    );
-  }
+  // Note: the vertical spacing below is to ensure we can scroll the page up
+  // enough for the drop-down metric menu to be visible.
+  // TODO(radu): remove this when we upgrade to a better component.
+  return (
+    <>
+      <Helmet title="Custom Chart | Debug" />
+      <BackToAdvanceDebug history={history} />
+      <section className="section">
+        <h1 className="base-heading">Custom Chart</h1>
+      </section>
+      <PageConfig>
+        <PageConfigItem>
+          <TimeScaleDropdown
+            currentScale={timeScale}
+            setTimeScale={setTimeScaleAction}
+          />
+        </PageConfigItem>
+        <button
+          className="edit-button chart-edit-button chart-edit-button--add"
+          onClick={addChart}
+        >
+          Add Chart
+        </button>
+      </PageConfig>
+      <section className="section">
+        <div className="l-columns">
+          <div className="chart-group l-columns__left">{renderCharts()}</div>
+          <div className="l-columns__right" />
+        </div>
+      </section>
+      <section className="section">{renderChartTables()}</section>
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+      <br />
+    </>
+  );
 }
 
-const mapStateToProps = (state: AdminUIState) => ({
-  nodesSummary: nodesSummarySelector(state),
-  nodesQueryValid: state.cachedData.nodes.valid,
-  metricsMetadata: metricsMetadataSelector(state),
-});
+export default withRouter(CustomChart);
 
-const mapDispatchToProps = {
-  refreshNodes,
-  refreshMetricMetadata,
-  setTimeRange,
-  setTimeScale,
-};
-
-export default withRouter(
-  connect(mapStateToProps, mapDispatchToProps)(CustomChart),
-);
-
-function isStoreMetric(nodeStatus: INodeStatus, metricName: string) {
-  return _.has(nodeStatus.store_statuses[0].metrics, metricName);
+function isStoreMetric(
+  recordedNames: Record<string, string>,
+  metricName: string,
+) {
+  if (metricName?.startsWith("cr.store")) {
+    return true;
+  }
+  return recordedNames[metricName]?.startsWith("cr.store") || false;
 }

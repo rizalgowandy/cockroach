@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -16,9 +11,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
 func runClockJump(ctx context.Context, t test.Test, c cluster.Cluster, tc clockJumpTestCase) {
@@ -34,13 +31,9 @@ func runClockJump(ctx context.Context, t test.Test, c cluster.Cluster, tc clockJ
 		t.Fatal(err)
 	}
 
-	if err := c.RunE(ctx, c.Node(1), "test -x ./cockroach"); err != nil {
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-	}
-	c.Wipe(ctx)
-	c.Start(ctx)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
 
-	db := c.Conn(ctx, c.Spec().NodeCount)
+	db := c.Conn(ctx, t.L(), c.Spec().NodeCount)
 	defer db.Close()
 	if _, err := db.Exec(
 		fmt.Sprintf(
@@ -61,17 +54,7 @@ func runClockJump(ctx context.Context, t test.Test, c cluster.Cluster, tc clockJ
 	// test is done to pacify the dead node detector. Do this after the
 	// clock offset is reset or the node will crash again.
 	var aliveAfterOffset bool
-	defer func() {
-		offsetInjector.recover(ctx, c.Spec().NodeCount)
-		// Resetting the clock is a jump in the opposite direction which
-		// can cause a crash even if the original jump didn't. Wait a few
-		// seconds before checking whether the node is alive and
-		// restarting it if not.
-		time.Sleep(3 * time.Second)
-		if !isAlive(db, t.L()) {
-			c.Start(ctx, c.Node(1))
-		}
-	}()
+
 	defer offsetInjector.recover(ctx, c.Spec().NodeCount)
 	offsetInjector.offset(ctx, c.Spec().NodeCount, tc.offset)
 
@@ -83,6 +66,13 @@ func runClockJump(ctx context.Context, t test.Test, c cluster.Cluster, tc clockJ
 	if aliveAfterOffset != tc.aliveAfterOffset {
 		t.Fatalf("Expected node health %v, got %v", tc.aliveAfterOffset, aliveAfterOffset)
 	}
+
+	// Resetting the clock is a jump in the opposite direction which can cause a
+	// crash even if the original jump didn't. Since we do not control when
+	// exactly the clock jumps, we simply stop and wipe the node (which also
+	// prevents the post-test assertions from complaining about a down node).
+	c.Wipe(ctx, c.All())
+	offsetInjector.recover(ctx, c.Spec().NodeCount)
 }
 
 type clockJumpTestCase struct {
@@ -136,7 +126,10 @@ func registerClockJumpTests(r registry.Registry) {
 			Owner: registry.OwnerKV,
 			// These tests muck with NTP, therefore we don't want the cluster reused
 			// by others.
-			Cluster: r.MakeClusterSpec(1, spec.ReuseTagged("offset-injector")),
+			Cluster:          r.MakeClusterSpec(1, spec.ReuseTagged("offset-injector"), spec.TerminateOnMigration()),
+			CompatibleClouds: registry.AllExceptAWS,
+			Suites:           registry.Suites(registry.Nightly),
+			Leases:           registry.MetamorphicLeases,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runClockJump(ctx, t, c, tc)
 			},

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -17,11 +12,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -44,18 +40,19 @@ func TestColumnarizerResetsInternalBatch(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 	c.Init(ctx)
 	foundRows := 0
 	for {
-		batch := c.Next()
+		batch := colexecop.NextNoMeta(c)
 		require.Nil(t, batch.Selection(), "Columnarizer didn't reset the internal batch")
 		if batch.Length() == 0 {
 			break
@@ -74,12 +71,13 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, tc := range []struct {
@@ -98,18 +96,16 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 			const errMsg = "artificial error"
 			rb := distsqlutils.NewRowBuffer([]*types.T{types.Int}, nil /* rows */, distsqlutils.RowBufferArgs{})
 			rb.Push(nil, &execinfrapb.ProducerMetadata{Err: errors.New(errMsg)})
-			c := NewBufferingColumnarizer(testAllocator, flowCtx, 0 /* processorID */, rb)
+			c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0 /* processorID */, rb)
 
 			c.Init(ctx)
 
-			// If the metadata is obtained through this Next call, the Columnarizer still
-			// returns it in DrainMeta.
-			err := colexecerror.CatchVectorizedRuntimeError(func() { c.Next() })
+			err := colexecerror.CatchVectorizedRuntimeError(func() { colexecop.NextNoMeta(c) })
 			require.True(t, testutils.IsError(err, errMsg), "unexpected error %v", err)
 
 			if tc.consumerClosed {
 				// Closing the Columnarizer should call ConsumerClosed on the processor.
-				require.NoError(t, c.Close())
+				require.NoError(t, c.Close(ctx))
 				require.Equal(t, execinfra.ConsumerClosed, rb.ConsumerStatus, "unexpected consumer status %d", rb.ConsumerStatus)
 			} else {
 				// Calling DrainMeta from the vectorized execution engine should propagate to
@@ -126,7 +122,6 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 }
 
 func BenchmarkColumnarize(b *testing.B) {
-	defer log.Scope(b).Close(b)
 	types := []*types.T{types.Int, types.Int}
 	nRows := 10000
 	nCols := 2
@@ -135,21 +130,22 @@ func BenchmarkColumnarize(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	b.SetBytes(int64(nRows * nCols * int(memsize.Int64)))
 
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 	c.Init(ctx)
 	for i := 0; i < b.N; i++ {
 		foundRows := 0
 		for {
-			batch := c.Next()
+			batch := colexecop.NextNoMeta(c)
 			if batch.Length() == 0 {
 				break
 			}

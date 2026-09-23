@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package metric
 
@@ -15,7 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 const (
@@ -34,7 +29,6 @@ type PrometheusRuleNode struct {
 }
 
 // PrometheusRuleGroup is a list of recording and alerting rules.
-// swagger:model PrometheusRuleGroup
 type PrometheusRuleGroup struct {
 	Rules []PrometheusRuleNode `yaml:"rules"`
 }
@@ -74,7 +68,7 @@ func (re *PrometheusRuleExporter) ScrapeRegistry(ctx context.Context) {
 	re.ruleRegistry.Each(func(rule Rule) {
 		ruleGroupName, ruleNode := rule.ToPrometheusRuleNode()
 		if ruleGroupName != alertRuleGroupName && ruleGroupName != recordingRuleGroupName {
-			log.Warning(ctx, "invalid prometheus group name, skipping rule")
+			log.Dev.Warning(ctx, "invalid prometheus group name, skipping rule")
 			return
 		}
 

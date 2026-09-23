@@ -1,26 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecwindow
 
 import (
 	"context"
-	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
@@ -31,7 +25,7 @@ import (
 // window function.
 func newBufferedWindowOperator(
 	args *WindowArgs, windower bufferedWindower, outputColType *types.T, memoryLimit int64,
-) colexecop.Operator {
+) colexecop.ClosableOperator {
 	outputTypes := make([]*types.T, len(args.InputTypes), len(args.InputTypes)+1)
 	copy(outputTypes, args.InputTypes)
 	outputTypes = append(outputTypes, outputColType)
@@ -43,15 +37,15 @@ func newBufferedWindowOperator(
 	queueCfg.SetCacheMode(colcontainer.DiskQueueCacheModeIntertwinedCalls)
 	return &bufferedWindowOp{
 		windowInitFields: windowInitFields{
-			OneInputNode: colexecop.NewOneInputNode(input),
-			allocator:    args.MainAllocator,
-			memoryLimit:  memoryLimit,
-			diskQueueCfg: queueCfg,
-			fdSemaphore:  args.FdSemaphore,
-			outputTypes:  outputTypes,
-			diskAcc:      args.DiskAcc,
-			outputColIdx: args.OutputColIdx,
-			outputColFam: typeconv.TypeFamilyToCanonicalTypeFamily(outputColType.Family()),
+			OneInputNode:    colexecop.NewOneInputNode(input),
+			allocator:       args.MainAllocator,
+			memoryLimit:     memoryLimit,
+			diskQueueCfg:    queueCfg,
+			fdSemaphore:     args.FdSemaphore,
+			outputTypes:     outputTypes,
+			diskAcc:         args.DiskAcc,
+			diskQueueMemAcc: args.DiskQueueMemAcc,
+			outputColIdx:    args.OutputColIdx,
 		},
 		windower: windower,
 	}
@@ -113,7 +107,7 @@ const (
 // buffer all tuples from each partition.
 type bufferedWindower interface {
 	Init(ctx context.Context)
-	Close()
+	Close(context.Context)
 
 	// seekNextPartition is called during the windowSeeking state on the current
 	// batch. It gives windowers a chance to perform any necessary pre-processing,
@@ -146,14 +140,14 @@ type windowInitFields struct {
 	colexecop.OneInputNode
 	colexecop.InitHelper
 
-	allocator    *colmem.Allocator
-	memoryLimit  int64
-	diskQueueCfg colcontainer.DiskQueueCfg
-	fdSemaphore  semaphore.Semaphore
-	outputTypes  []*types.T
-	diskAcc      *mon.BoundAccount
-	outputColIdx int
-	outputColFam types.Family
+	allocator       *colmem.Allocator
+	memoryLimit     int64
+	diskQueueCfg    colcontainer.DiskQueueCfg
+	fdSemaphore     semaphore.Semaphore
+	outputTypes     []*types.T
+	diskAcc         *mon.BoundAccount
+	diskQueueMemAcc *mon.BoundAccount
+	outputColIdx    int
 }
 
 // bufferedWindowOp extracts common fields for the various window operators
@@ -164,6 +158,7 @@ type windowInitFields struct {
 type bufferedWindowOp struct {
 	colexecop.CloserHelper
 	windowInitFields
+	cancelChecker colexecutils.CancelChecker
 
 	// windower houses the fields and logic specific to the window function being
 	// calculated.
@@ -200,6 +195,7 @@ func (b *bufferedWindowOp) Init(ctx context.Context) {
 	if !b.InitHelper.Init(ctx) {
 		return
 	}
+	b.cancelChecker.Init(b.Ctx)
 	b.Input.Init(b.Ctx)
 	b.windower.Init(b.Ctx)
 	b.state = windowLoading
@@ -211,19 +207,24 @@ func (b *bufferedWindowOp) Init(ctx context.Context) {
 			DiskQueueCfg:       b.diskQueueCfg,
 			FDSemaphore:        b.fdSemaphore,
 			DiskAcc:            b.diskAcc,
+			DiskQueueMemAcc:    b.diskQueueMemAcc,
 		},
 	)
 	b.windower.startNewPartition()
 }
 
-var _ colexecop.Operator = &bufferedWindowOp{}
+var _ colexecop.ClosableOperator = &bufferedWindowOp{}
 
-func (b *bufferedWindowOp) Next() coldata.Batch {
+func (b *bufferedWindowOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	var err error
 	for {
+		b.cancelChecker.CheckEveryCall()
 		switch b.state {
 		case windowLoading:
-			batch := b.Input.Next()
+			batch, meta := b.Input.Next()
+			if meta != nil {
+				return nil, meta
+			}
 			if batch.Length() == 0 {
 				// We have reached the end of the input.
 				if !b.bufferQueue.Empty() || (b.currentBatch != nil && b.currentBatch.Length() > 0) {
@@ -239,6 +240,8 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 			// Load the next batch into currentBatch. If currentBatch still has data,
 			// move it into the queue.
 			if b.currentBatch != nil && b.currentBatch.Length() > 0 {
+				// TODO(yuzefovich): it is quite unfortunate that the output
+				// vector is being spilled to disk. Consider refactoring this.
 				b.bufferQueue.Enqueue(b.Ctx, b.currentBatch)
 			}
 			// We have to copy the input batch data because calling Next on the input
@@ -249,9 +252,8 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 			sel := batch.Selection()
 			// We don't limit the batches based on the memory footprint because
 			// we assume that the input is producing reasonably sized batches.
-			const maxBatchMemSize = math.MaxInt64
-			b.currentBatch, _ = b.allocator.ResetMaybeReallocate(
-				b.outputTypes, b.currentBatch, batch.Length(), maxBatchMemSize,
+			b.currentBatch, _ = b.allocator.ResetMaybeReallocateNoMemLimit(
+				b.outputTypes, b.currentBatch, batch.Length(),
 			)
 			b.allocator.PerformOperation(b.currentBatch.ColVecs(), func() {
 				for colIdx, vec := range batch.ColVecs() {
@@ -299,14 +301,6 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 				if output, err = b.bufferQueue.Dequeue(b.Ctx); err != nil {
 					colexecerror.InternalError(err)
 				}
-				// The spilling queue sets 'maxSetLength' to the length of the batch for
-				// bytes-like types, so we have to reset it so that `Set` can be used.
-				switch b.outputColFam {
-				case types.BytesFamily:
-					output.ColVec(b.outputColIdx).Bytes().Truncate(b.processingIdx)
-				case types.JsonFamily:
-					output.ColVec(b.outputColIdx).JSON().Truncate(b.processingIdx)
-				}
 				// Set all the window output values that remain unset, then emit this
 				// batch. Note that because the beginning of the next partition will
 				// always be located in currentBatch, the current partition will always
@@ -319,20 +313,14 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 					// first of the tuples yet to be processed was somewhere in the batch.
 					b.processingIdx = 0
 				}
-				// Although we didn't change the length of the batch, it is necessary to
-				// set the length anyway (to maintain the invariant of flat bytes).
-				output.SetLength(output.Length())
-				return output
+				return output, nil
 			}
 			if b.currentBatch.Length() > 0 {
 				b.windower.processBatch(b.currentBatch, b.processingIdx, b.nextPartitionIdx)
 				if b.nextPartitionIdx >= b.currentBatch.Length() {
-					// This was the last batch and it has been entirely filled. Although
-					// we didn't change the length of the batch, it is necessary to set
-					// the length anyway (to maintain the invariant of flat bytes).
-					b.currentBatch.SetLength(b.currentBatch.Length())
+					// This was the last batch and it has been entirely filled.
 					b.state = windowFinished
-					return b.currentBatch
+					return b.currentBatch, nil
 				}
 				// The next partition begins within this batch. Set processingIdx to the
 				// beginning of the next partition and seek to the end of the next
@@ -345,29 +333,24 @@ func (b *bufferedWindowOp) Next() coldata.Batch {
 			colexecerror.InternalError(
 				errors.AssertionFailedf("window operator in processing state without buffered rows"))
 		case windowFinished:
-			if err = b.Close(); err != nil {
+			if err = b.Close(b.Ctx); err != nil {
 				colexecerror.InternalError(err)
 			}
-			return coldata.ZeroBatch
+			return coldata.ZeroBatch, nil
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("window operator in unhandled state"))
 			// This code is unreachable, but the compiler cannot infer that.
-			return nil
+			return nil, nil
 		}
 	}
 }
 
-func (b *bufferedWindowOp) Close() error {
-	if !b.CloserHelper.Close() || b.Ctx == nil {
-		// Either Close() has already been called or Init() was never called. In
-		// both cases there is nothing to do.
+func (b *bufferedWindowOp) Close(ctx context.Context) error {
+	if !b.CloserHelper.Close() {
 		return nil
 	}
-	if err := b.bufferQueue.Close(b.EnsureCtx()); err != nil {
-		return err
-	}
-	b.windower.Close()
-	return nil
+	b.windower.Close(ctx)
+	return b.bufferQueue.Close(ctx)
 }
 
 // partitionSeekerBase extracts common fields and methods for buffered windower

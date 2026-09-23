@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package cmpconn assists in comparing results from DB connections.
 package cmpconn
@@ -177,6 +172,11 @@ func CompareConns(
 	defer cancel()
 	connRows := make(map[string]pgx.Rows)
 	connExecs := make(map[string]string)
+	defer func() {
+		for _, r := range connRows {
+			r.Close()
+		}
+	}()
 	for name, conn := range conns {
 		connExecs[name] = exec
 		if cwm, withMutators := conn.(*connWithMutators); withMutators {
@@ -186,7 +186,6 @@ func CompareConns(
 		if err != nil {
 			return true, nil //nolint:returnerrcheck
 		}
-		defer rows.Close()
 		connRows[name] = rows
 	}
 

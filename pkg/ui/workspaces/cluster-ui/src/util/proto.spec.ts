@@ -1,14 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import { assert } from "chai";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { INodeStatus, rollupStoreMetrics } from "./proto";
 
@@ -61,10 +54,14 @@ describe("Proto utils", () => {
     });
 
     it("sums up values for every metric", () => {
-      assert.deepEqual(
-        rollupStoreMetrics(nodeStatus),
+      expect(rollupStoreMetrics(nodeStatus)).toEqual(
         statusWithRolledMetrics.metrics,
       );
+    });
+
+    it("does not explode when node fields are missing", () => {
+      const emptyNodeStatus: Partial<INodeStatus> = {};
+      expect(rollupStoreMetrics(emptyNodeStatus)).toEqual({});
     });
   });
 });

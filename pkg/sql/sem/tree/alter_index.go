@@ -1,14 +1,11 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
+
+import "fmt"
 
 // AlterIndex represents an ALTER INDEX statement.
 type AlterIndex struct {
@@ -50,9 +47,13 @@ type AlterIndexCmd interface {
 	alterIndexCmd()
 }
 
-func (*AlterIndexPartitionBy) alterIndexCmd() {}
+func (*AlterIndexPartitionBy) alterIndexCmd()        {}
+func (*AlterIndexSetStorageParams) alterIndexCmd()   {}
+func (*AlterIndexResetStorageParams) alterIndexCmd() {}
 
 var _ AlterIndexCmd = &AlterIndexPartitionBy{}
+var _ AlterIndexCmd = &AlterIndexSetStorageParams{}
+var _ AlterIndexCmd = &AlterIndexResetStorageParams{}
 
 // AlterIndexPartitionBy represents an ALTER INDEX PARTITION BY
 // command.
@@ -63,4 +64,59 @@ type AlterIndexPartitionBy struct {
 // Format implements the NodeFormatter interface.
 func (node *AlterIndexPartitionBy) Format(ctx *FmtCtx) {
 	ctx.FormatNode(node.PartitionByIndex)
+}
+
+// AlterIndexSetStorageParams represents an ALTER INDEX SET (...) command.
+type AlterIndexSetStorageParams struct {
+	StorageParams StorageParams
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterIndexSetStorageParams) Format(ctx *FmtCtx) {
+	ctx.WriteString(" SET (")
+	ctx.FormatNode(&node.StorageParams)
+	ctx.WriteString(")")
+}
+
+// AlterIndexResetStorageParams represents an ALTER INDEX RESET (...) command.
+type AlterIndexResetStorageParams struct {
+	Params []string
+}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterIndexResetStorageParams) Format(ctx *FmtCtx) {
+	ctx.WriteString(" RESET (")
+	for i, param := range node.Params {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.WriteString(param)
+	}
+	ctx.WriteString(")")
+}
+
+// AlterIndexVisible represents a ALTER INDEX ... [VISIBLE | NOT VISIBLE] statement.
+type AlterIndexVisible struct {
+	Index        TableIndexName
+	Invisibility IndexInvisibility
+	IfExists     bool
+}
+
+var _ Statement = &AlterIndexVisible{}
+
+// Format implements the NodeFormatter interface.
+func (node *AlterIndexVisible) Format(ctx *FmtCtx) {
+	ctx.WriteString("ALTER INDEX ")
+	if node.IfExists {
+		ctx.WriteString("IF EXISTS ")
+	}
+	ctx.FormatNode(&node.Index)
+	switch {
+	case node.Invisibility.FloatProvided:
+		ctx.WriteString(" VISIBILITY " + fmt.Sprintf("%.2f", 1-node.Invisibility.Value))
+	case node.Invisibility.Value == 1.0:
+		ctx.WriteString(" NOT VISIBLE")
+	default:
+		ctx.WriteString(" VISIBLE")
+	}
 }

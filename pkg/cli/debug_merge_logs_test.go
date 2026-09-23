@@ -1,19 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -168,6 +163,21 @@ func getCases(format string) []testCase {
 			dataPaths: []string{"/5/redactable.log"},
 			flags:     []string{"--redact=true", "--redactable-output=true", "--file-pattern", ".*"},
 		},
+		{
+			name:      "6.no-tenant-filter",
+			dataPaths: []string{"/6/*/*"},
+			flags:     []string{"--redact=false", "--redactable-output=false", "--file-pattern", ".*"},
+		},
+		{
+			name:      "6.app-tenants-filter",
+			dataPaths: []string{"/6/*/*"},
+			flags:     []string{"--redact=false", "--redactable-output=false", "--file-pattern", ".*", "--tenant-ids=2,3"},
+		},
+		{
+			name:      "6.system-tenant-filter",
+			dataPaths: []string{"/6/*/*"},
+			flags:     []string{"--redact=false", "--redactable-output=false", "--file-pattern", ".*", "--tenant-ids=1"},
+		},
 	}
 	for i := range cases {
 		cases[i].format = format
@@ -181,6 +191,9 @@ func resetDebugMergeLogFlags(errorFn func(s string)) {
 			errorFn(fmt.Sprintf("Failed to set flag to default: %v", err))
 		}
 	})
+	// (Value).Set() for Slice flags has weird behavior where it appends to the existing
+	// slice instead of truly clearing the value. Manually reset it instead.
+	debugMergeLogsOpts.tenantIDsFilter = []string{}
 }
 
 func (c testCase) run(t *testing.T) {
@@ -214,7 +227,7 @@ func (c testCase) run(t *testing.T) {
 	// Note: the expected output lives in filepath.Join(testCase.base, "results", testCase.name)
 	resultFile := filepath.Join(base, "results", c.name)
 
-	expected, err := ioutil.ReadFile(resultFile)
+	expected, err := os.ReadFile(resultFile)
 	if err != nil {
 		t.Errorf("Failed to read expected result from %v: %v", resultFile, err)
 	}
@@ -229,9 +242,9 @@ func TestDebugMergeLogs(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	// Run the test for each possible log format.
-	format := []interface{}{"crdb-v2", "crdb-v1"}
-	testutils.RunValues(t, "format", format, func(t *testing.T, format interface{}) {
-		cases := getCases(format.(string))
+	format := []string{"crdb-v2", "crdb-v1"}
+	testutils.RunValues(t, "format", format, func(t *testing.T, format string) {
+		cases := getCases(format)
 		for _, c := range cases {
 			t.Run(c.name, c.run)
 		}

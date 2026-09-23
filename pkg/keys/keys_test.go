@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keys
 
@@ -17,6 +12,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -33,7 +29,6 @@ func TestStoreKeyEncodeDecode(t *testing.T) {
 	}{
 		{key: StoreIdentKey(), expSuffix: localStoreIdentSuffix, expDetail: nil},
 		{key: StoreGossipKey(), expSuffix: localStoreGossipSuffix, expDetail: nil},
-		{key: StoreClusterVersionKey(), expSuffix: localStoreClusterVersionSuffix, expDetail: nil},
 		{key: StoreLastUpKey(), expSuffix: localStoreLastUpSuffix, expDetail: nil},
 		{key: StoreHLCUpperBoundKey(), expSuffix: localStoreHLCUpperBoundSuffix, expDetail: nil},
 	}
@@ -541,9 +536,9 @@ func TestBatchRange(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		var ba roachpb.BatchRequest
+		var ba kvpb.BatchRequest
 		for _, pair := range c.req {
-			ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+			ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{
 				Key: roachpb.Key(pair[0]), EndKey: roachpb.Key(pair[1]),
 			}})
 		}
@@ -553,6 +548,178 @@ func TestBatchRange(t *testing.T) {
 			t.Errorf("%d: expected [%q,%q), got [%q,%q)", i, c.exp[0], c.exp[1], actPair[0], actPair[1])
 		}
 	}
+}
+
+// TestRangeBatchWithGCRequests tests the Range function with GC requests
+// containing different subtypes: point keys, range keys, and clear range.
+func TestRangeBatchWithGCRequests(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	span := func(start, end string) roachpb.Span {
+		return roachpb.Span{
+			Key:    roachpb.Key(start),
+			EndKey: roachpb.Key(end),
+		}
+	}
+
+	keys := func(ks ...string) []kvpb.GCRequest_GCKey {
+		result := make([]kvpb.GCRequest_GCKey, len(ks))
+		for i, k := range ks {
+			result[i] = kvpb.GCRequest_GCKey{Key: roachpb.Key(k)}
+		}
+		return result
+	}
+
+	testCases := []struct {
+		name       string
+		header     roachpb.Span
+		keys       []kvpb.GCRequest_GCKey
+		clearRange roachpb.Span
+		rangeKeys  roachpb.Span
+		want       roachpb.Span
+	}{
+		{
+			name:   "point keys fully contained in header span",
+			header: span("a", "z"),
+			keys:   keys("b", "c", "d"),
+			want:   span("a", "z"),
+		},
+		{
+			name:      "range keys fully contained in header span",
+			header:    span("a", "z"),
+			rangeKeys: span("b", "h"),
+			want:      span("a", "z"),
+		},
+		{
+			name:       "clear range fully contained in header span",
+			header:     span("a", "z"),
+			clearRange: span("m", "n"),
+			want:       span("a", "z"),
+		},
+		{
+			name:   "point keys at header span boundaries",
+			header: span("a", "z"),
+			keys:   keys("a", "y"),
+			want:   span("a", "z"),
+		},
+		{
+			name:      "range keys at header span boundaries",
+			header:    span("a", "z"),
+			rangeKeys: span("a", "z"),
+			want:      span("a", "z"),
+		},
+		{
+			name:       "clear range at header span boundaries",
+			header:     span("a", "z"),
+			clearRange: span("a", "z"),
+			want:       span("a", "z"),
+		},
+		// Tests for keys that straddle the request header. Such constructions
+		// were historically possible when the MVCC GC queue constructed GC
+		// requests: see https://github.com/cockroachdb/cockroach/issues/162085.
+		// The result should expand to include the straddling keys.
+		{
+			name:       "clear range straddles header on the left",
+			header:     span("c", "z"),
+			clearRange: span("a", "m"),
+			want:       span("a", "z"),
+		},
+		{
+			name:       "clear range straddles header on the right",
+			header:     span("a", "m"),
+			clearRange: span("f", "z"),
+			want:       span("a", "z"),
+		},
+		{
+			name:       "clear range straddles header on both sides",
+			header:     span("c", "m"),
+			clearRange: span("a", "z"),
+			want:       span("a", "z"),
+		},
+		{
+			name:      "range keys straddle header on the left",
+			header:    span("c", "z"),
+			rangeKeys: span("a", "f"),
+			want:      span("a", "z"),
+		},
+		{
+			name:      "range keys straddle header on the right",
+			header:    span("a", "m"),
+			rangeKeys: span("f", "z"),
+			want:      span("a", "z"),
+		},
+		{
+			name:      "range keys straddle header on both sides",
+			header:    span("c", "m"),
+			rangeKeys: span("a", "z"),
+			want:      span("a", "z"),
+		},
+		{
+			name:   "point key straddles header on the left",
+			header: span("c", "m"),
+			keys:   keys("a", "d"),
+			want:   span("a", "m"),
+		},
+		{
+			name:   "point key straddles header on the right",
+			header: span("c", "m"),
+			keys:   keys("d", "z"),
+			want:   span("c", "z\x00"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := kvpb.GCRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    tc.header.Key,
+					EndKey: tc.header.EndKey,
+				},
+				Keys: tc.keys,
+			}
+			if tc.clearRange.Key != nil {
+				req.ClearRange = &kvpb.GCRequest_GCClearRange{
+					StartKey: tc.clearRange.Key,
+					EndKey:   tc.clearRange.EndKey,
+				}
+			}
+			if tc.rangeKeys.Key != nil {
+				req.RangeKeys = []kvpb.GCRequest_GCRangeKey{
+					{StartKey: tc.rangeKeys.Key, EndKey: tc.rangeKeys.EndKey},
+				}
+			}
+			var ba kvpb.BatchRequest
+			ba.Add(&req)
+			rs, err := Range(ba.Requests)
+			require.NoError(t, err)
+			require.Equal(t, roachpb.RSpan{Key: roachpb.RKey(tc.want.Key), EndKey: roachpb.RKey(tc.want.EndKey)}, rs)
+		})
+	}
+}
+
+// TestRangeBatchWithGCClearRangeLocalRangeIDError verifies that calling Range
+// with a GC request with a ClearRange that spans LocalRangeID keys results in
+// an error.
+func TestRangeBatchWithGCClearRangeLocalRangeIDError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	localRangeIDKey := roachpb.Key(LocalRangeIDPrefix)
+	req := kvpb.GCRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    roachpb.Key("a"),
+			EndKey: roachpb.Key("z"),
+		},
+		ClearRange: &kvpb.GCRequest_GCClearRange{
+			StartKey: localRangeIDKey,
+			EndKey:   append(localRangeIDKey, byte('z')),
+		},
+	}
+	var ba kvpb.BatchRequest
+	ba.Add(&req)
+	_, err := Range(ba.Requests)
+	require.Error(t, err)
+	require.True(t, testutils.IsError(err, "ClearRange request cannot span LocalRangeID keys"),
+		"expected error about LocalRangeID keys, got: %v", err)
 }
 
 // TestBatchError verifies that Range returns an error if a request has an invalid range.
@@ -572,8 +739,8 @@ func TestBatchError(t *testing.T) {
 	}
 
 	for i, c := range testCases {
-		var ba roachpb.BatchRequest
-		ba.Add(&roachpb.ScanRequest{RequestHeader: roachpb.RequestHeader{
+		var ba kvpb.BatchRequest
+		ba.Add(&kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{
 			Key: roachpb.Key(c.req[0]), EndKey: roachpb.Key(c.req[1]),
 		}})
 		if _, err := Range(ba.Requests); !testutils.IsError(err, c.errMsg) {
@@ -582,8 +749,8 @@ func TestBatchError(t *testing.T) {
 	}
 
 	// Test a case where a non-range request has an end key.
-	var ba roachpb.BatchRequest
-	ba.Add(&roachpb.GetRequest{RequestHeader: roachpb.RequestHeader{
+	var ba kvpb.BatchRequest
+	ba.Add(&kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{
 		Key: roachpb.Key("a"), EndKey: roachpb.Key("b"),
 	}})
 	if _, err := Range(ba.Requests); !testutils.IsError(err, "end key specified for non-range operation") {
@@ -601,7 +768,7 @@ func TestMakeFamilyKey(t *testing.T) {
 
 func TestEnsureSafeSplitKey(t *testing.T) {
 	tenSysCodec := SystemSQLCodec
-	ten5Codec := MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	encInt := encoding.EncodeUvarintAscending
 	encInts := func(c SQLCodec, vals ...uint64) roachpb.Key {
 		k := c.TenantPrefix()
@@ -622,6 +789,8 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		expected roachpb.Key
 	}{
 		{es(), es()},                     // Not a table key
+		{es(1), es(1)},                   // /Table/1 -> /Table/1
+		{es(1, 2), es(1, 2)},             // /Table/1/2 -> /Table/1/2
 		{es(1, 2, 0), es(1, 2)},          // /Table/1/2/0 -> /Table/1/2
 		{es(1, 2, 1), es(1)},             // /Table/1/2/1 -> /Table/1
 		{es(1, 2, 2), es()},              // /Table/1/2/2 -> /Table
@@ -631,6 +800,8 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		{es(1, 2, 3, 4, 1), es(1, 2, 3)}, // /Table/1/2/3/4/1 -> /Table/1/2/3
 		// Same test cases, but for tenant 5.
 		{e5(), e5()},                     // Not a table key
+		{e5(1), e5(1)},                   // /Tenant/5/Table/1 -> /Tenant/5/Table/1
+		{e5(1, 2), e5(1, 2)},             // /Tenant/5/Table/1/2 -> /Tenant/5/Table/1/2
 		{e5(1, 2, 0), e5(1, 2)},          // /Tenant/5/Table/1/2/0 -> /Tenant/5/Table/1/2
 		{e5(1, 2, 1), e5(1)},             // /Tenant/5/Table/1/2/1 -> /Tenant/5/Table/1
 		{e5(1, 2, 2), e5()},              // /Tenant/5/Table/1/2/2 -> /Tenant/5/Table
@@ -639,14 +810,16 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		{e5(1, 2, 200, 2), e5(1, 2)},     // /Tenant/5/Table/1/2/200/2 -> /Tenant/5/Table/1/2
 		{e5(1, 2, 3, 4, 1), e5(1, 2, 3)}, // /Tenant/5/Table/1/2/3/4/1 -> /Tenant/5/Table/1/2/3
 		// Test cases using SQL encoding functions.
-		{MakeFamilyKey(tenSysCodec.IndexPrefix(1, 2), 0), es(1, 2)},               // /Table/1/2/0 -> /Table/1/2
-		{MakeFamilyKey(tenSysCodec.IndexPrefix(1, 2), 1), es(1, 2)},               // /Table/1/2/1 -> /Table/1/2
-		{MakeFamilyKey(encInt(tenSysCodec.IndexPrefix(1, 2), 3), 0), es(1, 2, 3)}, // /Table/1/2/3/0 -> /Table/1/2/3
-		{MakeFamilyKey(encInt(tenSysCodec.IndexPrefix(1, 2), 3), 1), es(1, 2, 3)}, // /Table/1/2/3/1 -> /Table/1/2/3
-		{MakeFamilyKey(ten5Codec.IndexPrefix(1, 2), 0), e5(1, 2)},                 // /Tenant/5/Table/1/2/0 -> /Table/1/2
-		{MakeFamilyKey(ten5Codec.IndexPrefix(1, 2), 1), e5(1, 2)},                 // /Tenant/5/Table/1/2/1 -> /Table/1/2
-		{MakeFamilyKey(encInt(ten5Codec.IndexPrefix(1, 2), 3), 0), e5(1, 2, 3)},   // /Tenant/5/Table/1/2/3/0 -> /Table/1/2/3
-		{MakeFamilyKey(encInt(ten5Codec.IndexPrefix(1, 2), 3), 1), e5(1, 2, 3)},   // /Tenant/5/Table/1/2/3/1 -> /Table/1/2/3
+		{encoding.EncodeStringAscending(es(1), "foo"), encoding.EncodeStringAscending(es(1), "foo")}, // Not a table key
+		{MakeFamilyKey(tenSysCodec.IndexPrefix(1, 2), 0), es(1, 2)},                                  // /Table/1/2/0 -> /Table/1/2
+		{MakeFamilyKey(tenSysCodec.IndexPrefix(1, 2), 1), es(1, 2)},                                  // /Table/1/2/1 -> /Table/1/2
+		{MakeFamilyKey(encInt(tenSysCodec.IndexPrefix(1, 2), 3), 0), es(1, 2, 3)},                    // /Table/1/2/3/0 -> /Table/1/2/3
+		{MakeFamilyKey(encInt(tenSysCodec.IndexPrefix(1, 2), 3), 1), es(1, 2, 3)},                    // /Table/1/2/3/1 -> /Table/1/2/3
+		{encoding.EncodeStringAscending(e5(1), "foo"), encoding.EncodeStringAscending(e5(1), "foo")}, // Not a table key
+		{MakeFamilyKey(ten5Codec.IndexPrefix(1, 2), 0), e5(1, 2)},                                    // /Tenant/5/Table/1/2/0 -> /Table/1/2
+		{MakeFamilyKey(ten5Codec.IndexPrefix(1, 2), 1), e5(1, 2)},                                    // /Tenant/5/Table/1/2/1 -> /Table/1/2
+		{MakeFamilyKey(encInt(ten5Codec.IndexPrefix(1, 2), 3), 0), e5(1, 2, 3)},                      // /Tenant/5/Table/1/2/3/0 -> /Table/1/2/3
+		{MakeFamilyKey(encInt(ten5Codec.IndexPrefix(1, 2), 3), 1), e5(1, 2, 3)},                      // /Tenant/5/Table/1/2/3/1 -> /Table/1/2/3
 	}
 	for i, d := range goodData {
 		out, err := EnsureSafeSplitKey(d.in)
@@ -673,24 +846,21 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 		err string
 	}{
 		// Column ID suffix size is too large.
-		{es(1), "malformed table key"},
-		{es(1, 2), "malformed table key"},
+		{es(1, 2, 5), "malformed table key"},
 		// The table ID is invalid.
 		{es(200)[:1], "insufficient bytes to decode uvarint value"},
-		// The index ID is invalid.
-		{es(1, 200)[:2], "insufficient bytes to decode uvarint value"},
 		// The column ID suffix is invalid.
+		{es(1, 200)[:2], "insufficient bytes to decode uvarint value"},
 		{es(1, 2, 200)[:3], "insufficient bytes to decode uvarint value"},
 		// Exercises a former overflow bug. We decode a uint(18446744073709551610) which, if cast
-		// to int carelessly, results in -6.
-		{encoding.EncodeVarintAscending(tenSysCodec.TablePrefix(999), 322434), "malformed table key"},
+		// to int carelessly, results in -6 for the column family length.
+		{encoding.EncodeVarintAscending(es(999, 2), 322434), "malformed table key"},
 		// Same test cases, but for tenant 5.
-		{e5(1), "malformed table key"},
-		{e5(1, 2), "malformed table key"},
+		{e5(1, 2, 5), "malformed table key"},
 		{e5(200)[:3], "insufficient bytes to decode uvarint value"},
 		{e5(1, 200)[:4], "insufficient bytes to decode uvarint value"},
 		{e5(1, 2, 200)[:5], "insufficient bytes to decode uvarint value"},
-		{encoding.EncodeVarintAscending(ten5Codec.TablePrefix(999), 322434), "malformed table key"},
+		{encoding.EncodeVarintAscending(e5(999, 2), 322434), "malformed table key"},
 	}
 	for i, d := range errorData {
 		_, err := EnsureSafeSplitKey(d.in)
@@ -700,12 +870,12 @@ func TestEnsureSafeSplitKey(t *testing.T) {
 	}
 }
 
-func TestTenantPrefix(t *testing.T) {
+func TestDecodeTenantPrefix(t *testing.T) {
 	tIDs := []roachpb.TenantID{
 		roachpb.SystemTenantID,
-		roachpb.MakeTenantID(2),
-		roachpb.MakeTenantID(999),
-		roachpb.MakeTenantID(math.MaxUint64),
+		roachpb.MustMakeTenantID(3),
+		roachpb.MustMakeTenantID(999),
+		roachpb.MustMakeTenantID(math.MaxUint64),
 	}
 	for _, tID := range tIDs {
 		t.Run(fmt.Sprintf("%v", tID), func(t *testing.T) {
@@ -733,6 +903,9 @@ func TestTenantPrefix(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+
+	_, _, err := DecodeTenantPrefix([]byte("\xfe\x88\x28\xa0\x9b"))
+	require.Error(t, err, roachpb.ErrInvalidTenantID)
 }
 
 func TestLockTableKeyEncodeDecode(t *testing.T) {
@@ -754,6 +927,33 @@ func TestLockTableKeyEncodeDecode(t *testing.T) {
 			k, err := DecodeLockTableSingleKey(ltKey)
 			require.NoError(t, err)
 			require.Equal(t, test.key, k)
+			require.NoError(t, ValidateLockTableSingleKey(ltKey))
+		})
+	}
+}
+
+func TestLockTableSingleKeyNext_Equivalent(t *testing.T) {
+	testCases := []struct {
+		key roachpb.Key
+	}{
+		{key: roachpb.Key("foo")},
+		{key: roachpb.Key("a")},
+		{key: roachpb.Key("")},
+		// Causes a doubly-local range local key.
+		{key: RangeDescriptorKey(roachpb.RKey("baz"))},
+	}
+	for _, test := range testCases {
+		t.Run("", func(t *testing.T) {
+			next := test.key.Next()
+			want, _ := LockTableSingleKey(next, nil)
+
+			got, _ := LockTableSingleNextKey(test.key, nil)
+			require.Equal(t, want, got)
+
+			k, err := DecodeLockTableSingleKey(got)
+			require.NoError(t, err)
+			require.NoError(t, ValidateLockTableSingleKey(got))
+			require.Equal(t, next, k)
 		})
 	}
 }

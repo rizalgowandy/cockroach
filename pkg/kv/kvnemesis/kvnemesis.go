@@ -1,25 +1,90 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+)
+
+var errInjected = errors.New("injected error")
+
+type loggerKey struct{}
+
+type logLogger struct {
+	dir string
+}
+
+func (l *logLogger) WriteFile(basename string, contents string) string {
+	f, err := os.Create(filepath.Join(l.dir, basename))
+	if err != nil {
+		return err.Error()
+	}
+	defer f.Close()
+	_, err = io.WriteString(f, contents)
+	if err != nil {
+		return err.Error()
+	}
+	return f.Name()
+}
+
+func (l *logLogger) Helper() { /* no-op */ }
+
+func (l *logLogger) Logf(format string, args ...interface{}) {
+	log.Dev.InfofDepth(context.Background(), 2, format, args...)
+}
+
+func l(ctx context.Context, basename string, format string, args ...interface{}) (optFile string) {
+	var logger Logger
+	logger, _ = ctx.Value(loggerKey{}).(Logger)
+	if logger == nil {
+		logger = &logLogger{dir: datapathutils.DebuggableTempDir()}
+	}
+	logger.Helper()
+
+	if basename != "" {
+		return logger.WriteFile(basename, fmt.Sprintf(format, args...))
+	}
+
+	logger.Logf(format, args...)
+	return ""
+}
+
+// TestMode defines how faults are inserted and validated.
+type TestMode int
+
+const (
+	// The default value of TestMode is 0, which corresponds to no faults.
+	_ TestMode = iota
+	// Safety mode is used to test for safety properties (i.e. serializability) in
+	// the presence of unlimited faults. Unavailability errors are expected and
+	// ignored.
+	Safety = 1
+	// Liveness mode is used to test for liveness properties (i.e. availability).
+	// To do so in the presence of faults, the test will inject faults carefully,
+	// ensuring a well-connected quorum of replicas is always available, and the
+	// tests connects to one of the nodes in it. Without loss of generality, we
+	// keep nodes 1 and 2 available and connected to each other.
+	// TODO(mira): don't hardcode the protected nodes.
+	Liveness = 2
 )
 
 // RunNemesis generates and applies a series of Operations to exercise the KV
@@ -29,57 +94,111 @@ func RunNemesis(
 	rng *rand.Rand,
 	env *Env,
 	config GeneratorConfig,
+	concurrency int,
 	numSteps int,
+	mode TestMode,
 	dbs ...*kv.DB,
 ) ([]error, error) {
-	const concurrency = 5
+	if env.L != nil {
+		ctx = context.WithValue(ctx, loggerKey{}, env.L)
+	}
 	if numSteps <= 0 {
 		return nil, fmt.Errorf("numSteps must be >0, got %v", numSteps)
 	}
 
-	g, err := MakeGenerator(config, newGetReplicasFn(dbs...))
+	n := nodes{
+		running: make(map[int]struct{}),
+		stopped: make(map[int]struct{}),
+		crashed: make(map[int]struct{}),
+	}
+	for i := 1; i <= config.NumNodes; i++ {
+		// In liveness mode, we don't allow stopping and restarting the two
+		// protected nodes (node 1 and node 2), so we don't include them in the set
+		// of running nodes at all.
+		protectedNode := i == 1 || i == 2
+		if mode == Liveness && protectedNode {
+			continue
+		}
+		n.running[i] = struct{}{}
+	}
+
+	dataSpan := GeneratorDataSpan()
+	g, err := MakeGenerator(config, newGetReplicasFn(dbs...), mode, &n)
 	if err != nil {
 		return nil, err
 	}
-	a := MakeApplier(env, dbs...)
-	w, err := Watch(ctx, env, dbs, GeneratorDataSpan())
+	applierDBs := dbs
+	// In Liveness mode, only nodes 1 and 2 are guaranteed to be available, so use
+	// only the first two DBs to apply operations.
+	if mode == Liveness && len(applierDBs) >= 2 {
+		applierDBs = applierDBs[:2]
+	}
+	a := MakeApplier(env, &n, applierDBs...)
+	w, err := Watch(ctx, env, dbs, dataSpan)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = w.Finish() }()
+	defer func() { _ = w.Finish(ctx) }()
 
 	var stepsStartedAtomic int64
 	stepsByWorker := make([][]Step, concurrency)
 
 	workerFn := func(ctx context.Context, workerIdx int) error {
 		workerName := fmt.Sprintf(`%d`, workerIdx)
-		var buf strings.Builder
+		stepIdx := -1
 		for atomic.AddInt64(&stepsStartedAtomic, 1) <= int64(numSteps) {
+			stepIdx++
 			step := g.RandStep(rng)
 
-			buf.Reset()
-			fmt.Fprintf(&buf, "step:")
-			step.format(&buf, formatCtx{indent: `  ` + workerName + ` PRE  `})
-			trace, err := a.Apply(ctx, &step)
-			buf.WriteString(trace.String())
-			step.Trace = buf.String()
-			if err != nil {
-				buf.Reset()
-				step.format(&buf, formatCtx{indent: `  ` + workerName + ` ERR `})
-				log.Infof(ctx, "error: %+v\n\n%s", err, buf.String())
+			stepPrefix := fmt.Sprintf("w%d_step%d", workerIdx, stepIdx)
+			basename := fmt.Sprintf("%s_%T", stepPrefix, reflect.Indirect(reflect.ValueOf(step.Op.GetValue())).Interface())
+
+			{
+				// Write next step into file so we know steps if test deadlock and has
+				// to be killed.
+				var buf strings.Builder
+				step.format(&buf, formatCtx{indent: `  ` + workerName + ` PRE `})
+				l(ctx, basename, "%s", &buf)
+			}
+			applyAndLogOp := func(ctx context.Context) error {
+				trace, err := a.Apply(ctx, &step)
+				step.Trace = l(ctx, fmt.Sprintf("%s_trace", stepPrefix), "%s", trace.String())
+
+				stepsByWorker[workerIdx] = append(stepsByWorker[workerIdx], step)
+
+				prefix := ` OP  `
+				if err != nil {
+					prefix = ` ERR `
+				}
+
+				{
+					var buf strings.Builder
+					fmt.Fprintf(&buf, "  before: %s", step.Before)
+					step.format(&buf, formatCtx{indent: `  ` + workerName + prefix})
+					fmt.Fprintf(&buf, "\n  after: %s", step.After)
+					l(ctx, basename, "%s", &buf)
+				}
 				return err
 			}
-			buf.Reset()
-			fmt.Fprintf(&buf, "\n  before: %s", step.Before)
-			step.format(&buf, formatCtx{indent: `  ` + workerName + ` OP  `})
-			fmt.Fprintf(&buf, "\n  after: %s", step.After)
-			log.Infof(ctx, "%v", buf.String())
-			stepsByWorker[workerIdx] = append(stepsByWorker[workerIdx], step)
+			if mode == Safety {
+				if err = timeutil.RunWithTimeout(ctx, "applying op", 10*time.Second, applyAndLogOp); err != nil {
+					return err
+				}
+			} else {
+				if err = applyAndLogOp(ctx); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}
+	env.Partitioner.EnablePartitions(true)
 	if err := ctxgroup.GroupWorkers(ctx, concurrency, workerFn); err != nil {
 		return nil, err
+	}
+	env.Partitioner.EnablePartitions(false)
+	for i := 0; i < config.NumNodes; i++ {
+		_ = env.ServerController.RestartServer(i)
 	}
 
 	allSteps := make(steps, 0, numSteps)
@@ -92,28 +211,82 @@ func RunNemesis(
 	if err := w.WaitForFrontier(ctx, allSteps.After()); err != nil {
 		return nil, err
 	}
-	kvs := w.Finish()
+	kvs := w.Finish(ctx)
 	defer kvs.Close()
-	failures := Validate(allSteps, kvs)
 
-	if len(failures) > 0 {
-		log.Infof(ctx, "reproduction steps:\n%s", printRepro(stepsByWorker))
-		log.Infof(ctx, "kvs (recorded from rangefeed):\n%s", kvs.DebugPrint("  "))
+	failures := Validate(allSteps, kvs, env.Tracker)
+	var filteredFailures []error
+	for _, f := range failures {
+		// ConditionFailedErrors are expected and can be ignored.
+		canBeIgnored := exceptConditionFailed(f)
+		// The following errors are expected in safety mode.
+		canBeIgnoredSafety := mode == Safety &&
+			(exceptReplicaUnavailable(f) || exceptAmbiguous(f) || exceptContextCanceled(f))
+		// Ambiguous errors are expected in liveness mode.
+		canBeIgnoredLiveness := mode == Liveness && exceptAmbiguous(f)
+		if !canBeIgnored && !canBeIgnoredSafety && !canBeIgnoredLiveness {
+			filteredFailures = append(filteredFailures, f)
+		}
+	}
 
-		span := GeneratorDataSpan()
-		scanKVs, err := dbs[0].Scan(ctx, span.Key, span.EndKey, -1)
-		if err != nil {
-			log.Infof(ctx, "could not scan actual latest values: %+v", err)
-		} else {
+	// Run consistency checks across the data span, primarily to check the
+	// accuracy of evaluated MVCC stats.
+	filteredFailures = append(filteredFailures, env.CheckConsistency(ctx, dataSpan)...)
+
+	if len(filteredFailures) > 0 {
+		var failuresFile string
+		{
+			var buf strings.Builder
+			for _, err := range filteredFailures {
+				l(ctx, "", "%s", err)
+				fmt.Fprintf(&buf, "%+v\n", err)
+				fmt.Fprintln(&buf, strings.Repeat("=", 80))
+			}
+			failuresFile = l(ctx, "failures", "%s", &buf)
+		}
+
+		reproFile := l(ctx, "repro.go", `// Seed: %d
+// Calls to Random Source: %d
+// Reproduction steps:
+%s`,
+			config.SeedForLogging,
+			config.RandSourceCounterForLogging.Count(),
+			printRepro(stepsByWorker))
+		rangefeedFile := l(ctx, "kvs-rangefeed.txt", "kvs (recorded from rangefeed):\n%s", kvs.DebugPrint("  "))
+		kvsFile := "<error>"
+		var scanKVs []kv.KeyValue
+		for i := 0; ; i++ {
+			var err error
+			scanKVs, err = dbs[0].Scan(ctx, dataSpan.Key, dataSpan.EndKey, -1)
+			if errors.Is(err, errInjected) && i < 100 {
+				// The scan may end up resolving intents, and the intent resolution may
+				// fail with an injected reproposal error. We do want to know the
+				// contents anyway, so retry appropriately. (The interceptor lowers the
+				// probability of injecting an error with successive attempts, so this
+				// is essentially guaranteed to work out).
+				//
+				// Just in case there is a real infinite loop here, we only try this
+				// 100 times.
+				continue
+			} else if err != nil {
+				l(ctx, "", "could not scan actual latest values: %+v", err)
+				break
+			}
 			var kvsBuf strings.Builder
 			for _, kv := range scanKVs {
 				fmt.Fprintf(&kvsBuf, "  %s %s -> %s\n", kv.Key, kv.Value.Timestamp, kv.Value.PrettyPrint())
 			}
-			log.Infof(ctx, "kvs (scan of latest values according to crdb):\n%s", kvsBuf.String())
+			kvsFile = l(ctx, "kvs-scan.txt", "kvs (scan of latest values according to crdb):\n%s", kvsBuf.String())
+			break
 		}
+		l(ctx, "", `failures(verbose): %s
+repro steps: %s
+rangefeed KVs: %s
+scan KVs: %s`,
+			failuresFile, reproFile, rangefeedFile, kvsFile)
 	}
 
-	return failures, nil
+	return filteredFailures, nil
 }
 
 func printRepro(stepsByWorker [][]Step) string {
@@ -127,12 +300,14 @@ func printRepro(stepsByWorker [][]Step) string {
 			buf.WriteString("\n")
 			buf.WriteString(fctx.indent)
 			step.Op.format(&buf, fctx)
-			buf.WriteString(step.Trace)
+			if len(step.Trace) > 0 {
+				fmt.Fprintf(&buf, "\n  // ^-- trace in: %s\n", step.Trace)
+			}
 			buf.WriteString("\n")
 		}
 		buf.WriteString("\n  return nil\n")
-		buf.WriteString("})\n")
+		buf.WriteString("})\n\n")
 	}
-	buf.WriteString("g.Wait()\n")
+	buf.WriteString("require.NoError(t, g.Wait())\n")
 	return buf.String()
 }

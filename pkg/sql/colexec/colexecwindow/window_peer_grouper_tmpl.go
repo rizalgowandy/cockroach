@@ -1,16 +1,10 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for window_peer_grouper.eg.go. It's
@@ -37,8 +31,10 @@ import (
 // the first within its peer group. Peers are tuples that belong to the same
 // partition and are equal on the ordering columns. If orderingCols is empty,
 // then all tuples within the partition are peers.
-// - partitionColIdx, if not columnOmitted, *must* specify the column in which
-//   'true' indicates the start of a new partition.
+//
+// NOTE: partitionColIdx, if not columnOmitted, *must* specify the column in which
+// 'true' indicates the start of a new partition.
+//
 // NOTE: the input *must* already be ordered on ordCols.
 func NewWindowPeerGrouper(
 	allocator *colmem.Allocator,
@@ -110,22 +106,20 @@ type _PEER_GROUPER_STRINGOp struct {
 
 var _ colexecop.Operator = &_PEER_GROUPER_STRINGOp{}
 
-func (p *_PEER_GROUPER_STRINGOp) Next() coldata.Batch {
-	b := p.Input.Next()
+func (p *_PEER_GROUPER_STRINGOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	b, meta := p.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	n := b.Length()
 	if n == 0 {
-		return b
+		return b, nil
 	}
 	// {{if .HasPartition}}
 	partitionCol := b.ColVec(p.partitionColIdx).Bool()
 	// {{end}}
 	sel := b.Selection()
 	peersVec := b.ColVec(p.outputColIdx)
-	if peersVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		peersVec.Nulls().UnsetNulls()
-	}
 	peersCol := peersVec.Bool()
 	if sel != nil {
 		for _, i := range sel[:n] {
@@ -188,7 +182,7 @@ func (p *_PEER_GROUPER_STRINGOp) Next() coldata.Batch {
 		// {{end}}
 		// {{end}}
 	}
-	return b
+	return b, nil
 }
 
 // {{end}}

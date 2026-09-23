@@ -1,18 +1,15 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ycsb
 
 import (
+	"math/rand/v2"
+
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"golang.org/x/exp/rand"
+	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 )
 
 // SkewedLatestGenerator is a random number generator that generates numbers in
@@ -22,7 +19,7 @@ type SkewedLatestGenerator struct {
 	mu struct {
 		syncutil.Mutex
 		iMax    uint64
-		zipfGen *ZipfGenerator
+		zipfGen *workloadimpl.ZipfGenerator
 	}
 }
 
@@ -35,7 +32,7 @@ func NewSkewedLatestGenerator(
 
 	z := SkewedLatestGenerator{}
 	z.mu.iMax = iMax
-	zipfGen, err := NewZipfGenerator(rng, 0, iMax-iMin, theta, verbose)
+	zipfGen, err := workloadimpl.NewZipfGenerator(rng, 0, iMax-iMin, theta, verbose)
 	if err != nil {
 		return nil, err
 	}

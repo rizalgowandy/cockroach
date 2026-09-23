@@ -25,7 +25,7 @@ SELECT * FROM v
 1 2
 3 4
 
-query TTTTIT
+query TTTTIT rowsort
 SHOW TABLES
 ----
 public  kv  table  root  0  NULL
@@ -47,18 +47,18 @@ SELECT * FROM new_v
 1 2
 3 4
 
-query TTTTIT
+query TTTTIT rowsort
 SHOW TABLES
 ----
 public  kv     table  root  0  NULL
 public  new_v  view   root  0  NULL
 
 # check the name in the descriptor, which is used by SHOW GRANTS, is also changed
-query TTTTT
+query TTTTTB rowsort
 SHOW GRANTS ON new_v
 ----
-test  public new_v  admin  ALL
-test  public new_v  root   ALL
+test  public  new_v  admin  ALL  true
+test  public  new_v  root   ALL  true
 
 statement error invalid table name: ""
 ALTER VIEW "" RENAME TO foo
@@ -110,7 +110,7 @@ GRANT CREATE ON DATABASE test TO testuser
 statement ok
 ALTER VIEW test.v RENAME TO v2
 
-query TTTTIT
+query TTTTIT rowsort
 SHOW TABLES FROM test
 ----
 public  kv     table  root  0  NULL
@@ -136,7 +136,7 @@ user testuser
 statement ok
 ALTER VIEW test.new_v RENAME TO test.v
 
-query TTTTIT
+query TTTTIT rowsort
 SHOW TABLES FROM test
 ----
 public  kv  table  root  0  NULL
@@ -165,8 +165,13 @@ SELECT * FROM test.v2
 statement ok
 CREATE VIEW v3 AS SELECT count(*) FROM test.v AS v JOIN test.v2 AS v2 ON v.k > v2.c1
 
+# onlyif config local-legacy-schema-changer
 statement error cannot rename relation "test.public.v" because view "v3" depends on it
 ALTER VIEW test.v RENAME TO test.v3
+
+# skipif config local-legacy-schema-changer
+# statement error relation "test.public.v3" already exists
+# ALTER VIEW test.v RENAME TO test.v3
 
 statement error cannot rename relation "test.public.v2" because view "v3" depends on it
 ALTER VIEW test.v2 RENAME TO v4

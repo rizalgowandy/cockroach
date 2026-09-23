@@ -1,5 +1,3 @@
-# LogicTest: !fakedist-metadata
-
 statement error pgcode 42P01 relation "foo" does not exist
 ALTER TABLE foo RENAME TO bar
 
@@ -44,11 +42,11 @@ SHOW TABLES
 public  new_kv  table  root  0  NULL
 
 # check the name in the descriptor, which is used by SHOW GRANTS, is also changed
-query TTTTT
+query TTTTTB rowsort
 SHOW GRANTS ON TABLE new_kv
 ----
-test  public new_kv  admin  ALL
-test  public new_kv  root   ALL
+test  public  new_kv  admin  ALL  true
+test  public  new_kv  root   ALL  true
 
 statement error invalid table name: ""
 ALTER TABLE "" RENAME TO foo
@@ -97,7 +95,7 @@ GRANT CREATE ON DATABASE test TO testuser
 statement ok
 ALTER TABLE test.t RENAME TO t2
 
-query TTTTIT
+query TTTTIT rowsort
 SHOW TABLES
 ----
 public  new_kv  table  root  0  NULL
@@ -118,7 +116,7 @@ GRANT DROP ON test.new_kv TO testuser
 
 user testuser
 
-query TTTTIT
+query TTTTIT rowsort
 SHOW TABLES
 ----
 public  new_kv  table  root  0  NULL
@@ -166,7 +164,10 @@ INSERT INTO d.kv (k,v) VALUES ('c', 'd')
 
 # Check that on a rollback a database name cannot be used.
 statement ok
-BEGIN
+SET autocommit_before_ddl = false
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
 statement ok
 CREATE DATABASE dd; CREATE TABLE dd.kv (k CHAR PRIMARY KEY, v CHAR)
@@ -182,7 +183,7 @@ INSERT INTO dd.kv (k,v) VALUES ('c', 'd')
 
 # Check that on a rollback a table name cannot be used.
 statement ok
-BEGIN
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
 statement ok
 CREATE TABLE d.kv2 (k CHAR PRIMARY KEY, v CHAR)
@@ -192,6 +193,9 @@ INSERT INTO d.kv2 (k,v) VALUES ('a', 'b')
 
 statement ok
 ROLLBACK
+
+statement ok
+RESET autocommit_before_ddl
 
 statement error pgcode 42P01 relation \"d.kv2\" does not exist
 INSERT INTO d.kv2 (k,v) VALUES ('c', 'd')
@@ -211,7 +215,6 @@ query T
 EXPLAIN ALTER TABLE kv RENAME TO kv2
 ----
 distribution: local
-vectorized: true
 ·
 • alter table
 

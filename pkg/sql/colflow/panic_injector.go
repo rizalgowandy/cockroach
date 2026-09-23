@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
@@ -56,15 +52,15 @@ func (i *panicInjector) Init(ctx context.Context) {
 		return
 	}
 	if i.rng.Float64() < initPanicInjectionProbability {
-		log.Info(i.Ctx, "injecting panic in Init")
+		log.Dev.Info(i.Ctx, "injecting panic in Init")
 		colexecerror.ExpectedError(errors.New("injected panic in Init"))
 	}
 	i.Input.Init(i.Ctx)
 }
 
-func (i *panicInjector) Next() coldata.Batch {
+func (i *panicInjector) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if i.rng.Float64() < nextPanicInjectionProbability {
-		log.Info(i.Ctx, "injecting panic in Next")
+		log.Dev.Info(i.Ctx, "injecting panic in Next")
 		colexecerror.ExpectedError(errors.New("injected panic in Next"))
 	}
 	return i.Input.Next()

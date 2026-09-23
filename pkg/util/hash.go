@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package util
 
@@ -60,4 +55,13 @@ func (f *FNV64) Add(c uint64) {
 // Sum returns the hash value accumulated till now.
 func (f *FNV64) Sum() uint64 {
 	return f.sum
+}
+
+// Fibonacci Hash is a multiplicative hash that maps the given `v` into 2^bits
+// values.
+//
+// Reference:
+//   - https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
+func FibHash(v uint64, bits int) uint64 {
+	return (v * 11400714819323198485) >> (64 - bits)
 }

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cluster
 
@@ -25,9 +20,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/docker/distribution/reference"
@@ -80,7 +75,11 @@ func hasImage(ctx context.Context, l *DockerCluster, ref string) error {
 	if err != nil {
 		return err
 	}
-	path := reference.Path(distributionRef)
+	path := distributionRef.Name()
+	// Images hosted on docker.io have local name without the domain name
+	if strings.HasPrefix(path, "docker.io") {
+		path = reference.Path(distributionRef)
+	}
 	// Correct for random docker stupidity:
 	//
 	// https://github.com/moby/moby/blob/7248742/registry/service.go#L207:L215
@@ -113,7 +112,7 @@ func hasImage(ctx context.Context, l *DockerCluster, ref string) error {
 	var imageList []string
 	for _, image := range images {
 		for _, tag := range image.RepoTags {
-			imageList = append(imageList, "%s %s", tag, image.ID)
+			imageList = append(imageList, fmt.Sprintf("%s %s", tag, image.ID))
 		}
 	}
 	return errors.Errorf("%s not found in:\n%s", wanted, strings.Join(imageList, "\n"))
@@ -126,12 +125,12 @@ func pullImage(
 	// acceptance test even though that image is already present. So we first
 	// check to see if our image is present in order to avoid this slowness.
 	if hasImage(ctx, l, ref) == nil {
-		log.Infof(ctx, "ImagePull %s already exists", ref)
+		log.Dev.Infof(ctx, "ImagePull %s already exists", ref)
 		return nil
 	}
 
-	log.Infof(ctx, "ImagePull %s starting", ref)
-	defer log.Infof(ctx, "ImagePull %s complete", ref)
+	log.Dev.Infof(ctx, "ImagePull %s starting", ref)
+	defer log.Dev.Infof(ctx, "ImagePull %s complete", ref)
 
 	rc, err := l.client.ImagePull(ctx, ref, options)
 	if err != nil {
@@ -249,7 +248,7 @@ func maybePanic(err error) {
 // Remove removes the container from docker. It is an error to remove a running
 // container.
 func (c *Container) Remove(ctx context.Context) error {
-	return c.cluster.client.ContainerRemove(ctx, c.id, types.ContainerRemoveOptions{
+	return c.cluster.client.ContainerRemove(ctx, c.id, types.ContainerRemoveOptions{ //lint:ignore SA1019 grandfathered
 		RemoveVolumes: true,
 		Force:         true,
 	})
@@ -268,7 +267,7 @@ func (c *Container) Kill(ctx context.Context) error {
 //
 // TODO(pmattis): Generalize the setting of parameters here.
 func (c *Container) Start(ctx context.Context) error {
-	return c.cluster.client.ContainerStart(ctx, c.id, types.ContainerStartOptions{})
+	return c.cluster.client.ContainerStart(ctx, c.id, types.ContainerStartOptions{}) //lint:ignore SA1019 grandfathered
 }
 
 // Restart restarts a running container.
@@ -280,16 +279,21 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	} else if ci.State.Running {
 		exp = append(exp, eventDie)
 	}
-	if err := c.cluster.client.ContainerRestart(ctx, c.id, timeout); err != nil {
+
+	timeoutSeconds := int(timeout.Seconds())
+	stopOpts := container.StopOptions{
+		Timeout: &timeoutSeconds,
+	}
+	if err := c.cluster.client.ContainerRestart(ctx, c.id, stopOpts); err != nil {
 		return err
 	}
 	c.cluster.expectEvent(c, append(exp, eventRestart)...)
 	return nil
 }
 
-// Wait waits for a running container to exit.
-func (c *Container) Wait(ctx context.Context, condition container.WaitCondition) error {
-	waitOKBodyCh, errCh := c.cluster.client.ContainerWait(ctx, c.id, condition)
+// WaitUntilNotRunning waits for a running container to exit.
+func (c *Container) WaitUntilNotRunning(ctx context.Context) error {
+	waitOKBodyCh, errCh := c.cluster.client.ContainerWait(ctx, c.id, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
 		return err
@@ -303,13 +307,21 @@ func (c *Container) Wait(ctx context.Context, condition container.WaitCondition)
 
 		out := io.MultiWriter(cmdLog, os.Stderr)
 		if err := c.Logs(ctx, out); err != nil {
-			log.Warningf(ctx, "%v", err)
+			log.Dev.Warningf(ctx, "%v", err)
 		}
 
 		if exitCode := waitOKBody.StatusCode; exitCode != 0 {
 			err = errors.Errorf("non-zero exit code: %d", exitCode)
 			fmt.Fprintln(out, err.Error())
-			log.Shoutf(ctx, severity.INFO, "command left-over files in %s", c.cluster.volumesDir)
+			volumesDir := c.cluster.volumesDir
+			// NB: TEST_UNDECLARED_OUTPUTS_DIR is set for remote Bazel tests.
+			undeclaredOutsDir := os.Getenv("TEST_UNDECLARED_OUTPUTS_DIR")
+			if undeclaredOutsDir != "" {
+				log.Dev.Shoutf(ctx, severity.INFO, "command left-over files in %s",
+					strings.Replace(volumesDir, undeclaredOutsDir, "outputs.zip", 1))
+			} else {
+				log.Dev.Shoutf(ctx, severity.INFO, "command left-over files in %s", volumesDir)
+			}
 		}
 
 		return err
@@ -318,7 +330,7 @@ func (c *Container) Wait(ctx context.Context, condition container.WaitCondition)
 
 // Logs outputs the containers logs to the given io.Writer.
 func (c *Container) Logs(ctx context.Context, w io.Writer) error {
-	rc, err := c.cluster.client.ContainerLogs(ctx, c.id, types.ContainerLogsOptions{
+	rc, err := c.cluster.client.ContainerLogs(ctx, c.id, types.ContainerLogsOptions{ //lint:ignore SA1019 grandfathered
 		ShowStdout: true,
 		ShowStderr: true,
 	})
@@ -355,7 +367,7 @@ func (c *Container) Inspect(ctx context.Context) (types.ContainerJSON, error) {
 func (c *Container) Addr(ctx context.Context, port nat.Port) *net.TCPAddr {
 	containerInfo, err := c.Inspect(ctx)
 	if err != nil {
-		log.Errorf(ctx, "%v", err)
+		log.Dev.Errorf(ctx, "%v", err)
 		return nil
 	}
 	bindings, ok := containerInfo.NetworkSettings.Ports[port]
@@ -364,7 +376,7 @@ func (c *Container) Addr(ctx context.Context, port nat.Port) *net.TCPAddr {
 	}
 	portNum, err := strconv.Atoi(bindings[0].HostPort)
 	if err != nil {
-		log.Errorf(ctx, "%v", err)
+		log.Dev.Errorf(ctx, "%v", err)
 		return nil
 	}
 	return &net.TCPAddr{
@@ -383,17 +395,19 @@ type resilientDockerClient struct {
 }
 
 func (cli resilientDockerClient) ContainerStart(
-	clientCtx context.Context, id string, opts types.ContainerStartOptions,
+	clientCtx context.Context,
+	id string,
+	opts types.ContainerStartOptions, //lint:ignore SA1019 grandfathered
 ) error {
 	for {
-		err := contextutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
+		err := timeutil.RunWithTimeout(clientCtx, "start container", 20*time.Second, func(ctx context.Context) error {
 			return cli.APIClient.ContainerStart(ctx, id, opts)
 		})
 
 		// Keep going if ContainerStart timed out, but client's context is not
 		// expired.
 		if errors.Is(err, context.DeadlineExceeded) && clientCtx.Err() == nil {
-			log.Warningf(clientCtx, "ContainerStart timed out, retrying")
+			log.Dev.Warningf(clientCtx, "ContainerStart timed out, retrying")
 			continue
 		}
 		return err
@@ -407,19 +421,19 @@ func (cli resilientDockerClient) ContainerCreate(
 	networkingConfig *network.NetworkingConfig,
 	platformSpec *specs.Platform,
 	containerName string,
-) (container.ContainerCreateCreatedBody, error) {
+) (container.CreateResponse, error) {
 	response, err := cli.APIClient.ContainerCreate(
 		ctx, config, hostConfig, networkingConfig, platformSpec, containerName,
 	)
 	if err != nil && strings.Contains(err.Error(), "already in use") {
-		log.Infof(ctx, "unable to create container %s: %v", containerName, err)
-		containers, cerr := cli.ContainerList(ctx, types.ContainerListOptions{
+		log.Dev.Infof(ctx, "unable to create container %s: %v", containerName, err)
+		containers, cerr := cli.ContainerList(ctx, types.ContainerListOptions{ //lint:ignore SA1019 grandfathered
 			All:   true,
 			Limit: -1, // no limit, see docker/docker/client/container_list.go
 		})
 		if cerr != nil {
-			log.Infof(ctx, "unable to list containers: %v", cerr)
-			return container.ContainerCreateCreatedBody{}, err
+			log.Dev.Infof(ctx, "unable to list containers: %v", cerr)
+			return container.CreateResponse{}, err
 		}
 		for _, c := range containers {
 			for _, n := range c.Names {
@@ -428,19 +442,19 @@ func (cli resilientDockerClient) ContainerCreate(
 				if n != containerName {
 					continue
 				}
-				log.Infof(ctx, "trying to remove %s", c.ID)
-				options := types.ContainerRemoveOptions{
+				log.Dev.Infof(ctx, "trying to remove %s", c.ID)
+				options := types.ContainerRemoveOptions{ //lint:ignore SA1019 grandfathered
 					RemoveVolumes: true,
 					Force:         true,
 				}
 				if rerr := cli.ContainerRemove(ctx, c.ID, options); rerr != nil {
-					log.Infof(ctx, "unable to remove container: %v", rerr)
-					return container.ContainerCreateCreatedBody{}, err
+					log.Dev.Infof(ctx, "unable to remove container: %v", rerr)
+					return container.CreateResponse{}, err
 				}
 				return cli.ContainerCreate(ctx, config, hostConfig, networkingConfig, platformSpec, containerName)
 			}
 		}
-		log.Warningf(ctx, "error indicated existing container %s, "+
+		log.Dev.Warningf(ctx, "error indicated existing container %s, "+
 			"but none found:\nerror: %s\ncontainers: %+v",
 			containerName, err, containers)
 		// We likely raced with a previous (late) removal of the container.

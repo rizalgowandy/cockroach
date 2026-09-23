@@ -1,333 +1,615 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import React from "react";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
+import { ArrowLeft } from "@cockroachlabs/icons";
+import {
+  InlineAlert,
+  Tooltip,
+  Text,
+  Heading,
+} from "@cockroachlabs/ui-components";
+import { Col, Row } from "antd";
 import classNames from "classnames/bind";
-import _ from "lodash";
+import get from "lodash/get";
+import Long from "long";
+import moment from "moment-timezone";
+import React, {
+  useContext,
+  useMemo,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+} from "react";
+import { Helmet } from "react-helmet";
+import { RouteComponentProps } from "react-router-dom";
 
-import statementsStyles from "../statementsPage/statementsPage.module.scss";
+import { useNodes } from "src/api/nodesApi";
+import {
+  SqlStatsSortType,
+  useCombinedTransactionStats,
+} from "src/api/statementsApi";
+import { useTxnInsights } from "src/api/txnInsightsApi";
+import { useUserSQLRoles } from "src/api/userApi";
+import { PageConfig, PageConfigItem } from "src/pageConfig";
+import {
+  populateRegionNodeForStatements,
+  makeStatementsColumns,
+} from "src/statementsTable/statementsTable";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
+import { Transaction } from "src/transactionsTable";
+import {
+  Bytes,
+  calculateTotalWorkload,
+  FixFingerprintHexValue,
+  Duration,
+  formatNumberForDisplay,
+  queryByName,
+  appNamesAttr,
+  unset,
+} from "src/util";
+
+import { InsightRecommendation } from "../api";
+import { formatTwoPlaces } from "../barCharts";
+import { Button } from "../button";
+import { ClusterDetailsContext, CockroachCloudContext } from "../contexts";
+import { getTxnInsightRecommendations, InsightType } from "../insights";
+import {
+  InsightsSortedTable,
+  makeInsightsColumns,
+} from "../insightsTable/insightsTable";
+import insightTableStyles from "../insightsTable/insightsTable.module.scss";
+import { Loading } from "../loading";
+import { Pagination } from "../pagination";
 import {
   SortedTable,
   ISortedTablePagination,
   SortSetting,
 } from "../sortedtable";
-import { Tooltip } from "@cockroachlabs/ui-components";
-import { Pagination } from "../pagination";
-import { TableStatistics } from "../tableStatistics";
-import { baseHeadingClasses } from "../transactionsPage/transactionsPageClasses";
-import { Button } from "../button";
-import { tableClasses } from "../transactionsTable/transactionsTableClasses";
 import { SqlBox } from "../sql";
-import { aggregateStatements } from "../transactionsPage/utils";
-import { Loading } from "../loading";
-import { SummaryCard } from "../summaryCard";
-import {
-  Bytes,
-  calculateTotalWorkload,
-  Duration,
-  formatNumberForDisplay,
-} from "src/util";
-import { UIConfigState } from "../store";
-import SQLActivityError from "../sqlActivity/errorComponent";
-
+import LoadingError from "../sqlActivity/errorComponent";
+import statementsStyles from "../statementsPage/statementsPage.module.scss";
+import { SummaryCard, SummaryCardItem } from "../summaryCard";
 import summaryCardStyles from "../summaryCard/summaryCard.module.scss";
-import transactionDetailsStyles from "./transactionDetails.modules.scss";
-import { Col, Row } from "antd";
-import { Text, Heading } from "@cockroachlabs/ui-components";
-import { formatTwoPlaces } from "../barCharts";
-import { ArrowLeft } from "@cockroachlabs/icons";
+import { TableStatistics } from "../tableStatistics";
 import {
-  populateRegionNodeForStatements,
-  makeStatementsColumns,
-} from "src/statementsTable/statementsTable";
-import { TransactionInfo } from "src/transactionsTable";
-import Long from "long";
+  getValidOption,
+  TimeScale,
+  timeScale1hMinOptions,
+  TimeScaleDropdown,
+} from "../timeScaleDropdown";
+import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import { baseHeadingClasses } from "../transactionsPage/transactionsPageClasses";
+import { aggregateStatements } from "../transactionsPage/utils";
+import { tableClasses } from "../transactionsTable/transactionsTableClasses";
+
+import transactionDetailsStyles from "./transactionDetails.modules.scss";
+import {
+  getStatementsForTransaction,
+  getTxnFromSqlStatsMemoized,
+  getTxnQueryString,
+} from "./transactionDetailsUtils";
 
 const { containerClass } = tableClasses;
 const cx = classNames.bind(statementsStyles);
+const timeScaleStylesCx = classNames.bind(timeScaleStyles);
+const insightsTableCx = classNames.bind(insightTableStyles);
 
-type Statement = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
-type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
+type Statement =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 
 const summaryCardStylesCx = classNames.bind(summaryCardStyles);
 const transactionDetailsStylesCx = classNames.bind(transactionDetailsStyles);
 
-interface TransactionDetailsProps {
-  transactionText: string;
-  statements?: Statement[];
-  nodeRegions: { [nodeId: string]: string };
-  transactionStats?: TransactionStats;
-  lastReset?: string | Date;
-  handleDetails: (txn?: TransactionInfo) => void;
-  error?: Error | null;
-  resetSQLStats: () => void;
-  isTenant: UIConfigState["isTenant"];
-  transactionFingerprintId: Long;
+export interface TransactionDetailsStateProps {
+  timeScale: TimeScale;
+  limit: number;
+  reqSortSetting: SqlStatsSortType;
+  transactionFingerprintId: string;
+  requestTime: moment.Moment;
 }
 
-interface TState {
-  sortSetting: SortSetting;
-  pagination: ISortedTablePagination;
+export interface TransactionDetailsDispatchProps {
+  onTimeScaleChange: (ts: TimeScale) => void;
+  onRequestTimeChange: (t: moment.Moment) => void;
 }
 
-export class TransactionDetails extends React.Component<
-  TransactionDetailsProps,
-  TState
-> {
-  state: TState = {
-    sortSetting: {
-      // Sort by statement latency as default column.
-      ascending: false,
-      columnTitle: "statementTime",
+export type TransactionDetailsProps = TransactionDetailsStateProps &
+  TransactionDetailsDispatchProps &
+  RouteComponentProps;
+
+export function TransactionDetails(
+  props: TransactionDetailsProps,
+): React.ReactElement {
+  const {
+    timeScale,
+    limit,
+    reqSortSetting,
+    transactionFingerprintId,
+    requestTime,
+    onTimeScaleChange,
+    onRequestTimeChange,
+    location,
+    match,
+    history,
+  } = props;
+
+  const { isTenant } = useContext(ClusterDetailsContext);
+  const isCockroachCloud = useContext(CockroachCloudContext);
+
+  const {
+    data: txnStatsData,
+    error: txnStatsError,
+    isLoading: txnStatsLoading,
+  } = useCombinedTransactionStats(timeScale, limit, reqSortSetting);
+  const { nodeRegionsByID: nodeRegions } = useNodes();
+  const { data: userRoles } = useUserSQLRoles();
+  const { data: txnInsightsData } = useTxnInsights(timeScale);
+
+  const hasAdminRole = userRoles?.roles?.includes("ADMIN") ?? false;
+  const hasViewActivityRedactedRole =
+    userRoles?.roles?.includes("VIEWACTIVITYREDACTED") ?? false;
+
+  // Replaces Redux selector selectTxnInsightsByFingerprint
+  const transactionInsights = useMemo(() => {
+    if (!transactionFingerprintId || !txnInsightsData?.results) return null;
+    const id = FixFingerprintHexValue(
+      BigInt(transactionFingerprintId).toString(16),
+    );
+    return txnInsightsData.results.filter(
+      txn => txn.transactionFingerprintID === id,
+    );
+  }, [transactionFingerprintId, txnInsightsData]);
+
+  // Initialize state from props
+  const getInitialState = () => {
+    const appsAsStr = queryByName(location, appNamesAttr) || null;
+    const txnDetails = getTxnFromSqlStatsMemoized(
+      txnStatsData,
+      match,
+      appsAsStr,
+    );
+    const apps = appsAsStr?.split(",").map(s => s.trim());
+    const stmts = getStatementsForTransaction(
+      txnDetails?.stats_data?.transaction_fingerprint_id.toString(),
+      apps,
+      txnStatsData?.statements,
+    );
+    return {
+      txnDetails,
+      statements: stmts,
+      latestTransactionText: getTxnQueryString(txnDetails, stmts),
+      appsAsStr,
+    };
+  };
+
+  const initialState = getInitialState();
+
+  const [sortSetting, setSortSetting] = useState<SortSetting>({
+    // Sort by statement latency as default column.
+    ascending: false,
+    columnTitle: "statementTime",
+  });
+
+  const [pagination, setPagination] = useState<ISortedTablePagination>({
+    pageSize: 10,
+    current: 1,
+  });
+
+  const [latestTransactionText, setLatestTransactionText] = useState<string>(
+    initialState.latestTransactionText,
+  );
+  const [txnDetails, setTxnDetails] = useState<Transaction | null>(
+    initialState.txnDetails,
+  );
+  const [statements, setStatements] = useState<Statement[] | null>(
+    initialState.statements,
+  );
+
+  // Ref to hold latest value for mount effect, avoiding stale closure
+  // while preserving "run once on mount" semantics.
+  const timeScaleRef = useRef(timeScale);
+  timeScaleRef.current = timeScale;
+
+  const changeTimeScale = useCallback(
+    (ts: TimeScale): void => {
+      if (onTimeScaleChange) {
+        onTimeScaleChange(ts);
+      }
+      onRequestTimeChange(moment());
     },
-    pagination: {
-      pageSize: 10,
-      current: 1,
-    },
+    [onRequestTimeChange, onTimeScaleChange],
+  );
+
+  // Update txnDetails when data changes
+  const updateTxnDetails = useCallback((): void => {
+    const newAppsAsStr = queryByName(location, appNamesAttr) || null;
+    const newTxnDetails = getTxnFromSqlStatsMemoized(
+      txnStatsData,
+      match,
+      newAppsAsStr,
+    );
+
+    const newStatements = getStatementsForTransaction(
+      newTxnDetails?.stats_data?.transaction_fingerprint_id.toString(),
+      newAppsAsStr?.split(",").map(s => s.trim()),
+      txnStatsData?.statements,
+    );
+
+    // Only overwrite the transaction text if it is non-null.
+    const transactionText =
+      getTxnQueryString(newTxnDetails, newStatements) ?? latestTransactionText;
+
+    // If a new, non-empty-string transaction text is available, cache the text.
+    if (
+      transactionText !== latestTransactionText ||
+      newTxnDetails !== txnDetails
+    ) {
+      setLatestTransactionText(transactionText);
+      setTxnDetails(newTxnDetails);
+      setStatements(newStatements);
+    }
+  }, [location, txnStatsData, match, latestTransactionText, txnDetails]);
+
+  // componentDidMount equivalent — validate timeScale on mount.
+  // Data fetching is handled by SWR hooks automatically.
+  useEffect(() => {
+    const ts = getValidOption(timeScaleRef.current, timeScale1hMinOptions);
+    if (ts !== timeScaleRef.current) {
+      changeTimeScale(ts);
+    }
+  }, [changeTimeScale]);
+
+  // Update txnDetails when relevant data changes.
+  const prevTransactionFingerprintIdRef = React.useRef(
+    transactionFingerprintId,
+  );
+  const prevTxnStatsDataRef = React.useRef(txnStatsData);
+  const prevLocationSearchRef = React.useRef(location?.search);
+
+  useEffect(() => {
+    if (
+      prevTransactionFingerprintIdRef.current !== transactionFingerprintId ||
+      prevTxnStatsDataRef.current !== txnStatsData ||
+      prevLocationSearchRef.current !== location?.search
+    ) {
+      updateTxnDetails();
+    }
+
+    prevTransactionFingerprintIdRef.current = transactionFingerprintId;
+    prevTxnStatsDataRef.current = txnStatsData;
+    prevLocationSearchRef.current = location?.search;
+  }, [
+    transactionFingerprintId,
+    txnStatsData,
+    location?.search,
+    updateTxnDetails,
+  ]);
+
+  const onChangeSortSetting = (ss: SortSetting): void => {
+    setSortSetting(ss);
   };
 
-  static defaultProps: Partial<TransactionDetailsProps> = {
-    isTenant: false,
+  const onChangePage = (current: number, pageSize: number): void => {
+    setPagination(prev => ({ ...prev, current, pageSize }));
   };
 
-  onChangeSortSetting = (ss: SortSetting): void => {
-    this.setState({
-      sortSetting: ss,
-    });
+  const backToTransactionsClick = (): void => {
+    history.push("/sql-activity?tab=Transactions&view=fingerprints");
   };
 
-  onChangePage = (current: number): void => {
-    const { pagination } = this.state;
-    this.setState({ pagination: { ...pagination, current } });
-  };
+  const transaction = txnDetails;
+  const error = txnStatsError;
+  const transactionStats = transaction?.stats_data?.stats;
+  const visibleApps = Array.from(
+    new Set(
+      statements?.map(s => (s.key.key_data.app ? s.key.key_data.app : unset)) ??
+        [],
+    ),
+  )?.join(", ");
 
-  render(): React.ReactElement {
-    const {
-      transactionText,
-      statements,
-      transactionStats,
-      handleDetails,
-      error,
-      nodeRegions,
-      transactionFingerprintId,
-    } = this.props;
-    return (
-      <div>
-        <section className={baseHeadingClasses.wrapper}>
-          <Button
-            onClick={() => handleDetails()}
-            type="unstyled-link"
-            size="small"
-            icon={<ArrowLeft fontSize={"10px"} />}
-            iconPosition="left"
-            className="small-margin"
-          >
-            Transactions
-          </Button>
-          <h3 className={baseHeadingClasses.tableName}>Transaction Details</h3>
-        </section>
-        <Loading
-          error={error}
-          loading={!statements || !transactionStats}
-          render={() => {
-            const { statements, transactionStats, isTenant } = this.props;
-            const { sortSetting, pagination } = this.state;
-            const txnScopedStmts = statements.filter(s =>
-              s.key.key_data.transaction_fingerprint_id.equals(
-                transactionFingerprintId,
-              ),
-            );
-            const aggregatedStatements = aggregateStatements(txnScopedStmts);
-            populateRegionNodeForStatements(
-              aggregatedStatements,
-              nodeRegions,
-              isTenant,
-            );
-            const duration = (v: number) => Duration(v * 1e9);
-
-            const transactionSampled =
-              transactionStats.exec_stats.count > Long.fromNumber(0);
-            const unavailableTooltip = !transactionSampled && (
-              <Tooltip
-                placement="bottom"
-                style="default"
-                content={
-                  <p>
-                    This metric is part of the transaction execution and
-                    therefore will not be available until it is sampled via
-                    tracing.
-                  </p>
-                }
-              >
-                <span className={cx("tooltip-info")}>unavailable</span>
-              </Tooltip>
-            );
-
+  return (
+    <div>
+      <Helmet title={"Details | Transactions"} />
+      <section className={baseHeadingClasses.wrapper}>
+        <Button
+          onClick={backToTransactionsClick}
+          type="unstyled-link"
+          size="small"
+          icon={<ArrowLeft fontSize={"10px"} />}
+          iconPosition="left"
+          className="small-margin"
+        >
+          Transactions
+        </Button>
+        <h3 className={baseHeadingClasses.tableName}>Transaction Details</h3>
+      </section>
+      <PageConfig>
+        <PageConfigItem>
+          <TimeScaleDropdown
+            options={timeScale1hMinOptions}
+            currentScale={timeScale}
+            setTimeScale={changeTimeScale}
+          />
+        </PageConfigItem>
+      </PageConfig>
+      <p className={timeScaleStylesCx("time-label", "label-no-margin-bottom")}>
+        <TimeScaleLabel
+          timeScale={timeScale}
+          requestTime={moment(requestTime)}
+        />
+      </p>
+      <Loading
+        error={error}
+        page={"transaction details"}
+        loading={txnStatsLoading}
+        render={() => {
+          if (!transaction) {
             return (
-              <React.Fragment>
-                <section className={containerClass}>
+              <section className={containerClass}>
+                {latestTransactionText && (
                   <Row
                     gutter={16}
                     className={transactionDetailsStylesCx("summary-columns")}
                   >
                     <Col span={16}>
                       <SqlBox
-                        value={transactionText}
+                        value={latestTransactionText}
                         className={transactionDetailsStylesCx("summary-card")}
+                        format={true}
                       />
                     </Col>
-                    <Col span={8}>
-                      <SummaryCard
-                        className={transactionDetailsStylesCx("summary-card")}
+                  </Row>
+                )}
+                <InlineAlert
+                  intent="info"
+                  title="Data not available for this time frame. Select a different time frame."
+                />
+              </section>
+            );
+          }
+
+          const aggregatedStatements = aggregateStatements(statements);
+          populateRegionNodeForStatements(aggregatedStatements, nodeRegions);
+          const duration = (v: number) => Duration(v * 1e9);
+
+          const transactionSampled =
+            transactionStats.exec_stats.count > Long.fromNumber(0);
+          const unavailableTooltip = !transactionSampled && (
+            <Tooltip
+              placement="bottom"
+              style="default"
+              content={
+                <p>
+                  This metric is part of the transaction execution and therefore
+                  will not be available until it is sampled via tracing.
+                </p>
+              }
+            >
+              <span className={cx("tooltip-info")}>unavailable</span>
+            </Tooltip>
+          );
+          const meanIdleLatency = (
+            <Text>
+              {formatNumberForDisplay(
+                get(transactionStats, "idle_lat.mean", 0),
+                duration,
+              )}
+            </Text>
+          );
+          const meanCommitLatency = (
+            <Text>
+              {formatNumberForDisplay(
+                get(transactionStats, "commit_lat.mean", 0),
+                duration,
+              )}
+            </Text>
+          );
+          const meansRows = `${formatNumberForDisplay(
+            transactionStats.rows_read.mean,
+            formatTwoPlaces,
+          )} /
+            ${formatNumberForDisplay(transactionStats.bytes_read.mean, Bytes)}`;
+          const bytesRead = transactionSampled ? (
+            <Text>
+              {formatNumberForDisplay(
+                transactionStats.exec_stats.network_bytes.mean,
+                Bytes,
+              )}
+            </Text>
+          ) : (
+            unavailableTooltip
+          );
+          const maxMem = transactionSampled ? (
+            <Text>
+              {formatNumberForDisplay(
+                transactionStats.exec_stats.max_mem_usage.mean,
+                Bytes,
+              )}
+            </Text>
+          ) : (
+            unavailableTooltip
+          );
+          const maxDisc = transactionSampled ? (
+            <Text>
+              {formatNumberForDisplay(
+                get(transactionStats, "exec_stats.max_disk_usage.mean", 0),
+                Bytes,
+              )}
+            </Text>
+          ) : (
+            unavailableTooltip
+          );
+
+          const insightsColumns = makeInsightsColumns(
+            isCockroachCloud,
+            hasAdminRole,
+            true,
+            true,
+          );
+          const tableData: InsightRecommendation[] = [];
+          if (transactionInsights) {
+            const tableDataTypes = new Set<InsightType>();
+            transactionInsights.forEach(txn => {
+              const rec = getTxnInsightRecommendations(txn);
+              rec.forEach(entry => {
+                if (!tableDataTypes.has(entry.type)) {
+                  tableData.push(entry);
+                  tableDataTypes.add(entry.type);
+                }
+              });
+            });
+          }
+
+          return (
+            <React.Fragment>
+              <section className={containerClass}>
+                <Row
+                  gutter={16}
+                  className={transactionDetailsStylesCx("summary-columns")}
+                >
+                  <Col span={16}>
+                    <SqlBox
+                      value={latestTransactionText}
+                      className={transactionDetailsStylesCx("summary-card")}
+                      format={true}
+                    />
+                  </Col>
+                  <Col span={8}>
+                    <SummaryCard
+                      className={transactionDetailsStylesCx("summary-card")}
+                    >
+                      <SummaryCardItem
+                        label="Mean transaction time"
+                        value={formatNumberForDisplay(
+                          transactionStats?.service_lat.mean,
+                          duration,
+                        )}
+                      />
+                      <SummaryCardItem
+                        label="Application name"
+                        value={visibleApps}
+                      />
+                      <SummaryCardItem
+                        label="Fingerprint ID"
+                        value={FixFingerprintHexValue(
+                          transaction?.stats_data.transaction_fingerprint_id.toString(
+                            16,
+                          ),
+                        )}
+                      />
+                      <p
+                        className={summaryCardStylesCx(
+                          "summary--card__divider",
+                        )}
+                      />
+                      <div
+                        className={summaryCardStylesCx("summary--card__item")}
                       >
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Heading type="h5">Mean transaction time</Heading>
-                          <Text>
-                            {formatNumberForDisplay(
-                              transactionStats.service_lat.mean,
-                              duration,
-                            )}
-                          </Text>
-                        </div>
-                        <p
-                          className={summaryCardStylesCx(
-                            "summary--card__divider",
+                        <Heading type="h5">Transaction resource usage</Heading>
+                      </div>
+                      <SummaryCardItem
+                        label="Idle latency"
+                        value={meanIdleLatency}
+                      />
+                      <SummaryCardItem
+                        label="Commit latency"
+                        value={meanCommitLatency}
+                      />
+                      <SummaryCardItem
+                        label="Mean rows/bytes read"
+                        value={meansRows}
+                      />
+                      <SummaryCardItem
+                        label="Bytes read over network"
+                        value={bytesRead}
+                      />
+                      <SummaryCardItem
+                        label="Mean rows written"
+                        value={formatNumberForDisplay(
+                          transactionStats.rows_written?.mean,
+                          formatTwoPlaces,
+                        )}
+                      />
+                      <SummaryCardItem
+                        label="Max memory usage"
+                        value={maxMem}
+                      />
+                      <SummaryCardItem
+                        label="Max scratch disk usage"
+                        value={maxDisc}
+                      />
+                    </SummaryCard>
+                  </Col>
+                </Row>
+                {tableData?.length > 0 && (
+                  <>
+                    <p
+                      className={summaryCardStylesCx(
+                        "summary--card__divider--large",
+                      )}
+                    />
+                    <Row gutter={24}>
+                      <Col className="gutter-row" span={24}>
+                        <InsightsSortedTable
+                          columns={insightsColumns}
+                          data={tableData}
+                          tableWrapperClassName={insightsTableCx(
+                            "sorted-table",
                           )}
                         />
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Heading type="h5">
-                            Transaction resource usage
-                          </Heading>
-                        </div>
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Text>Mean rows/bytes read</Text>
-                          <Text>
-                            {formatNumberForDisplay(
-                              transactionStats.rows_read.mean,
-                              formatTwoPlaces,
-                            )}
-                            {" / "}
-                            {formatNumberForDisplay(
-                              transactionStats.bytes_read.mean,
-                              Bytes,
-                            )}
-                          </Text>
-                        </div>
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Text>Bytes read over network</Text>
-                          {transactionSampled && (
-                            <Text>
-                              {formatNumberForDisplay(
-                                transactionStats.exec_stats.network_bytes.mean,
-                                Bytes,
-                              )}
-                            </Text>
-                          )}
-                          {unavailableTooltip}
-                        </div>
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Text>Mean rows written</Text>
-                          <Text>
-                            {formatNumberForDisplay(
-                              transactionStats.rows_written?.mean,
-                              formatTwoPlaces,
-                            )}
-                          </Text>
-                        </div>
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Text>Max memory usage</Text>
-                          {transactionSampled && (
-                            <Text>
-                              {formatNumberForDisplay(
-                                transactionStats.exec_stats.max_mem_usage.mean,
-                                Bytes,
-                              )}
-                            </Text>
-                          )}
-                          {unavailableTooltip}
-                        </div>
-                        <div
-                          className={summaryCardStylesCx("summary--card__item")}
-                        >
-                          <Text>Max scratch disk usage</Text>
-                          {transactionSampled && (
-                            <Text>
-                              {formatNumberForDisplay(
-                                _.get(
-                                  transactionStats,
-                                  "exec_stats.max_disk_usage.mean",
-                                  0,
-                                ),
-                                Bytes,
-                              )}
-                            </Text>
-                          )}
-                          {unavailableTooltip}
-                        </div>
-                      </SummaryCard>
-                    </Col>
-                  </Row>
-                  <TableStatistics
-                    pagination={pagination}
-                    totalCount={statements.length}
-                    arrayItemName={
-                      "statement fingerprints for this transaction"
-                    }
-                    activeFilters={0}
-                  />
-                  <div className={cx("table-area")}>
-                    <SortedTable
-                      data={aggregatedStatements}
-                      columns={makeStatementsColumns(
-                        aggregatedStatements,
-                        "", // selectedApp
-                        calculateTotalWorkload(aggregatedStatements),
-                        nodeRegions,
-                        "transactionDetails",
-                        isTenant,
-                      )}
-                      className={cx("statements-table")}
-                      sortSetting={sortSetting}
-                      onChangeSortSetting={this.onChangeSortSetting}
-                    />
-                  </div>
-                </section>
-                <Pagination
-                  pageSize={pagination.pageSize}
-                  current={pagination.current}
-                  total={statements.length}
-                  onChange={this.onChangePage}
+                      </Col>
+                    </Row>
+                  </>
+                )}
+                <p
+                  className={summaryCardStylesCx(
+                    "summary--card__divider--large",
+                  )}
                 />
-              </React.Fragment>
-            );
-          }}
-          renderError={() =>
-            SQLActivityError({
-              statsType: "transactions",
-            })
-          }
-        />
-      </div>
-    );
-  }
+                <TableStatistics
+                  pagination={pagination}
+                  totalCount={aggregatedStatements.length}
+                  arrayItemName={"statement fingerprints for this transaction"}
+                  activeFilters={0}
+                />
+                <div className={cx("table-area")}>
+                  <SortedTable
+                    data={aggregatedStatements}
+                    columns={makeStatementsColumns(
+                      aggregatedStatements,
+                      [],
+                      calculateTotalWorkload(aggregatedStatements),
+                      "transactionDetails",
+                      isTenant,
+                      hasViewActivityRedactedRole,
+                    ).filter(c => !(isTenant && c.hideIfTenant))}
+                    className={cx("statements-table")}
+                    sortSetting={sortSetting}
+                    onChangeSortSetting={onChangeSortSetting}
+                    pagination={pagination}
+                  />
+                </div>
+              </section>
+              <Pagination
+                pageSize={pagination.pageSize}
+                current={pagination.current}
+                total={aggregatedStatements.length}
+                onChange={onChangePage}
+                onShowSizeChange={onChangePage}
+              />
+            </React.Fragment>
+          );
+        }}
+        renderError={() =>
+          LoadingError({
+            statsType: "transactions",
+            error: error,
+          })
+        }
+      />
+    </div>
+  );
 }

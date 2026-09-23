@@ -1,19 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ssmemstorage
 
 import (
+	"slices"
 	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 )
 
@@ -27,30 +23,38 @@ type baseIterator struct {
 type StmtStatsIterator struct {
 	baseIterator
 	stmtKeys     stmtList
-	currentValue *roachpb.CollectedStatementStatistics
+	currentValue *appstatspb.CollectedStatementStatistics
 }
 
 // NewStmtStatsIterator returns a StmtStatsIterator.
 func NewStmtStatsIterator(
-	container *Container, options *sqlstats.IteratorOptions,
-) *StmtStatsIterator {
+	container *Container, options sqlstats.IteratorOptions,
+) StmtStatsIterator {
 	var stmtKeys stmtList
-	container.mu.Lock()
-	for k := range container.mu.stmts {
-		stmtKeys = append(stmtKeys, k)
-	}
-	container.mu.Unlock()
+	func() {
+		container.mu.Lock()
+		defer container.mu.Unlock()
+		for k := range container.mu.stmts {
+			stmtKeys = append(stmtKeys, k)
+		}
+	}()
+
 	if options.SortedKey {
 		sort.Sort(stmtKeys)
 	}
 
-	return &StmtStatsIterator{
+	return StmtStatsIterator{
 		baseIterator: baseIterator{
 			container: container,
 			idx:       -1,
 		},
 		stmtKeys: stmtKeys,
 	}
+}
+
+// Initialized returns true if the iterator has been initialized, false otherwise.
+func (s *StmtStatsIterator) Initialized() bool {
+	return s.container != nil
 }
 
 // Next updates the current value returned by the subsequent Cur() call. Next()
@@ -63,9 +67,7 @@ func (s *StmtStatsIterator) Next() bool {
 
 	stmtKey := s.stmtKeys[s.idx]
 
-	stmtFingerprintID := constructStatementFingerprintIDFromStmtKey(stmtKey)
-	statementStats, _, _ :=
-		s.container.getStatsForStmtWithKey(stmtKey, invalidStmtFingerprintID, false /* createIfNonexistent */)
+	statementStats := s.container.getStatsForStmtWithKey(stmtKey)
 
 	// If the key is not found (and we expected to find it), the table must
 	// have been cleared between now and the time we read all the keys. In
@@ -75,37 +77,51 @@ func (s *StmtStatsIterator) Next() bool {
 	}
 
 	statementStats.mu.Lock()
-	data := statementStats.mu.data
+	data := copyDataLocked(statementStats)
 	distSQLUsed := statementStats.mu.distSQLUsed
 	vectorized := statementStats.mu.vectorized
 	fullScan := statementStats.mu.fullScan
-	database := statementStats.mu.database
 	querySummary := statementStats.mu.querySummary
 	statementStats.mu.Unlock()
 
-	s.currentValue = &roachpb.CollectedStatementStatistics{
-		Key: roachpb.StatementStatisticsKey{
-			Query:                    stmtKey.anonymizedStmt,
+	s.currentValue = &appstatspb.CollectedStatementStatistics{
+		Key: appstatspb.StatementStatisticsKey{
+			Query:                    statementStats.meta.stmtNoConstants,
 			QuerySummary:             querySummary,
 			DistSQL:                  distSQLUsed,
 			Vec:                      vectorized,
-			ImplicitTxn:              stmtKey.implicitTxn,
 			FullScan:                 fullScan,
-			Failed:                   stmtKey.failed,
 			App:                      s.container.appName,
-			Database:                 database,
+			Database:                 statementStats.meta.database,
+			PlanHash:                 stmtKey.planHash,
 			TransactionFingerprintID: stmtKey.transactionFingerprintID,
 		},
-		ID:    stmtFingerprintID,
-		Stats: data,
+		ID:                  statementStats.ID,
+		Stats:               data,
+		AggregatedTs:        stmtKey.aggregatedTs,
+		AggregationInterval: stmtKey.aggInterval,
 	}
 
 	return true
 }
 
-// Cur returns the roachpb.CollectedStatementStatistics at the current internal
+// copyDataLocked Copies the statement stat's data object under the mutex.
+// This function requires that there is a lock on the stats object.
+func copyDataLocked(stats *stmtStats) appstatspb.StatementStatistics {
+	stats.mu.AssertHeld()
+	data := stats.mu.data
+	data.Nodes = slices.Clone(data.Nodes)
+	data.KVNodeIDs = slices.Clone(data.KVNodeIDs)
+	data.Regions = slices.Clone(data.Regions)
+	data.PlanGists = slices.Clone(data.PlanGists)
+	data.IndexRecommendations = slices.Clone(data.IndexRecommendations)
+	data.Indexes = slices.Clone(data.Indexes)
+	return data
+}
+
+// Cur returns the appstatspb.CollectedStatementStatistics at the current internal
 // counter.
-func (s *StmtStatsIterator) Cur() *roachpb.CollectedStatementStatistics {
+func (s *StmtStatsIterator) Cur() *appstatspb.CollectedStatementStatistics {
 	return s.currentValue
 }
 
@@ -114,13 +130,11 @@ func (s *StmtStatsIterator) Cur() *roachpb.CollectedStatementStatistics {
 type TxnStatsIterator struct {
 	baseIterator
 	txnKeys  txnList
-	curValue *roachpb.CollectedTransactionStatistics
+	curValue *appstatspb.CollectedTransactionStatistics
 }
 
 // NewTxnStatsIterator returns a new instance of TxnStatsIterator.
-func NewTxnStatsIterator(
-	container *Container, options *sqlstats.IteratorOptions,
-) *TxnStatsIterator {
+func NewTxnStatsIterator(container *Container, options sqlstats.IteratorOptions) TxnStatsIterator {
 	var txnKeys txnList
 	container.mu.Lock()
 	for k := range container.mu.txns {
@@ -131,13 +145,18 @@ func NewTxnStatsIterator(
 		sort.Sort(txnKeys)
 	}
 
-	return &TxnStatsIterator{
+	return TxnStatsIterator{
 		baseIterator: baseIterator{
 			container: container,
 			idx:       -1,
 		},
 		txnKeys: txnKeys,
 	}
+}
+
+// Initialized returns true if the iterator has been initialized, false otherwise.
+func (t *TxnStatsIterator) Initialized() bool {
+	return t.container != nil
 }
 
 // Next updates the current value returned by the subsequent Cur() call. Next()
@@ -148,12 +167,12 @@ func (t *TxnStatsIterator) Next() bool {
 		return false
 	}
 
-	txnKey := t.txnKeys[t.idx]
+	key := t.txnKeys[t.idx]
 
 	// We don't want to create the key if it doesn't exist, so it's okay to
 	// pass nil for the statementFingerprintIDs, as they are only set when a key is
 	// constructed.
-	txnStats, _, _ := t.container.getStatsForTxnWithKey(txnKey, nil /* stmtFingerprintIDs */, false /* createIfNonexistent */)
+	txnStats := t.container.getStatsForTxnWithKey(key)
 
 	// If the key is not found (and we expected to find it), the table must
 	// have been cleared between now and the time we read all the keys. In
@@ -165,18 +184,20 @@ func (t *TxnStatsIterator) Next() bool {
 	txnStats.mu.Lock()
 	defer txnStats.mu.Unlock()
 
-	t.curValue = &roachpb.CollectedTransactionStatistics{
+	t.curValue = &appstatspb.CollectedTransactionStatistics{
 		StatementFingerprintIDs:  txnStats.statementFingerprintIDs,
 		App:                      t.container.appName,
 		Stats:                    txnStats.mu.data,
-		TransactionFingerprintID: txnKey,
+		TransactionFingerprintID: key.transactionFingerprintID,
+		AggregatedTs:             key.aggregatedTs,
+		AggregationInterval:      key.aggInterval,
 	}
 
 	return true
 }
 
-// Cur returns the roachpb.CollectedTransactionStatistics at the current internal
+// Cur returns the appstatspb.CollectedTransactionStatistics at the current internal
 // counter.
-func (t *TxnStatsIterator) Cur() *roachpb.CollectedTransactionStatistics {
+func (t *TxnStatsIterator) Cur() *appstatspb.CollectedTransactionStatistics {
 	return t.curValue
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package invertedidx
 
@@ -16,6 +11,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geogfn"
+	// Blank import so projections are initialized correctly.
+	_ "github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
@@ -27,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -62,8 +60,8 @@ func GetGeoIndexRelationship(expr opt.ScalarExpr) (_ geoindex.RelationshipType, 
 // geospatial relationship. It is implemented by getSpanExprForGeographyIndex
 // and getSpanExprForGeometryIndex and used in extractGeoFilterCondition.
 type getSpanExprForGeoIndexFn func(
-	context.Context, tree.Datum, []tree.Datum, geoindex.RelationshipType, *geoindex.Config,
-) inverted.Expression
+	context.Context, tree.Datum, []tree.Datum, geoindex.RelationshipType, geopb.Config,
+) (inverted.Expression, error)
 
 // getSpanExprForGeographyIndex gets a SpanExpression that constrains the given
 // geography index according to the given constant and geospatial relationship.
@@ -72,8 +70,8 @@ func getSpanExprForGeographyIndex(
 	d tree.Datum,
 	additionalParams []tree.Datum,
 	relationship geoindex.RelationshipType,
-	indexConfig *geoindex.Config,
-) inverted.Expression {
+	indexConfig geopb.Config,
+) (inverted.Expression, error) {
 	geogIdx := geoindex.NewS2GeographyIndex(*indexConfig.S2Geography)
 	geog := d.(*tree.DGeography).Geography
 
@@ -81,39 +79,58 @@ func getSpanExprForGeographyIndex(
 	case geoindex.Covers:
 		unionKeySpans, err := geogIdx.Covers(ctx, geog)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	case geoindex.CoveredBy:
 		rpKeyExpr, err := geogIdx.CoveredBy(ctx, geog)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 		spanExpr, err := invertedexpr.GeoRPKeyExprToSpanExpr(rpKeyExpr)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return spanExpr
+		return spanExpr, nil
 
 	case geoindex.DWithin:
 		// Parameters are type checked earlier. Keep this consistent with the definition
 		// in geo_builtins.go.
 		if len(additionalParams) != 1 && len(additionalParams) != 2 {
-			panic(errors.AssertionFailedf("unexpected param length %d", len(additionalParams)))
+			return nil, errors.AssertionFailedf("unexpected param length %d", len(additionalParams))
 		}
 		d, ok := additionalParams[0].(*tree.DFloat)
 		if !ok {
-			panic(errors.AssertionFailedf(
-				"parameter %s is not float", additionalParams[0].ResolvedType()))
+			return nil, errors.AssertionFailedf(
+				"parameter %s is not float", additionalParams[0].ResolvedType())
 		}
 		distanceMeters := float64(*d)
+		// At distance=0, the spans produced by geogIdx.DWithin are equivalent
+		// to those of geogIdx.Intersects: DWithin builds the same cell
+		// covering of geog and then expands it by an angle proportional to
+		// the distance, which is a no-op at distance=0 regardless of the
+		// use_spheroid argument. We delegate to Intersects because it avoids
+		// an upstream check in the DWithin path that produces empty spans at
+		// distance=0 and prevents index acceleration. Note that this
+		// equivalence is only at the index-span layer; ST_DWithin and
+		// ST_Intersects can disagree at the function level (in particular,
+		// spheroid vs. sphere math for geography), but the recheck of the
+		// original ST_DWithin filter on top of the inverted scan preserves
+		// the original semantics.
+		if distanceMeters == 0 {
+			unionKeySpans, err := geogIdx.Intersects(ctx, geog)
+			if err != nil {
+				return nil, err
+			}
+			return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
+		}
 		useSpheroid := geogfn.UseSpheroid
 		if len(additionalParams) == 2 {
 			b, ok := additionalParams[1].(*tree.DBool)
 			if !ok {
-				panic(errors.AssertionFailedf(
-					"parameter %s is not bool", additionalParams[1].ResolvedType()))
+				return nil, errors.AssertionFailedf(
+					"parameter %s is not bool", additionalParams[1].ResolvedType())
 			}
 			if !*b {
 				useSpheroid = geogfn.UseSphere
@@ -121,19 +138,19 @@ func getSpanExprForGeographyIndex(
 		}
 		unionKeySpans, err := geogIdx.DWithin(ctx, geog, distanceMeters, useSpheroid)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	case geoindex.Intersects:
 		unionKeySpans, err := geogIdx.Intersects(ctx, geog)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	default:
-		panic(errors.AssertionFailedf("unhandled relationship: %v", relationship))
+		return nil, errors.AssertionFailedf("unhandled relationship: %v", relationship)
 	}
 }
 
@@ -159,8 +176,8 @@ func getSpanExprForGeometryIndex(
 	d tree.Datum,
 	additionalParams []tree.Datum,
 	relationship geoindex.RelationshipType,
-	indexConfig *geoindex.Config,
-) inverted.Expression {
+	indexConfig geopb.Config,
+) (inverted.Expression, error) {
 	geomIdx := geoindex.NewS2GeometryIndex(*indexConfig.S2Geometry)
 	geom := d.(*tree.DGeometry).Geometry
 
@@ -168,46 +185,62 @@ func getSpanExprForGeometryIndex(
 	case geoindex.Covers:
 		unionKeySpans, err := geomIdx.Covers(ctx, geom)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	case geoindex.CoveredBy:
 		rpKeyExpr, err := geomIdx.CoveredBy(ctx, geom)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 		spanExpr, err := invertedexpr.GeoRPKeyExprToSpanExpr(rpKeyExpr)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return spanExpr
+		return spanExpr, nil
 
 	case geoindex.DFullyWithin:
 		distance := getDistanceParam(additionalParams)
 		unionKeySpans, err := geomIdx.DFullyWithin(ctx, geom, distance)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	case geoindex.DWithin:
 		distance := getDistanceParam(additionalParams)
+		// At distance=0, the spans produced by geomIdx.DWithin are equivalent
+		// to those of geomIdx.Intersects: DWithin buffers geom by the
+		// distance and then computes Intersects spans on the result, and
+		// buffering by 0 is a no-op (modulo a degenerate case where it
+		// produces an empty geometry, which is what made the existing path
+		// produce empty spans and prevented index acceleration). Note that
+		// this equivalence is only at the index-span layer; the recheck of
+		// the original ST_DWithin filter on top of the inverted scan
+		// preserves the function-level semantics.
+		if distance == 0 {
+			unionKeySpans, err := geomIdx.Intersects(ctx, geom)
+			if err != nil {
+				return nil, err
+			}
+			return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
+		}
 		unionKeySpans, err := geomIdx.DWithin(ctx, geom, distance)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	case geoindex.Intersects:
 		unionKeySpans, err := geomIdx.Intersects(ctx, geom)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans)
+		return invertedexpr.GeoUnionKeySpansToSpanExpr(unionKeySpans), nil
 
 	default:
-		panic(errors.AssertionFailedf("unhandled relationship: %v", relationship))
+		return nil, errors.AssertionFailedf("unhandled relationship: %v", relationship)
 	}
 }
 
@@ -274,10 +307,10 @@ func (g *geoJoinPlanner) extractInvertedJoinConditionFromLeaf(
 // of the comparison operation. If commuteArgs is true, returns a new function
 // representing the same relationship but with commuted arguments. For example:
 //
-//   ST_Intersects(g1, g2) <-> ST_Intersects(g2, g1)
-//   ST_Covers(g1, g2) <-> ST_CoveredBy(g2, g1)
-//   g1 && g2 -> ST_Intersects(g2, g1)
-//   g1 ~ g2 -> ST_CoveredBy(g2, g1)
+//	ST_Intersects(g1, g2) <-> ST_Intersects(g2, g1)
+//	ST_Covers(g1, g2) <-> ST_CoveredBy(g2, g1)
+//	g1 && g2 -> ST_Intersects(g2, g1)
+//	g1 ~ g2 -> ST_CoveredBy(g2, g1)
 //
 // See geoindex.CommuteRelationshipMap for the full list of mappings.
 //
@@ -331,16 +364,231 @@ type geoFilterPlanner struct {
 
 var _ invertedFilterPlanner = &geoFilterPlanner{}
 
+// STDistanceUseSpheroid returns true if the use_spheroid argument of
+// st_distance is not explicitly false. use_spheroid is the third argument of
+// st_distance for the geography overload and it is true by default. The
+// geometry overload does not have a use_spheroid argument, so if either of the
+// first two arguments are geometries, it returns false.
+func (g *geoFilterPlanner) STDistanceUseSpheroid(args memo.ScalarListExpr) bool {
+	if len(args) < 2 {
+		panic(errors.AssertionFailedf("expected st_distance to have at least two arguments"))
+	}
+	if args[0].DataType().Family() == types.GeometryFamily ||
+		args[1].DataType().Family() == types.GeometryFamily {
+		return false
+	}
+	const useSpheroidIdx = 2
+	if len(args) <= useSpheroidIdx {
+		// The use_spheroid argument is true by default, so return true if it
+		// was not provided.
+		return true
+	}
+	return args[useSpheroidIdx].Op() != opt.FalseOp
+}
+
+// MaybeMakeSTDWithin attempts to derive an ST_DWithin (or ST_DFullyWithin)
+// function that is similar to an expression of the following form:
+// ST_Distance(a,b) <= x. The ST_Distance function can be on either side of the
+// inequality, and the inequality can be one of the following: '<', '<=', '>',
+// '>='. This replacement allows early-exit behavior, and may enable use of an
+// inverted index scan. If the derived expression would need to be negated with
+// a NotExpr, so the derivation fails, and expr, ok=false is returned.
+func (g *geoFilterPlanner) MaybeMakeSTDWithin(
+	expr opt.ScalarExpr,
+	args memo.ScalarListExpr,
+	bound opt.ScalarExpr,
+	fnIsLeftArg bool,
+	fullyWithin bool,
+) (derivedExpr opt.ScalarExpr, ok bool) {
+	op := expr.Op()
+	var not bool
+	var name string
+	fnName := "st_dwithin"
+	if fullyWithin {
+		fnName = "st_dfullywithin"
+	}
+	incName := fnName
+	exName := fnName + "exclusive"
+	switch op {
+	case opt.GeOp:
+		if fnIsLeftArg {
+			// Matched expression: ST_Distance(a,b) >= x.
+			not = true
+			name = exName
+		} else {
+			// Matched expression: x >= ST_Distance(a,b).
+			not = false
+			name = incName
+		}
+
+	case opt.GtOp:
+		if fnIsLeftArg {
+			// Matched expression: ST_Distance(a,b) > x.
+			not = true
+			name = incName
+		} else {
+			// Matched expression: x > ST_Distance(a,b).
+			not = false
+			name = exName
+		}
+
+	case opt.LeOp:
+		if fnIsLeftArg {
+			// Matched expression: ST_Distance(a,b) <= x.
+			not = false
+			name = incName
+		} else {
+			// Matched expression: x <= ST_Distance(a,b).
+			not = true
+			name = exName
+		}
+
+	case opt.LtOp:
+		if fnIsLeftArg {
+			// Matched expression: ST_Distance(a,b) < x.
+			not = false
+			name = exName
+		} else {
+			// Matched expression: x < ST_Distance(a,b).
+			not = true
+			name = incName
+		}
+	}
+	if not {
+		// ST_DWithin and ST_DWithinExclusive are equivalent to ST_Distance <= x and
+		// ST_Distance < x respectively. The comparison operator in the matched
+		// expression (if ST_Distance is normalized to be on the left) is either '>'
+		// or '>='. Therefore, we would have to take the opposite of within. This
+		// would not result in a useful expression for inverted index scan, so return
+		// ok=false.
+		return expr, false
+	}
+	newArgs := make(memo.ScalarListExpr, len(args)+1)
+	const distanceIdx, useSpheroidIdx = 2, 3
+	copy(newArgs, args[:distanceIdx])
+
+	// The distance parameter must be type float.
+	newArgs[distanceIdx] = g.factory.ConstructCast(bound, types.Float)
+
+	// Add the use_spheroid parameter if it exists.
+	if len(newArgs) > useSpheroidIdx {
+		newArgs[useSpheroidIdx] = args[useSpheroidIdx-1]
+	}
+
+	props, overload, ok := memo.FindFunction(&newArgs, name)
+	if !ok {
+		panic(errors.AssertionFailedf("could not find overload for %s", name))
+	}
+	within := g.factory.ConstructFunction(newArgs, &memo.FunctionPrivate{
+		Name:       name,
+		Typ:        types.Bool,
+		Properties: props,
+		Overload:   overload,
+	})
+	return within, true
+}
+
+// maybeDeriveUsefulInvertedFilterCondition identifies an expression of the
+// form: 'st_distance(a, b, bool) = 0', 'st_distance(...) <= x' or
+// 'st_maxdistance(...) <= x', and returns a function call to st_dwithin,
+// st_dwithinexclusive, st_dfullywithin, st_dfullywithinexclusive or
+// st_intersects which is almost equivalent to the original expression, except
+// for empty or null geography/geometry inputs (it may evaluate to true in more
+// cases). The derived expression may enable use of an inverted index scan. See
+// the MaybeMakeSTDWithin or MakeIntersectionFunction method for the specific
+// function that is used to replace expressions with different comparison
+// operators (e.g. '<' vs '<='). Note that the `st_distance` or `st_maxdistance`
+// may be on the left or right of the comparison operation (LT, GT, LE, GE).
+func (g *geoFilterPlanner) maybeDeriveUsefulInvertedFilterCondition(
+	expr opt.ScalarExpr,
+) (opt.ScalarExpr, bool) {
+	var left, right opt.ScalarExpr
+	var function *memo.FunctionExpr
+	leftIsFunction := false
+	rightIsFunction := false
+	c := g.factory.CustomFuncs()
+	switch t := expr.(type) {
+	case *memo.EqExpr:
+		left = t.Left
+		right = t.Right
+		function, leftIsFunction = left.(*memo.FunctionExpr)
+		if !leftIsFunction {
+			return expr, false
+		}
+		private := &function.FunctionPrivate
+		if private.Name != "st_distance" {
+			return expr, false
+		}
+		if g.STDistanceUseSpheroid(function.Args) {
+			return expr, false
+		}
+		constant, rightIsConstant := right.(*memo.ConstExpr)
+		if !rightIsConstant {
+			return expr, false
+		}
+		value := constant.Value
+		if !c.IsFloatDatum(value) {
+			return expr, false
+		}
+		if !c.DatumsEqual(value, tree.NewDInt(0)) {
+			return expr, false
+		}
+		return c.MakeIntersectionFunction(function.Args), true
+	case *memo.LtExpr, *memo.GtExpr, *memo.LeExpr, *memo.GeExpr:
+		left = t.Child(0).(opt.ScalarExpr)
+		right = t.Child(1).(opt.ScalarExpr)
+		function, leftIsFunction = left.(*memo.FunctionExpr)
+		if !leftIsFunction {
+			function, rightIsFunction = right.(*memo.FunctionExpr)
+			if !rightIsFunction {
+				return expr, false
+			}
+		}
+		// Combinations which result in a `NOT st_d*` function would not enable
+		// inverted index scan, so no need to derive filters for these cases.
+		if leftIsFunction && (t.Op() == opt.GtOp || t.Op() == opt.GeOp) {
+			return expr, false
+		} else if rightIsFunction && (t.Op() == opt.LtOp || t.Op() == opt.LeOp) {
+			return expr, false
+		}
+		// Main logic below to eliminate a code nesting level.
+	default:
+		return expr, false
+	}
+
+	if function == nil {
+		return expr, false
+	}
+	args := function.Args
+	private := &function.FunctionPrivate
+	if private.Name != "st_distance" && private.Name != "st_maxdistance" {
+		return expr, false
+	}
+	var boundExpr opt.ScalarExpr
+	if leftIsFunction {
+		boundExpr = right
+	} else {
+		boundExpr = left
+	}
+	if private.Name == "st_distance" {
+		return g.MaybeMakeSTDWithin(expr, args, boundExpr, leftIsFunction, false /* fullyWithin */)
+	}
+	return g.MaybeMakeSTDWithin(expr, args, boundExpr, leftIsFunction, true /* fullyWithin */)
+}
+
 // extractInvertedFilterConditionFromLeaf is part of the invertedFilterPlanner
 // interface.
 func (g *geoFilterPlanner) extractInvertedFilterConditionFromLeaf(
-	evalCtx *tree.EvalContext, expr opt.ScalarExpr,
+	ctx context.Context, evalCtx *eval.Context, expr opt.ScalarExpr,
 ) (
 	invertedExpr inverted.Expression,
 	remainingFilters opt.ScalarExpr,
 	_ *invertedexpr.PreFiltererStateForInvertedFilterer,
 ) {
 	var args memo.ScalarListExpr
+	filterIsDerived := false
+	originalExpr := expr
+	expr, filterIsDerived = g.maybeDeriveUsefulInvertedFilterCondition(expr)
 	switch t := expr.(type) {
 	case *memo.FunctionExpr:
 		args = t.Args
@@ -372,15 +620,18 @@ func (g *geoFilterPlanner) extractInvertedFilterConditionFromLeaf(
 	//
 	// See geoindex.CommuteRelationshipMap for the full list of mappings.
 	invertedExpr, pfState := extractGeoFilterCondition(
-		evalCtx.Context, g.factory, expr, args, false /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
+		ctx, g.factory, expr, args, false /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
 	)
 	if _, ok := invertedExpr.(inverted.NonInvertedColExpression); ok {
 		invertedExpr, pfState = extractGeoFilterCondition(
-			evalCtx.Context, g.factory, expr, args, true /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
+			ctx, g.factory, expr, args, true /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
 		)
 	}
-	if !invertedExpr.IsTight() {
-		remainingFilters = expr
+	// A derived filter may not be semantically equivalent to the original, so we
+	// need to apply the original filter in that case, the same as when the
+	// inverted expression is not tight.
+	if !invertedExpr.IsTight() || filterIsDerived {
+		remainingFilters = originalExpr
 	}
 	return invertedExpr, remainingFilters, pfState
 }
@@ -414,7 +665,11 @@ func extractGeoFilterCondition(
 	preFilterExpr :=
 		makeExprFromRelationshipAndParams(factory, expr, args, commuteArgs, relationship)
 
-	return getSpanExpr(ctx, d, additionalParams, relationship, index.GeoConfig()),
+	invExpr, err := getSpanExpr(ctx, d, additionalParams, relationship, index.GeoConfig())
+	if err != nil {
+		return inverted.NonInvertedColExpression{}, nil
+	}
+	return invExpr,
 		&invertedexpr.PreFiltererStateForInvertedFilterer{
 			Expr: preFilterExpr,
 			Col:  arg2.Col,
@@ -685,7 +940,7 @@ func (p *PreFilterer) PreFilter(
 				if err != nil {
 					return false, err
 				}
-				angleToExpand := s1.Angle(distance / proj.Spheroid.SphereRadius)
+				angleToExpand := s1.Angle(distance / proj.Spheroid.SphereRadius())
 				if useSphereOrSpheroid == geogfn.UseSpheroid {
 					angleToExpand *= (1 + geogfn.SpheroidErrorFraction)
 				}
@@ -705,10 +960,10 @@ func (p *PreFilterer) PreFilter(
 // geoDatumsToInvertedExpr implements invertedexpr.DatumsToInvertedExpr for
 // geospatial columns.
 type geoDatumsToInvertedExpr struct {
-	evalCtx      *tree.EvalContext
+	evalCtx      *eval.Context
 	colTypes     []*types.T
 	invertedExpr tree.TypedExpr
-	indexConfig  *geoindex.Config
+	indexConfig  geopb.Config
 	typ          *types.T
 	getSpanExpr  getSpanExprForGeoIndexFn
 
@@ -716,21 +971,19 @@ type geoDatumsToInvertedExpr struct {
 	filterer *PreFilterer
 
 	row   rowenc.EncDatumRow
-	alloc rowenc.DatumAlloc
+	alloc tree.DatumAlloc
 }
 
 var _ invertedexpr.DatumsToInvertedExpr = &geoDatumsToInvertedExpr{}
-var _ tree.IndexedVarContainer = &geoDatumsToInvertedExpr{}
+var _ eval.IndexedVarContainer = &geoDatumsToInvertedExpr{}
 
-// IndexedVarEval is part of the IndexedVarContainer interface.
-func (g *geoDatumsToInvertedExpr) IndexedVarEval(
-	idx int, ctx *tree.EvalContext,
-) (tree.Datum, error) {
+// IndexedVarEval is part of the eval.IndexedVarContainer interface.
+func (g *geoDatumsToInvertedExpr) IndexedVarEval(idx int) (tree.Datum, error) {
 	err := g.row[idx].EnsureDecoded(g.colTypes[idx], &g.alloc)
 	if err != nil {
 		return nil, err
 	}
-	return g.row[idx].Datum.Eval(ctx)
+	return g.row[idx].Datum, nil
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
@@ -738,17 +991,15 @@ func (g *geoDatumsToInvertedExpr) IndexedVarResolvedType(idx int) *types.T {
 	return g.colTypes[idx]
 }
 
-// IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
-func (g *geoDatumsToInvertedExpr) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	n := tree.Name(fmt.Sprintf("$%d", idx))
-	return &n
-}
-
 // NewGeoDatumsToInvertedExpr returns a new geoDatumsToInvertedExpr.
 func NewGeoDatumsToInvertedExpr(
-	evalCtx *tree.EvalContext, colTypes []*types.T, expr tree.TypedExpr, config *geoindex.Config,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	colTypes []*types.T,
+	expr tree.TypedExpr,
+	config geopb.Config,
 ) (invertedexpr.DatumsToInvertedExpr, error) {
-	if geoindex.IsEmptyConfig(config) {
+	if config.IsEmpty() {
 		return nil, fmt.Errorf("inverted joins are currently only supported for geospatial indexes")
 	}
 
@@ -757,10 +1008,10 @@ func NewGeoDatumsToInvertedExpr(
 		colTypes:    colTypes,
 		indexConfig: config,
 	}
-	if geoindex.IsGeographyConfig(config) {
+	if config.IsGeography() {
 		g.typ = types.Geography
 		g.getSpanExpr = getSpanExprForGeographyIndex
-	} else if geoindex.IsGeometryConfig(config) {
+	} else if config.IsGeometry() {
 		g.typ = types.Geometry
 		g.getSpanExpr = getSpanExprForGeometryIndex
 	} else {
@@ -810,7 +1061,11 @@ func NewGeoDatumsToInvertedExpr(
 			// it for every row.
 			var invertedExpr inverted.Expression
 			if d, ok := nonIndexParam.(tree.Datum); ok {
-				invertedExpr = g.getSpanExpr(evalCtx.Ctx(), d, additionalParams, relationship, g.indexConfig)
+				var err error
+				invertedExpr, err = g.getSpanExpr(ctx, d, additionalParams, relationship, g.indexConfig)
+				if err != nil {
+					return nil, err
+				}
 			} else if funcExprCount == 1 {
 				// Currently pre-filtering is limited to a single FuncExpr.
 				preFilterRelationship = relationship
@@ -857,7 +1112,7 @@ func (g *geoDatumsToInvertedExpr) Convert(
 				// We call Copy so the caller can modify the returned expression.
 				return t.invertedExpr.Copy(), nil
 			}
-			d, err := t.nonIndexParam.Eval(g.evalCtx)
+			d, err := eval.Expr(ctx, g.evalCtx, t.nonIndexParam)
 			if err != nil {
 				return nil, err
 			}
@@ -867,7 +1122,7 @@ func (g *geoDatumsToInvertedExpr) Convert(
 			if g.filterer != nil {
 				preFilterState = g.filterer.Bind(d)
 			}
-			return g.getSpanExpr(ctx, d, t.additionalParams, t.relationship, g.indexConfig), nil
+			return g.getSpanExpr(ctx, d, t.additionalParams, t.relationship, g.indexConfig)
 
 		default:
 			return nil, fmt.Errorf("unsupported expression %v", t)

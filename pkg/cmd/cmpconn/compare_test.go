@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cmpconn
 
@@ -15,7 +10,7 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/jackc/pgtype"
 )
 
@@ -72,7 +67,7 @@ func TestCompareVals(t *testing.T) {
 				pgtype.Numeric{
 					Int:    big1,
 					Exp:    -19,
-					Status: 2,
+					Status: pgtype.Present,
 					NaN:    false,
 				},
 			},
@@ -80,8 +75,42 @@ func TestCompareVals(t *testing.T) {
 				pgtype.Numeric{
 					Int:    big2,
 					Exp:    -16,
-					Status: 2,
+					Status: pgtype.Present,
 					NaN:    false,
+				},
+			},
+		},
+		{
+			equal: true,
+			a: []interface{}{
+				pgtype.Numeric{
+					Int:    big.NewInt(0),
+					Exp:    -1,
+					Status: pgtype.Present,
+					NaN:    false,
+				},
+			},
+			b: []interface{}{
+				pgtype.Numeric{
+					Int:    big.NewInt(0),
+					Exp:    6,
+					Status: pgtype.Present,
+					NaN:    false,
+				},
+			},
+		},
+		{
+			equal: true,
+			a: []interface{}{
+				pgtype.Numeric{
+					Status: pgtype.Present,
+					NaN:    true,
+				},
+			},
+			b: []interface{}{
+				pgtype.Numeric{
+					Status: pgtype.Present,
+					NaN:    true,
 				},
 			},
 		},

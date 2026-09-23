@@ -1,19 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -24,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -32,11 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 func TestSorter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	v := [6]rowenc.EncDatum{}
 	for i := range v {
@@ -265,18 +260,19 @@ func TestSorter(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					ctx := context.Background()
 					st := cluster.MakeTestingClusterSettings()
-					tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+					tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), nil /* statsCollector */)
 					if err != nil {
 						t.Fatal(err)
 					}
 					defer tempEngine.Close()
 
-					evalCtx := tree.MakeTestingEvalContext(st)
+					evalCtx := eval.MakeTestingEvalContext(st)
 					defer evalCtx.Stop(ctx)
 					diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 					defer diskMonitor.Stop(ctx)
 					flowCtx := execinfra.FlowCtx{
 						EvalCtx: &evalCtx,
+						Mon:     evalCtx.TestingMon,
 						Cfg: &execinfra.ServerConfig{
 							Settings:    cluster.MakeTestingClusterSettings(),
 							TempStorage: tempEngine,
@@ -291,11 +287,11 @@ func TestSorter(t *testing.T) {
 					in := distsqlutils.NewRowBuffer(c.types, c.input, distsqlutils.RowBufferArgs{})
 					out := &distsqlutils.RowBuffer{}
 
-					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &c.spec, in, &c.post, out)
+					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &c.spec, in, &c.post)
 					if err != nil {
 						t.Fatal(err)
 					}
-					s.Run(context.Background())
+					s.Run(context.Background(), out)
 					if !out.ProducerClosed() {
 						t.Fatalf("output RowReceiver not closed")
 					}
@@ -338,6 +334,7 @@ func TestSorter(t *testing.T) {
 // an invalid k-parameter.
 func TestSortInvalidLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	spec := execinfrapb.SorterSpec{}
 	spec.Limit = 0
@@ -345,12 +342,13 @@ func TestSortInvalidLimit(t *testing.T) {
 	t.Run("KZeroNoTopK", func(t *testing.T) {
 		ctx := context.Background()
 		st := cluster.MakeTestingClusterSettings()
-		evalCtx := tree.MakeTestingEvalContext(st)
+		evalCtx := eval.MakeTestingEvalContext(st)
 		defer evalCtx.Stop(ctx)
 		diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 		defer diskMonitor.Stop(ctx)
 		flowCtx := execinfra.FlowCtx{
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
@@ -359,9 +357,8 @@ func TestSortInvalidLimit(t *testing.T) {
 
 		post := execinfrapb.PostProcessSpec{}
 		in := distsqlutils.NewRowBuffer([]*types.T{types.Int}, rowenc.EncDatumRows{}, distsqlutils.RowBufferArgs{})
-		out := &distsqlutils.RowBuffer{}
 		proc, err := newSorter(
-			context.Background(), &flowCtx, 0, &spec, in, &post, out,
+			context.Background(), &flowCtx, 0, &spec, in, &post,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -369,13 +366,15 @@ func TestSortInvalidLimit(t *testing.T) {
 		if _, sortAll := proc.(*sortAllProcessor); !sortAll {
 			t.Fatalf("expected *sortAllProcessor, got %T", proc)
 		}
+		// Allow for the processor cleanup.
+		proc.Run(ctx, &distsqlutils.RowBuffer{})
 	})
 
 	t.Run("KZero", func(t *testing.T) {
 		var k uint64
 		// All arguments apart from spec and post are not necessary.
 		if _, err := newSortTopKProcessor(
-			nil, 0, &spec, nil, nil, nil, k,
+			context.Background(), nil, 0, &spec, nil, nil, k,
 		); !testutils.IsError(err, errSortTopKZeroK.Error()) {
 			t.Fatalf("unexpected error %v, expected %v", err, errSortTopKZeroK)
 		}
@@ -394,19 +393,20 @@ func BenchmarkSortAll(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 		DiskMonitor: diskMonitor,
 	}
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 	spec := execinfrapb.SorterSpec{OutputOrdering: twoColOrdering}
 	post := execinfrapb.PostProcessSpec{}
 
@@ -417,12 +417,12 @@ func BenchmarkSortAll(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				s, err := newSorter(
-					context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post, &rowDisposer{},
+					context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post,
 				)
 				if err != nil {
 					b.Fatal(err)
 				}
-				s.Run(context.Background())
+				s.Run(context.Background(), &rowDisposer{})
 				input.Reset()
 			}
 		})
@@ -437,37 +437,39 @@ func BenchmarkSortLimit(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 		DiskMonitor: diskMonitor,
 	}
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 	spec := execinfrapb.SorterSpec{OutputOrdering: twoColOrdering}
 
 	const numRows = 1 << 16
 	b.Run(fmt.Sprintf("rows=%d", numRows), func(b *testing.B) {
 		input := execinfra.NewRepeatableRowSource(types.TwoIntCols, randgen.MakeRandIntRows(rng, numRows, numCols))
-		for _, limit := range []uint64{1 << 4, 1 << 8, 1 << 12, 1 << 16} {
-			post := execinfrapb.PostProcessSpec{Limit: limit}
+		for _, limit := range []int64{1 << 4, 1 << 8, 1 << 12, 1 << 16} {
+			spec.Limit = limit
 			b.Run(fmt.Sprintf("Limit=%d", limit), func(b *testing.B) {
 				b.SetBytes(int64(numRows * numCols * 8))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					s, err := newSorter(
-						context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post, &rowDisposer{},
+						context.Background(), &flowCtx, 0, /* processorID */
+						&spec, input, &execinfrapb.PostProcessSpec{Limit: 0},
 					)
 					if err != nil {
 						b.Fatal(err)
 					}
-					s.Run(context.Background())
+					s.Run(context.Background(), &rowDisposer{})
 					input.Reset()
 				}
 			})
@@ -484,19 +486,20 @@ func BenchmarkSortChunks(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 		DiskMonitor: diskMonitor,
 	}
 
-	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+	rng, _ := randutil.NewTestRand()
 	spec := execinfrapb.SorterSpec{
 		OutputOrdering:   twoColOrdering,
 		OrderingMatchLen: 1,
@@ -514,11 +517,11 @@ func BenchmarkSortChunks(b *testing.B) {
 				b.SetBytes(int64(numRows * numCols * 8))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post, &rowDisposer{})
+					s, err := newSorter(context.Background(), &flowCtx, 0 /* processorID */, &spec, input, &post)
 					if err != nil {
 						b.Fatal(err)
 					}
-					s.Run(context.Background())
+					s.Run(context.Background(), &rowDisposer{})
 					input.Reset()
 				}
 			})

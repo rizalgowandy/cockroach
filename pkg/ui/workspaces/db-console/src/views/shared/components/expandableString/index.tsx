@@ -1,22 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
-import React from "react";
+import isNil from "lodash/isNil";
+import React, { useState } from "react";
 
 import { trustIcon } from "src/util/trust";
 
 import collapseIcon from "!!raw-loader!assets/collapse.svg";
 import expandIcon from "!!raw-loader!assets/expand.svg";
 
-import "./expandable.styl";
+import "./expandable.scss";
 
 const truncateLength = 50;
 
@@ -25,58 +20,46 @@ interface ExpandableStringProps {
   long: string;
 }
 
-interface ExpandableStringState {
-  expanded: boolean;
-}
-
 // ExpandableString displays a short string with a clickable ellipsis. When
 // clicked, the component displays long. If short is not specified, it uses
 // the first 50 chars of long.
-export class ExpandableString extends React.Component<
-  ExpandableStringProps,
-  ExpandableStringState
-> {
-  state: ExpandableStringState = {
-    expanded: false,
-  };
+export function ExpandableString({
+  short,
+  long,
+}: ExpandableStringProps): React.ReactElement {
+  const [expanded, setExpanded] = useState(false);
 
-  onClick = (ev: any) => {
+  const onClick = (ev: any) => {
     ev.preventDefault();
-    this.setState({ expanded: !this.state.expanded });
+    setExpanded(prev => !prev);
   };
 
-  renderText(expanded: boolean) {
+  const renderText = () => {
     if (expanded) {
       return (
         <span className="expandable__text expandable__text--expanded">
-          {this.props.long}
+          {long}
         </span>
       );
     }
 
-    const short =
-      this.props.short || this.props.long.substr(0, truncateLength).trim();
-    return <span className="expandable__text">{short}&nbsp;&hellip;</span>;
+    const shortText = short || long.substr(0, truncateLength).trim();
+    return <span className="expandable__text">{shortText}&nbsp;&hellip;</span>;
+  };
+
+  const neverCollapse = isNil(short) && long.length <= truncateLength + 2;
+  if (neverCollapse) {
+    return <span className="expandable__long">{long}</span>;
   }
 
-  render() {
-    const { short, long } = this.props;
-
-    const neverCollapse = _.isNil(short) && long.length <= truncateLength + 2;
-    if (neverCollapse) {
-      return <span className="expandable__long">{this.props.long}</span>;
-    }
-
-    const { expanded } = this.state;
-    const icon = expanded ? collapseIcon : expandIcon;
-    return (
-      <div className="expandable" onClick={this.onClick}>
-        <span className="expandable__long">{this.renderText(expanded)}</span>
-        <span
-          className="expandable__icon"
-          dangerouslySetInnerHTML={trustIcon(icon)}
-        />
-      </div>
-    );
-  }
+  const icon = expanded ? collapseIcon : expandIcon;
+  return (
+    <div className="expandable" onClick={onClick}>
+      <span className="expandable__long">{renderText()}</span>
+      <span
+        className="expandable__icon"
+        dangerouslySetInnerHTML={trustIcon(icon)}
+      />
+    </div>
+  );
 }

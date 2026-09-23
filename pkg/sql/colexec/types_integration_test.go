@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -23,8 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -44,19 +41,20 @@ func TestSQLTypesIntegration(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
 		DiskMonitor: diskMonitor,
 	}
 
-	var da rowenc.DatumAlloc
+	var da tree.DatumAlloc
 	rng, _ := randutil.NewTestRand()
 	typesToTest := 20
 
@@ -72,20 +70,22 @@ func TestSQLTypesIntegration(t *testing.T) {
 			rows := make(rowenc.EncDatumRows, numRows)
 			for i := 0; i < numRows; i++ {
 				rows[i] = make(rowenc.EncDatumRow, 1)
-				rows[i][0] = rowenc.DatumToEncDatum(typ, randgen.RandDatum(rng, typ, true /* nullOk */))
+				rows[i][0] = rowenc.DatumToEncDatumUnsafe(typ, randgen.RandDatum(rng, typ, true /* nullOk */))
 			}
 			typs := []*types.T{typ}
 			source := execinfra.NewRepeatableRowSource(typs, rows)
 
-			columnarizer := NewBufferingColumnarizer(testAllocator, flowCtx, 0 /* processorID */, source)
+			columnarizer := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0 /* processorID */, source)
 
-			c, err := colserde.NewArrowBatchConverter(typs)
+			c, err := colserde.NewArrowBatchConverter(typs, colserde.BiDirectional, testMemAcc)
 			require.NoError(t, err)
+			defer c.Close(ctx)
 			r, err := colserde.NewRecordBatchSerializer(typs)
 			require.NoError(t, err)
 			arrowOp := newArrowTestOperator(columnarizer, c, r, typs)
 
 			materializer := NewMaterializer(
+				nil, /* streamingMemAcc */
 				flowCtx,
 				1, /* processorID */
 				colexecargs.OpWithMetaInfo{Root: arrowOp},
@@ -99,7 +99,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 				require.Nil(t, meta)
 				numActualRows++
 				require.Equal(t, len(expectedRow), len(actualRow))
-				cmp, err := expectedRow[0].Compare(typ, &da, &evalCtx, &actualRow[0])
+				cmp, err := expectedRow[0].Compare(ctx, typ, &da, &evalCtx, &actualRow[0])
 				require.NoError(t, err)
 				require.Equal(t, 0, cmp)
 			}
@@ -140,11 +140,11 @@ func newArrowTestOperator(
 	}
 }
 
-func (a *arrowTestOperator) Next() coldata.Batch {
-	batchIn := a.Input.Next()
+func (a *arrowTestOperator) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batchIn := colexecop.NextNoMeta(a.Input)
 	// Note that we don't need to handle zero-length batches in a special way.
 	var buf bytes.Buffer
-	arrowDataIn, err := a.c.BatchToArrow(batchIn)
+	arrowDataIn, err := a.c.BatchToArrow(a.Ctx, batchIn)
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
@@ -152,7 +152,7 @@ func (a *arrowTestOperator) Next() coldata.Batch {
 	if err != nil {
 		colexecerror.InternalError(err)
 	}
-	var arrowDataOut []*array.Data
+	var arrowDataOut []array.Data
 	batchLength, err := a.r.Deserialize(&arrowDataOut, buf.Bytes())
 	if err != nil {
 		colexecerror.InternalError(err)
@@ -161,5 +161,5 @@ func (a *arrowTestOperator) Next() coldata.Batch {
 	if err := a.c.ArrowToBatch(arrowDataOut, batchLength, batchOut); err != nil {
 		colexecerror.InternalError(err)
 	}
-	return batchOut
+	return batchOut, nil
 }

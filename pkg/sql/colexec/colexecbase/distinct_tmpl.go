@@ -1,16 +1,10 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for distinct.eg.go. It's formatted in a
@@ -29,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -101,7 +96,7 @@ func newSingleDistinct(
 type partitioner interface {
 	// partition partitions the input colVec of size n, writing true to the
 	// outputCol for every value that differs from the previous one.
-	partition(colVec coldata.Vec, outputCol []bool, n int)
+	partition(colVec *coldata.Vec, outputCol []bool, n int)
 
 	// partitionWithOrder is like partition, except it performs the partitioning
 	// on the input Vec as if it were ordered via the input order vector, which is
@@ -110,7 +105,7 @@ type partitioner interface {
 	// implies a reordered input vector [b,b,a], the resultant outputCol would be
 	// [true, false, true], indicating a distinct value at the 0th and 2nd
 	// elements.
-	partitionWithOrder(colVec coldata.Vec, order []int, outputCol []bool, n int)
+	partitionWithOrder(colVec *coldata.Vec, order []int, outputCol []bool, n int)
 }
 
 // newPartitioner returns a new partitioner on type t.
@@ -139,6 +134,8 @@ func newPartitioner(t *types.T, nullsAreDistinct bool) partitioner {
 // true to the resultant bool column for every value that differs from the
 // previous one.
 type distinct_TYPEOp struct {
+	colexecop.OneInputHelper
+
 	// outputCol is the boolean output column. It is shared by all of the
 	// other distinct operators in a distinct operator set.
 	outputCol []bool
@@ -146,8 +143,6 @@ type distinct_TYPEOp struct {
 	// lastVal is the last value seen by the operator, so that the distincting
 	// still works across batch boundaries.
 	lastVal _GOTYPE
-
-	colexecop.OneInputHelper
 
 	// distinctColIdx is the index of the column to distinct upon.
 	distinctColIdx int
@@ -171,10 +166,13 @@ func (p *distinct_TYPEOp) Reset(ctx context.Context) {
 	}
 }
 
-func (p *distinct_TYPEOp) Next() coldata.Batch {
-	batch := p.Input.Next()
+func (p *distinct_TYPEOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batch, meta := p.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	if batch.Length() == 0 {
-		return batch
+		return batch, nil
 	}
 	outputCol := p.outputCol
 	vec := batch.ColVec(p.distinctColIdx)
@@ -239,7 +237,7 @@ func (p *distinct_TYPEOp) Next() coldata.Batch {
 	}
 	p.lastValNull = lastValNull
 
-	return batch
+	return batch, nil
 }
 
 // {{end}}
@@ -255,7 +253,7 @@ type partitioner_TYPE struct {
 }
 
 func (p partitioner_TYPE) partitionWithOrder(
-	colVec coldata.Vec, order []int, outputCol []bool, n int,
+	colVec *coldata.Vec, order []int, outputCol []bool, n int,
 ) {
 	var lastVal _GOTYPE
 	var lastValNull bool
@@ -284,7 +282,7 @@ func (p partitioner_TYPE) partitionWithOrder(
 	}
 }
 
-func (p partitioner_TYPE) partition(colVec coldata.Vec, outputCol []bool, n int) {
+func (p partitioner_TYPE) partition(colVec *coldata.Vec, outputCol []bool, n int) {
 	var (
 		lastVal     _GOTYPE
 		lastValNull bool

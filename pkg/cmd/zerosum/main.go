@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -112,7 +107,7 @@ func (z *zeroSum) run(workers, monkeys int) {
 func (z *zeroSum) setup() uint32 {
 	db := z.Nodes[0].DB()
 	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS zerosum"); err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		log.Dev.Fatalf(context.Background(), "%v", err)
 	}
 
 	accounts := `
@@ -122,7 +117,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 )
 `
 	if _, err := db.Exec(accounts); err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		log.Dev.Fatalf(context.Background(), "%v", err)
 	}
 
 	tableIDQuery := `
@@ -132,7 +127,7 @@ SELECT tables.id FROM system.namespace tables
 `
 	var tableID uint32
 	if err := db.QueryRow(tableIDQuery, "zerosum", "accounts").Scan(&tableID); err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		log.Dev.Fatalf(context.Background(), "%v", err)
 	}
 	return tableID
 }
@@ -152,7 +147,7 @@ func (z *zeroSum) maybeLogError(err error) {
 	if localcluster.IsUnavailableError(err) || strings.Contains(err.Error(), "range is frozen") {
 		return
 	}
-	log.Errorf(context.Background(), "%v", err)
+	log.Dev.Errorf(context.Background(), "%v", err)
 	atomic.AddUint64(&z.stats.errors, 1)
 }
 
@@ -183,7 +178,7 @@ func (z *zeroSum) worker() {
 				var id uint64
 				var balance int64
 				if err = rows.Scan(&id, &balance); err != nil {
-					log.Fatalf(context.Background(), "%v", err)
+					log.Dev.Fatalf(context.Background(), "%v", err)
 				}
 				switch id {
 				case from:
@@ -285,7 +280,7 @@ func (z *zeroSum) chaos() {
 	case "flappy":
 		go z.chaosFlappy()
 	default:
-		log.Fatalf(context.Background(), "unknown chaos type: %s", z.chaosType)
+		log.Dev.Fatalf(context.Background(), "unknown chaos type: %s", z.chaosType)
 	}
 }
 
@@ -315,10 +310,10 @@ func (z *zeroSum) verify(d time.Duration) {
 			continue
 		}
 		if total != 0 {
-			log.Fatalf(context.Background(), "unexpected total balance %d", total)
+			log.Dev.Fatalf(context.Background(), "unexpected total balance %d", total)
 		}
 		if accounts < committedAccounts {
-			log.Fatalf(context.Background(), "expected at least %d accounts, but found %d",
+			log.Dev.Fatalf(context.Background(), "expected at least %d accounts, but found %d",
 				committedAccounts, accounts)
 		}
 	}
@@ -449,7 +444,7 @@ func main() {
 
 	go func() {
 		s := <-signalCh
-		log.Infof(context.Background(), "signal received: %v", s)
+		log.Dev.Infof(context.Background(), "signal received: %v", s)
 		c.Close()
 		os.Exit(1)
 	}()

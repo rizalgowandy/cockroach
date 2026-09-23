@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecbase
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 )
 
 // fnOp is an operator that executes an arbitrary function for its side-effects,
@@ -28,10 +24,13 @@ type fnOp struct {
 
 var _ colexecop.ResettableOperator = &fnOp{}
 
-func (f *fnOp) Next() coldata.Batch {
-	batch := f.Input.Next()
+func (f *fnOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batch, meta := f.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	f.fn()
-	return batch
+	return batch, nil
 }
 
 func (f *fnOp) Reset(ctx context.Context) {

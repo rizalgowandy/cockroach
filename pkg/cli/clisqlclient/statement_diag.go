@@ -1,19 +1,17 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlclient
 
 import (
+	"context"
 	"database/sql/driver"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -30,8 +28,8 @@ type StmtDiagBundleInfo struct {
 
 // StmtDiagListBundles retrieves information about all available statement
 // diagnostics bundles.
-func StmtDiagListBundles(conn Conn) ([]StmtDiagBundleInfo, error) {
-	result, err := stmtDiagListBundlesInternal(conn)
+func StmtDiagListBundles(ctx context.Context, conn Conn) ([]StmtDiagBundleInfo, error) {
+	result, err := stmtDiagListBundlesInternal(ctx, conn)
 	if err != nil {
 		return nil, errors.Wrap(
 			err, "failed to retrieve statement diagnostics bundles",
@@ -40,13 +38,12 @@ func StmtDiagListBundles(conn Conn) ([]StmtDiagBundleInfo, error) {
 	return result, nil
 }
 
-func stmtDiagListBundlesInternal(conn Conn) ([]StmtDiagBundleInfo, error) {
-	rows, err := conn.Query(
+func stmtDiagListBundlesInternal(ctx context.Context, conn Conn) ([]StmtDiagBundleInfo, error) {
+	rows, err := conn.Query(ctx,
 		`SELECT id, statement_fingerprint, collected_at
 		 FROM system.statement_diagnostics
 		 WHERE error IS NULL
 		 ORDER BY collected_at DESC`,
-		nil, /* args */
 	)
 	if err != nil {
 		return nil, err
@@ -59,10 +56,32 @@ func stmtDiagListBundlesInternal(conn Conn) ([]StmtDiagBundleInfo, error) {
 		} else if err != nil {
 			return nil, err
 		}
+		i, ok := vals[0].(int64)
+		if !ok {
+			// We're arriving in this function via the interactive shell,
+			// with result type inference disabled.
+			// The value has been read as a string.
+			i, err = strconv.ParseInt(vals[0].(string), 10, 64)
+			if err != nil {
+				return nil, err
+			}
+		}
+		d, ok := vals[2].(time.Time)
+		if !ok {
+			// We're arriving in this function via the interactive shell,
+			// with result type inference disabled.
+			// The value has been read as a string.
+			ts := vals[2].(string)
+			ts = strings.TrimSuffix(ts, "+00")
+			d, err = time.Parse("2006-01-02 15:04:05.999999", ts)
+			if err != nil {
+				return nil, err
+			}
+		}
 		info := StmtDiagBundleInfo{
-			ID:          vals[0].(int64),
+			ID:          i,
 			Statement:   vals[1].(string),
-			CollectedAt: vals[2].(time.Time),
+			CollectedAt: d,
 		}
 		result = append(result, info)
 	}
@@ -77,18 +96,30 @@ func stmtDiagListBundlesInternal(conn Conn) ([]StmtDiagBundleInfo, error) {
 type StmtDiagActivationRequest struct {
 	ID int64
 	// Statement is the SQL statement fingerprint.
-	Statement   string
-	RequestedAt time.Time
+	Statement string
+	// If empty then any plan will do.
+	PlanGist string
+	// If true and PlanGist is not empty, then any plan not matching the gist
+	// will do.
+	AntiPlanGist bool
+	RequestedAt  time.Time
+	// Zero value indicates that there is no sampling probability set on the
+	// request.
+	SamplingProbability float64
 	// Zero value indicates that there is no minimum latency set on the request.
 	MinExecutionLatency time.Duration
 	// Zero value indicates that the request never expires.
 	ExpiresAt time.Time
+	// If true, then the redacted bundle is requested.
+	Redacted bool
 }
 
 // StmtDiagListOutstandingRequests retrieves outstanding statement diagnostics
 // activation requests.
-func StmtDiagListOutstandingRequests(conn Conn) ([]StmtDiagActivationRequest, error) {
-	result, err := stmtDiagListOutstandingRequestsInternal(conn)
+func StmtDiagListOutstandingRequests(
+	ctx context.Context, conn Conn,
+) ([]StmtDiagActivationRequest, error) {
+	result, err := stmtDiagListOutstandingRequestsInternal(ctx, conn)
 	if err != nil {
 		return nil, errors.Wrap(
 			err, "failed to retrieve outstanding statement diagnostics activation requests",
@@ -97,7 +128,9 @@ func StmtDiagListOutstandingRequests(conn Conn) ([]StmtDiagActivationRequest, er
 	return result, nil
 }
 
-func stmtDiagListOutstandingRequestsInternal(conn Conn) ([]StmtDiagActivationRequest, error) {
+func stmtDiagListOutstandingRequestsInternal(
+	ctx context.Context, conn Conn,
+) ([]StmtDiagActivationRequest, error) {
 	// Converting an INTERVAL to a number of milliseconds within that interval
 	// is a pain - we extract the number of seconds and multiply it by 1000,
 	// then we extract the number of milliseconds and add that up to the
@@ -106,18 +139,18 @@ func stmtDiagListOutstandingRequestsInternal(conn Conn) ([]StmtDiagActivationReq
 	getMilliseconds := `EXTRACT(epoch FROM min_execution_latency)::INT8 * 1000 +
                         EXTRACT(millisecond FROM min_execution_latency)::INT8 -
                         EXTRACT(second FROM min_execution_latency)::INT8 * 1000`
-	rows, err := conn.Query(
-		`SELECT id, statement_fingerprint, requested_at, `+getMilliseconds+`, expires_at
-		 FROM system.statement_diagnostics_requests
-		 WHERE NOT completed
-		 ORDER BY requested_at DESC`,
-		nil, /* args */
+	rows, err := conn.Query(ctx,
+		"SELECT id, statement_fingerprint, requested_at, "+getMilliseconds+`,
+                                   expires_at, sampling_probability, plan_gist, anti_plan_gist, redacted
+			FROM system.statement_diagnostics_requests
+			WHERE NOT completed
+			ORDER BY requested_at DESC`,
 	)
 	if err != nil {
 		return nil, err
 	}
 	var result []StmtDiagActivationRequest
-	vals := make([]driver.Value, 5)
+	vals := make([]driver.Value, 9)
 	for {
 		if err := rows.Next(vals); err == io.EOF {
 			break
@@ -125,19 +158,39 @@ func stmtDiagListOutstandingRequestsInternal(conn Conn) ([]StmtDiagActivationReq
 			return nil, err
 		}
 		var minExecutionLatency time.Duration
+		var expiresAt time.Time
+		var samplingProbability float64
+		var planGist string
+		var antiPlanGist, redacted bool
+
 		if ms, ok := vals[3].(int64); ok {
 			minExecutionLatency = time.Millisecond * time.Duration(ms)
 		}
-		var expiresAt time.Time
 		if e, ok := vals[4].(time.Time); ok {
 			expiresAt = e
+		}
+		if sp, ok := vals[5].(float64); ok {
+			samplingProbability = sp
+		}
+		if gist, ok := vals[6].(string); ok {
+			planGist = gist
+		}
+		if antiGist, ok := vals[7].(bool); ok {
+			antiPlanGist = antiGist
+		}
+		if b, ok := vals[8].(bool); ok {
+			redacted = b
 		}
 		info := StmtDiagActivationRequest{
 			ID:                  vals[0].(int64),
 			Statement:           vals[1].(string),
+			PlanGist:            planGist,
+			AntiPlanGist:        antiPlanGist,
 			RequestedAt:         vals[2].(time.Time),
+			SamplingProbability: samplingProbability,
 			MinExecutionLatency: minExecutionLatency,
 			ExpiresAt:           expiresAt,
+			Redacted:            redacted,
 		}
 		result = append(result, info)
 	}
@@ -148,8 +201,8 @@ func stmtDiagListOutstandingRequestsInternal(conn Conn) ([]StmtDiagActivationReq
 }
 
 // StmtDiagDownloadBundle downloads the bundle with the given ID to a file.
-func StmtDiagDownloadBundle(conn Conn, id int64, filename string) error {
-	if err := stmtDiagDownloadBundleInternal(conn, id, filename); err != nil {
+func StmtDiagDownloadBundle(ctx context.Context, conn Conn, id int64, filename string) error {
+	if err := stmtDiagDownloadBundleInternal(ctx, conn, id, filename); err != nil {
 		return errors.Wrapf(
 			err, "failed to download statement diagnostics bundle %d to '%s'", id, filename,
 		)
@@ -157,11 +210,13 @@ func StmtDiagDownloadBundle(conn Conn, id int64, filename string) error {
 	return nil
 }
 
-func stmtDiagDownloadBundleInternal(conn Conn, id int64, filename string) error {
+func stmtDiagDownloadBundleInternal(
+	ctx context.Context, conn Conn, id int64, filename string,
+) error {
 	// Retrieve the chunk IDs; these are stored in an INT ARRAY column.
-	rows, err := conn.Query(
+	rows, err := conn.Query(ctx,
 		"SELECT unnest(bundle_chunks) FROM system.statement_diagnostics WHERE id = $1",
-		[]driver.Value{id},
+		id,
 	)
 	if err != nil {
 		return err
@@ -191,9 +246,9 @@ func stmtDiagDownloadBundleInternal(conn Conn, id int64, filename string) error 
 	}
 
 	for _, chunkID := range chunkIDs {
-		data, err := conn.QueryRow(
+		data, err := conn.QueryRow(ctx,
 			"SELECT data FROM system.statement_bundle_chunks WHERE id = $1",
-			[]driver.Value{chunkID},
+			chunkID,
 		)
 		if err != nil {
 			_ = out.Close()
@@ -209,10 +264,10 @@ func stmtDiagDownloadBundleInternal(conn Conn, id int64, filename string) error 
 }
 
 // StmtDiagDeleteBundle deletes a statement diagnostics bundle.
-func StmtDiagDeleteBundle(conn Conn, id int64) error {
-	_, err := conn.QueryRow(
+func StmtDiagDeleteBundle(ctx context.Context, conn Conn, id int64) error {
+	_, err := conn.QueryRow(ctx,
 		"SELECT 1 FROM system.statement_diagnostics WHERE id = $1",
-		[]driver.Value{id},
+		id,
 	)
 	if err != nil {
 		if err == io.EOF {
@@ -220,63 +275,60 @@ func StmtDiagDeleteBundle(conn Conn, id int64) error {
 		}
 		return err
 	}
-	return conn.ExecTxn(func(conn TxBoundConn) error {
+	return conn.ExecTxn(ctx, func(ctx context.Context, conn TxBoundConn) error {
 		// Delete the request metadata.
-		if err := conn.Exec(
+		if err := conn.Exec(ctx,
 			"DELETE FROM system.statement_diagnostics_requests WHERE statement_diagnostics_id = $1",
-			[]driver.Value{id},
+			id,
 		); err != nil {
 			return err
 		}
 		// Delete the bundle chunks.
-		if err := conn.Exec(
+		if err := conn.Exec(ctx,
 			`DELETE FROM system.statement_bundle_chunks
 			  WHERE id IN (
 				  SELECT unnest(bundle_chunks) FROM system.statement_diagnostics WHERE id = $1
 				)`,
-			[]driver.Value{id},
+			id,
 		); err != nil {
 			return err
 		}
 		// Finally, delete the diagnostics entry.
-		return conn.Exec(
+		return conn.Exec(ctx,
 			"DELETE FROM system.statement_diagnostics WHERE id = $1",
-			[]driver.Value{id},
+			id,
 		)
 	})
 }
 
 // StmtDiagDeleteAllBundles deletes all statement diagnostics bundles.
-func StmtDiagDeleteAllBundles(conn Conn) error {
-	return conn.ExecTxn(func(conn TxBoundConn) error {
+func StmtDiagDeleteAllBundles(ctx context.Context, conn Conn) error {
+	return conn.ExecTxn(ctx, func(ctx context.Context, conn TxBoundConn) error {
 		// Delete the request metadata.
-		if err := conn.Exec(
+		if err := conn.Exec(ctx,
 			"DELETE FROM system.statement_diagnostics_requests WHERE completed",
-			nil,
 		); err != nil {
 			return err
 		}
 		// Delete all bundle chunks.
-		if err := conn.Exec(
+		if err := conn.Exec(ctx,
 			`DELETE FROM system.statement_bundle_chunks WHERE true`,
-			nil,
 		); err != nil {
 			return err
 		}
 		// Finally, delete the diagnostics entry.
-		return conn.Exec(
+		return conn.Exec(ctx,
 			"DELETE FROM system.statement_diagnostics WHERE true",
-			nil,
 		)
 	})
 }
 
 // StmtDiagCancelOutstandingRequest deletes an outstanding statement diagnostics
 // activation request.
-func StmtDiagCancelOutstandingRequest(conn Conn, id int64) error {
-	_, err := conn.QueryRow(
+func StmtDiagCancelOutstandingRequest(ctx context.Context, conn Conn, id int64) error {
+	_, err := conn.QueryRow(ctx,
 		"DELETE FROM system.statement_diagnostics_requests WHERE id = $1 RETURNING id",
-		[]driver.Value{id},
+		id,
 	)
 	if err != nil {
 		if err == io.EOF {
@@ -289,9 +341,8 @@ func StmtDiagCancelOutstandingRequest(conn Conn, id int64) error {
 
 // StmtDiagCancelAllOutstandingRequests deletes all outstanding statement
 // diagnostics activation requests.
-func StmtDiagCancelAllOutstandingRequests(conn Conn) error {
-	return conn.Exec(
+func StmtDiagCancelAllOutstandingRequests(ctx context.Context, conn Conn) error {
+	return conn.Exec(ctx,
 		"DELETE FROM system.statement_diagnostics_requests WHERE NOT completed",
-		nil,
 	)
 }

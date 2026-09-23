@@ -1,103 +1,113 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import * as protos from "@cockroachlabs/crdb-protobuf-client";
+import { InlineAlert } from "@cockroachlabs/ui-components";
 import classNames from "classnames/bind";
-import styles from "../statementsPage/statementsPage.module.scss";
-import moment, { Moment } from "moment";
+import flatMap from "lodash/flatMap";
+import isString from "lodash/isString";
+import moment from "moment-timezone";
+import React, {
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+} from "react";
 import { RouteComponentProps } from "react-router-dom";
+
+import { useNodes } from "src/api/nodesApi";
+import { useResetSQLStats } from "src/api/sqlStatsApi";
 import {
-  makeTransactionsColumns,
-  TransactionInfo,
-  TransactionsTable,
-} from "../transactionsTable";
-import { DateRange } from "src/dateRange";
-import { TransactionDetails } from "../transactionDetails";
+  SqlStatsSortType,
+  SqlStatsSortOptions,
+  useCombinedTransactionStats,
+} from "src/api/statementsApi";
+import { useUserSQLRoles } from "src/api/userApi";
+import { SearchCriteria } from "src/searchCriteria/searchCriteria";
+import { TimeScaleLabel } from "src/timeScaleDropdown/timeScaleLabel";
+import { TimestampToMoment, syncHistory, unique } from "src/util";
 import {
-  ColumnDescriptor,
-  handleSortSettingFromQueryString,
-  ISortedTablePagination,
-  SortSetting,
-  updateSortSettingQueryParamsOnTab,
-} from "../sortedtable";
-import { Pagination } from "../pagination";
-import { TableStatistics } from "../tableStatistics";
-import { statisticsClasses } from "./transactionsPageClasses";
-import {
-  aggregateAcrossNodeIDs,
-  generateRegionNode,
-  getTrxAppFilterOptions,
-  statementFingerprintIdsToText,
-  searchTransactionsData,
-  filterTransactions,
-  getStatementsByFingerprintIdAndTime,
-} from "./utils";
-import Long from "long";
-import { merge } from "lodash";
-import { unique, syncHistory } from "src/util";
-import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
+  STATS_LONG_LOADING_DURATION,
+  getSortLabel,
+  getSortColumn,
+  getSubsetWarning,
+  getReqSortColumn,
+} from "src/util/sqlActivityConstants";
+
+import ColumnsSelector from "../columnsSelector/columnsSelector";
+import { isSelectedColumn } from "../columnsSelector/utils";
+import { commonStyles } from "../common";
+import { ClusterDetailsContext } from "../contexts";
+import { Delayed } from "../delayed";
 import { Loading } from "../loading";
+import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
 import { PageConfig, PageConfigItem } from "../pageConfig";
-import { Search } from "../search";
+import { Pagination, ResultsPerPageLabel } from "../pagination";
 import {
   Filter,
   Filters,
   defaultFilters,
   handleFiltersFromQueryString,
   updateFiltersQueryParamsOnTab,
+  SelectedFilters,
 } from "../queryFilter";
-import { UIConfigState } from "../store";
-import { StatementsRequest } from "src/api/statementsApi";
-import ColumnsSelector from "../columnsSelector/columnsSelector";
-import { SelectOption } from "../multiSelectCheckbox/multiSelectCheckbox";
+import { Search } from "../search";
+import {
+  handleSortSettingFromQueryString,
+  ISortedTablePagination,
+  SortSetting,
+  updateSortSettingQueryParamsOnTab,
+} from "../sortedtable";
+import ClearStats from "../sqlActivity/clearStats";
+import LoadingError from "../sqlActivity/errorComponent";
+import styles from "../statementsPage/statementsPage.module.scss";
 import {
   getLabel,
   StatisticTableColumnKeys,
 } from "../statsTableUtil/statsTableUtil";
-import ClearStats from "../sqlActivity/clearStats";
-import SQLActivityError from "../sqlActivity/errorComponent";
-import { commonStyles } from "../common";
+import {
+  TimeScale,
+  timeScale1hMinOptions,
+  getValidOption,
+} from "../timeScaleDropdown";
+import timeScaleStyles from "../timeScaleDropdown/timeScale.module.scss";
+import {
+  makeTransactionsColumns,
+  TransactionInfo,
+  TransactionsTable,
+} from "../transactionsTable";
 
-type IStatementsResponse = protos.cockroach.server.serverpb.IStatementsResponse;
-type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
-type Timestamp = protos.google.protobuf.ITimestamp;
+import { EmptyTransactionsPlaceholder } from "./emptyTransactionsPlaceholder";
+import { statisticsClasses } from "./transactionsPageClasses";
+import { TransactionViewType } from "./transactionsPageTypes";
+import {
+  generateRegion,
+  generateRegionNode,
+  getTrxAppFilterOptions,
+  searchTransactionsData,
+  filterTransactions,
+} from "./utils";
 
 const cx = classNames.bind(styles);
-
-interface TState {
-  aggregatedTs: Timestamp | null;
-  filters?: Filters;
-  pagination: ISortedTablePagination;
-  statementFingerprintIds: Long[] | null;
-  transactionFingerprintId: Long | null;
-  transactionStats: TransactionStats | null;
-}
+const timeScaleStylesCx = classNames.bind(timeScaleStyles);
 
 export interface TransactionsPageStateProps {
   columns: string[];
-  data: IStatementsResponse;
-  dateRange: [Moment, Moment];
-  error?: Error | null;
+  timeScale: TimeScale;
+  limit: number;
+  reqSortSetting: SqlStatsSortType;
   filters: Filters;
-  isTenant?: UIConfigState["isTenant"];
-  nodeRegions: { [nodeId: string]: string };
-  pageSize?: number;
   search: string;
   sortSetting: SortSetting;
+  requestTime: moment.Moment;
 }
 
 export interface TransactionsPageDispatchProps {
-  refreshData: (req?: StatementsRequest) => void;
-  resetSQLStats: () => void;
-  onDateRangeChange?: (start: Moment, end: Moment) => void;
+  onTimeScaleChange?: (ts: TimeScale) => void;
+  onChangeLimit: (limit: number) => void;
+  onChangeReqSort: (sort: SqlStatsSortType) => void;
   onColumnsChange?: (selectedColumns: string[]) => void;
   onFilterChange?: (value: Filters) => void;
   onSearchComplete?: (query: string) => void;
@@ -106,211 +116,226 @@ export interface TransactionsPageDispatchProps {
     columnTitle: string,
     ascending: boolean,
   ) => void;
+  onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) => void;
+  onRequestTimeChange: (t: moment.Moment) => void;
 }
 
 export type TransactionsPageProps = TransactionsPageStateProps &
   TransactionsPageDispatchProps &
   RouteComponentProps;
 
-function statementsRequestFromProps(
+export function TransactionsPage(
   props: TransactionsPageProps,
-): protos.cockroach.server.serverpb.StatementsRequest {
-  return new protos.cockroach.server.serverpb.StatementsRequest({
-    combined: true,
-    start: Long.fromNumber(props.dateRange[0].unix()),
-    end: Long.fromNumber(props.dateRange[1].unix()),
-  });
-}
-export class TransactionsPage extends React.Component<
-  TransactionsPageProps,
-  TState
-> {
-  constructor(props: TransactionsPageProps) {
-    super(props);
-    this.state = {
-      pagination: {
-        pageSize: this.props.pageSize || 20,
-        current: 1,
-      },
-      aggregatedTs: null,
-      statementFingerprintIds: null,
-      transactionStats: null,
-      transactionFingerprintId: null,
-    };
-    const stateFromHistory = this.getStateFromHistory();
-    this.state = merge(this.state, stateFromHistory);
-  }
+): React.ReactElement {
+  const {
+    columns: userSelectedColumnsToShow,
+    timeScale: propsTimeScale,
+    limit: propsLimit,
+    reqSortSetting: propsReqSortSetting,
+    filters: propsFilters,
+    search,
+    sortSetting,
+    requestTime,
+    onTimeScaleChange,
+    onChangeLimit: propsOnChangeLimit,
+    onChangeReqSort: propsOnChangeReqSort,
+    onColumnsChange,
+    onFilterChange,
+    onSearchComplete,
+    onSortingChange,
+    onApplySearchCriteria,
+    onRequestTimeChange,
+    history,
+  } = props;
 
-  getStateFromHistory = (): Partial<TState> => {
-    const {
+  const { isTenant } = useContext(ClusterDetailsContext);
+
+  const {
+    data: txnData,
+    error: txnError,
+    isLoading: txnLoading,
+  } = useCombinedTransactionStats(
+    propsTimeScale,
+    propsLimit,
+    propsReqSortSetting,
+  );
+  const { nodeRegionsByID: nodeRegions } = useNodes();
+  const { data: userRoles } = useUserSQLRoles();
+  const { reset: resetSQLStats } = useResetSQLStats();
+
+  const hasAdminRole = userRoles?.roles?.includes("ADMIN") ?? false;
+  const oldestDataAvailable = txnData?.oldest_aggregated_ts_returned;
+
+  // Local state for search criteria (can differ from props until applied)
+  const [localTimeScale, setLocalTimeScale] =
+    useState<TimeScale>(propsTimeScale);
+  const [localLimit, setLocalLimit] = useState<number>(propsLimit);
+  const [localReqSortSetting, setLocalReqSortSetting] =
+    useState<SqlStatsSortType>(propsReqSortSetting);
+
+  const [filters, setFilters] = useState<Filters | undefined>(() => {
+    // Initialize filters from query string
+    const latestFilter = handleFiltersFromQueryString(
       history,
-      search,
-      sortSetting,
-      filters,
-      onSearchComplete,
-      onSortingChange,
+      propsFilters,
       onFilterChange,
-    } = this.props;
-    const searchParams = new URLSearchParams(history.location.search);
+    );
+    return latestFilter;
+  });
 
-    // Search query.
+  const [pagination, setPagination] = useState<ISortedTablePagination>({
+    pageSize: 50,
+    current: 1,
+  });
+
+  // Refs to hold latest values for mount effects, avoiding stale closures
+  // while preserving "run once on mount" semantics.
+  const onSearchCompleteRef = useRef(onSearchComplete);
+  const searchRef = useRef(search);
+  const sortSettingRef = useRef(sortSetting);
+  const onSortingChangeRef = useRef(onSortingChange);
+  const propsTimeScaleRef = useRef(propsTimeScale);
+  const onTimeScaleChangeRef = useRef(onTimeScaleChange);
+  const onRequestTimeChangeRef = useRef(onRequestTimeChange);
+
+  // Keep refs up to date on each render
+  onSearchCompleteRef.current = onSearchComplete;
+  searchRef.current = search;
+  sortSettingRef.current = sortSetting;
+  onSortingChangeRef.current = onSortingChange;
+  propsTimeScaleRef.current = propsTimeScale;
+  onTimeScaleChangeRef.current = onTimeScaleChange;
+  onRequestTimeChangeRef.current = onRequestTimeChange;
+
+  // Initialize search from query string
+  useEffect(() => {
+    const searchParams = new URLSearchParams(history.location.search);
     const searchQuery = searchParams.get("q") || undefined;
-    if (onSearchComplete && searchQuery && search != searchQuery) {
-      onSearchComplete(searchQuery);
+    if (
+      onSearchCompleteRef.current &&
+      searchQuery &&
+      searchRef.current !== searchQuery
+    ) {
+      onSearchCompleteRef.current(searchQuery);
     }
 
-    // Sort Settings.
+    // Sort Settings from query string
     handleSortSettingFromQueryString(
       "Transactions",
       history.location.search,
-      sortSetting,
-      onSortingChange,
+      sortSettingRef.current,
+      onSortingChangeRef.current,
     );
+  }, [history.location.search]);
 
-    // Filters.
-    const latestFilter = handleFiltersFromQueryString(
-      history,
-      filters,
-      onFilterChange,
-    );
+  // componentDidMount equivalent — validate timeScale on mount.
+  useEffect(() => {
+    // In case the user selected an option not available on this page,
+    // force a selection of a valid option.
+    const ts = getValidOption(propsTimeScaleRef.current, timeScale1hMinOptions);
+    if (ts !== propsTimeScaleRef.current) {
+      setLocalTimeScale(ts);
+      if (onTimeScaleChangeRef.current) {
+        onTimeScaleChangeRef.current(ts);
+      }
+      onRequestTimeChangeRef.current(moment());
+    }
+  }, []);
 
-    return {
-      filters: latestFilter,
-    };
-  };
-
-  refreshData = (): void => {
-    const req = statementsRequestFromProps(this.props);
-    this.props.refreshData(req);
-  };
-
-  componentDidMount(): void {
-    this.refreshData();
-  }
-
-  updateQueryParams(): void {
-    const { history, search, sortSetting } = this.props;
+  // Update query params when relevant state changes
+  useEffect(() => {
     const tab = "Transactions";
 
-    // Search.
+    // Search
     const searchParams = new URLSearchParams(history.location.search);
     const currentTab = searchParams.get("tab") || "";
     const searchQueryString = searchParams.get("q") || "";
-    if (currentTab === tab && search && search != searchQueryString) {
-      syncHistory(
-        {
-          q: search,
-        },
-        history,
-      );
+    if (currentTab === tab && search && search !== searchQueryString) {
+      syncHistory({ q: search }, history);
     }
 
-    // Filters.
-    updateFiltersQueryParamsOnTab(tab, this.state.filters, history);
+    // Filters
+    updateFiltersQueryParamsOnTab(tab, filters, history);
 
-    // Sort Setting.
+    // Sort Setting
     updateSortSettingQueryParamsOnTab(
       tab,
       sortSetting,
+      { ascending: false, columnTitle: "executionCount" },
+      history,
+    );
+  }, [history, search, filters, sortSetting]);
+
+  const onChangeSortSetting = useCallback(
+    (ss: SortSetting): void => {
+      syncHistory(
+        {
+          ascending: ss.ascending.toString(),
+          columnTitle: ss.columnTitle,
+        },
+        history,
+      );
+      if (onSortingChange) {
+        onSortingChange("Transactions", ss.columnTitle, ss.ascending);
+      }
+    },
+    [history, onSortingChange],
+  );
+
+  const isSortSettingSameAsReqSort = (): boolean => {
+    return getSortColumn(propsReqSortSetting) === sortSetting.columnTitle;
+  };
+
+  const onChangePage = (current: number, pageSize: number): void => {
+    setPagination(prev => ({ ...prev, current, pageSize }));
+  };
+
+  const resetPagination = (): void => {
+    setPagination(prev => ({
+      current: 1,
+      pageSize: prev.pageSize,
+    }));
+  };
+
+  const onClearSearchField = (): void => {
+    if (onSearchComplete) {
+      onSearchComplete("");
+    }
+    syncHistory({ q: undefined }, history);
+  };
+
+  const onSubmitSearchField = (searchValue: string): void => {
+    if (onSearchComplete) {
+      onSearchComplete(searchValue);
+    }
+    resetPagination();
+    syncHistory({ q: searchValue }, history);
+  };
+
+  const onSubmitFilters = (newFilters: Filters): void => {
+    if (onFilterChange) {
+      onFilterChange(newFilters);
+    }
+    setFilters(newFilters);
+    resetPagination();
+    syncHistory(
       {
-        ascending: false,
-        columnTitle: "executionCount",
+        app: newFilters.app,
+        timeNumber: newFilters.timeNumber,
+        timeUnit: newFilters.timeUnit,
+        regions: newFilters.regions,
+        nodes: newFilters.nodes,
       },
       history,
     );
-  }
+  };
 
-  componentDidUpdate(): void {
-    this.updateQueryParams();
-    this.refreshData();
-  }
-
-  onChangeSortSetting = (ss: SortSetting): void => {
-    syncHistory(
-      {
-        ascending: ss.ascending.toString(),
-        columnTitle: ss.columnTitle,
-      },
-      this.props.history,
-    );
-    if (this.props.onSortingChange) {
-      this.props.onSortingChange("Transactions", ss.columnTitle, ss.ascending);
+  const onClearFilters = (): void => {
+    if (onFilterChange) {
+      onFilterChange(defaultFilters);
     }
-  };
-
-  onChangePage = (current: number): void => {
-    const { pagination } = this.state;
-    this.setState({ pagination: { ...pagination, current } });
-  };
-
-  resetPagination = (): void => {
-    this.setState((prevState: TState) => {
-      return {
-        pagination: {
-          current: 1,
-          pageSize: prevState.pagination.pageSize,
-        },
-      };
-    });
-  };
-
-  onClearSearchField = (): void => {
-    if (this.props.onSearchComplete) {
-      this.props.onSearchComplete("");
-    }
-    syncHistory(
-      {
-        q: undefined,
-      },
-      this.props.history,
-    );
-  };
-
-  onSubmitSearchField = (search: string): void => {
-    if (this.props.onSearchComplete) {
-      this.props.onSearchComplete(search);
-    }
-    this.resetPagination();
-    syncHistory(
-      {
-        q: search,
-      },
-      this.props.history,
-    );
-  };
-
-  onSubmitFilters = (filters: Filters): void => {
-    if (this.props.onFilterChange) {
-      this.props.onFilterChange(filters);
-    }
-
-    this.setState({
-      filters: filters,
-    });
-    this.resetPagination();
-    syncHistory(
-      {
-        app: filters.app,
-        timeNumber: filters.timeNumber,
-        timeUnit: filters.timeUnit,
-        regions: filters.regions,
-        nodes: filters.nodes,
-      },
-      this.props.history,
-    );
-  };
-
-  onClearFilters = (): void => {
-    if (this.props.onFilterChange) {
-      this.props.onFilterChange(defaultFilters);
-    }
-
-    this.setState({
-      filters: {
-        ...defaultFilters,
-      },
-    });
-    this.resetPagination();
+    setFilters({ ...defaultFilters });
+    resetPagination();
     syncHistory(
       {
         app: undefined,
@@ -319,275 +344,327 @@ export class TransactionsPage extends React.Component<
         regions: undefined,
         nodes: undefined,
       },
-      this.props.history,
+      history,
     );
   };
 
-  handleDetails = (transaction?: TransactionInfo): void => {
-    this.setState({
-      statementFingerprintIds:
-        transaction?.stats_data?.statement_fingerprint_ids,
-      transactionStats: transaction?.stats_data?.stats,
-      aggregatedTs: transaction?.stats_data?.aggregated_ts,
-      transactionFingerprintId:
-        transaction?.stats_data?.transaction_fingerprint_id,
-    });
+  const changeTimeScale = (ts: TimeScale): void => {
+    setLocalTimeScale(ts);
   };
 
-  lastReset = (): Date => {
-    return new Date(Number(this.props.data?.last_reset.seconds) * 1000);
+  const onChangeLimit = (newLimit: number): void => {
+    setLocalLimit(newLimit);
   };
 
-  changeDateRange = (start: Moment, end: Moment): void => {
-    if (this.props.onDateRangeChange) {
-      this.props.onDateRangeChange(start, end);
+  const onChangeReqSort = (newSort: SqlStatsSortType): void => {
+    setLocalReqSortSetting(newSort);
+  };
+
+  const updateRequestParams = useCallback((): void => {
+    if (propsLimit !== localLimit) {
+      propsOnChangeLimit(localLimit);
     }
+
+    if (propsReqSortSetting !== localReqSortSetting) {
+      propsOnChangeReqSort(localReqSortSetting);
+    }
+
+    if (propsTimeScale !== localTimeScale) {
+      if (onTimeScaleChange) {
+        onTimeScaleChange(localTimeScale);
+      }
+    }
+
+    if (onApplySearchCriteria) {
+      onApplySearchCriteria(
+        localTimeScale,
+        localLimit,
+        getSortLabel(localReqSortSetting, "Transaction"),
+      );
+    }
+    onRequestTimeChange(moment());
+
+    const ss: SortSetting = {
+      ascending: false,
+      columnTitle: getSortColumn(localReqSortSetting),
+    };
+    onChangeSortSetting(ss);
+  }, [
+    propsLimit,
+    localLimit,
+    propsReqSortSetting,
+    localReqSortSetting,
+    propsTimeScale,
+    localTimeScale,
+    propsOnChangeLimit,
+    propsOnChangeReqSort,
+    onTimeScaleChange,
+    onApplySearchCriteria,
+    onRequestTimeChange,
+    onChangeSortSetting,
+  ]);
+
+  // Track when we need to call updateRequestParams after sort setting change
+  const pendingUpdateRef = useRef(false);
+  const prevLocalReqSortSettingRef = useRef(localReqSortSetting);
+
+  useEffect(() => {
+    if (
+      pendingUpdateRef.current &&
+      prevLocalReqSortSettingRef.current !== localReqSortSetting
+    ) {
+      pendingUpdateRef.current = false;
+      updateRequestParams();
+    }
+    prevLocalReqSortSettingRef.current = localReqSortSetting;
+  }, [localReqSortSetting, updateRequestParams]);
+
+  const onUpdateSortSettingAndApplyWithPending = useCallback((): void => {
+    const newReqSort = getReqSortColumn(sortSetting.columnTitle);
+    pendingUpdateRef.current = true;
+    setLocalReqSortSetting(newReqSort);
+  }, [sortSetting.columnTitle]);
+
+  const hasReqSortOption = (): boolean => {
+    let found = false;
+    Object.values(SqlStatsSortOptions).forEach(option => {
+      const optionString = isString(option) ? option : getSortColumn(option);
+      if (optionString === sortSetting.columnTitle) {
+        found = true;
+      }
+    });
+    return found;
   };
 
-  resetTime = (): void => {
-    // Default range to reset to is one hour ago.
-    this.changeDateRange(
-      moment.utc().subtract(1, "hours"),
-      moment.utc().add(1, "minute"),
+  const renderTransactions = (): React.ReactElement => {
+    const data = txnData;
+    const internalAppNamePrefix = data?.internal_app_name_prefix || "";
+    const statements = data?.statements || [];
+
+    // We apply the search filters and app name filters prior to aggregating across Node IDs
+    const { transactions: filteredTransactions, activeFilters } =
+      filterTransactions(
+        searchTransactionsData(search, data?.transactions || [], statements),
+        filters,
+        internalAppNamePrefix,
+        statements,
+        nodeRegions,
+        isTenant,
+      );
+
+    const appNames = getTrxAppFilterOptions(
+      data?.transactions || [],
+      internalAppNamePrefix,
+    );
+
+    const transactionsToDisplay: TransactionInfo[] = filteredTransactions.map(
+      t => ({
+        stats_data: t.stats_data,
+        regions: generateRegion(t, statements),
+        regionNodes: generateRegionNode(t, statements, nodeRegions),
+      }),
+    );
+    const { current, pageSize } = pagination;
+    const hasData = data?.transactions?.length > 0;
+    const isUsedFilter = search?.length > 0;
+
+    const nodes = Object.keys(nodeRegions)
+      .map(n => Number(n))
+      .sort();
+
+    const regions = unique(
+      isTenant
+        ? flatMap(statements, statement => statement.stats.regions)
+        : nodes.map(node => nodeRegions[node.toString()]),
+    ).sort();
+
+    // Creates a list of all possible columns
+    const columns = makeTransactionsColumns(
+      transactionsToDisplay,
+      statements,
+      isTenant,
+      search,
+    )
+      .filter(c => !(c.name === "regions" && regions.length < 2))
+      .filter(c => !(c.name === "regionNodes" && regions.length < 2))
+      .filter(c => !(isTenant && c.hideIfTenant));
+
+    // Create list of SelectOptions
+    const tableColumns = columns
+      .filter(c => !c.alwaysShow)
+      .map(
+        (c): SelectOption => ({
+          label: getLabel(c.name as StatisticTableColumnKeys, "transaction"),
+          value: c.name,
+          isSelected: isSelectedColumn(userSelectedColumnsToShow, c),
+        }),
+      );
+
+    // List of all columns that will be displayed based on the column selection.
+    const displayColumns = columns.filter(c =>
+      isSelectedColumn(userSelectedColumnsToShow, c),
+    );
+
+    const sortSettingLabel = getSortLabel(propsReqSortSetting, "Transaction");
+    const showSortWarning =
+      !isSortSettingSameAsReqSort() &&
+      hasReqSortOption() &&
+      transactionsToDisplay.length === propsLimit;
+
+    return (
+      <>
+        <h5 className={`${commonStyles("base-heading")} ${cx("margin-top")}`}>
+          {`Results - Top ${propsLimit} Transaction Fingerprints by ${sortSettingLabel}`}
+        </h5>
+        <section className={cx("filter-area")}>
+          <PageConfig className={cx("float-left")}>
+            <PageConfigItem>
+              <Search
+                onSubmit={onSubmitSearchField}
+                onClear={onClearSearchField}
+                defaultValue={search}
+              />
+            </PageConfigItem>
+            <PageConfigItem>
+              <Filter
+                onSubmitFilters={onSubmitFilters}
+                appNames={appNames}
+                regions={regions}
+                timeLabel={"Transaction fingerprint"}
+                nodes={nodes.map(n => "n" + n)}
+                activeFilters={activeFilters}
+                filters={filters}
+                showRegions={regions.length > 1}
+                showNodes={!isTenant && nodes.length > 1}
+              />
+            </PageConfigItem>
+            <PageConfigItem>
+              <ColumnsSelector
+                options={tableColumns}
+                onSubmitColumns={onColumnsChange}
+              />
+            </PageConfigItem>
+          </PageConfig>
+          <PageConfig className={cx("float-right")}>
+            <PageConfigItem>
+              <p className={timeScaleStylesCx("time-label")}>
+                <TimeScaleLabel
+                  timeScale={propsTimeScale}
+                  requestTime={moment(requestTime)}
+                  oldestDataTime={
+                    oldestDataAvailable &&
+                    TimestampToMoment(oldestDataAvailable)
+                  }
+                />
+                {", "}
+                <ResultsPerPageLabel
+                  pagination={{
+                    ...pagination,
+                    total: transactionsToDisplay.length,
+                  }}
+                  pageName={"Transactions"}
+                  search={search}
+                />
+              </p>
+            </PageConfigItem>
+            {hasAdminRole && (
+              <PageConfigItem
+                className={`${commonStyles("separator")} ${cx(
+                  "reset-btn-area",
+                )} `}
+              >
+                <ClearStats
+                  resetSQLStats={resetSQLStats}
+                  tooltipType="transaction"
+                />
+              </PageConfigItem>
+            )}
+          </PageConfig>
+        </section>
+        <section className={statisticsClasses.tableContainerClass}>
+          <SelectedFilters
+            filters={filters}
+            onRemoveFilter={onSubmitFilters}
+            onClearFilters={onClearFilters}
+          />
+          {showSortWarning && (
+            <InlineAlert
+              intent="warning"
+              title={getSubsetWarning(
+                "transaction",
+                propsLimit,
+                sortSettingLabel,
+                sortSetting.columnTitle as StatisticTableColumnKeys,
+                onUpdateSortSettingAndApplyWithPending,
+              )}
+              className={cx("margin-bottom")}
+            />
+          )}
+          <TransactionsTable
+            columns={displayColumns}
+            transactions={transactionsToDisplay}
+            sortSetting={sortSetting}
+            onChangeSortSetting={onChangeSortSetting}
+            pagination={pagination}
+            renderNoResult={
+              <EmptyTransactionsPlaceholder
+                transactionView={TransactionViewType.FINGERPRINTS}
+                isEmptySearchResults={hasData && isUsedFilter}
+              />
+            }
+          />
+        </section>
+        <Pagination
+          pageSize={pageSize}
+          current={current}
+          total={transactionsToDisplay.length}
+          onChange={onChangePage}
+          onShowSizeChange={onChangePage}
+        />
+      </>
     );
   };
 
-  renderTransactionsList(): React.ReactElement {
-    return (
+  const longLoadingMessage = (
+    <Delayed delay={STATS_LONG_LOADING_DURATION}>
+      <InlineAlert
+        intent="info"
+        title="If the selected time interval contains a large amount of data, this page might take a few minutes to load."
+      />
+    </Delayed>
+  );
+
+  return (
+    <>
+      <SearchCriteria
+        searchType="Transaction"
+        topValue={localLimit}
+        byValue={localReqSortSetting}
+        currentScale={localTimeScale}
+        onChangeTop={onChangeLimit}
+        onChangeBy={onChangeReqSort}
+        onChangeTimeScale={changeTimeScale}
+        onApply={updateRequestParams}
+      />
       <div className={cx("table-area")}>
         <Loading
-          loading={!this.props?.data}
-          error={this.props?.error}
-          render={() => {
-            const {
-              data,
-              resetSQLStats,
-              nodeRegions,
-              isTenant,
-              onColumnsChange,
-              columns: userSelectedColumnsToShow,
-              sortSetting,
-              search,
-            } = this.props;
-            const { pagination, filters } = this.state;
-            const { statements, internal_app_name_prefix } = data;
-            const appNames = getTrxAppFilterOptions(
-              data.transactions,
-              internal_app_name_prefix,
-            );
-            // If the cluster is a tenant cluster we don't show info
-            // about nodes/regions.
-            const nodes = isTenant
-              ? []
-              : Object.keys(nodeRegions)
-                  .map(n => Number(n))
-                  .sort();
-            const regions = isTenant
-              ? []
-              : unique(nodes.map(node => nodeRegions[node.toString()])).sort();
-            // We apply the search filters and app name filters prior to aggregating across Node IDs
-            // in order to match what's done on the Statements Page.
-            //
-            // TODO(davidh): Once the redux layer for TransactionsPage is added to this repo,
-            // extract this work into the selector
-            const {
-              transactions: filteredTransactions,
-              activeFilters,
-            } = filterTransactions(
-              searchTransactionsData(search, data.transactions, statements),
-              filters,
-              internal_app_name_prefix,
-              statements,
-              nodeRegions,
-              isTenant,
-            );
-            const transactionsToDisplay: TransactionInfo[] = aggregateAcrossNodeIDs(
-              filteredTransactions,
-              statements,
-            ).map(t => ({
-              stats_data: t.stats_data,
-              node_id: t.node_id,
-              regionNodes: isTenant
-                ? []
-                : generateRegionNode(t, statements, nodeRegions),
-            }));
-            const { current, pageSize } = pagination;
-            const hasData = data.transactions?.length > 0;
-            const isUsedFilter = search?.length > 0;
-
-            // Creates a list of all possible columns,
-            // hiding nodeRegions if is not multi-region and
-            // hiding columns that won't be displayed for tenants.
-            const columns = makeTransactionsColumns(
-              transactionsToDisplay,
-              statements,
-              isTenant,
-              this.handleDetails,
-              search,
-            )
-              .filter(c => !(c.name === "regionNodes" && regions.length < 2))
-              .filter(c => !(isTenant && c.hideIfTenant));
-
-            const isColumnSelected = (c: ColumnDescriptor<TransactionInfo>) => {
-              return (
-                ((userSelectedColumnsToShow === null ||
-                  userSelectedColumnsToShow === undefined) &&
-                  c.showByDefault !== false) || // show column if list of visible was never defined and can be show by default.
-                (userSelectedColumnsToShow !== null &&
-                  userSelectedColumnsToShow.includes(c.name)) || // show column if user changed its visibility.
-                c.alwaysShow === true // show column if alwaysShow option is set explicitly.
-              );
-            };
-
-            // Iterate over all available columns and create list of SelectOptions with initial selection
-            // values based on stored user selections in local storage and default column configs.
-            // Columns that are set to alwaysShow are filtered from the list.
-            const tableColumns = columns
-              .filter(c => !c.alwaysShow)
-              .map(
-                (c): SelectOption => ({
-                  label: getLabel(
-                    c.name as StatisticTableColumnKeys,
-                    "transaction",
-                  ),
-                  value: c.name,
-                  isSelected: isColumnSelected(c),
-                }),
-              );
-
-            // List of all columns that will be displayed based on the column selection.
-            const displayColumns = columns.filter(c => isColumnSelected(c));
-
-            return (
-              <>
-                <PageConfig>
-                  <PageConfigItem>
-                    <Search
-                      onSubmit={this.onSubmitSearchField as any}
-                      onClear={this.onClearSearchField}
-                      defaultValue={search}
-                      placeholder={"Search Transactions"}
-                    />
-                  </PageConfigItem>
-                  <PageConfigItem>
-                    <Filter
-                      onSubmitFilters={this.onSubmitFilters}
-                      appNames={appNames}
-                      regions={regions}
-                      nodes={nodes.map(n => "n" + n)}
-                      activeFilters={activeFilters}
-                      filters={filters}
-                      showRegions={regions.length > 1}
-                      showNodes={nodes.length > 1}
-                    />
-                  </PageConfigItem>
-                  <PageConfigItem>
-                    <DateRange
-                      start={this.props.dateRange[0]}
-                      end={this.props.dateRange[1]}
-                      onSubmit={this.changeDateRange}
-                    />
-                  </PageConfigItem>
-                  <PageConfigItem>
-                    <button
-                      className={cx("reset-btn")}
-                      onClick={this.resetTime}
-                    >
-                      reset time
-                    </button>
-                  </PageConfigItem>
-                  <PageConfigItem className={commonStyles("separator")}>
-                    <ClearStats
-                      resetSQLStats={resetSQLStats}
-                      tooltipType="transaction"
-                    />
-                  </PageConfigItem>
-                </PageConfig>
-                <section className={statisticsClasses.tableContainerClass}>
-                  <ColumnsSelector
-                    options={tableColumns}
-                    onSubmitColumns={onColumnsChange}
-                  />
-                  <TableStatistics
-                    pagination={pagination}
-                    search={search}
-                    totalCount={transactionsToDisplay.length}
-                    arrayItemName="transactions"
-                    activeFilters={activeFilters}
-                    onClearFilters={this.onClearFilters}
-                  />
-                  <TransactionsTable
-                    columns={displayColumns}
-                    transactions={transactionsToDisplay}
-                    sortSetting={sortSetting}
-                    onChangeSortSetting={this.onChangeSortSetting}
-                    pagination={pagination}
-                    renderNoResult={
-                      <EmptyTransactionsPlaceholder
-                        isEmptySearchResults={hasData && isUsedFilter}
-                      />
-                    }
-                  />
-                </section>
-                <Pagination
-                  pageSize={pageSize}
-                  current={current}
-                  total={transactionsToDisplay.length}
-                  onChange={this.onChangePage}
-                />
-              </>
-            );
-          }}
+          loading={txnLoading}
+          page={"transactions"}
+          error={txnError}
+          render={() => renderTransactions()}
           renderError={() =>
-            SQLActivityError({
+            LoadingError({
               statsType: "transactions",
+              error: txnError,
+              sourceTables: txnData?.txns_source_table && [
+                txnData?.txns_source_table,
+                txnData?.stmts_source_table,
+              ],
             })
           }
         />
+        {txnLoading && longLoadingMessage}
       </div>
-    );
-  }
-
-  renderTransactionDetails(): React.ReactElement {
-    const { statements } = this.props.data;
-    const {
-      aggregatedTs,
-      statementFingerprintIds,
-      transactionStats,
-      transactionFingerprintId,
-    } = this.state;
-    const transactionDetails =
-      statementFingerprintIds &&
-      getStatementsByFingerprintIdAndTime(
-        statementFingerprintIds,
-        aggregatedTs,
-        statements,
-      );
-    const transactionText =
-      statementFingerprintIds &&
-      statementFingerprintIdsToText(statementFingerprintIds, statements);
-
-    return (
-      <TransactionDetails
-        transactionText={transactionText}
-        statements={transactionDetails}
-        nodeRegions={this.props.nodeRegions}
-        transactionStats={transactionStats}
-        lastReset={this.lastReset()}
-        handleDetails={this.handleDetails}
-        error={this.props.error}
-        resetSQLStats={this.props.resetSQLStats}
-        isTenant={this.props.isTenant}
-        transactionFingerprintId={transactionFingerprintId}
-      />
-    );
-  }
-
-  render(): React.ReactElement {
-    const { statementFingerprintIds } = this.state;
-    const renderTxDetailsView = !!statementFingerprintIds;
-    return renderTxDetailsView
-      ? this.renderTransactionDetails()
-      : this.renderTransactionsList();
-  }
+    </>
+  );
 }

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package urlcheck
 
@@ -109,7 +104,7 @@ func chompUnbalanced(left, right rune, s string) string {
 }
 
 func checkURL(client *http.Client, url string) error {
-	resp, err := client.Head(url)
+	resp, err := httpDo(client, "HEAD", url)
 	if err != nil {
 		return err
 	}
@@ -126,7 +121,7 @@ func checkURL(client *http.Client, url string) error {
 	// for any other error. Still, we link to several misconfigured servers that
 	// return 403 Forbidden or 500 Internal Server Error for HEAD requests, but
 	// not for GET requests.
-	resp, err = client.Get(url)
+	resp, err = httpDo(client, "GET", url)
 	if err != nil {
 		return err
 	}
@@ -139,6 +134,21 @@ func checkURL(client *http.Client, url string) error {
 	}
 
 	return errors.Newf("%s", errors.Safe(resp.Status))
+}
+
+// N.B. we set custom User-Agent header to avoid being blocked.
+// E.g., as of 08/25/25, Wikipedia blocks default UAs [1].
+// [1] https://phabricator.wikimedia.org/T400119
+func httpDo(c *http.Client, requestType string, url string) (resp *http.Response, err error) {
+	req, err := http.NewRequest(requestType, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// This UA seems to comply with Wikipedia's policy [1].
+	// [1] https://foundation.wikimedia.org/wiki/Policy:Wikimedia_Foundation_User-Agent_Policy
+	req.Header.Set("User-Agent", "MyGoApplication/1.0 (https://example.com/myapp; myapp@example.com)")
+
+	return c.Do(req)
 }
 
 func checkURLWithRetries(client *http.Client, url string) error {

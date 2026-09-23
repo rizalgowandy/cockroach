@@ -10,8 +10,9 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/uncertainty",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverpb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/hlc",
     ],
 )
@@ -24,8 +25,9 @@ go_test(
     ],
     embed = [":uncertainty"],
     deps = [
+        "//pkg/kv/kvpb",
         "//pkg/kv/kvserver/kvserverpb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "@com_github_stretchr_testify//require",

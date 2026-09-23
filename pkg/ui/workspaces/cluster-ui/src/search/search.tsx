@@ -1,81 +1,83 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { Button, Form, Input } from "antd";
-import { InputProps } from "antd/lib/input";
-import classNames from "classnames/bind";
 import {
   Cancel as CancelIcon,
   Search as SearchIcon,
 } from "@cockroachlabs/icons";
+import { Button, Input, ConfigProvider } from "antd";
+import classNames from "classnames/bind";
+import noop from "lodash/noop";
+import React, { useState } from "react";
+
+import { crlTheme } from "../antdTheme";
+
 import styles from "./search.module.scss";
 
+import type { InputProps } from "antd/lib/input";
+
 interface ISearchProps {
-  onSubmit: (search: string) => void;
+  onSubmit?: (search: string) => void;
+  onChange?: (value: string) => void;
   onClear?: () => void;
   defaultValue?: string;
+  placeholder?: string;
+  suffix?: boolean;
 }
 
-interface ISearchState {
-  value: string;
-  submitted: boolean;
-  submit?: boolean;
-}
-
-type TSearchProps = ISearchProps & InputProps;
+type TSearchProps = ISearchProps &
+  Omit<InputProps, "onSubmit" | "defaultValue" | "placeholder" | "onChange">; // Omit shadowed props by ISearchProps type.
 
 const cx = classNames.bind(styles);
 
-export class Search extends React.Component<TSearchProps, ISearchState> {
-  state = {
-    value: this.props.defaultValue || "",
-    submitted: false,
-  };
+export function Search({
+  onSubmit = noop,
+  onChange = noop,
+  onClear = noop,
+  defaultValue = "",
+  placeholder = "Search Statements",
+  suffix,
+  ...inputProps
+}: TSearchProps): React.ReactElement {
+  const [value, setValue] = useState(defaultValue || "");
+  const [submitted, setSubmitted] = useState(false);
 
-  onSubmit = (e: React.SyntheticEvent) => {
-    e && e.preventDefault();
-    const { value } = this.state;
-    const { onSubmit } = this.props;
+  const handleSubmit = (e: React.SyntheticEvent): void => {
+    e?.preventDefault && e.preventDefault();
     onSubmit(value);
     if (value.length > 0) {
-      this.setState({
-        submitted: true,
-      });
+      setSubmitted(true);
     }
   };
 
-  onChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const value: string = event.target.value;
-    const submitted = value.length === 0;
-    this.setState(
-      { value, submitted },
-      () => submitted && this.onSubmit(event),
-    );
+  const handleChange = (event: React.ChangeEvent<HTMLInputElement>): void => {
+    const newValue: string = event.target.value;
+    const isSubmitted = newValue.length === 0;
+    onChange(newValue);
+    setValue(newValue);
+    setSubmitted(isSubmitted);
   };
 
-  onClear = () => {
-    const { onClear } = this.props;
-    this.setState({ value: "", submit: false });
+  const handleClear = (): void => {
+    setValue("");
+    setSubmitted(false);
     onClear();
   };
 
-  renderSuffix = () => {
-    const { value, submitted } = this.state;
+  const renderSuffix = (): React.ReactElement => {
+    if (suffix === false) {
+      return null;
+    }
     if (value.length > 0) {
       if (submitted) {
         return (
           <Button
-            onClick={this.onClear}
-            type="default"
+            onClick={handleClear}
+            type="text"
             className={cx("clear-search")}
+            size="small"
           >
             <CancelIcon className={cx("suffix-icon")} />
           </Button>
@@ -83,9 +85,10 @@ export class Search extends React.Component<TSearchProps, ISearchState> {
       }
       return (
         <Button
-          type="default"
-          htmlType="submit"
+          type="text"
+          onClick={handleSubmit}
           className={cx("submit-search")}
+          size="small"
         >
           Enter
         </Button>
@@ -94,25 +97,19 @@ export class Search extends React.Component<TSearchProps, ISearchState> {
     return null;
   };
 
-  render() {
-    const { value, submitted } = this.state;
-    const { onClear, ...inputProps } = this.props;
-    const className = submitted ? cx("submitted") : "";
-
-    return (
-      <Form onSubmit={this.onSubmit} className={cx("search-form")}>
-        <Form.Item>
-          <Input
-            className={className}
-            placeholder="Search Statements"
-            onChange={this.onChange}
-            prefix={<SearchIcon className={cx("prefix-icon")} />}
-            suffix={this.renderSuffix()}
-            value={value}
-            {...inputProps}
-          />
-        </Form.Item>
-      </Form>
-    );
-  }
+  return (
+    <ConfigProvider theme={crlTheme}>
+      <Input
+        className={cx("root")}
+        onChange={handleChange}
+        onPressEnter={handleSubmit}
+        prefix={<SearchIcon className={cx("prefix-icon")} />}
+        suffix={renderSuffix()}
+        value={value}
+        placeholder={placeholder}
+        size={"small"}
+        {...inputProps}
+      />
+    </ConfigProvider>
+  );
 }

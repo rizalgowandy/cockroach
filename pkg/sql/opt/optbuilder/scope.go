@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -18,17 +13,20 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // scope is used for the build process and maintains the variables that have
@@ -68,8 +66,9 @@ type scope struct {
 	// distinctOnCols records the DISTINCT ON columns by ID.
 	distinctOnCols opt.ColSet
 
-	// extraCols contains columns specified by the ORDER BY or DISTINCT ON clauses
-	// which don't appear in cols.
+	// extraCols contains columns specified by the ORDER BY or DISTINCT ON
+	// clauses, or needed by FOR UPDATE or FOR SHARE clauses, which don't appear
+	// in cols.
 	extraCols []scopeColumn
 
 	// expr is the SQL node built with this scope.
@@ -98,6 +97,10 @@ type scope struct {
 	// scopes.
 	ctes map[string]*cteSource
 
+	// alias is set to the last data source alias we've come across, if we
+	// are processing a data source with an alias.
+	alias *tree.AliasClause
+
 	// context is the current context in the SQL query (e.g., "SELECT" or
 	// "HAVING"). It is used for error messages and to identify scoping errors
 	// (e.g., aggregates are not allowed in the FROM clause of their own query
@@ -106,6 +109,31 @@ type scope struct {
 
 	// atRoot is whether we are currently at a root context.
 	atRoot bool
+
+	// checkMaxParamOrd is true if attempts to resolve a routine parameter via
+	// ordinal reference syntax (like $1) should be checked against the
+	// maxParamOrd.
+	checkMaxParamOrd bool
+
+	// maxParamOrd, if set, is the maximum 1-based ordinal reference that can be
+	// used to resolve a routine parameter. This is used to selectively allow
+	// references to internally-generated parameters such as those for PL/pgSQL
+	// sub-routines.
+	maxParamOrd int
+
+	// plpgsqlVarRef, if non-nil, is invoked by VisitPre to give PL/pgSQL a
+	// chance to rewrite a ColumnItem of the form `var.field` (where `var` is
+	// a composite-typed PL/pgSQL variable) into a parenthesized field-access
+	// expression. This mirrors the post-column-ref hook Postgres installs in
+	// pl_comp.c. It returns:
+	//   - rewritten != nil: the rewritten expression to use in place of the
+	//     ColumnItem.
+	//   - rewritten == nil && knownVar: the prefix names a PL/pgSQL variable
+	//     in scope, but no field-access rewrite applies (e.g. the variable is
+	//     scalar or no field with the given name exists).
+	//   - rewritten == nil && !knownVar: the prefix does not name any
+	//     PL/pgSQL variable in scope.
+	plpgsqlVarRef func(*tree.ColumnItem) (rewritten tree.Expr, knownVar bool)
 }
 
 // exprKind is used to represent the kind of the current expression in the
@@ -124,12 +152,16 @@ const (
 	exprKindOffset
 	exprKindOn
 	exprKindOrderBy
+	exprKindOrderByDelete
+	exprKindOrderByUpdate
 	exprKindReturning
 	exprKindSelect
+	exprKindStoreID
 	exprKindValues
 	exprKindWhere
 	exprKindWindowFrameStart
 	exprKindWindowFrameEnd
+	exprKindWhen
 )
 
 var exprKindName = [...]string{
@@ -144,12 +176,16 @@ var exprKindName = [...]string{
 	exprKindOffset:            "OFFSET",
 	exprKindOn:                "ON",
 	exprKindOrderBy:           "ORDER BY",
+	exprKindOrderByDelete:     "ORDER BY in DELETE",
+	exprKindOrderByUpdate:     "ORDER BY in UPDATE",
 	exprKindReturning:         "RETURNING",
 	exprKindSelect:            "SELECT",
+	exprKindStoreID:           "RELOCATE STORE ID",
 	exprKindValues:            "VALUES",
 	exprKindWhere:             "WHERE",
 	exprKindWindowFrameStart:  "WINDOW FRAME START",
 	exprKindWindowFrameEnd:    "WINDOW FRAME END",
+	exprKindWhen:              "WHEN",
 }
 
 func (k exprKind) String() string {
@@ -194,6 +230,20 @@ func (s *scope) replace() *scope {
 	return r
 }
 
+// findPLpgSQLVarRef walks the parent scope chain and returns the nearest
+// non-nil plpgsqlVarRef hook, or nil if no ancestor has one installed. This
+// mirrors how findFuncArgCol locates checkMaxParamOrd / maxParamOrd by
+// traversing parents, so the hook only has to be set on the scope passed to
+// buildSQLExpr / buildSQLStatement and not propagated through push/replace.
+func (s *scope) findPLpgSQLVarRef() func(*tree.ColumnItem) (tree.Expr, bool) {
+	for ; s != nil; s = s.parent {
+		if s.plpgsqlVarRef != nil {
+			return s.plpgsqlVarRef
+		}
+	}
+	return nil
+}
+
 // appendColumnsFromScope adds newly bound variables to this scope.
 // The expressions in the new columns are reset to nil.
 func (s *scope) appendColumnsFromScope(src *scope) {
@@ -203,28 +253,6 @@ func (s *scope) appendColumnsFromScope(src *scope) {
 	// the new scope.
 	for i := l; i < len(s.cols); i++ {
 		s.cols[i].scalar = nil
-	}
-}
-
-// appendOrdinaryColumnsFromTable adds all non-mutation and non-system columns from the
-// given table metadata to this scope.
-func (s *scope) appendOrdinaryColumnsFromTable(tabMeta *opt.TableMeta, alias *tree.TableName) {
-	tab := tabMeta.Table
-	if s.cols == nil {
-		s.cols = make([]scopeColumn, 0, tab.ColumnCount())
-	}
-	for i, n := 0, tab.ColumnCount(); i < n; i++ {
-		tabCol := tab.Column(i)
-		if tabCol.Kind() != cat.Ordinary {
-			continue
-		}
-		s.cols = append(s.cols, scopeColumn{
-			name:       scopeColName(tabCol.ColName()),
-			table:      *alias,
-			typ:        tabCol.DatumType(),
-			id:         tabMeta.MetaID.ColumnID(i),
-			visibility: columnVisibility(tabCol.Visibility()),
-		})
 	}
 }
 
@@ -315,6 +343,22 @@ func (s *scope) getColumn(col opt.ColumnID) *scopeColumn {
 	return nil
 }
 
+// getColumnWithIDAndReferenceName returns the scopeColumn with the given id and
+// reference name (either in cols or extraCols).
+func (s *scope) getColumnWithIDAndReferenceName(col opt.ColumnID, refName tree.Name) *scopeColumn {
+	for i := range s.cols {
+		if s.cols[i].id == col && s.cols[i].name.MatchesReferenceName(refName) {
+			return &s.cols[i]
+		}
+	}
+	for i := range s.extraCols {
+		if s.extraCols[i].id == col && s.cols[i].name.MatchesReferenceName(refName) {
+			return &s.extraCols[i]
+		}
+	}
+	return nil
+}
+
 // getColumnForTableOrdinal returns the column with a specific tableOrdinal
 // value, or nil if it doesn't exist.
 func (s *scope) getColumnForTableOrdinal(tabOrd int) *scopeColumn {
@@ -342,12 +386,15 @@ func (s *scope) makeOrderingChoice() props.OrderingChoice {
 }
 
 // makePhysicalProps constructs physical properties using the columns in the
-// scope for presentation and s.ordering for required ordering.
+// scope for presentation and s.ordering for required ordering. The distribution
+// is determined based on the locality of the gateway node, since data must
+// always be returned to the gateway.
 func (s *scope) makePhysicalProps() *physical.Required {
 	p := &physical.Required{
 		Presentation: s.makePresentation(),
 	}
 	p.Ordering.FromOrdering(s.ordering)
+	p.Distribution.FromLocality(s.builder.evalCtx.Locality)
 	return p
 }
 
@@ -386,8 +433,9 @@ func (s *scope) makePresentationWithHiddenCols() physical.Presentation {
 }
 
 // walkExprTree walks the given expression and performs name resolution,
-// replaces unresolved column names with columnProps, and replaces subqueries
-// with typed subquery structs.
+// replaces unresolved column names with columnProps, replaces subqueries with
+// typed subquery structs, and replaces placeholders with scope columns when
+// they are references to function arguments.
 func (s *scope) walkExprTree(expr tree.Expr) tree.Expr {
 	// TODO(peter): The caller should specify the desired number of columns. This
 	// is needed when a subquery is used by an UPDATE statement.
@@ -458,12 +506,23 @@ func (s *scope) resolveAndRequireType(expr tree.Expr, desired *types.T) tree.Typ
 	if err != nil {
 		panic(err)
 	}
-	return tree.ReType(s.ensureNullType(texpr, desired), desired)
+	return s.ensureNullType(texpr, desired)
+}
+
+// resolveTypeAndReject converts the given expr to a tree.TypedExpr. It is
+// similar to resolveType, but also allows tree.SemaRejectFlags to be provided.
+// The original tree.SemaRejectFlags are restored before the function returns.
+func (s *scope) resolveTypeAndReject(
+	expr tree.Expr, desired *types.T, context string, flags tree.SemaRejectFlags,
+) tree.TypedExpr {
+	defer s.builder.semaCtx.Properties.Restore(s.builder.semaCtx.Properties)
+	s.builder.semaCtx.Properties.Require(context, flags)
+	return s.resolveType(expr, desired)
 }
 
 // ensureNullType tests the type of the given expression. If types.Unknown, then
 // ensureNullType wraps the expression in a CAST to the desired type (assuming
-// it is not types.Any). types.Unknown is a special type used for null values,
+// it is not types.AnyElement). types.Unknown is a special type used for null values,
 // and can be cast to any other type.
 func (s *scope) ensureNullType(texpr tree.TypedExpr, desired *types.T) tree.TypedExpr {
 	if desired.Family() != types.AnyFamily && texpr.ResolvedType().Family() == types.UnknownFamily {
@@ -522,6 +581,17 @@ func (s *scope) colList() opt.ColList {
 	return colList
 }
 
+// forEachColWithExtras applies the given function to every column in the scope,
+// including extra columns.
+func (s *scope) forEachColWithExtras(fn func(col *scopeColumn)) {
+	for i := range s.cols {
+		fn(&s.cols[i])
+	}
+	for i := range s.extraCols {
+		fn(&s.extraCols[i])
+	}
+}
+
 // hasSameColumns returns true if this scope has the same columns
 // as the other scope.
 //
@@ -535,7 +605,8 @@ func (s *scope) hasSameColumns(other *scope) bool {
 }
 
 // removeHiddenCols removes hidden columns from the scope (and moves them to
-// extraCols, in case they are referenced by ORDER BY or DISTINCT ON).
+// extraCols, in case they are referenced by ORDER BY or DISTINCT ON or needed
+// by FOR UPDATE or FOR SHARE).
 func (s *scope) removeHiddenCols() {
 	n := 0
 	for i := range s.cols {
@@ -551,12 +622,6 @@ func (s *scope) removeHiddenCols() {
 	s.cols = s.cols[:n]
 }
 
-// isAnonymousTable returns true if the table name of the first column
-// in this scope is empty.
-func (s *scope) isAnonymousTable() bool {
-	return len(s.cols) > 0 && s.cols[0].table.ObjectName == ""
-}
-
 // setTableAlias qualifies the names of all columns in this scope with the
 // given alias name, as if they were part of a table with that name. If the
 // alias is the empty string, then setTableAlias removes any existing column
@@ -570,7 +635,7 @@ func (s *scope) setTableAlias(alias tree.Name) {
 
 // See (*scope).findExistingCol.
 func findExistingColInList(
-	expr tree.TypedExpr, cols []scopeColumn, allowSideEffects bool, evalCtx *tree.EvalContext,
+	expr tree.TypedExpr, cols []scopeColumn, allowSideEffects bool, evalCtx *eval.Context,
 ) *scopeColumn {
 	exprStr := symbolicExprStr(expr)
 	for i := range cols {
@@ -578,7 +643,10 @@ func findExistingColInList(
 		if expr == col {
 			return col
 		}
-		if exprStr == col.getExprStr() {
+		// TODO(yuzefovich): using equivalent type condition is not exactly the
+		// right thing to do. See discussion on PR #165860 the right fix in the
+		// type-checker.
+		if col.typ.Equivalent(expr.ResolvedType()) && exprStr == col.getExprStr() {
 			if allowSideEffects || col.scalar == nil {
 				return col
 			}
@@ -594,7 +662,9 @@ func findExistingColInList(
 
 // findExistingCol finds the given expression among the bound variables in this
 // scope. Returns nil if the expression is not found (or an expression is found
-// but it has side-effects and allowSideEffects is false).
+// but it has side-effects and allowSideEffects is false). The types of the
+// given expression and the bound variable need to be equivalent.
+//
 // If a column is found and we are tracking view dependencies, we add the column
 // to the view dependencies since it means this column is being referenced.
 func (s *scope) findExistingCol(expr tree.TypedExpr, allowSideEffects bool) *scopeColumn {
@@ -605,10 +675,33 @@ func (s *scope) findExistingCol(expr tree.TypedExpr, allowSideEffects bool) *sco
 	return col
 }
 
+// findFuncArgCol returns the column that represents a function argument and has
+// an ordinal matching the given 0-based ordinal position. If such a column is
+// not found in the current scope, ancestor scopes are successively searched.
+// If no matching function argument column is found, nil is returned.
+func (s *scope) findFuncArgCol(ord int) *scopeColumn {
+	for ; s != nil; s = s.parent {
+		if s.checkMaxParamOrd && ord > (s.maxParamOrd-1) {
+			// Referencing this function parameter by ordinal is not allowed. Subtract
+			// 1 from maxParamOrd to convert it to a 0-based ordinal.
+			return nil
+		}
+		for i := range s.cols {
+			col := &s.cols[i]
+			if col.funcParamReferencedBy(ord) {
+				return col
+			}
+		}
+	}
+	return nil
+}
+
 // startAggFunc is called when the builder starts building an aggregate
 // function. It is used to disallow nested aggregates and ensure that a
 // grouping error is not called on the aggregate arguments. For example:
-//   SELECT max(v) FROM kv GROUP BY k
+//
+//	SELECT max(v) FROM kv GROUP BY k
+//
 // should not throw an error, even though v is not a grouping column.
 // Non-grouping columns are allowed inside aggregate functions.
 //
@@ -784,7 +877,7 @@ func (s *scope) FindSourceProvidingColumn(
 			if candidate.ambiguous {
 				return nil, nil, -1, s.newAmbiguousColumnError(colName, candidate.matchClass)
 			}
-			return &col.table, col, int(col.id), nil
+			return &col.table, col, int(col.id), col.resolveErr
 		}
 		// No matches in this scope; proceed to the parent scope.
 	}
@@ -924,8 +1017,10 @@ func (s *scope) Resolve(
 	inScope := srcMeta.(*scope)
 	for i := range inScope.cols {
 		col := &inScope.cols[i]
-		if col.name.MatchesReferenceName(colName) && sourceNameMatches(*prefix, col.table) {
-			return col, nil
+		if col.visibility != inaccessible &&
+			col.name.MatchesReferenceName(colName) &&
+			sourceNameMatches(*prefix, col.table) {
+			return col, col.resolveErr
 		}
 	}
 
@@ -975,7 +1070,13 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 	case *tree.ColumnItem:
 		colI, resolveErr := colinfo.ResolveColumnItem(s.builder.ctx, s, t)
 		if resolveErr != nil {
+			// It may be a reference to a table, e.g. SELECT tbl FROM tbl.
+			// Attempt to resolve as a TupleStar.
 			if sqlerrors.IsUndefinedColumnError(resolveErr) {
+				if s.context == exprKindWhen {
+					panic(errors.WithHint(resolveErr,
+						"column references in a trigger WHEN clause must be prefixed with NEW or OLD"))
+				}
 				// Attempt to resolve as columnname.*, which allows items
 				// such as SELECT row_to_json(tbl_name) FROM tbl_name to work.
 				return func() (bool, tree.Expr) {
@@ -983,13 +1084,81 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 					return s.VisitPre(columnNameAsTupleStar(string(t.ColumnName)))
 				}()
 			}
+			if sqlerrors.IsUndefinedRelationError(resolveErr) && t.TableName.Object() != "" {
+				// If we are inside a PL/pgSQL routine and the prefix names a
+				// composite-typed PL/pgSQL variable, rewrite `var.field` into
+				// the equivalent parenthesized field access `(var).field`.
+				// Postgres does this via a post-column-ref parser hook in
+				// pl_comp.c; we reproduce the behavior here.
+				var plpgsqlKnownVar bool
+				if hook := s.findPLpgSQLVarRef(); hook != nil {
+					rewritten, knownVar := hook(t)
+					if rewritten != nil {
+						return true, rewritten
+					}
+					plpgsqlKnownVar = knownVar
+				}
+				// If the prefix already names a PL/pgSQL variable in scope, the
+				// "surround in parentheses" hint would be misleading: parens
+				// won't help when the variable is scalar or lacks the named
+				// field. Postgres also emits no hint in this case. Fall through
+				// to the bare error below.
+				if !plpgsqlKnownVar {
+					// Attempt to resolve as columnname.fieldname in order to provide a more
+					// helpful error message.
+					_, sourceResolveErr := colinfo.ResolveColumnItem(
+						s.builder.ctx, s, &tree.ColumnItem{ColumnName: tree.Name(t.TableName.Object())},
+					)
+					if sourceResolveErr == nil {
+						panic(errors.WithHint(resolveErr,
+							"to access a field of a composite-typed column, "+
+								"surround the column name in parentheses: (colName).fieldName"))
+					}
+				}
+			}
 			panic(resolveErr)
+		}
+		// Check for an ambiguous reference: SQL name resolution succeeded,
+		// but a same-named composite PL/pgSQL variable in scope would also
+		// resolve. Postgres raises ERRCODE_AMBIGUOUS_COLUMN here (see
+		// plpgsql_post_column_ref in pl_comp.c).
+		if t.TableName != nil && t.TableName.Object() != "" {
+			if hook := s.findPLpgSQLVarRef(); hook != nil {
+				if rewritten, _ := hook(t); rewritten != nil {
+					panic(errors.WithDetail(
+						pgerror.Newf(pgcode.AmbiguousColumn,
+							"column reference %q is ambiguous", tree.AsStringWithFlags(t, tree.FmtSimple)),
+						"It could refer to either a PL/pgSQL variable or a table column.",
+					))
+				}
+			}
 		}
 		return false, colI.(*scopeColumn)
 
+	case *tree.Placeholder:
+		// Replace placeholders that are references to function arguments with
+		// scope columns that represent those arguments.
+		//
+		// NOTE: This likely won't work if we want to allow PREPARE statements
+		// within user-defined function bodies. We'll need to avoid replacing
+		// placeholders that are prepared statement parameters.
+		if col := s.findFuncArgCol(int(t.Idx)); col != nil {
+			return false, col
+		}
+
 	case *tree.FuncExpr:
-		def, err := t.Func.Resolve(s.builder.semaCtx.SearchPath)
+		semaCtx := s.builder.semaCtx
+		// TODO(mgartner): At this point the the function has not been type checked
+		// and resolved to one overload yet. Consider refactoring this so that it
+		// can handle overloads with the same name.
+		def, err := t.Func.Resolve(s.builder.ctx, semaCtx.SearchPath, semaCtx.FunctionResolver)
 		if err != nil {
+			if t.InCall && errors.Is(err, tree.ErrRoutineUndefined) {
+				panic(errors.WithHint(
+					pgerror.Newf(pgcode.UndefinedFunction, "procedure %s does not exist", t.Func),
+					"No procedure matches the given name.",
+				))
+			}
 			panic(err)
 		}
 
@@ -1025,7 +1194,7 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 
 	case *tree.ComparisonExpr:
 		switch t.Operator.Symbol {
-		case tree.In, tree.NotIn, tree.Any, tree.Some, tree.All:
+		case treecmp.In, treecmp.NotIn, treecmp.Any, treecmp.Some, treecmp.All:
 			if sub, ok := t.Right.(*tree.Subquery); ok {
 				// Copy the Comparison expression so that the tree isn't mutated.
 				copy := *t
@@ -1065,7 +1234,7 @@ func (s *scope) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
 // the FROM clause to a lateral cross join between the input and a Zip of all
 // the srfs in the s.srfs slice. See Builder.buildProjectSet in srfs.go for
 // more details.
-func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf {
+func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.ResolvedFunctionDefinition) *srf {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
 	// context.
@@ -1075,7 +1244,7 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 		tree.RejectAggregates|tree.RejectWindowApplications|tree.RejectNestedGenerators)
 
 	expr := f.Walk(s)
-	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.AnyElement)
 	if err != nil {
 		panic(err)
 	}
@@ -1103,17 +1272,31 @@ func (s *scope) replaceSRF(f *tree.FuncExpr, def *tree.FunctionDefinition) *srf 
 
 // isOrderedSetAggregate returns if the input function definition is an
 // ordered-set aggregate, and the overridden function definition if so.
-func isOrderedSetAggregate(def *tree.FunctionDefinition) (*tree.FunctionDefinition, bool) {
+func isOrderedSetAggregate(
+	def *tree.ResolvedFunctionDefinition,
+) (*tree.ResolvedFunctionDefinition, bool) {
 	// The impl functions are private because they should never be run directly.
 	// Thus, they need to be marked as non-private before using them.
-	switch def {
-	case tree.FunDefs["percentile_disc"]:
-		newDef := *tree.FunDefs["percentile_disc_impl"]
-		newDef.Private = false
+
+	// FunctionProperties exist in function definitions and their overloads, so we
+	// unset all private fields here.
+	unsetPrivate := func(def *tree.ResolvedFunctionDefinition) {
+		for i := range def.Overloads {
+			newOverload := def.Overloads[i]
+			newOverload.Private = false
+			def.Overloads[i] = newOverload
+		}
+	}
+	switch def.Name {
+	case "percentile_disc":
+		builtinDef := tree.ResolvedBuiltinFuncDefs[catconstants.PgCatalogName+"."+"percentile_disc_impl"]
+		newDef := *builtinDef
+		unsetPrivate(&newDef)
 		return &newDef, true
-	case tree.FunDefs["percentile_cont"]:
-		newDef := *tree.FunDefs["percentile_cont_impl"]
-		newDef.Private = false
+	case "percentile_cont":
+		builtinDef := tree.ResolvedBuiltinFuncDefs[catconstants.PgCatalogName+"."+"percentile_cont_impl"]
+		newDef := *builtinDef
+		unsetPrivate(&newDef)
 		return &newDef, true
 	}
 	return def, false
@@ -1130,7 +1313,7 @@ func isOrderedSetAggregate(def *tree.FunctionDefinition) (*tree.FunctionDefiniti
 // the variables referenced by the aggregate (or the current scope if the
 // aggregate references no variables). The aggOutScope.groupby.aggs slice is
 // used later by the Builder to build aggregations in the aggregation scope.
-func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
+func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.ResolvedFunctionDefinition) tree.Expr {
 	f, def = s.replaceCount(f, def)
 
 	// We need to save and restore the previous value of the field in
@@ -1162,7 +1345,7 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 		copy(fCopy.Exprs, oldExprs)
 
 		// Add implicit column to the input expressions.
-		fCopy.Exprs = append(fCopy.Exprs, s.resolveType(fCopy.OrderBy[0].Expr, types.Any))
+		fCopy.Exprs = append(fCopy.Exprs, s.resolveType(fCopy.OrderBy[0].Expr, types.AnyElement))
 	}
 
 	expr := fCopy.Walk(s)
@@ -1181,14 +1364,14 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 			defer func() { s.builder.semaCtx.Properties.Restore(oldProps) }()
 
 			s.builder.semaCtx.Properties.Require("FILTER", tree.RejectSpecial)
-			_, err := tree.TypeCheck(s.builder.ctx, expr.(*tree.FuncExpr).Filter, s.builder.semaCtx, types.Any)
+			_, err := tree.TypeCheck(s.builder.ctx, expr.(*tree.FuncExpr).Filter, s.builder.semaCtx, types.AnyElement)
 			if err != nil {
 				panic(err)
 			}
 		}()
 	}
 
-	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.AnyElement)
 	if err != nil {
 		panic(err)
 	}
@@ -1200,7 +1383,7 @@ func (s *scope) replaceAggregate(f *tree.FuncExpr, def *tree.FunctionDefinition)
 
 	private := memo.FunctionPrivate{
 		Name:       def.Name,
-		Properties: &def.FunctionProperties,
+		Properties: &f.ResolvedOverload().FunctionProperties,
 		Overload:   f.ResolvedOverload(),
 	}
 
@@ -1238,7 +1421,7 @@ func (s *scope) constructWindowDef(def tree.WindowDef) tree.WindowDef {
 	}
 }
 
-func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
+func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.ResolvedFunctionDefinition) tree.Expr {
 	f, def = s.replaceCount(f, def)
 
 	if err := tree.CheckIsWindowOrAgg(def); err != nil {
@@ -1260,7 +1443,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 
 	expr := fCopy.Walk(s)
 
-	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.AnyElement)
 	if err != nil {
 		panic(err)
 	}
@@ -1273,20 +1456,15 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 	// We will be performing type checking on expressions from PARTITION BY and
 	// ORDER BY clauses below, and we need the semantic context to know that we
 	// are in a window function. InWindowFunc is updated when type checking
-	// FuncExpr above, but it is reset upon returning from that, so we need to do
-	// this update manually.
-	defer func(ctx *tree.SemaContext, prevWindow bool) {
-		ctx.Properties.Derived.InWindowFunc = prevWindow
-	}(
-		s.builder.semaCtx,
-		s.builder.semaCtx.Properties.Derived.InWindowFunc,
-	)
-	s.builder.semaCtx.Properties.Derived.InWindowFunc = true
+	// FuncExpr above, but it is reset upon returning from that, so we need to
+	// do this update manually.
+	defer s.builder.semaCtx.Properties.Ancestors.PopTo(s.builder.semaCtx.Properties.Ancestors)
+	s.builder.semaCtx.Properties.Ancestors.Push(tree.WindowFuncAncestor)
 
 	oldPartitions := f.WindowDef.Partitions
 	f.WindowDef.Partitions = make(tree.Exprs, len(oldPartitions))
 	for i, e := range oldPartitions {
-		typedExpr := s.resolveType(e, types.Any)
+		typedExpr := s.resolveType(e, types.AnyElement)
 		f.WindowDef.Partitions[i] = typedExpr
 	}
 
@@ -1297,7 +1475,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 		if ord.OrderType != tree.OrderByColumn {
 			panic(errOrderByIndexInWindow)
 		}
-		typedExpr := s.resolveType(ord.Expr, types.Any)
+		typedExpr := s.resolveType(ord.Expr, types.AnyElement)
 		ord.Expr = typedExpr
 		f.WindowDef.OrderBy[i] = &ord
 	}
@@ -1312,7 +1490,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 		FuncExpr: f,
 		def: memo.FunctionPrivate{
 			Name:       def.Name,
-			Properties: &def.FunctionProperties,
+			Properties: &f.ResolvedOverload().FunctionProperties,
 			Overload:   f.ResolvedOverload(),
 		},
 	}
@@ -1340,7 +1518,7 @@ func (s *scope) replaceWindowFn(f *tree.FuncExpr, def *tree.FunctionDefinition) 
 
 // replaceSQLFn replaces a tree.SQLClass function with a sqlFnInfo struct. See
 // comments above tree.SQLClass and sqlFnInfo for details.
-func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tree.Expr {
+func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.ResolvedFunctionDefinition) tree.Expr {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
 	// context.
@@ -1349,7 +1527,7 @@ func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tre
 	s.builder.semaCtx.Properties.Require("SQL function", tree.RejectSpecial)
 
 	expr := f.Walk(s)
-	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.Any)
+	typedFunc, err := tree.TypeCheck(s.builder.ctx, expr, s.builder.semaCtx, types.AnyElement)
 	if err != nil {
 		panic(err)
 	}
@@ -1367,7 +1545,7 @@ func (s *scope) replaceSQLFn(f *tree.FuncExpr, def *tree.FunctionDefinition) tre
 		FuncExpr: f,
 		def: memo.FunctionPrivate{
 			Name:       def.Name,
-			Properties: &def.FunctionProperties,
+			Properties: &f.ResolvedOverload().FunctionProperties,
 			Overload:   f.ResolvedOverload(),
 		},
 		args: args,
@@ -1387,11 +1565,11 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 	startBound, endBound := bounds.StartBound, bounds.EndBound
 	var requiredType *types.T
 	switch frame.Mode {
-	case tree.ROWS:
+	case treewindow.ROWS:
 		// In ROWS mode, offsets must be non-null, non-negative integers. Non-nullity
 		// and non-negativity will be checked later.
 		requiredType = types.Int
-	case tree.RANGE:
+	case treewindow.RANGE:
 		// In RANGE mode, offsets must be non-null and non-negative datums of a type
 		// dependent on the type of the ordering column. Non-nullity and
 		// non-negativity will be checked later.
@@ -1406,14 +1584,14 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 			if !types.IsAdditiveType(requiredType) {
 				return pgerror.Newf(pgcode.Windowing,
 					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s",
-					log.Safe(requiredType))
+					redact.Safe(requiredType))
 			}
 			if types.IsDateTimeType(requiredType) {
 				// Spec: for datetime ordering columns, the required type is an 'interval'.
 				requiredType = types.Interval
 			}
 		}
-	case tree.GROUPS:
+	case treewindow.GROUPS:
 		if len(windowDef.OrderBy) == 0 {
 			return pgerror.Newf(pgcode.Windowing, "GROUPS mode requires an ORDER BY clause")
 		}
@@ -1440,8 +1618,8 @@ func analyzeWindowFrame(s *scope, windowDef *tree.WindowDef) error {
 
 // replaceCount replaces count(*) with count_rows().
 func (s *scope) replaceCount(
-	f *tree.FuncExpr, def *tree.FunctionDefinition,
-) (*tree.FuncExpr, *tree.FunctionDefinition) {
+	f *tree.FuncExpr, def *tree.ResolvedFunctionDefinition,
+) (*tree.FuncExpr, *tree.ResolvedFunctionDefinition) {
 	if len(f.Exprs) != 1 {
 		return f, def
 	}
@@ -1455,6 +1633,9 @@ func (s *scope) replaceCount(
 	}
 	f.Exprs[0] = vn
 
+	// It is ok to use string equality here, even if there is a UDF named
+	// "count" because UDFs cannot be aggregate functions. This code path is
+	// only executed for aggregate functions.
 	if strings.EqualFold(def.Name, "count") && f.Type == 0 {
 		if _, ok := vn.(tree.UnqualifiedStar); ok {
 			if f.Filter != nil {
@@ -1469,7 +1650,7 @@ func (s *scope) replaceCount(
 				e := &cpy
 				e.Exprs = tree.Exprs{tree.DBoolTrue}
 
-				newDef, err := e.Func.Resolve(s.builder.semaCtx.SearchPath)
+				newDef, err := e.Func.Resolve(s.builder.ctx, s.builder.semaCtx.SearchPath, nil /* resolver */)
 				if err != nil {
 					panic(err)
 				}
@@ -1491,11 +1672,11 @@ func (s *scope) replaceCount(
 			}
 			// We call TypeCheck to fill in FuncExpr internals. This is a fixed
 			// expression; we should not hit an error here.
-			semaCtx := tree.MakeSemaContext()
-			if _, err := e.TypeCheck(s.builder.ctx, &semaCtx, types.Any); err != nil {
+			semaCtx := tree.MakeSemaContext(nil /* resolver */)
+			if _, err := e.TypeCheck(s.builder.ctx, &semaCtx, types.AnyElement); err != nil {
 				panic(err)
 			}
-			newDef, err := e.Func.Resolve(s.builder.semaCtx.SearchPath)
+			newDef, err := e.Func.Resolve(s.builder.ctx, s.builder.semaCtx.SearchPath, nil /* resolver */)
 			if err != nil {
 				panic(err)
 			}
@@ -1550,11 +1731,6 @@ func (*scope) VisitPost(expr tree.Expr) tree.Expr {
 // type for any IndexedVars.
 var _ tree.IndexedVarContainer = &scope{}
 
-// IndexedVarEval is part of the IndexedVarContainer interface.
-func (s *scope) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	panic(errors.AssertionFailedf("unimplemented: scope.IndexedVarEval"))
-}
-
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
 func (s *scope) IndexedVarResolvedType(idx int) *types.T {
 	if idx >= len(s.cols) {
@@ -1566,11 +1742,6 @@ func (s *scope) IndexedVarResolvedType(idx int) *types.T {
 			"invalid column ordinal: @%d", idx+1))
 	}
 	return s.cols[idx].typ
-}
-
-// IndexedVarNodeFormatter is part of the IndexedVarContainer interface.
-func (s *scope) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
-	panic(errors.AssertionFailedf("unimplemented: scope.IndexedVarNodeFormatter"))
 }
 
 // newAmbiguousSourceError returns an error with a helpful error message to be

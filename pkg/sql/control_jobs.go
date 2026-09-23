@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,63 +9,42 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
 )
 
 type controlJobsNode struct {
-	rows          planNode
-	desiredStatus jobs.Status
-	numRows       int
+	singleInputPlanNode
+	rowsAffectedOutputHelper
+	desiredStatus jobs.State
 	reason        string
 }
 
-var jobCommandToDesiredStatus = map[tree.JobCommand]jobs.Status{
-	tree.CancelJob: jobs.StatusCanceled,
-	tree.ResumeJob: jobs.StatusRunning,
-	tree.PauseJob:  jobs.StatusPaused,
+var jobCommandToDesiredStatus = map[tree.JobCommand]jobs.State{
+	tree.CancelJob: jobs.StateCanceled,
+	tree.ResumeJob: jobs.StateRunning,
+	tree.PauseJob:  jobs.StatePaused,
 }
 
-// FastPathResults implements the planNodeFastPath inteface.
-func (n *controlJobsNode) FastPathResults() (int, bool) {
-	return n.numRows, true
-}
-
+// startExec implements the planNode interface.
 func (n *controlJobsNode) startExec(params runParams) error {
-	userIsAdmin, err := params.p.HasAdminRole(params.ctx)
-	if err != nil {
-		return err
-	}
-
-	// users can pause/resume/cancel jobs owned by non-admin users
-	// if they have CONTROLJOBS privilege.
-	if !userIsAdmin {
-		hasControlJob, err := params.p.HasRoleOption(params.ctx, roleoption.CONTROLJOB)
-		if err != nil {
-			return err
-		}
-
-		if !hasControlJob {
-			return pgerror.Newf(pgcode.InsufficientPrivilege,
-				"user %s does not have %s privilege",
-				params.p.User(), roleoption.CONTROLJOB)
-		}
-	}
-
-	if n.desiredStatus != jobs.StatusPaused && len(n.reason) > 0 {
+	if n.desiredStatus != jobs.StatePaused && len(n.reason) > 0 {
 		return errors.AssertionFailedf("status %v is not %v and thus does not support a reason %v",
-			n.desiredStatus, jobs.StatusPaused, n.reason)
+			n.desiredStatus, jobs.StatePaused, n.reason)
 	}
 
 	reg := params.p.ExecCfg().JobRegistry
+	globalPrivileges, err := jobsauth.GetGlobalJobPrivileges(params.ctx, params.p)
+	if err != nil {
+		return err
+	}
 	for {
-		ok, err := n.rows.Next(params)
+		ok, err := n.input.Next(params)
 		if err != nil {
 			return err
 		}
@@ -78,68 +52,60 @@ func (n *controlJobsNode) startExec(params runParams) error {
 			break
 		}
 
-		jobIDDatum := n.rows.Values()[0]
+		jobIDDatum := n.input.Values()[0]
 		if jobIDDatum == tree.DNull {
 			continue
 		}
 
-		jobID, ok := tree.AsDInt(jobIDDatum)
+		jobID, ok := jobIDDatum.(*tree.DInt)
 		if !ok {
 			return errors.AssertionFailedf("%q: expected *DInt, found %T", jobIDDatum, jobIDDatum)
 		}
 
-		job, err := reg.LoadJobWithTxn(params.ctx, jobspb.JobID(jobID), params.p.Txn())
-		if err != nil {
-			return err
-		}
-
-		if job != nil {
-			owner := job.Payload().UsernameProto.Decode()
-
-			if !userIsAdmin {
-				ok, err := params.p.UserHasAdminRole(params.ctx, owner)
-				if err != nil {
+		//lint:ignore SA1019 TODO: migrate to job_info_storage.go API
+		if err := reg.DeprecatedUpdateJobWithTxn(params.ctx, jobspb.JobID(*jobID), params.p.InternalSQLTxn(),
+			func(txn isql.Txn, md jobs.DeprecatedJobMetadata, ju *jobs.DeprecatedJobUpdater) error {
+				if err := jobsauth.Authorize(params.ctx, params.p,
+					md.ID, md.Payload.UsernameProto.Decode(), jobsauth.ControlAccess, globalPrivileges); err != nil {
 					return err
 				}
-
-				// Owner is an admin but user executing the statement is not.
-				if ok {
-					return pgerror.Newf(pgcode.InsufficientPrivilege,
-						"only admins can control jobs owned by other admins")
+				switch n.desiredStatus {
+				case jobs.StatePaused:
+					return ju.PauseRequested(params.ctx, txn, md, n.reason)
+				case jobs.StateRunning:
+					return ju.Unpaused(params.ctx, md)
+				case jobs.StateCanceled:
+					return ju.CancelRequested(params.ctx, md)
+				default:
+					return errors.AssertionFailedf("unhandled status %v", n.desiredStatus)
 				}
-			}
-		}
-
-		switch n.desiredStatus {
-		case jobs.StatusPaused:
-			err = reg.PauseRequested(params.ctx, params.p.txn, jobspb.JobID(jobID), n.reason)
-		case jobs.StatusRunning:
-			err = reg.Unpause(params.ctx, params.p.txn, jobspb.JobID(jobID))
-		case jobs.StatusCanceled:
-			err = reg.CancelRequested(params.ctx, params.p.txn, jobspb.JobID(jobID))
-		default:
-			err = errors.AssertionFailedf("unhandled status %v", n.desiredStatus)
-		}
-		if err != nil {
+			}); err != nil {
 			return err
 		}
-		n.numRows++
+
+		n.incAffectedRows()
 	}
 	switch n.desiredStatus {
-	case jobs.StatusPaused:
+	case jobs.StatePaused:
 		telemetry.Inc(sqltelemetry.SchemaJobControlCounter("pause"))
-	case jobs.StatusRunning:
+	case jobs.StateRunning:
 		telemetry.Inc(sqltelemetry.SchemaJobControlCounter("resume"))
-	case jobs.StatusCanceled:
+	case jobs.StateCanceled:
 		telemetry.Inc(sqltelemetry.SchemaJobControlCounter("cancel"))
 	}
 	return nil
 }
 
-func (*controlJobsNode) Next(runParams) (bool, error) { return false, nil }
+// Next implements the planNode interface.
+func (n *controlJobsNode) Next(_ runParams) (bool, error) {
+	return n.next(), nil
+}
 
-func (*controlJobsNode) Values() tree.Datums { return nil }
+// Values implements the planNode interface.
+func (n *controlJobsNode) Values() tree.Datums {
+	return n.values()
+}
 
 func (n *controlJobsNode) Close(ctx context.Context) {
-	n.rows.Close(ctx)
+	n.input.Close(ctx)
 }

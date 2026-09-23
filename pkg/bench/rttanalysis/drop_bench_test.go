@@ -1,17 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
 import "testing"
 
+// BenchmarkDropRole is a benchmark for the DROP ROLE statement.
+// benchmark-ci: benchtime=20x
 func BenchmarkDropRole(b *testing.B) { reg.Run(b) }
 func init() {
 	reg.Register("DropRole", []RoundTripBenchTestCase{
@@ -33,6 +30,8 @@ func init() {
 	})
 }
 
+// BenchmarkDropTable is a benchmark for the DROP TABLE statement.
+// benchmark-ci: benchtime=20x
 func BenchmarkDropTable(b *testing.B) { reg.Run(b) }
 func init() {
 	reg.Register("DropTable", []RoundTripBenchTestCase{
@@ -54,6 +53,8 @@ func init() {
 	})
 }
 
+// BenchmarkDropView is a benchmark for the DROP VIEW statement.
+// benchmark-ci: benchtime=20x
 func BenchmarkDropView(b *testing.B) { reg.Run(b) }
 func init() {
 	reg.Register("DropView", []RoundTripBenchTestCase{
@@ -80,6 +81,8 @@ CREATE VIEW vx3 AS SELECT x FROM t;`,
 	})
 }
 
+// BenchmarkDropSequence is a benchmark for the DROP SEQUENCE statement.
+// benchmark-ci: benchtime=20x
 func BenchmarkDropSequence(b *testing.B) { reg.Run(b) }
 func init() {
 	reg.Register("DropSequence", []RoundTripBenchTestCase{
@@ -101,6 +104,8 @@ func init() {
 	})
 }
 
+// BenchmarkDropDatabase is a benchmark for the DROP DATABASE statement.
+// benchmark-ci: benchtime=20x
 func BenchmarkDropDatabase(b *testing.B) { reg.Run(b) }
 func init() {
 	reg.Register("DropDatabase", []RoundTripBenchTestCase{

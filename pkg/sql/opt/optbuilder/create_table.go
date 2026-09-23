@@ -1,19 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -24,24 +19,22 @@ import (
 // statement.
 func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outScope *scope) {
 	b.DisableMemoReuse = true
-	isTemp := resolveTemporaryStatus(&ct.Table, ct.Persistence)
+	isTemp := resolveTemporaryStatus(ct.Table.ObjectNamePrefix, ct.Persistence)
 	if isTemp {
 		// Postgres allows using `pg_temp` as an alias for the session specific temp
 		// schema. In PG, the following are equivalent:
 		// CREATE TEMP TABLE t <=> CREATE TABLE pg_temp.t <=> CREATE TEMP TABLE pg_temp.t
 		//
-		// The temporary schema is created the first time a session creates
-		// a temporary object, so it is possible to use `pg_temp` in a fully
-		// qualified name when the temporary schema does not exist. To allow this,
-		// we explicitly set the SchemaName to `public` for temporary tables, as
-		// the public schema is guaranteed to exist. This ensures the FQN can be
-		// resolved correctly.
-		// TODO(solon): Once it is possible to drop schemas, it will no longer be
-		// safe to set the schema name to `public`, as it may have been dropped.
-		ct.Table.ObjectNamePrefix.SchemaName = tree.PublicSchemaName
+		// The temporary schema is created the first time a session creates a
+		// temporary object, so it is possible to use `pg_temp` in a fully qualified
+		// name when the temporary schema does not exist. To allow the name to be
+		// resolved, we unset the explicitly named schema and set the Persistence to
+		// temporary.
+		ct.Table.ObjectNamePrefix.SchemaName = ""
+		ct.Table.ObjectNamePrefix.ExplicitSchema = false
 		ct.Persistence = tree.PersistenceTemporary
 	}
-	sch, resName := b.resolveSchemaForCreate(&ct.Table)
+	sch, resName := b.resolveSchemaForCreateTable(&ct.Table, isTemp)
 	ct.Table.ObjectNamePrefix = resName
 	schID := b.factory.Metadata().AddSchema(sch)
 
@@ -81,7 +74,7 @@ func (b *Builder) buildCreateTable(ct *tree.CreateTable, inScope *scope) (outSco
 		input = outScope.expr
 		if !ct.AsHasUserSpecifiedPrimaryKey() {
 			// Synthesize rowid column, and append to end of column list.
-			props, overloads := builtins.GetBuiltinProperties("unique_rowid")
+			props, overloads := builtinsregistry.GetBuiltinProperties("unique_rowid")
 			private := &memo.FunctionPrivate{
 				Name:       "unique_rowid",
 				Typ:        types.Int,

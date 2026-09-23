@@ -1,20 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import Select from "react-select";
-import { Button } from "../button";
-import { CaretDown } from "@cockroachlabs/icons";
+import { CaretDown, Cancel } from "@cockroachlabs/icons";
 import { Input } from "antd";
 import { History } from "history";
-import { isEqual } from "lodash";
+import isEqual from "lodash/isEqual";
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import Select from "react-select";
+
+import { Button } from "../button";
+import { selectCustomStyles } from "../common";
+import { MultiSelectCheckbox } from "../multiSelectCheckbox/multiSelectCheckbox";
+import { syncHistory } from "../util";
+
 import {
   dropdownButton,
   dropdownContentWrapper,
@@ -25,53 +25,62 @@ import {
   hidden,
   caretDown,
   checkbox,
+  badge,
+  clearBnt,
 } from "./filterClasses";
-import { MultiSelectCheckbox } from "../multiSelectCheckbox/multiSelectCheckbox";
-import { syncHistory } from "../util";
 
-interface QueryFilter {
+export interface QueryFilterProps {
   onSubmitFilters: (filters: Filters) => void;
   smth?: string;
-  appNames: string[];
+  appNames?: string[];
   activeFilters: number;
   filters: Filters;
   dbNames?: string[];
+  usernames?: string[];
+  sessionStatuses?: string[];
+  executionStatuses?: string[];
+  schemaInsightTypes?: string[];
+  workloadInsightTypes?: string[];
   regions?: string[];
   nodes?: string[];
+  hideAppNames?: boolean;
+  hideTimeLabel?: boolean;
   showDB?: boolean;
+  showUsername?: boolean;
+  showSessionStatus?: boolean;
+  showExecutionStatus?: boolean;
+  showSchemaInsightTypes?: boolean;
+  showWorkloadInsightTypes?: boolean;
   showSqlType?: boolean;
   showScan?: boolean;
   showRegions?: boolean;
   showNodes?: boolean;
-}
-interface FilterState {
-  hide: boolean;
-  filters: Filters;
+  timeLabel?: string;
 }
 
-export interface SelectOptions {
-  label: string;
-  value: string;
-}
-
-export interface Filters {
+export interface Filters extends Record<string, string | boolean> {
   app?: string;
   timeNumber?: string;
   timeUnit?: string;
   database?: string;
   sqlType?: string;
   fullScan?: boolean;
-  distributed?: boolean;
   regions?: string;
   nodes?: string;
+  username?: string;
+  sessionStatus?: string;
+  executionStatus?: string;
+  schemaInsightType?: string;
+  workloadInsightType?: string;
 }
 
 const timeUnit = [
   { label: "seconds", value: "seconds" },
   { label: "milliseconds", value: "milliseconds" },
+  { label: "minutes", value: "minutes" },
 ];
 
-export const defaultFilters: Filters = {
+export const defaultFilters: Required<Filters> = {
   app: "",
   timeNumber: "0",
   timeUnit: "seconds",
@@ -80,7 +89,32 @@ export const defaultFilters: Filters = {
   database: "",
   regions: "",
   nodes: "",
+  username: "",
+  sessionStatus: "",
+  schemaInsightType: "",
+  workloadInsightType: "",
+  executionStatus: "",
 };
+
+// getFullFiltersObject returns Filters with every field defined as
+// either what is specified in partialFilters, or 'null' if unset in
+// partialFilters.
+export function getFullFiltersAsStringRecord(
+  partialFilters: Partial<Filters>,
+): Record<string, string | null> {
+  const filters: Record<string, string> = {};
+  Object.keys(defaultFilters).forEach(filterKey => {
+    if (
+      filterKey in partialFilters &&
+      partialFilters[filterKey] !== inactiveFiltersState[filterKey]
+    ) {
+      filters[filterKey] = partialFilters[filterKey]?.toString();
+      return;
+    }
+    filters[filterKey] = null;
+  });
+  return filters;
+}
 
 /**
  * For each key on the defaultFilters, check if there is a new value
@@ -97,22 +131,19 @@ export const getFiltersFromQueryString = (
 ): Record<string, string> => {
   const searchParams = new URLSearchParams(queryString);
 
-  return Object.keys(defaultFilters).reduce(
-    (filters, filter: keyof Filters): Filters => {
-      const defaultValue = defaultFilters[filter];
-      const queryStringFilter = searchParams.get(filter);
-      const filterValue =
-        queryStringFilter == null
-          ? defaultValue // If this filter doesn't exist on query string, use default value.
-          : typeof defaultValue == "boolean"
+  return Object.keys(defaultFilters).reduce((filters, filter): Filters => {
+    const defaultValue = defaultFilters[filter];
+    const queryStringFilter = searchParams.get(filter);
+    const filterValue =
+      queryStringFilter == null
+        ? defaultValue // If this filter doesn't exist on query string, use default value.
+        : typeof defaultValue == "boolean"
           ? searchParams.get(filter) === "true" // If it's a Boolean, convert from String to Boolean;
           : defaultValue.constructor(searchParams.get(filter)); // Otherwise, use the constructor for that class.
-      // Boolean is converted without using its own constructor because the value from the query
-      // params is a string and Boolean('false') = true, which would be incorrect.
-      return { [filter]: filterValue, ...filters };
-    },
-    {},
-  );
+    // Boolean is converted without using its own constructor because the value from the query
+    // params is a string and Boolean('false') = true, which would be incorrect.
+    return { [filter]: filterValue, ...filters };
+  }, {});
 };
 
 /**
@@ -155,11 +186,12 @@ export const handleFiltersFromQueryString = (
         app: filters.app,
         timeNumber: filters.timeNumber,
         timeUnit: filters.timeUnit,
-        fullScan: filters.fullScan.toString(),
+        fullScan: filters.fullScan?.toString(),
         sqlType: filters.sqlType,
         database: filters.database,
         regions: filters.regions,
         nodes: filters.nodes,
+        sessionStatus: filters.sessionStatus,
       },
       history,
     );
@@ -198,11 +230,12 @@ export const updateFiltersQueryParamsOnTab = (
         app: filters.app,
         timeNumber: filters.timeNumber,
         timeUnit: filters.timeUnit,
-        fullScan: filters.fullScan.toString(),
+        fullScan: filters.fullScan?.toString(),
         sqlType: filters.sqlType,
         database: filters.database,
         regions: filters.regions,
         nodes: filters.nodes,
+        sessionStatus: filters.sessionStatus,
       },
       history,
     );
@@ -210,375 +243,649 @@ export const updateFiltersQueryParamsOnTab = (
 };
 
 /**
- * The State of the filter that is consider inactive.
+ * The State of the filter that is considered inactive.
  * It's different from defaultFilters because we don't want to take
  * timeUnit into consideration.
  * For example, if the timeUnit changes, but the timeValue is still 0,
  * we want to consider 0 active Filters
  */
-export const inactiveFiltersState: Filters = {
+export const inactiveFiltersState: Required<Omit<Filters, "timeUnit">> = {
   app: "",
   timeNumber: "0",
   fullScan: false,
   sqlType: "",
   database: "",
   regions: "",
+  sessionStatus: "",
   nodes: "",
+  workloadInsightType: "",
+  schemaInsightType: "",
+  executionStatus: "",
+  username: "",
 };
 
-export const calculateActiveFilters = (filters: Filters): number => {
-  return Object.keys(inactiveFiltersState).reduce(
-    (active, filter: keyof Filters) => {
-      return inactiveFiltersState[filter] !== filters[filter]
-        ? (active += 1)
-        : active;
-    },
-    0,
+const getActiveFilters = (filters: Filters): string[] => {
+  return Object.keys(inactiveFiltersState).filter(
+    filter =>
+      filters[filter] != null &&
+      inactiveFiltersState[filter] !== filters[filter],
   );
 };
 
-export const getTimeValueInSeconds = (filters: Filters): number | "empty" => {
-  if (filters.timeNumber === "0") return "empty";
-  return filters.timeUnit === "seconds"
-    ? Number(filters.timeNumber)
-    : Number(filters.timeNumber) / 1000;
+export const calculateActiveFilters = (filters: Filters): number => {
+  return getActiveFilters(filters).length;
 };
 
-export class Filter extends React.Component<QueryFilter, FilterState> {
-  state: FilterState = {
-    hide: true,
-    filters: {
-      ...this.props.filters,
-    },
-  };
-
-  dropdownRef: React.RefObject<HTMLDivElement> = React.createRef();
-
-  componentDidMount(): void {
-    window.addEventListener("click", this.outsideClick, false);
+export const getTimeValueInSeconds = (filters: Filters): number | "empty" => {
+  if (filters.timeNumber === "0" || filters.timeNumber == null) return "empty";
+  switch (filters.timeUnit) {
+    case "seconds":
+      return Number(filters.timeNumber);
+    case "minutes":
+      return Number(filters.timeNumber) * 60;
+    default:
+      // Milliseconds
+      return Number(filters.timeNumber) / 1000;
   }
-  componentWillUnmount(): void {
-    window.removeEventListener("click", this.outsideClick, false);
-  }
-  componentDidUpdate(prevProps: QueryFilter): void {
-    if (prevProps.filters !== this.props.filters) {
-      this.setState({
-        filters: {
-          ...this.props.filters,
-        },
-      });
-    }
-  }
-  outsideClick = (event: any): void => {
-    this.setState({ hide: true });
-  };
+};
 
-  insideClick = (event: any): void => {
+export function Filter({
+  onSubmitFilters,
+  appNames,
+  activeFilters,
+  filters: propsFilters,
+  dbNames,
+  usernames,
+  sessionStatuses,
+  executionStatuses,
+  schemaInsightTypes,
+  workloadInsightTypes,
+  regions,
+  nodes,
+  hideAppNames,
+  hideTimeLabel,
+  showDB,
+  showUsername,
+  showSessionStatus,
+  showExecutionStatus,
+  showSchemaInsightTypes,
+  showWorkloadInsightTypes,
+  showSqlType,
+  showScan,
+  showRegions,
+  showNodes,
+  timeLabel,
+}: QueryFilterProps): React.ReactElement {
+  const [hide, setHide] = useState(true);
+  const [filters, setFilters] = useState<Filters>({ ...propsFilters });
+
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setFilters({ ...propsFilters });
+  }, [propsFilters]);
+
+  const outsideClick = useCallback((): void => {
+    setHide(true);
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener("click", outsideClick, false);
+    return () => {
+      window.removeEventListener("click", outsideClick, false);
+    };
+  }, [outsideClick]);
+
+  const insideClick = (event: React.MouseEvent<HTMLDivElement>): void => {
     event.stopPropagation();
   };
 
-  toggleFilters = (): void => {
-    this.setState({
-      hide: !this.state.hide,
-    });
+  const toggleFilters = (): void => {
+    setHide(prev => !prev);
   };
 
-  handleSubmit = (): void => {
-    this.props.onSubmitFilters(this.state.filters);
-    this.setState({ hide: true });
+  const handleSubmit = (): void => {
+    onSubmitFilters(filters);
+    setHide(true);
   };
 
-  handleSelectChange = (
+  const handleSelectChange = (
     event: { label: string; value: string },
     field: string,
   ): void => {
-    this.setState({
-      filters: {
-        ...this.state.filters,
-        [field]: event.value,
-      },
-    });
+    setFilters(prev => ({
+      ...prev,
+      [field]: event.value,
+    }));
   };
 
-  handleChange = (event: any, field: string): void => {
-    this.setState({
-      filters: {
-        ...this.state.filters,
-        [field]:
-          event.value ||
-          event.target.checked ||
-          this.validateInput(event.target.value),
-      },
-    });
-  };
-
-  toggleFullScan = (event: any) => {
-    this.setState({
-      filters: {
-        ...this.state.filters,
-        fullScan: event.target.checked,
-      },
-    });
-  };
-
-  validateInput = (value: string): string => {
+  const validateInput = (value: string): string => {
     const isInteger = /^[0-9]+$/;
     return (value === "" || isInteger.test(value)) && value.length <= 3
       ? value
-      : this.state.filters.timeNumber;
+      : filters.timeNumber ?? "";
   };
 
-  clearInput = (): void => {
-    this.setState({
-      filters: {
-        ...this.state.filters,
-        timeNumber: "",
-      },
-    });
-  };
-
-  isOptionSelected = (option: string, field: string): boolean => {
-    const selection = field.split(",");
-    return selection.length > 0 && selection.includes(option);
-  };
-
-  render(): React.ReactElement {
-    const { hide, filters } = this.state;
-    const {
-      appNames,
-      dbNames,
-      regions,
-      nodes,
-      activeFilters,
-      showDB,
-      showSqlType,
-      showScan,
-      showRegions,
-      showNodes,
-    } = this.props;
-    const dropdownArea = hide ? hidden : dropdown;
-    const customStyles = {
-      container: (provided: any) => ({
-        ...provided,
-        border: "none",
-      }),
-      option: (provided: any, state: any) => ({
-        ...provided,
-        backgroundColor: state.isSelected
-          ? "#DEEBFF"
-          : provided.backgroundColor,
-        color: "#394455",
-      }),
-      control: (provided: any) => ({
-        ...provided,
-        width: "100%",
-        borderColor: "#C0C6D9",
-      }),
-      dropdownIndicator: (provided: any) => ({
-        ...provided,
-        color: "#C0C6D9",
-      }),
-      singleValue: (provided: any) => ({
-        ...provided,
-        color: "#475872",
-      }),
-    };
-    const customStylesSmall = { ...customStyles };
-    customStylesSmall.container = (provided: any) => ({
-      ...provided,
-      width: "141px",
-      border: "none",
-    });
-
-    const appsOptions = appNames.map(app => ({
-      label: app,
-      value: app,
-      isSelected: this.isOptionSelected(app, filters.app),
+  const handleChange = (
+    event: React.ChangeEvent<HTMLInputElement>,
+    field: string,
+  ): void => {
+    setFilters(prev => ({
+      ...prev,
+      [field]: event.target.checked || validateInput(event.target.value),
     }));
-    const appValue = appsOptions.filter(option => {
-      return filters.app.split(",").includes(option.label);
-    });
-    const appFilter = (
-      <div>
-        <div className={filterLabel.margin}>App</div>
-        <MultiSelectCheckbox
-          options={appsOptions}
-          placeholder="All"
-          field="app"
-          parent={this}
-          value={appValue}
-        />
-      </div>
-    );
+  };
 
-    const databasesOptions = showDB
+  const toggleFullScan = (event: React.ChangeEvent<HTMLInputElement>): void => {
+    setFilters(prev => ({
+      ...prev,
+      fullScan: event.target.checked,
+    }));
+  };
+
+  const clearInput = (): void => {
+    setFilters(prev => ({
+      ...prev,
+      timeNumber: "",
+    }));
+  };
+
+  const isOptionSelected = (option: string, field: string): boolean => {
+    const selection = field?.split(",");
+    return selection?.length > 0 && selection?.includes(option);
+  };
+
+  const handleMultiSelectChange = (field: string, selected: string): void => {
+    setFilters(prev => ({
+      ...prev,
+      [field]: selected,
+    }));
+  };
+
+  const dropdownArea = hide ? hidden : dropdown;
+  const customStylesSmall = { ...selectCustomStyles };
+  customStylesSmall.container = (provided: any) => ({
+    ...provided,
+    width: "141px",
+    border: "none",
+  });
+
+  const appFilters = filters.app ?? "";
+  const appsOptions =
+    !hideAppNames && appNames
+      ? appNames.map(app => ({
+          label: app,
+          value: app,
+          isSelected: isOptionSelected(app, appFilters),
+        }))
+      : [];
+
+  const selectedApps = appFilters.split(",");
+  const appValue = appsOptions.filter(option => {
+    return selectedApps.includes(option.label);
+  });
+  const appFilter = (
+    <div>
+      <div className={filterLabel.margin}>{getLabelFromKey("app")}</div>
+      <MultiSelectCheckbox
+        options={appsOptions}
+        placeholder="All"
+        field="app"
+        onChange={handleMultiSelectChange}
+        value={appValue}
+      />
+    </div>
+  );
+
+  const databaseFilters = filters.database ?? "";
+  const databasesOptions =
+    showDB && dbNames
       ? dbNames.map(db => ({
           label: db,
           value: db,
-          isSelected: this.isOptionSelected(db, filters.database),
+          isSelected: isOptionSelected(db, databaseFilters),
         }))
       : [];
-    const databaseValue = databasesOptions.filter(option => {
-      return filters.database.split(",").includes(option.label);
-    });
-    const dbFilter = (
-      <div>
-        <div className={filterLabel.margin}>Database</div>
-        <MultiSelectCheckbox
-          options={databasesOptions}
-          placeholder="All"
-          field="database"
-          parent={this}
-          value={databaseValue}
-        />
-      </div>
-    );
 
-    const regionsOptions = showRegions
+  const selectedDatabases = databaseFilters.split(",");
+  const databaseValue = databasesOptions.filter(option => {
+    return selectedDatabases.includes(option.label);
+  });
+  const dbFilter = (
+    <div>
+      <div className={filterLabel.margin}>{getLabelFromKey("database")}</div>
+      <MultiSelectCheckbox
+        options={databasesOptions}
+        placeholder="All"
+        field="database"
+        onChange={handleMultiSelectChange}
+        value={databaseValue}
+      />
+    </div>
+  );
+
+  const usernameFilters = filters.username ?? "";
+  const usernameOptions =
+    showUsername && usernames
+      ? usernames.map(username => ({
+          label: username,
+          value: username,
+          isSelected: isOptionSelected(username, usernameFilters),
+        }))
+      : [];
+
+  const selectedUsernames = usernameFilters.split(",");
+  const usernameValue = usernameOptions.filter(option => {
+    return selectedUsernames.includes(option.label);
+  });
+  const usernameFilter = (
+    <div>
+      <div className={filterLabel.margin}>{getLabelFromKey("username")}</div>
+      <MultiSelectCheckbox
+        options={usernameOptions}
+        placeholder="All"
+        field="username"
+        onChange={handleMultiSelectChange}
+        value={usernameValue}
+      />
+    </div>
+  );
+
+  const sessionStatusFilters = filters.sessionStatus ?? "";
+  const sessionStatusOptions =
+    showSessionStatus && sessionStatuses
+      ? sessionStatuses.map(sessionStatus => ({
+          label: sessionStatus,
+          value: sessionStatus,
+          isSelected: isOptionSelected(sessionStatus, sessionStatusFilters),
+        }))
+      : [];
+
+  const selectedSessionStatuses = sessionStatusFilters.split(",");
+  const sessionStatusValue = sessionStatusOptions.filter(option => {
+    return selectedSessionStatuses.includes(option.label);
+  });
+  const sessionStatusFilter = (
+    <div>
+      <div className={filterLabel.margin}>
+        {getLabelFromKey("sessionStatus")}
+      </div>
+      <MultiSelectCheckbox
+        options={sessionStatusOptions}
+        placeholder="All"
+        field="sessionStatus"
+        onChange={handleMultiSelectChange}
+        value={sessionStatusValue}
+      />
+    </div>
+  );
+
+  const executionStatusFilters = filters.executionStatus ?? "";
+  const executionStatusOptions =
+    showExecutionStatus && executionStatuses
+      ? executionStatuses.map(executionStatus => ({
+          label: executionStatus,
+          value: executionStatus,
+          isSelected: isOptionSelected(executionStatus, executionStatusFilters),
+        }))
+      : [];
+
+  const selectedExecutionStatuses = executionStatusFilters.split(",");
+  const executionStatusValue = executionStatusOptions.filter(option =>
+    selectedExecutionStatuses.includes(option.label),
+  );
+  const executionStatusFilter = (
+    <div>
+      <div className={filterLabel.margin}>
+        {getLabelFromKey("executionStatus")}
+      </div>
+      <MultiSelectCheckbox
+        options={executionStatusOptions}
+        placeholder="All"
+        field="executionStatus"
+        onChange={handleMultiSelectChange}
+        value={executionStatusValue}
+      />
+    </div>
+  );
+
+  const schemaInsightType = filters.schemaInsightType ?? "";
+  const schemaInsightTypeOptions =
+    showSchemaInsightTypes && schemaInsightTypes
+      ? schemaInsightTypes.map(schemaInsight => ({
+          label: schemaInsight,
+          value: schemaInsight,
+          isSelected: isOptionSelected(schemaInsight, schemaInsightType),
+        }))
+      : [];
+  const selectedSchemaInsightTypes = schemaInsightType.split(",");
+  const schemaInsightTypeValue = schemaInsightTypeOptions.filter(option =>
+    selectedSchemaInsightTypes.includes(option.label),
+  );
+  const schemaInsightTypeFilter = (
+    <div>
+      <div className={filterLabel.margin}>
+        {getLabelFromKey("schemaInsightType")}
+      </div>
+      <MultiSelectCheckbox
+        options={schemaInsightTypeOptions}
+        placeholder="All"
+        field="schemaInsightType"
+        onChange={handleMultiSelectChange}
+        value={schemaInsightTypeValue}
+      />
+    </div>
+  );
+
+  const workloadInsightTypeFilters = filters.workloadInsightType ?? "";
+  const workloadInsightTypeOptions =
+    showWorkloadInsightTypes && workloadInsightTypes
+      ? workloadInsightTypes.map(workloadInsight => ({
+          label: workloadInsight,
+          value: workloadInsight,
+          isSelected: isOptionSelected(
+            workloadInsight,
+            workloadInsightTypeFilters,
+          ),
+        }))
+      : [];
+
+  const selectedWorkloadInsightTypes = workloadInsightTypeFilters.split(",");
+  const workloadInsightTypeValue = workloadInsightTypeOptions.filter(option => {
+    return selectedWorkloadInsightTypes.includes(option.label);
+  });
+  const workloadInsightTypeFilter = (
+    <div>
+      <div className={filterLabel.margin}>
+        {getLabelFromKey("workloadInsightType")}
+      </div>
+      <MultiSelectCheckbox
+        options={workloadInsightTypeOptions}
+        placeholder="All"
+        field="workloadInsightType"
+        onChange={handleMultiSelectChange}
+        value={workloadInsightTypeValue}
+      />
+    </div>
+  );
+
+  const regionsFilters = filters.regions ?? "";
+  const regionsOptions =
+    showRegions && regions
       ? regions.map(region => ({
           label: region,
           value: region,
-          isSelected: this.isOptionSelected(region, filters.regions),
+          isSelected: isOptionSelected(region, regionsFilters),
         }))
       : [];
-    const regionsValue = regionsOptions.filter(option =>
-      filters.regions.split(",").includes(option.label),
-    );
-    const regionsFilter = (
-      <div>
-        <div className={filterLabel.margin}>Region</div>
-        <MultiSelectCheckbox
-          options={regionsOptions}
-          placeholder="All"
-          field="regions"
-          parent={this}
-          value={regionsValue}
-        />
-      </div>
-    );
+  const selectedRegions = regionsFilters.split(",");
+  const regionsValue = regionsOptions.filter(option =>
+    selectedRegions.includes(option.label),
+  );
+  const regionsFilter = (
+    <div>
+      <div className={filterLabel.margin}>{getLabelFromKey("regions")}</div>
+      <MultiSelectCheckbox
+        options={regionsOptions}
+        placeholder="All"
+        field="regions"
+        onChange={handleMultiSelectChange}
+        value={regionsValue}
+      />
+    </div>
+  );
 
-    const nodesOptions = showNodes
+  const nodeFilters = filters.nodes ?? "";
+  const nodesOptions =
+    showNodes && nodes
       ? nodes.map(node => ({
           label: node,
           value: node,
-          isSelected: this.isOptionSelected(node, filters.nodes),
+          isSelected: isOptionSelected(node, nodeFilters),
         }))
       : [];
-    const nodesValue = nodesOptions.filter(option => {
-      return filters.nodes.split(",").includes(option.label);
-    });
-    const nodesFilter = (
-      <div>
-        <div className={filterLabel.margin}>Node</div>
-        <MultiSelectCheckbox
-          options={nodesOptions}
-          placeholder="All"
-          field="nodes"
-          parent={this}
-          value={nodesValue}
-        />
+
+  const selectedNodes = nodeFilters.split(",");
+  const nodesValue = nodesOptions.filter(option => {
+    return selectedNodes.includes(option.label);
+  });
+  const nodesFilter = (
+    <div>
+      <div className={filterLabel.margin}>{getLabelFromKey("nodes")}</div>
+      <MultiSelectCheckbox
+        options={nodesOptions}
+        placeholder="All"
+        field="nodes"
+        onChange={handleMultiSelectChange}
+        value={nodesValue}
+      />
+    </div>
+  );
+
+  const sqlTypeFilters = filters.sqlType ?? "";
+  const sqlTypes = showSqlType
+    ? [
+        {
+          label: "DDL",
+          value: "TypeDDL",
+          isSelected: isOptionSelected("DDL", sqlTypeFilters),
+        },
+        {
+          label: "DML",
+          value: "TypeDML",
+          isSelected: isOptionSelected("DML", sqlTypeFilters),
+        },
+        {
+          label: "DCL",
+          value: "TypeDCL",
+          isSelected: isOptionSelected("DCL", sqlTypeFilters),
+        },
+        {
+          label: "TCL",
+          value: "TypeTCL",
+          isSelected: isOptionSelected("TCL", sqlTypeFilters),
+        },
+      ]
+    : [];
+
+  const selectedSqlTypes = sqlTypeFilters.split(",");
+  const sqlTypeValue = sqlTypes?.filter(option => {
+    return selectedSqlTypes.includes(option.label);
+  });
+  const sqlTypeFilter = (
+    <div>
+      <div className={filterLabel.margin}>{getLabelFromKey("sqlType")}</div>
+      <MultiSelectCheckbox
+        options={sqlTypes}
+        placeholder="All"
+        field="sqlType"
+        onChange={handleMultiSelectChange}
+        value={sqlTypeValue}
+      />
+    </div>
+  );
+
+  const fullScanFilter = (
+    <div className={filterLabel.margin}>
+      <input
+        type="checkbox"
+        id="full-table-scan-toggle"
+        checked={filters.fullScan}
+        onChange={e => toggleFullScan(e)}
+        className={checkbox.input}
+      />
+      <label htmlFor="full-table-scan-toggle" className={checkbox.label}>
+        Only show statements with full table scans
+      </label>
+    </div>
+  );
+  // TODO replace all onChange actions in Selects and Checkboxes with one onSubmit in <form />
+
+  return (
+    <div onClick={insideClick} ref={dropdownRef}>
+      <div className={dropdownButton} onClick={toggleFilters}>
+        Filters ({activeFilters})&nbsp;
+        <CaretDown className={caretDown} />
       </div>
-    );
-
-    const sqlTypes = [
-      {
-        label: "DDL",
-        value: "TypeDDL",
-        isSelected: this.isOptionSelected("DDL", filters.sqlType),
-      },
-      {
-        label: "DML",
-        value: "TypeDML",
-        isSelected: this.isOptionSelected("DML", filters.sqlType),
-      },
-      {
-        label: "DCL",
-        value: "TypeDCL",
-        isSelected: this.isOptionSelected("DCL", filters.sqlType),
-      },
-      {
-        label: "TCL",
-        value: "TypeTCL",
-        isSelected: this.isOptionSelected("TCL", filters.sqlType),
-      },
-    ];
-
-    const sqlTypeValue = sqlTypes.filter(option => {
-      return filters.sqlType.split(",").includes(option.label);
-    });
-    const sqlTypeFilter = (
-      <div>
-        <div className={filterLabel.margin}>Statement Type</div>
-        <MultiSelectCheckbox
-          options={sqlTypes}
-          placeholder="All"
-          field="sqlType"
-          parent={this}
-          value={sqlTypeValue}
-        />
-      </div>
-    );
-
-    const fullScanFilter = (
-      <div className={filterLabel.margin}>
-        <input
-          type="checkbox"
-          id="full-table-scan-toggle"
-          checked={filters.fullScan}
-          onChange={e => this.toggleFullScan(e)}
-          className={checkbox.input}
-        />
-        <label htmlFor="full-table-scan-toggle" className={checkbox.label}>
-          Only show statements that contain queries with full table scans
-        </label>
-      </div>
-    );
-    // TODO replace all onChange actions in Selects and Checkboxes with one onSubmit in <form />
-
-    return (
-      <div onClick={this.insideClick} ref={this.dropdownRef}>
-        <div className={dropdownButton} onClick={this.toggleFilters}>
-          Filters ({activeFilters})&nbsp;
-          <CaretDown className={caretDown} />
-        </div>
-        <div className={dropdownArea}>
-          <div className={dropdownContentWrapper}>
-            {appFilter}
-            {showDB ? dbFilter : ""}
-            {showSqlType ? sqlTypeFilter : ""}
-            {showRegions ? regionsFilter : ""}
-            {showNodes ? nodesFilter : ""}
-            <div className={filterLabel.margin}>
-              Query fingerprint runs longer than
-            </div>
-            <section className={timePair.wrapper}>
-              <Input
-                value={filters.timeNumber}
-                onChange={e => this.handleChange(e, "timeNumber")}
-                onFocus={this.clearInput}
-                className={timePair.timeNumber}
-              />
-              <Select
-                options={timeUnit}
-                value={timeUnit.filter(unit => unit.label == filters.timeUnit)}
-                onChange={e => this.handleSelectChange(e, "timeUnit")}
-                className={timePair.timeUnit}
-                styles={customStylesSmall}
-              />
-            </section>
-            {showScan ? fullScanFilter : ""}
-            <div className={applyBtn.wrapper}>
-              <Button
-                className={applyBtn.btn}
-                textAlign="center"
-                onClick={this.handleSubmit}
-              >
-                Apply
-              </Button>
-            </div>
+      <div className={dropdownArea}>
+        <div className={dropdownContentWrapper}>
+          {!hideAppNames ? appFilter : ""}
+          {showDB ? dbFilter : ""}
+          {showUsername ? usernameFilter : ""}
+          {showSessionStatus ? sessionStatusFilter : ""}
+          {showExecutionStatus ? executionStatusFilter : ""}
+          {showSchemaInsightTypes ? schemaInsightTypeFilter : ""}
+          {showWorkloadInsightTypes ? workloadInsightTypeFilter : ""}
+          {showSqlType ? sqlTypeFilter : ""}
+          {showRegions ? regionsFilter : ""}
+          {showNodes ? nodesFilter : ""}
+          {hideTimeLabel
+            ? ""
+            : filters.timeUnit && (
+                <>
+                  <div className={filterLabel.margin}>
+                    {timeLabel
+                      ? `${timeLabel} runs longer than`
+                      : "Statement fingerprint runs longer than"}
+                  </div>
+                  <section className={timePair.wrapper}>
+                    <Input
+                      value={filters.timeNumber}
+                      onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                        handleChange(e, "timeNumber")
+                      }
+                      onFocus={clearInput}
+                      className={timePair.timeNumber}
+                    />
+                    <Select
+                      options={timeUnit}
+                      value={timeUnit.filter(
+                        unit => unit.label === filters.timeUnit,
+                      )}
+                      onChange={e => handleSelectChange(e, "timeUnit")}
+                      className={timePair.timeUnit}
+                      styles={customStylesSmall}
+                    />
+                  </section>
+                </>
+              )}
+          {showScan ? fullScanFilter : ""}
+          <div className={applyBtn.wrapper}>
+            <Button
+              className={applyBtn.btn}
+              textAlign="center"
+              onClick={handleSubmit}
+            >
+              Apply
+            </Button>
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+interface SelectedFilterProps {
+  filters: Filters;
+  onRemoveFilter: (filters: Filters) => void;
+  onClearFilters: () => void;
+  className?: string;
+}
+export function SelectedFilters(
+  props: SelectedFilterProps,
+): React.ReactElement {
+  const { filters, onRemoveFilter, onClearFilters, className } = props;
+  const activeFilters = getActiveFilters(filters);
+  const badges = activeFilters.map(filter => {
+    return (
+      <FilterBadge
+        filters={filters}
+        name={filter}
+        values={filters[filter]}
+        unit={filters["timeUnit"] ?? ""}
+        key={filter}
+        onRemoveFilter={onRemoveFilter}
+      />
     );
+  });
+
+  return (
+    <div className={`${badge.area} ${className}`}>
+      {badges}
+      {activeFilters.length > 0 && (
+        <Button
+          onClick={() => onClearFilters()}
+          type="flat"
+          size="small"
+          className={clearBnt.btn}
+        >
+          Clear filters
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function removeFilter(
+  filters: Filters,
+  filter: string,
+  onRemoveFilter: (filters: Filters) => void,
+): void {
+  filters[filter] = inactiveFiltersState[filter];
+  onRemoveFilter({ ...filters });
+}
+interface FilterBadgeProps {
+  filters: Filters;
+  name: string;
+  values: string | boolean;
+  unit: string;
+  onRemoveFilter: (filters: Filters) => void;
+}
+function FilterBadge(props: FilterBadgeProps): React.ReactElement {
+  const { filters, name, values, onRemoveFilter } = props;
+  const unit = name === "timeNumber" ? props.unit : "";
+  let value = `${getLabelFromKey(name)}: ${values.toString()} ${unit}`;
+  if (value.length > 100) {
+    value = value.substring(0, 100) + "...";
+  }
+  return (
+    <div className={badge.wrapper}>
+      {value}
+      <Cancel
+        className={badge.closeArea}
+        onClick={() => removeFilter({ ...filters }, name, onRemoveFilter)}
+      />
+    </div>
+  );
+}
+
+function getLabelFromKey(key: string): string {
+  switch (key) {
+    case "app":
+      return "Application Name";
+    case "database":
+      return "Database";
+    case "executionStatus":
+      return "Execution Status";
+    case "fullScan":
+      return "Full Scan";
+    case "nodes":
+      return "Node";
+    case "regions":
+      return "Region";
+    case "schemaInsightType":
+      return "Schema Insight Type";
+    case "sessionStatus":
+      return "Session Status";
+    case "sqlType":
+      return "Statement Type";
+    case "timeNumber":
+      return "Runs Longer Than";
+    case "username":
+      return "User Name";
+    case "workloadInsightType":
+      return "Workload Insight Type";
+    default:
+      return key;
   }
 }

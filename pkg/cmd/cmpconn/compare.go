@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cmpconn
 
@@ -14,7 +9,7 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
@@ -115,7 +110,13 @@ var (
 					v = strings.Replace(t, ":00+00:00", ":00+00", 1)
 				case pgtype.Numeric:
 					if t.Status == pgtype.Present {
-						v = apd.NewWithBigInt(t.Int, t.Exp)
+						if t.NaN {
+							v = &apd.Decimal{Form: apd.NaN}
+						} else {
+							var coeff apd.BigInt
+							coeff.SetMathBigInt(t.Int)
+							v = apd.NewWithBigInt(&coeff, t.Exp)
+						}
 					}
 				case int64:
 					v = apd.New(t, 0)

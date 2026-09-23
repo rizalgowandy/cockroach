@@ -1,15 +1,9 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 //go:build execgen_template
-// +build execgen_template
 
 package colexec
 
@@ -17,6 +11,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -84,6 +80,8 @@ func populateEqChains(
 	return eqChainsCount
 }
 
+var zeroIntColumn = make([]int, coldata.MaxBatchSize)
+
 // populateEqChains populates op.scratch.eqChains with indices of tuples from b
 // that belong to the same groups. It returns the number of equality chains as
 // well as a selection vector that contains "heads" of each of the chains. The
@@ -126,23 +124,14 @@ func (op *hashAggregator) populateEqChains(
 func findSplit(
 	op *hashAggregator, start int, end int, sel []int, useSel bool, ascending bool,
 ) (bool, int) {
-	if useSel {
-		_ = sel[start]
-		_ = sel[end]
-	} else {
-		_ = op.distinctOutput[start]
-		_ = op.distinctOutput[end]
-	}
 	if ascending {
 		for i := start; i <= end; i++ {
 			if useSel {
-				//gcassert:bce
 				idx := sel[i]
 				if op.distinctOutput[idx] {
 					return true, i
 				}
 			} else {
-				//gcassert:bce
 				if op.distinctOutput[i] {
 					return true, i
 				}
@@ -151,13 +140,11 @@ func findSplit(
 	} else {
 		for i := start; i >= end; i-- {
 			if useSel {
-				//gcassert:bce
 				idx := sel[i]
 				if op.distinctOutput[idx] {
 					return true, i
 				}
 			} else {
-				//gcassert:bce
 				if op.distinctOutput[i] {
 					return true, i
 				}
@@ -181,7 +168,7 @@ func findSplit(
 // If partialOrder is false, there are no guarantees on input ordering and all
 // input tuples are processed before emitting any data.
 // execgen:template<partialOrder>
-func getNext(op *hashAggregator, partialOrder bool) coldata.Batch {
+func getNext(op *hashAggregator, partialOrder bool) (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	for {
 		switch op.state {
 		case hashAggregatorBuffering:
@@ -224,11 +211,15 @@ func getNext(op *hashAggregator, partialOrder bool) coldata.Batch {
 				)
 			}
 
-			op.bufferingState.pendingBatch, op.bufferingState.unprocessedIdx = op.Input.Next(), 0
+			var meta *execinfrapb.ProducerMetadata
+			op.bufferingState.pendingBatch, meta = op.Input.Next()
+			if meta != nil {
+				return nil, meta
+			}
 			op.bufferingState.unprocessedIdx = 0
 			if partialOrder {
 				op.distincterInput.SetBatch(op.bufferingState.pendingBatch)
-				op.distincter.Next()
+				colexecop.NextNoMeta(op.distincter)
 			}
 			n := op.bufferingState.pendingBatch.Length()
 			if op.inputTrackingState.tuples != nil {
@@ -340,25 +331,21 @@ func getNext(op *hashAggregator, partialOrder bool) coldata.Batch {
 		case hashAggregatorOutputting:
 			// Note that ResetMaybeReallocate truncates the requested capacity
 			// at coldata.BatchSize(), so we can just try asking for
-			// len(op.buckets) capacity.
+			// len(op.buckets)-op.curOutputBucketIdx (the number of remaining
+			// output tuples) capacity.
 			op.output, _ = op.accountingHelper.ResetMaybeReallocate(
-				op.outputTypes, op.output, len(op.buckets), op.maxOutputBatchMemSize,
+				op.outputTypes, op.output, len(op.buckets)-op.curOutputBucketIdx,
 			)
 			curOutputIdx := 0
-			for curOutputIdx < op.output.Capacity() &&
-				op.curOutputBucketIdx < len(op.buckets) &&
-				(op.maxCapacity == 0 || curOutputIdx < op.maxCapacity) {
+			for batchDone := false; op.curOutputBucketIdx < len(op.buckets) && !batchDone; {
 				bucket := op.buckets[op.curOutputBucketIdx]
 				for fnIdx, fn := range bucket.fns {
 					fn.SetOutput(op.output.ColVec(fnIdx))
 					fn.Flush(curOutputIdx)
 				}
-				op.accountingHelper.AccountForSet(curOutputIdx)
+				batchDone = op.accountingHelper.AccountForSet(curOutputIdx)
 				curOutputIdx++
 				op.curOutputBucketIdx++
-				if op.maxCapacity == 0 && op.accountingHelper.Allocator.Used() >= op.maxOutputBatchMemSize {
-					op.maxCapacity = curOutputIdx
-				}
 			}
 			if op.curOutputBucketIdx >= len(op.buckets) {
 				if partialOrder {
@@ -397,20 +384,20 @@ func getNext(op *hashAggregator, partialOrder bool) coldata.Batch {
 				}
 			}
 			op.output.SetLength(curOutputIdx)
-			return op.output
+			return op.output, nil
 
 		case hashAggregatorDone:
-			return coldata.ZeroBatch
+			return coldata.ZeroBatch, nil
 
 		default:
 			colexecerror.InternalError(errors.AssertionFailedf("hash aggregator in unhandled state"))
 			// This code is unreachable, but the compiler cannot infer that.
-			return nil
+			return nil, nil
 		}
 	}
 }
 
-func (op *hashAggregator) Next() coldata.Batch {
+func (op *hashAggregator) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if len(op.spec.OrderedGroupCols) > 0 {
 		return getNext(op, true)
 	} else {

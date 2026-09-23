@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -14,13 +9,18 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -56,17 +56,21 @@ const memRequiredByWindower = 100 * 1024
 type windower struct {
 	execinfra.ProcessorBase
 
+	evalCtx *eval.Context
+
 	// runningState represents the state of the windower. This is in addition to
 	// ProcessorBase.State - the runningState is only relevant when
 	// ProcessorBase.State == StateRunning.
-	runningState windowerState
-	input        execinfra.RowSource
-	inputDone    bool
-	inputTypes   []*types.T
-	outputTypes  []*types.T
-	datumAlloc   rowenc.DatumAlloc
-	acc          mon.BoundAccount
-	diskMonitor  *mon.BytesMonitor
+	runningState        windowerState
+	input               execinfra.RowSource
+	inputDone           bool
+	inputTypes          []*types.T
+	outputTypes         []*types.T
+	datumAlloc          tree.DatumAlloc
+	acc                 mon.BoundAccount
+	aggFuncsAcc         mon.BoundAccount
+	unlimitedMemMonitor *mon.BytesMonitor
+	diskMonitor         *mon.BytesMonitor
 
 	scratch       []byte
 	cancelChecker cancelchecker.CancelChecker
@@ -76,7 +80,7 @@ type windower struct {
 	partition                  *rowcontainer.DiskBackedIndexedRowContainer
 	orderOfWindowFnsProcessing []int
 	windowFns                  []*windowFunc
-	builtins                   []tree.WindowFunc
+	builtins                   []eval.WindowFunc
 
 	populated           bool
 	partitionIdx        int
@@ -89,29 +93,48 @@ type windower struct {
 
 var _ execinfra.Processor = &windower{}
 var _ execinfra.RowSource = &windower{}
-var _ execinfra.OpNode = &windower{}
+var _ execopnode.OpNode = &windower{}
 
 const windowerProcName = "windower"
 
 func newWindower(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.WindowerSpec,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
-	output execinfra.RowReceiver,
 ) (*windower, error) {
 	w := &windower{
-		input: input,
+		evalCtx: flowCtx.NewEvalCtx(),
+		input:   input,
 	}
-	evalCtx := flowCtx.NewEvalCtx()
 	w.inputTypes = input.OutputTypes()
-	ctx := evalCtx.Ctx()
+
+	// Limit the memory use by creating a child monitor with a hard limit.
+	// windower will overflow to disk if this limit is not enough.
+	limitedMon := execinfra.NewLimitedMonitorWithLowerBound(
+		ctx, flowCtx, "windower-limited", memRequiredByWindower,
+	)
+	// TODO(yuzefovich): w.acc is bound to the limited monitor, but it's used in
+	// several places where we don't know how to spill to disk. Consider
+	// implementing a strategy where we start out using the limited account, and
+	// when hitting the memory limit, we spill what we can, and if that is
+	// insufficient, then we use the unlimited account.
+	w.acc = limitedMon.MakeBoundAccount()
+	mn := mon.MakeName("windower")
+	w.unlimitedMemMonitor = execinfra.NewMonitor(ctx, flowCtx.Mon, mn.Unlimited())
+	// If we have aggregate builtins that aggregate a single datum, we want
+	// them to reuse the same shared memory account with the windower. Notably,
+	// we need to update the eval context before constructing the window
+	// builtins.
+	w.aggFuncsAcc = w.unlimitedMemMonitor.MakeBoundAccount()
+	w.evalCtx.SingleDatumAggMemAccount = &w.aggFuncsAcc
 
 	w.partitionBy = spec.PartitionBy
 	windowFns := spec.WindowFns
 	w.windowFns = make([]*windowFunc, 0, len(windowFns))
-	w.builtins = make([]tree.WindowFunc, 0, len(windowFns))
+	w.builtins = make([]eval.WindowFunc, 0, len(windowFns))
 	// windower passes through all of its input columns and appends an output
 	// column for each of window functions it is computing.
 	w.outputTypes = make([]*types.T, len(w.inputTypes)+len(windowFns))
@@ -122,13 +145,13 @@ func newWindower(
 		for i, argIdx := range windowFn.ArgsIdxs {
 			argTypes[i] = w.inputTypes[argIdx]
 		}
-		windowConstructor, outputType, err := execinfrapb.GetWindowFunctionInfo(windowFn.Func, argTypes...)
+		windowConstructor, outputType, err := execagg.GetWindowFunctionInfo(windowFn.Func, argTypes...)
 		if err != nil {
 			return nil, err
 		}
 		w.outputTypes[windowFn.OutputColIdx] = outputType
 
-		w.builtins = append(w.builtins, windowConstructor(evalCtx))
+		w.builtins = append(w.builtins, windowConstructor(w.evalCtx))
 		wf := &windowFunc{
 			ordering:     windowFn.Ordering,
 			argsIdxs:     windowFn.ArgsIdxs,
@@ -141,31 +164,14 @@ func newWindower(
 	}
 	w.outputRow = make(rowenc.EncDatumRow, len(w.outputTypes))
 
-	// Limit the memory use by creating a child monitor with a hard limit.
-	// windower will overflow to disk if this limit is not enough.
-	limit := execinfra.GetWorkMemLimit(flowCtx)
-	if limit < memRequiredByWindower {
-		if !flowCtx.Cfg.TestingKnobs.ForceDiskSpill && flowCtx.Cfg.TestingKnobs.MemoryLimitBytes == 0 {
-			return nil, errors.Errorf(
-				"window functions require %d bytes of RAM but only %d are in the budget. "+
-					"Consider increasing sql.distsql.temp_storage.workmem cluster setting or distsql_workmem session variable",
-				memRequiredByWindower, limit)
-		}
-		// The limit is set very low by the tests, but the windower requires
-		// some amount of RAM, so we override the limit.
-		limit = memRequiredByWindower
-	}
-	limitedMon := mon.NewMonitorInheritWithLimit("windower-limited", limit, evalCtx.Mon)
-	limitedMon.Start(ctx, evalCtx.Mon, mon.BoundAccount{})
-
 	if err := w.InitWithEvalCtx(
+		ctx,
 		w,
 		post,
 		w.outputTypes,
 		flowCtx,
-		evalCtx,
+		w.evalCtx,
 		processorID,
-		output,
 		limitedMon,
 		execinfra.ProcStateOpts{InputsToDrain: []execinfra.RowSource{w.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -176,9 +182,9 @@ func newWindower(
 		return nil, err
 	}
 
-	w.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "windower-disk")
+	w.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, mn.Disk())
 	w.allRowsPartitioned = rowcontainer.NewHashDiskBackedRowContainer(
-		evalCtx, w.MemMonitor, w.diskMonitor, flowCtx.Cfg.TempStorage,
+		w.evalCtx, w.MemMonitor, w.unlimitedMemMonitor, w.diskMonitor, flowCtx.Cfg.TempStorage,
 	)
 	if err := w.allRowsPartitioned.Init(
 		ctx,
@@ -190,12 +196,7 @@ func newWindower(
 		return nil, err
 	}
 
-	w.acc = w.MemMonitor.MakeBoundAccount()
-	// If we have aggregate builtins that aggregate a single datum, we want
-	// them to reuse the same shared memory account with the windower.
-	evalCtx.SingleDatumAggMemAccount = &w.acc
-
-	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		w.input = newInputStatCollector(w.input)
 		w.ExecStatsForTrace = w.execStatsForTrace
 	}
@@ -207,7 +208,7 @@ func newWindower(
 func (w *windower) Start(ctx context.Context) {
 	ctx = w.StartInternal(ctx, windowerProcName)
 	w.input.Start(ctx)
-	w.cancelChecker.Reset(ctx)
+	w.cancelChecker.Reset(ctx, rowinfra.RowExecCancelCheckInterval)
 	w.runningState = windowerAccumulating
 }
 
@@ -222,7 +223,7 @@ func (w *windower) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 		case windowerEmittingRows:
 			w.runningState, row, meta = w.emitRow()
 		default:
-			log.Fatalf(w.Ctx, "unsupported state: %d", w.runningState)
+			log.Dev.Fatalf(w.Ctx(), "unsupported state: %d", w.runningState)
 		}
 
 		if row == nil && meta == nil {
@@ -244,16 +245,18 @@ func (w *windower) close() {
 		if w.allRowsIterator != nil {
 			w.allRowsIterator.Close()
 		}
-		w.allRowsPartitioned.Close(w.Ctx)
+		w.allRowsPartitioned.Close(w.Ctx())
 		if w.partition != nil {
-			w.partition.Close(w.Ctx)
+			w.partition.Close(w.Ctx())
 		}
 		for _, builtin := range w.builtins {
-			builtin.Close(w.Ctx, w.EvalCtx)
+			builtin.Close(w.Ctx(), w.evalCtx)
 		}
-		w.acc.Close(w.Ctx)
-		w.MemMonitor.Stop(w.Ctx)
-		w.diskMonitor.Stop(w.Ctx)
+		w.acc.Close(w.Ctx())
+		w.MemMonitor.Stop(w.Ctx())
+		w.aggFuncsAcc.Close(w.Ctx())
+		w.unlimitedMemMonitor.Stop(w.Ctx())
+		w.diskMonitor.Stop(w.Ctx())
 	}
 }
 
@@ -277,17 +280,17 @@ func (w *windower) accumulateRows() (
 			return windowerAccumulating, nil, meta
 		}
 		if row == nil {
-			log.VEvent(w.Ctx, 1, "accumulation complete")
+			log.VEvent(w.Ctx(), 1, "accumulation complete")
 			w.inputDone = true
 			// We need to sort all the rows based on partitionBy columns so that all
 			// rows belonging to the same hash bucket are contiguous.
-			w.allRowsPartitioned.Sort(w.Ctx)
+			w.allRowsPartitioned.Sort(w.Ctx())
 			break
 		}
 
 		// The underlying row container will decode all datums as necessary, so we
 		// don't need to worry about that.
-		if err := w.allRowsPartitioned.AddRow(w.Ctx, row); err != nil {
+		if err := w.allRowsPartitioned.AddRow(w.Ctx(), row); err != nil {
 			w.MoveToDraining(err)
 			return windowerStateUnknown, nil, w.DrainHelper()
 		}
@@ -310,7 +313,7 @@ func (w *windower) emitRow() (windowerState, rowenc.EncDatumRow, *execinfrapb.Pr
 				return windowerStateUnknown, nil, w.DrainHelper()
 			}
 
-			if err := w.computeWindowFunctions(w.Ctx, w.EvalCtx); err != nil {
+			if err := w.computeWindowFunctions(w.Ctx(), w.evalCtx); err != nil {
 				w.MoveToDraining(err)
 				return windowerStateUnknown, nil, w.DrainHelper()
 			}
@@ -340,7 +343,7 @@ func (w *windower) emitRow() (windowerState, rowenc.EncDatumRow, *execinfrapb.Pr
 func (w *windower) spillAllRowsToDisk() error {
 	if w.allRowsPartitioned != nil {
 		if !w.allRowsPartitioned.UsingDisk() {
-			if err := w.allRowsPartitioned.SpillToDisk(w.Ctx); err != nil {
+			if err := w.allRowsPartitioned.SpillToDisk(w.Ctx()); err != nil {
 				return err
 			}
 		} else {
@@ -348,7 +351,7 @@ func (w *windower) spillAllRowsToDisk() error {
 			// w.partition if possible.
 			if w.partition != nil {
 				if !w.partition.UsingDisk() {
-					if err := w.partition.SpillToDisk(w.Ctx); err != nil {
+					if err := w.partition.SpillToDisk(w.Ctx()); err != nil {
 						return err
 					}
 				}
@@ -362,12 +365,12 @@ func (w *windower) spillAllRowsToDisk() error {
 // error, it forces all rows to spill and attempts to grow acc by usage
 // one more time.
 func (w *windower) growMemAccount(acc *mon.BoundAccount, usage int64) error {
-	if err := acc.Grow(w.Ctx, usage); err != nil {
+	if err := acc.Grow(w.Ctx(), usage); err != nil {
 		if sqlerrors.IsOutOfMemoryError(err) {
 			if err := w.spillAllRowsToDisk(); err != nil {
 				return err
 			}
-			if err := acc.Grow(w.Ctx, usage); err != nil {
+			if err := acc.Grow(w.Ctx(), usage); err != nil {
 				return err
 			}
 		} else {
@@ -413,7 +416,7 @@ func (w *windower) findOrderOfWindowFnsToProcessIn() {
 // function to be processed.
 func (w *windower) processPartition(
 	ctx context.Context,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	partition *rowcontainer.DiskBackedIndexedRowContainer,
 	partitionIdx int,
 ) error {
@@ -440,7 +443,7 @@ func (w *windower) processPartition(
 		// partition and populating it below for a custom window frame is
 		// suboptimal. Consider extracting this logic into the constructor of
 		// the windower and reusing the same objects between partitions.
-		frameRun := &tree.WindowFrameRun{
+		frameRun := &eval.WindowFrameRun{
 			ArgsIdxs:     windowFn.argsIdxs,
 			FilterColIdx: windowFn.filterColIdx,
 		}
@@ -503,7 +506,7 @@ func (w *windower) processPartition(
 					// For datetime related ordering columns, offset must be an Interval.
 					offsetTyp = types.Interval
 				}
-				plusOp, minusOp, found := tree.WindowFrameRangeOps{}.LookupImpl(colTyp, offsetTyp)
+				plusOp, minusOp, found := eval.WindowFrameRangeOps{}.LookupImpl(colTyp, offsetTyp)
 				if !found {
 					return pgerror.Newf(pgcode.Windowing,
 						"given logical offset cannot be combined with ordering column")
@@ -602,7 +605,7 @@ func (w *windower) processPartition(
 // computeWindowFunctions computes all window functions over all partitions.
 // Partitions are processed one at a time with the underlying row container
 // reused (and reordered if needed).
-func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.EvalContext) error {
+func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *eval.Context) error {
 	w.findOrderOfWindowFnsToProcessIn()
 
 	// We don't know how many partitions there are, so we'll be accounting for
@@ -621,9 +624,10 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 	w.partition = rowcontainer.NewDiskBackedIndexedRowContainer(
 		ordering,
 		w.inputTypes,
-		w.EvalCtx,
+		w.FlowCtx.EvalCtx,
 		w.FlowCtx.Cfg.TempStorage,
 		w.MemMonitor,
+		w.unlimitedMemMonitor,
 		w.diskMonitor,
 	)
 	i, err := w.allRowsPartitioned.NewAllRowsIterator(ctx)
@@ -641,7 +645,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 		} else if !ok {
 			break
 		}
-		row, err := i.Row()
+		row, err := i.EncRow()
 		if err != nil {
 			return err
 		}
@@ -693,7 +697,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 				}
 			}
 		}
-		if err := w.partition.AddRow(w.Ctx, row); err != nil {
+		if err := w.partition.AddRow(w.Ctx(), row); err != nil {
 			return err
 		}
 	}
@@ -707,7 +711,7 @@ func (w *windower) computeWindowFunctions(ctx context.Context, evalCtx *tree.Eva
 func (w *windower) populateNextOutputRow() (bool, error) {
 	if w.partitionIdx < len(w.partitionSizes) {
 		if w.allRowsIterator == nil {
-			w.allRowsIterator = w.allRowsPartitioned.NewUnmarkedIterator(w.Ctx)
+			w.allRowsIterator = w.allRowsPartitioned.NewUnmarkedIterator(w.Ctx())
 			w.allRowsIterator.Rewind()
 		}
 		// rowIdx is the index of the next row to be emitted from the
@@ -718,7 +722,7 @@ func (w *windower) populateNextOutputRow() (bool, error) {
 		} else if !ok {
 			return false, nil
 		}
-		inputRow, err := w.allRowsIterator.Row()
+		inputRow, err := w.allRowsIterator.EncRow()
 		w.allRowsIterator.Next()
 		if err != nil {
 			return false, err
@@ -726,7 +730,10 @@ func (w *windower) populateNextOutputRow() (bool, error) {
 		copy(w.outputRow, inputRow[:len(w.inputTypes)])
 		for windowFnIdx, windowFn := range w.windowFns {
 			windowFnRes := w.windowValues[w.partitionIdx][windowFnIdx][rowIdx]
-			encWindowFnRes := rowenc.DatumToEncDatum(w.outputTypes[windowFn.outputColIdx], windowFnRes)
+			encWindowFnRes, err := rowenc.DatumToEncDatum(w.outputTypes[windowFn.outputColIdx], windowFnRes)
+			if err != nil {
+				return false, err
+			}
 			w.outputRow[windowFn.outputColIdx] = encWindowFnRes
 		}
 		w.rowsInBucketEmitted++
@@ -752,7 +759,7 @@ type windowFunc struct {
 
 type partitionPeerGrouper struct {
 	ctx       context.Context
-	evalCtx   *tree.EvalContext
+	evalCtx   *eval.Context
 	partition *rowcontainer.DiskBackedIndexedRowContainer
 	ordering  execinfrapb.Ordering
 	rowCopy   rowenc.EncDatumRow
@@ -788,7 +795,10 @@ func (n *partitionPeerGrouper) InSameGroup(i, j int) (bool, error) {
 			n.err = err
 			return false, n.err
 		}
-		if c := da.Compare(n.evalCtx, db); c != 0 {
+		if c, err := da.Compare(n.ctx, n.evalCtx, db); err != nil {
+			n.err = err
+			return false, n.err
+		} else if c != 0 {
 			if o.Direction != execinfrapb.Ordering_Column_ASC {
 				return false, nil
 			}
@@ -821,28 +831,28 @@ func (w *windower) execStatsForTrace() *execinfrapb.ComponentStats {
 	return &execinfrapb.ComponentStats{
 		Inputs: []execinfrapb.InputStats{is},
 		Exec: execinfrapb.ExecStats{
-			MaxAllocatedMem:  optional.MakeUint(uint64(w.MemMonitor.MaximumBytes())),
+			MaxAllocatedMem:  optional.MakeUint(uint64(w.MemMonitor.MaximumBytes() + w.unlimitedMemMonitor.MaximumBytes())),
 			MaxAllocatedDisk: optional.MakeUint(uint64(w.diskMonitor.MaximumBytes())),
 		},
 		Output: w.OutputHelper.Stats(),
 	}
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (w *windower) ChildCount(verbose bool) int {
-	if _, ok := w.input.(execinfra.OpNode); ok {
+	if _, ok := w.input.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (w *windower) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (w *windower) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		if n, ok := w.input.(execinfra.OpNode); ok {
+		if n, ok := w.input.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("input to windower is not an execinfra.OpNode")
+		panic("input to windower is not an execopnode.OpNode")
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

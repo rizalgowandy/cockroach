@@ -1,25 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { Location, createPath } from "history";
 import { Action } from "redux";
-import { ThunkAction } from "redux-thunk";
 import { createSelector } from "reselect";
 
-import { userLogin, userLogout } from "src/util/api";
 import { AdminUIState } from "src/redux/state";
 import { LOGIN_PAGE, LOGOUT_PAGE } from "src/routes/login";
-import { cockroach } from "src/js/protos";
+import { userLogout } from "src/util/api";
 import { getDataFromServer } from "src/util/dataFromServer";
 
-import UserLoginRequest = cockroach.server.serverpb.UserLoginRequest;
+import { clearTenantCookie } from "./cookies";
 
 const dataFromServer = getDataFromServer();
 
@@ -64,25 +57,7 @@ class LoginEnabledState {
   }
 }
 
-class LoginDisabledState {
-  displayUserMenu(): boolean {
-    return true;
-  }
-
-  secureCluster(): boolean {
-    return false;
-  }
-
-  hideLoginPage(): boolean {
-    return true;
-  }
-
-  loggedInUser(): string {
-    return null;
-  }
-}
-
-class NoLoginState {
+class InsecureState {
   displayUserMenu(): boolean {
     return false;
   }
@@ -96,7 +71,7 @@ class NoLoginState {
   }
 
   loggedInUser(): string {
-    return null;
+    return "";
   }
 }
 
@@ -105,12 +80,9 @@ class NoLoginState {
 export const selectLoginState = createSelector(
   (state: AdminUIState) => state.login,
   (login: LoginAPIState) => {
-    if (!dataFromServer.ExperimentalUseLogin) {
-      return new NoLoginState();
-    }
-
-    if (!dataFromServer.LoginEnabled) {
-      return new LoginDisabledState();
+    const dataFromServer = getDataFromServer();
+    if (dataFromServer.Insecure) {
+      return new InsecureState();
     }
 
     return new LoginEnabledState(login);
@@ -144,110 +116,49 @@ export function getLoginPage(location: Location) {
 
 // Redux implementation.
 
-// State
-
+// LoginAPIState is the Redux state for login. Only loggedInUser is
+// managed via Redux — it's the one piece of login state that other
+// components (requireLogin, loginIndicator, alertDataProvider) need.
 export interface LoginAPIState {
   loggedInUser: string;
-  error: Error;
-  inProgress: boolean;
-  oidcAutoLogin: boolean;
-  oidcLoginEnabled: boolean;
-  oidcButtonText: string;
 }
 
 export const emptyLoginState: LoginAPIState = {
   loggedInUser: dataFromServer.LoggedInUser,
-  error: null,
-  inProgress: false,
-  oidcAutoLogin: dataFromServer.OIDCAutoLogin,
-  oidcLoginEnabled: dataFromServer.OIDCLoginEnabled,
-  oidcButtonText: dataFromServer.OIDCButtonText,
 };
 
 // Actions
 
-const LOGIN_BEGIN = "cockroachui/auth/LOGIN_BEGIN";
 const LOGIN_SUCCESS = "cockroachui/auth/LOGIN_SUCCESS";
-const LOGIN_FAILURE = "cockroachui/auth/LOGIN_FAILURE";
-
-const loginBeginAction = {
-  type: LOGIN_BEGIN,
-};
 
 interface LoginSuccessAction extends Action {
   type: typeof LOGIN_SUCCESS;
   loggedInUser: string;
 }
 
-function loginSuccess(loggedInUser: string): LoginSuccessAction {
+export function loginSuccess(loggedInUser: string): LoginSuccessAction {
   return {
     type: LOGIN_SUCCESS,
     loggedInUser,
   };
 }
 
-interface LoginFailureAction extends Action {
-  type: typeof LOGIN_FAILURE;
-  error: Error;
-}
-
-function loginFailure(error: Error): LoginFailureAction {
-  return {
-    type: LOGIN_FAILURE,
-    error,
-  };
-}
-
-const LOGOUT_BEGIN = "cockroachui/auth/LOGOUT_BEGIN";
-
-const logoutBeginAction = {
-  type: LOGOUT_BEGIN,
-};
-
-export function doLogin(
-  username: string,
-  password: string,
-): ThunkAction<Promise<void>, AdminUIState, void, Action> {
-  return dispatch => {
-    dispatch(loginBeginAction);
-
-    const loginReq = new UserLoginRequest({
-      username,
-      password,
-    });
-    return userLogin(loginReq).then(
-      () => {
-        dispatch(loginSuccess(username));
-      },
-      err => {
-        dispatch(loginFailure(err));
-      },
-    );
-  };
-}
-
-export function doLogout(): ThunkAction<
-  Promise<void>,
-  AdminUIState,
-  void,
-  Action
-> {
-  return dispatch => {
-    dispatch(logoutBeginAction);
-
-    // Make request to log out, reloading the page whether it succeeds or not.
-    // If there was a successful log out but the network dropped the response somehow,
-    // you'll get the login page on reload. If The logout actually didn't work, you'll
-    // be reloaded to the same page and can try to log out again.
-    return userLogout().then(
-      () => {
-        document.location.reload();
-      },
-      () => {
-        document.location.reload();
-      },
-    );
-  };
+export function doLogout(): void {
+  // Clearing the tenant cookie on logout is necessary in order to
+  // avoid routing login requests to that specific tenant.
+  clearTenantCookie();
+  // Make request to log out, reloading the page whether it succeeds or not.
+  // If there was a successful log out but the network dropped the response somehow,
+  // you'll get the login page on reload. If The logout actually didn't work, you'll
+  // be reloaded to the same page and can try to log out again.
+  userLogout().then(
+    () => {
+      document.location.reload();
+    },
+    () => {
+      document.location.reload();
+    },
+  );
 }
 
 // Reducer
@@ -257,33 +168,10 @@ export function loginReducer(
   action: Action,
 ): LoginAPIState {
   switch (action.type) {
-    case LOGIN_BEGIN:
-      return {
-        ...state,
-        loggedInUser: null,
-        error: null,
-        inProgress: true,
-      };
     case LOGIN_SUCCESS:
       return {
         ...state,
         loggedInUser: (action as LoginSuccessAction).loggedInUser,
-        inProgress: false,
-        error: null,
-      };
-    case LOGIN_FAILURE:
-      return {
-        ...state,
-        loggedInUser: null,
-        inProgress: false,
-        error: (action as LoginFailureAction).error,
-      };
-    case LOGOUT_BEGIN:
-      return {
-        ...state,
-        loggedInUser: state.loggedInUser,
-        inProgress: true,
-        error: null,
       };
     default:
       return state;

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -18,34 +13,88 @@ import (
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvtestutils"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
 
-// Env manipulates the environment (cluster settings, zone configurations) that
-// the Applier operates in.
+// Logger is the log sink used by kvnemesis.
+type Logger interface {
+	Helper()
+	Logf(string, ...interface{})
+	WriteFile(basename string, contents string) string
+}
+
+type ServerController interface {
+	StopServer(idx int)
+	RestartServer(idx int) error
+	CrashNode(idx int)
+}
+
+type MvccGCController interface {
+	MvccGCRangeForKey(key []byte) error
+}
+
+type PtsController interface {
+	Start(ctx context.Context, timestamp hlc.Timestamp) error
+	Advance(ctx context.Context, timestamp hlc.Timestamp) error
+	Finish(ctx context.Context) error
+}
+
+// Env manipulates the environment (cluster settings, zone configurations,
+// server crashes/restarts, MVCC GC, protected timestamp) that the Applier
+// operates in.
 type Env struct {
-	sqlDBs []*gosql.DB
+	SQLDBs           []*gosql.DB
+	Tracker          *SeqTracker
+	L                Logger
+	Partitioner      *rpc.Partitioner
+	ServerController ServerController
+	MvccGCController MvccGCController
+	PtsController    PtsController
 }
 
 func (e *Env) anyNode() *gosql.DB {
 	// NOTE: There is currently no need to round-robin through the sql gateways,
 	// so we always just return the first DB.
-	return e.sqlDBs[0]
+	return e.SQLDBs[0]
+}
+
+// CheckConsistency runs a consistency check on all ranges in the given span,
+// primarily to verify that MVCC stats are accurate. Any failures are returned
+// as a list of errors. RANGE_CONSISTENT_STATS_ESTIMATED is considered a
+// success, since stats estimates are fine (if unfortunate).
+func (e *Env) CheckConsistency(ctx context.Context, span roachpb.Span) []error {
+	return kvtestutils.CheckConsistency(ctx, e.anyNode(), span)
 }
 
 // SetClosedTimestampInterval sets the kv.closed_timestamp.target_duration
 // cluster setting to the provided duration.
 func (e *Env) SetClosedTimestampInterval(ctx context.Context, d time.Duration) error {
-	q := fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`, d)
-	_, err := e.anyNode().ExecContext(ctx, q)
-	return err
+	return e.SetClusterSetting(ctx, "kv.closed_timestamp.target_duration", d.String())
 }
 
 // ResetClosedTimestampInterval resets the kv.closed_timestamp.target_duration
 // cluster setting to its default value.
 func (e *Env) ResetClosedTimestampInterval(ctx context.Context) error {
-	const q = `SET CLUSTER SETTING kv.closed_timestamp.target_duration TO DEFAULT`
+	return e.SetClusterSettingToDefault(ctx, "kv.closed_timestamp.target_duration")
+}
+
+// SetClusterSetting sets the cluster setting with the provided name to the
+// provided value.
+func (e *Env) SetClusterSetting(ctx context.Context, name, val string) error {
+	q := fmt.Sprintf(`SET CLUSTER SETTING %s = '%s'`, name, val)
+	_, err := e.anyNode().ExecContext(ctx, q)
+	return err
+}
+
+// SetClusterSettingToDefault resets the cluster setting with the provided name
+// to its default value.
+func (e *Env) SetClusterSettingToDefault(ctx context.Context, name string) error {
+	q := fmt.Sprintf(`SET CLUSTER SETTING %s TO DEFAULT`, name)
 	_, err := e.anyNode().ExecContext(ctx, q)
 	return err
 }

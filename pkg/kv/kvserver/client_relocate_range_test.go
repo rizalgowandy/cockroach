@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"math/rand"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,11 +17,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -43,15 +42,20 @@ func relocateAndCheck(
 	voterTargets []roachpb.ReplicationTarget,
 	nonVoterTargets []roachpb.ReplicationTarget,
 ) (retries int) {
+	t.Helper()
 	every := log.Every(1 * time.Second)
 	testutils.SucceedsSoon(t, func() error {
 		err := tc.Servers[0].DB().
 			AdminRelocateRange(
-				context.Background(), startKey.AsRawKey(), voterTargets, nonVoterTargets,
+				context.Background(),
+				startKey.AsRawKey(),
+				voterTargets,
+				nonVoterTargets,
+				true, /* transferLeaseToFirstVoter */
 			)
 		if err != nil {
 			if every.ShouldLog() {
-				log.Infof(context.Background(), "AdminRelocateRange failed with error: %s", err)
+				log.KvExec.Infof(context.Background(), "AdminRelocateRange failed with error: %s", err)
 			}
 			retries++
 		}
@@ -77,9 +81,13 @@ func requireRelocationFailure(
 ) {
 	testutils.SucceedsSoon(t, func() error {
 		err := tc.Servers[0].DB().AdminRelocateRange(
-			ctx, startKey.AsRawKey(), voterTargets, nonVoterTargets,
+			ctx,
+			startKey.AsRawKey(),
+			voterTargets,
+			nonVoterTargets,
+			true, /* transferLeaseToFirstVoter */
 		)
-		if kv.IsExpectedRelocateError(err) {
+		if kvtestutils.IsExpectedRelocateError(err) {
 			return err
 		}
 		require.Regexp(t, errRegExp, err)
@@ -132,7 +140,7 @@ func requireLeaseAt(
 	})
 }
 
-func usesAtomicReplicationChange(ops []roachpb.ReplicationChange) bool {
+func usesAtomicReplicationChange(ops []kvpb.ReplicationChange) bool {
 	// There are 4 sets of operations that are executed atomically:
 	// 1. Voter rebalances (ADD_VOTER, REMOVE_VOTER)
 	// 2. Non-voter promoted to voter (ADD_VOTER, REMOVE_NON_VOTER)
@@ -140,10 +148,12 @@ func usesAtomicReplicationChange(ops []roachpb.ReplicationChange) bool {
 	// 4. Voter swapped with non-voter (ADD_VOTER, REMOVE_NON_VOTER,
 	// ADD_NON_VOTER, REMOVE_VOTER)
 	if len(ops) >= 2 {
+		// Either a simple voter rebalance, or its a non-voter promotion.
 		if ops[0].ChangeType == roachpb.ADD_VOTER && ops[1].ChangeType.IsRemoval() {
 			return true
 		}
 	}
+	// Demotion of a voter.
 	if len(ops) == 2 &&
 		ops[0].ChangeType == roachpb.ADD_NON_VOTER && ops[1].ChangeType == roachpb.REMOVE_VOTER {
 		return true
@@ -158,7 +168,7 @@ func TestAdminRelocateRange(t *testing.T) {
 	ctx := context.Background()
 
 	type intercept struct {
-		ops         []roachpb.ReplicationChange
+		ops         []kvpb.ReplicationChange
 		leaseTarget *roachpb.ReplicationTarget
 	}
 	var intercepted []intercept
@@ -189,7 +199,7 @@ func TestAdminRelocateRange(t *testing.T) {
 
 	knobs := base.TestingKnobs{
 		Store: &kvserver.StoreTestingKnobs{
-			OnRelocatedOne: func(ops []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget) {
+			OnRelocatedOne: func(ops []kvpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget) {
 				intercepted = append(intercepted, intercept{
 					ops:         ops,
 					leaseTarget: leaseTarget,
@@ -238,10 +248,9 @@ func TestAdminRelocateRange(t *testing.T) {
 	}
 
 	// s5 (LH) ---> s3 (LH)
-	// Lateral movement while at replication factor one. In this case atomic
-	// replication changes cannot be used; we add-then-remove instead.
+	// Lateral movement while at replication factor one.
 	{
-		requireNumAtomic(0, 2, func() {
+		requireNumAtomic(1, 0, func() {
 			relocateAndCheck(t, tc, k, tc.Targets(2), nil /* nonVoterTargets */)
 		})
 	}
@@ -299,6 +308,44 @@ func TestAdminRelocateRange(t *testing.T) {
 	}
 }
 
+// TestAdminRelocateRangeWithoutLeaseTransfer tests that `AdminRelocateRange`
+// only transfers the lease away to the first voting replica in the target slice
+// if the callers asks it to.
+func TestAdminRelocateRangeWithoutLeaseTransfer(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	args := base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	}
+
+	tc := testcluster.StartTestCluster(t, 5 /* numNodes */, args)
+	defer tc.Stopper().Stop(ctx)
+
+	k := keys.MustAddr(tc.ScratchRange(t))
+
+	// Add voters to the first three nodes.
+	relocateAndCheck(t, tc, k, tc.Targets(0, 1, 2), nil /* nonVoterTargets */)
+
+	// Move the last voter without asking for the lease to move.
+	err := tc.Servers[0].DB().AdminRelocateRange(
+		context.Background(),
+		k.AsRawKey(),
+		tc.Targets(3, 1, 0),
+		nil,   /* nonVoterTargets */
+		false, /* transferLeaseToFirstVoter */
+	)
+	require.NoError(t, err)
+	leaseholder, err := tc.FindRangeLeaseHolder(tc.LookupRangeOrFatal(t, k.AsRawKey()), nil /* hint */)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		roachpb.ReplicationTarget{NodeID: leaseholder.NodeID, StoreID: leaseholder.StoreID},
+		tc.Target(0),
+	)
+}
+
 func TestAdminRelocateRangeFailsWithDuplicates(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -308,7 +355,7 @@ func TestAdminRelocateRangeFailsWithDuplicates(t *testing.T) {
 		ReplicationMode: base.ReplicationManual,
 	}
 
-	tc := testcluster.StartTestCluster(t, numNodes, args)
+	tc := testcluster.StartTestCluster(t, 3, args)
 	defer tc.Stopper().Stop(ctx)
 
 	k := keys.MustAddr(tc.ScratchRange(t))
@@ -339,7 +386,11 @@ func TestAdminRelocateRangeFailsWithDuplicates(t *testing.T) {
 	}
 	for _, subtest := range tests {
 		err := tc.Servers[0].DB().AdminRelocateRange(
-			context.Background(), k.AsRawKey(), tc.Targets(subtest.voterTargets...), tc.Targets(subtest.nonVoterTargets...),
+			context.Background(),
+			k.AsRawKey(),
+			tc.Targets(subtest.voterTargets...),
+			tc.Targets(subtest.nonVoterTargets...),
+			true, /* transferLeaseToFirstVoter */
 		)
 		require.Regexp(t, subtest.expectedErr, err)
 	}
@@ -409,15 +460,15 @@ func TestReplicaRemovalDuringGet(t *testing.T) {
 
 	// Perform write.
 	pArgs := putArgs(key, []byte("foo"))
-	_, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSender(), pArgs)
+	_, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSenderI().(kv.Sender), pArgs)
 	require.Nil(t, pErr)
 
 	// Perform delayed read during replica removal.
 	resp, pErr := evalDuringReplicaRemoval(ctx, getArgs(key))
 	require.Nil(t, pErr)
 	require.NotNil(t, resp)
-	require.NotNil(t, resp.(*roachpb.GetResponse).Value)
-	val, err := resp.(*roachpb.GetResponse).Value.GetBytes()
+	require.NotNil(t, resp.(*kvpb.GetResponse).Value)
+	val, err := resp.(*kvpb.GetResponse).Value.GetBytes()
 	require.NoError(t, err)
 	require.Equal(t, []byte("foo"), val)
 }
@@ -428,6 +479,7 @@ func TestReplicaRemovalDuringGet(t *testing.T) {
 func TestReplicaRemovalDuringCPut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderDuress(t, "https://github.com/cockroachdb/cockroach/issues/166892")
 
 	ctx := context.Background()
 	tc, key, evalDuringReplicaRemoval := setupReplicaRemovalTest(t, ctx)
@@ -435,7 +487,7 @@ func TestReplicaRemovalDuringCPut(t *testing.T) {
 
 	// Perform write.
 	pArgs := putArgs(key, []byte("foo"))
-	_, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSender(), pArgs)
+	_, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSenderI().(kv.Sender), pArgs)
 	require.Nil(t, pErr)
 
 	// Perform delayed conditional put during replica removal. This will cause
@@ -446,7 +498,7 @@ func TestReplicaRemovalDuringCPut(t *testing.T) {
 	req := cPutArgs(key, []byte("bar"), []byte("foo"))
 	_, pErr = evalDuringReplicaRemoval(ctx, req)
 	require.NotNil(t, pErr)
-	require.IsType(t, &roachpb.AmbiguousResultError{}, pErr.GetDetail())
+	require.IsType(t, &kvpb.AmbiguousResultError{}, pErr.GetDetail())
 }
 
 // setupReplicaRemovalTest sets up a test cluster that can be used to test
@@ -459,7 +511,7 @@ func setupReplicaRemovalTest(
 ) (
 	*testcluster.TestCluster,
 	roachpb.Key,
-	func(context.Context, roachpb.Request) (roachpb.Response, *roachpb.Error),
+	func(context.Context, kvpb.Request) (kvpb.Response, *kvpb.Error),
 ) {
 	t.Helper()
 
@@ -467,7 +519,7 @@ func setupReplicaRemovalTest(
 
 	requestReadyC := make(chan struct{}) // signals main thread that request is teed up
 	requestEvalC := make(chan struct{})  // signals cluster to evaluate the request
-	evalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
+	evalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 		if args.Ctx.Value(magicKey{}) != nil {
 			requestReadyC <- struct{}{}
 			<-requestEvalC
@@ -488,7 +540,7 @@ func setupReplicaRemovalTest(
 					AllowLeaseRequestProposalsWhenNotLeader: true,
 				},
 				Server: &server.TestingKnobs{
-					ClockSource: manual.UnixNano,
+					WallClock: manual,
 				},
 			},
 		},
@@ -501,27 +553,36 @@ func setupReplicaRemovalTest(
 
 	// Return a function that can be used to evaluate a delayed request
 	// during replica removal.
-	evalDuringReplicaRemoval := func(ctx context.Context, req roachpb.Request) (roachpb.Response, *roachpb.Error) {
+	evalDuringReplicaRemoval := func(ctx context.Context, req kvpb.Request) (kvpb.Response, *kvpb.Error) {
 		// Submit request and wait for it to block.
 		type result struct {
-			resp roachpb.Response
-			err  *roachpb.Error
+			resp kvpb.Response
+			err  *kvpb.Error
 		}
-		resultC := make(chan result)
-		err := tc.Stopper().RunAsyncTask(ctx, "request", func(ctx context.Context) {
+		resultC := make(chan result, 1)
+		srv := tc.Servers[0]
+		err := srv.Stopper().RunAsyncTask(ctx, "request", func(ctx context.Context) {
 			reqCtx := context.WithValue(ctx, magicKey{}, struct{}{})
-			resp, pErr := kv.SendWrapped(reqCtx, tc.Servers[0].DistSender(), req)
+			resp, pErr := kv.SendWrapped(reqCtx, srv.DistSenderI().(kv.Sender), req)
 			resultC <- result{resp, pErr}
 		})
 		require.NoError(t, err)
 		<-requestReadyC
+
+		// Ensure the blocked request is always unblocked, even if the
+		// operations below fatal. Without this, a Fatalf triggers
+		// runtime.Goexit which runs deferred tc.Stopper().Stop(), but the
+		// stopper hangs forever waiting for the async task blocked on
+		// requestEvalC.
+		closeRequestEvalC := sync.OnceFunc(func() { close(requestEvalC) })
+		defer closeRequestEvalC()
 
 		// Transfer leaseholder to other store.
 		rangeDesc, err := tc.LookupRange(key)
 		require.NoError(t, err)
 		repl, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(rangeDesc.RangeID)
 		require.NoError(t, err)
-		_, err = tc.MoveRangeLeaseNonCooperatively(ctx, rangeDesc, tc.Target(1), manual)
+		_, err = tc.MoveRangeLeaseNonCooperatively(t, ctx, rangeDesc, tc.Target(1), manual)
 		require.NoError(t, err)
 
 		// Remove first store from raft group.
@@ -541,7 +602,7 @@ func setupReplicaRemovalTest(
 		time.Sleep(500 * time.Millisecond)
 
 		// Allow request to resume, and return the result.
-		close(requestEvalC)
+		closeRequestEvalC()
 		r := <-resultC
 		return r.resp, r.err
 	}

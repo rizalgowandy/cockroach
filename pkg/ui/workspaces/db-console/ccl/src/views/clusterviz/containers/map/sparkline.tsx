@@ -1,18 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import d3 from "d3";
+import { util } from "@cockroachlabs/cluster-ui";
+import { extent } from "d3-array";
+import { scaleLinear } from "d3-scale";
+import { Selection } from "d3-selection";
+import { line } from "d3-shape";
 import React from "react";
 
-import { NanoToMilli } from "src/util/convert";
+import { BACKGROUND_BLUE, MAIN_BLUE } from "src/views/shared/colors";
 import { MetricsDataComponentProps } from "src/views/shared/components/metricQuery";
 import createChartComponent from "src/views/shared/util/d3-react";
-import { BACKGROUND_BLUE, MAIN_BLUE } from "src/views/shared/colors";
 
 interface SparklineConfig {
   width: number;
@@ -46,20 +46,21 @@ function sparklineChart(config: SparklineConfig) {
     bottom: 1,
   };
 
-  const xScale = d3.scale.linear().range([margin.left, width - margin.right]);
-  const yScale = d3.scale.linear().range([height - margin.bottom, margin.top]);
+  const xScale = scaleLinear().range([margin.left, width - margin.right]);
+  const yScale = scaleLinear().range([height - margin.bottom, margin.top]);
 
-  const drawPath = d3.svg
-    .line<Datapoint>()
+  const drawPath = line<Datapoint>()
     .x((d: Datapoint) => xScale(d.timestamp))
     .y((d: Datapoint) => yScale(d.value));
 
-  return function renderSparkline(sel: d3.Selection<SparklineChartProps>) {
+  return function renderSparkline(
+    sel: Selection<SVGElement, SparklineChartProps, null, undefined>,
+  ) {
     // TODO(couchand): unsingletonize this
     const { results } = sel.datum();
 
-    xScale.domain(d3.extent(results, (d: Datapoint) => d.timestamp));
-    yScale.domain(d3.extent(results, (d: Datapoint) => d.value));
+    xScale.domain(extent(results, (d: Datapoint) => d.timestamp));
+    yScale.domain(extent(results, (d: Datapoint) => d.value));
 
     const bg = sel.selectAll("rect").data([null]);
 
@@ -108,7 +109,7 @@ interface SparklineMetricsDataComponentProps {
 export class SparklineMetricsDataComponent extends React.Component<
   MetricsDataComponentProps & SparklineMetricsDataComponentProps
 > {
-  chart: React.ComponentClass<SparklineChartProps>;
+  chart: React.ComponentType<SparklineChartProps>;
 
   constructor(
     props: MetricsDataComponentProps & SparklineMetricsDataComponentProps,
@@ -138,7 +139,7 @@ export class SparklineMetricsDataComponent extends React.Component<
 
     data.results.forEach(({ datapoints }) => {
       datapoints.forEach(({ timestamp_nanos, value }) => {
-        const timestamp = NanoToMilli(timestamp_nanos.toNumber());
+        const timestamp = util.NanoToMilli(timestamp_nanos.toNumber());
 
         if (timestamps.indexOf(timestamp) !== -1) {
           resultsByTimestamp[timestamp].value += value;

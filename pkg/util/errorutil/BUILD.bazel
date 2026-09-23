@@ -5,15 +5,15 @@ go_library(
     srcs = [
         "catch.go",
         "error.go",
+        "sentinel.go",
         "tenant.go",
         "tenant_deprecated_wrapper.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/util/errorutil",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/settings",
-        "//pkg/util/errorutil/unimplemented",
-        "//pkg/util/log/logcrash",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )

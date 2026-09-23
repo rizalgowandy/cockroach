@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package diskmap
 
@@ -26,16 +21,17 @@ type Factory interface {
 // SortedDiskMapIterator is a simple iterator used to iterate over keys and/or
 // values.
 // Example use of iterating over all keys:
-// 	var i SortedDiskMapIterator
-// 	for i.Rewind(); ; i.Next() {
-// 		if ok, err := i.Valid(); err != nil {
+//
+//	var i SortedDiskMapIterator
+//	for i.Rewind(); ; i.Next() {
+//		if ok, err := i.Valid(); err != nil {
 //			// Handle error.
-// 		} else if !ok {
+//		} else if !ok {
 //			break
-// 		}
-// 		key := i.UnsafeKey()
+//		}
+//		key := i.UnsafeKey()
 //		// Do something.
-// 	}
+//	}
 type SortedDiskMapIterator interface {
 	// SeekGE sets the iterator's position to the first key greater than or equal
 	// to the provided key.
@@ -70,11 +66,17 @@ type SortedDiskMapBatchWriter interface {
 	// Flush flushes all writes to the underlying store. The batch can be reused
 	// after a call to Flush().
 	Flush() error
-	// The number of put calls since the last time the writer was flushed.
-	NumPutsSinceFlush() int
+	// The number of put and delete calls since the last time the writer was
+	// flushed.
+	NumMutationsSinceFlush() int
 	// Close flushes all writes to the underlying store and frees up resources
 	// held by the batch writer.
 	Close(context.Context) error
+
+	// DeleteRange removes all keys in the range [start, end) from the batch.
+	// The deletion is applied on Flush(), Close(), or when the batch writer
+	// reaches its capacity.
+	DeleteRange(start, end []byte) error
 }
 
 // SortedDiskMap is an on-disk map. Keys are iterated over in sorted order.

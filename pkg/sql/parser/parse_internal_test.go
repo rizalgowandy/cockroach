@@ -1,18 +1,15 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package parser
 
 import (
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestScanOneStmt(t *testing.T) {
@@ -44,7 +41,7 @@ func TestScanOneStmt(t *testing.T) {
 		{
 			sql: `SELECT 1 /* comment */  ; /* comment */  ; /* comment */ `,
 			exp: []stmt{{
-				sql: `SELECT 1`,
+				sql: `SELECT 1 /* comment */  `,
 				tok: []int{SELECT, ICONST},
 			}},
 		},
@@ -73,11 +70,11 @@ func TestScanOneStmt(t *testing.T) {
 			sql: ` ; /* x */ SELECT 1  ; SET /* y */ ; ;  INSERT INTO table;  ;`,
 			exp: []stmt{
 				{
-					sql: `SELECT 1`,
+					sql: `SELECT 1  `,
 					tok: []int{SELECT, ICONST},
 				},
 				{
-					sql: `SET`,
+					sql: `SET /* y */ `,
 					tok: []int{SET},
 				},
 				{
@@ -138,5 +135,46 @@ func TestScanOneStmt(t *testing.T) {
 		if !reflect.DeepEqual(result, tc.exp) {
 			t.Errorf("expected\n  %+v, but found\n  %+v", tc.exp, result)
 		}
+	}
+}
+
+func TestParseWithDept_retainComment(t *testing.T) {
+	testData := []struct {
+		in  string
+		exp [][]string
+	}{
+		{in: ``, exp: nil},
+		{in: `SELECT 1;`, exp: [][]string{nil}},
+		{in: `
+		-- comment
+		SELECT 1`, exp: [][]string{{`-- comment`}}},
+		{in: `/* comment */ SELECT 1`, exp: [][]string{{`/* comment */`}}},
+		{in: `SELECT 1 /* comment */`, exp: [][]string{{`/* comment */`}}},
+		{in: `SELECT 1;SELECT 2`, exp: [][]string{nil, nil}},
+		{in: `SELECT 1 /* block comment1 */ ;SELECT 2 /* block comment2 */`, exp: [][]string{{`/* block comment1 */`}, {`/* block comment2 */`}}},
+		{in: `SELECT 1 /* block comment */ ;SELECT 2 -- single-line-comment`, exp: [][]string{{`/* block comment */`}, {`-- single-line-comment`}}},
+		{in: `SELECT 1 /* block comment */ /* block comment */`, exp: [][]string{{`/* block comment */`, `/* block comment */`}}},
+		{in: `
+/* This is a select 1 */
+SELECT 1 -- in-line comment
+;
+-- This is a select 2
+SELECT 2; -- comment ignore, not part of statement
+/** Comment ignored, not part of statement */
+`, exp: [][]string{{`/* This is a select 1 */`, `-- in-line comment`}, {`-- This is a select 2`}}},
+	}
+	var p Parser
+	for _, d := range testData {
+		t.Run(d.in, func(t *testing.T) {
+			stmts, err := p.ParseWithOptions(d.in, DefaultParseOptions.RetainComments())
+			require.NoError(t, err)
+
+			var res [][]string
+			for i := range stmts {
+				res = append(res, stmts[i].Comments)
+			}
+
+			require.Equal(t, d.exp, res)
+		})
 	}
 }

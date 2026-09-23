@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -17,17 +12,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
+	"github.com/cockroachdb/cockroach/pkg/sql/storageparam/indexstorageparam"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
 
 type alterIndexNode struct {
+	zeroInputPlanNode
 	n         *tree.AlterIndex
 	tableDesc *tabledesc.Mutable
 	index     catalog.Index
@@ -44,10 +43,39 @@ func (p *planner) AlterIndex(ctx context.Context, n *tree.AlterIndex) (planNode,
 		return nil, err
 	}
 
-	tableDesc, index, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
+	// Check if the table actually exists. expandMutableIndexName returns the
+	// underlying table.
+	_, tableDesc, err := expandMutableIndexName(ctx, p, &n.Index, !n.IfExists /* requireTable */)
 	if err != nil {
+		// Error if no table is found and IfExists is false.
 		return nil, err
 	}
+
+	if tableDesc == nil {
+		// No error if no table but IfExists is true.
+		return newZeroNode(nil /* columns */), nil
+	}
+
+	// Check if the index actually exists.
+	index := catalog.FindIndexByName(tableDesc, string(n.Index.Index))
+	if index == nil {
+		if n.IfExists {
+			// Nothing needed if no index exists and IfExists is true.
+			return newZeroNode(nil /* columns */), nil
+		}
+		return nil, pgerror.Newf(pgcode.UndefinedObject,
+			"index %q does not exist", string(n.Index.Index))
+	}
+
+	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
+		return nil, err
+	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := p.checkSchemaChangeIsAllowed(ctx, tableDesc, n); err != nil {
+		return nil, err
+	}
+
 	return &alterIndexNode{n: n, tableDesc: tableDesc, index: index}, nil
 }
 
@@ -79,10 +107,16 @@ func (n *alterIndexNode) startExec(params runParams) error {
 					"cannot change the partitioning of an index if the table has PARTITION ALL BY defined",
 				)
 			}
-			if n.index.GetPartitioning().NumImplicitColumns() > 0 {
+			if n.index.ImplicitPartitioningColumnCount() > 0 {
 				return unimplemented.New(
 					"ALTER INDEX PARTITION BY",
 					"cannot ALTER INDEX PARTITION BY on an index which already has implicit column partitioning",
+				)
+			}
+			if n.index.IsSharded() {
+				return pgerror.Newf(
+					pgcode.FeatureNotSupported,
+					"cannot set explicit partitioning with ALTER INDEX PARTITION BY on a hash sharded index",
 				)
 			}
 			allowImplicitPartitioning := params.p.EvalContext().SessionData().ImplicitColumnPartitioningEnabled ||
@@ -119,16 +153,71 @@ func (n *alterIndexNode) startExec(params runParams) error {
 				descriptorChanged = true
 				if err := deleteRemovedPartitionZoneConfigs(
 					params.ctx,
-					params.p.txn,
+					params.p.InternalSQLTxn(),
 					n.tableDesc,
 					n.index.GetID(),
 					oldPartitioning,
 					n.index.GetPartitioning(),
 					params.extendedEvalCtx.ExecCfg,
+					params.extendedEvalCtx.Tracing.KVTracingEnabled(),
 				); err != nil {
 					return err
 				}
 			}
+		case *tree.AlterIndexSetStorageParams:
+			telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra("index", "set_storage_params"))
+			indexDesc := n.index.IndexDescDeepCopy()
+			setter := indexstorageparam.Setter{IndexDesc: &indexDesc, NewObject: false}
+			if err := storageparam.Set(
+				params.ctx,
+				params.p.SemaCtx(),
+				params.EvalContext(),
+				t.StorageParams,
+				&setter,
+			); err != nil {
+				return err
+			}
+			if err := paramparse.ValidateIndexStorageParams(
+				params.ctx,
+				t.StorageParams,
+				paramparse.IndexStorageParamContext{
+					IsPrimaryKey:            n.index.Primary(),
+					IsUnique:                indexDesc.Unique,
+					IsSharded:               indexDesc.Sharded.IsSharded,
+					HasImplicitPartitioning: indexDesc.Partitioning.NumImplicitColumns > 0,
+					Version:                 params.EvalContext().Settings.Version,
+				},
+			); err != nil {
+				return err
+			}
+			if n.index.Primary() {
+				n.tableDesc.SetPrimaryIndex(*setter.IndexDesc)
+			} else {
+				n.tableDesc.SetPublicNonPrimaryIndex(n.index.Ordinal(), *setter.IndexDesc)
+			}
+			n.index = n.tableDesc.ActiveIndexes()[n.index.Ordinal()]
+			descriptorChanged = true
+
+		case *tree.AlterIndexResetStorageParams:
+			telemetry.Inc(sqltelemetry.SchemaChangeAlterCounterWithExtra("index", "reset_storage_params"))
+			indexDesc := n.index.IndexDescDeepCopy()
+			setter := indexstorageparam.Setter{IndexDesc: &indexDesc, NewObject: false}
+			if err := storageparam.Reset(
+				params.ctx,
+				params.EvalContext(),
+				t.Params,
+				&setter,
+			); err != nil {
+				return err
+			}
+			if n.index.Primary() {
+				n.tableDesc.SetPrimaryIndex(*setter.IndexDesc)
+			} else {
+				n.tableDesc.SetPublicNonPrimaryIndex(n.index.Ordinal(), *setter.IndexDesc)
+			}
+			n.index = n.tableDesc.ActiveIndexes()[n.index.Ordinal()]
+			descriptorChanged = true
+
 		default:
 			return errors.AssertionFailedf(
 				"unsupported alter command: %T", cmd)
@@ -136,7 +225,8 @@ func (n *alterIndexNode) startExec(params runParams) error {
 
 	}
 
-	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+	version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
+	if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
 		return err
 	}
 
@@ -147,7 +237,7 @@ func (n *alterIndexNode) startExec(params runParams) error {
 	}
 	mutationID := descpb.InvalidMutationID
 	if addedMutations {
-		mutationID = n.tableDesc.ClusterVersion.NextMutationID
+		mutationID = n.tableDesc.ClusterVersion().NextMutationID
 	}
 	if err := params.p.writeSchemaChange(
 		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),

@@ -1,19 +1,24 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { emptyLoginState } from "src/redux/login";
-import { LoginPageProps } from "./loginPage";
 import { createMemoryHistory } from "history";
 import { RouteComponentProps } from "react-router-dom";
 
+import type { LoginPageProps, LoginPageState } from "./loginPage";
+
 const history = createMemoryHistory({ initialEntries: ["/statements"] });
+
+const emptyLoginState: LoginPageState = {
+  loggedInUser: "",
+  error: null,
+  inProgress: false,
+  oidcAutoLogin: false,
+  oidcLoginEnabled: false,
+  oidcButtonText: "",
+  oidcGenerateJWTAuthTokenEnabled: false,
+};
 
 export const loginPagePropsFixture: LoginPageProps & RouteComponentProps = {
   history,

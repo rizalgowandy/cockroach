@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sidetransport
 
@@ -15,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -32,13 +28,13 @@ type mockStores struct {
 type rangeUpdate struct {
 	rid      roachpb.RangeID
 	closedTS hlc.Timestamp
-	lai      ctpb.LAI
+	lai      kvpb.LeaseAppliedIndex
 }
 
 var _ Stores = &mockStores{}
 
 func (m *mockStores) ForwardSideTransportClosedTimestampForRange(
-	ctx context.Context, rangeID roachpb.RangeID, closedTS hlc.Timestamp, lai ctpb.LAI,
+	ctx context.Context, rangeID roachpb.RangeID, closedTS hlc.Timestamp, lai kvpb.LeaseAppliedIndex,
 ) {
 	upd := rangeUpdate{
 		rid:      rangeID,
@@ -61,15 +57,15 @@ func (m *mockStores) getAndClearRecording() []rangeUpdate {
 var ts10 = hlc.Timestamp{WallTime: 10}
 var ts11 = hlc.Timestamp{WallTime: 11}
 var ts12 = hlc.Timestamp{WallTime: 12}
-var ts20 = hlc.Timestamp{WallTime: 20, Synthetic: true}
-var ts21 = hlc.Timestamp{WallTime: 21, Synthetic: true}
-var ts22 = hlc.Timestamp{WallTime: 22, Synthetic: true}
-var laiZero = ctpb.LAI(0)
+var ts20 = hlc.Timestamp{WallTime: 20}
+var ts21 = hlc.Timestamp{WallTime: 21}
+var ts22 = hlc.Timestamp{WallTime: 22}
+var laiZero = kvpb.LeaseAppliedIndex(0)
 
-const lai100 = ctpb.LAI(100)
-const lai101 = ctpb.LAI(101)
-const lai102 = ctpb.LAI(102)
-const lai103 = ctpb.LAI(102)
+const lai100 = kvpb.LeaseAppliedIndex(100)
+const lai101 = kvpb.LeaseAppliedIndex(101)
+const lai102 = kvpb.LeaseAppliedIndex(102)
+const lai103 = kvpb.LeaseAppliedIndex(103)
 
 func TestIncomingStreamProcessUpdateBasic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -90,13 +86,13 @@ func TestIncomingStreamProcessUpdateBasic(t *testing.T) {
 		SeqNum:   1,
 		Snapshot: true,
 		ClosedTimestamps: []ctpb.Update_GroupUpdate{
-			{Policy: roachpb.LAG_BY_CLUSTER_SETTING, ClosedTimestamp: ts10},
-			{Policy: roachpb.LEAD_FOR_GLOBAL_READS, ClosedTimestamp: ts20},
+			{Policy: ctpb.LAG_BY_CLUSTER_SETTING, ClosedTimestamp: ts10},
+			{Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO, ClosedTimestamp: ts20},
 		},
 		AddedOrUpdated: []ctpb.Update_RangeUpdate{
-			{RangeID: 1, LAI: lai100, Policy: roachpb.LAG_BY_CLUSTER_SETTING},
-			{RangeID: 2, LAI: lai101, Policy: roachpb.LAG_BY_CLUSTER_SETTING},
-			{RangeID: 3, LAI: lai102, Policy: roachpb.LEAD_FOR_GLOBAL_READS},
+			{RangeID: 1, LAI: lai100, Policy: ctpb.LAG_BY_CLUSTER_SETTING},
+			{RangeID: 2, LAI: lai101, Policy: ctpb.LAG_BY_CLUSTER_SETTING},
+			{RangeID: 3, LAI: lai102, Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO},
 		},
 		Removed: nil,
 	}
@@ -118,11 +114,11 @@ func TestIncomingStreamProcessUpdateBasic(t *testing.T) {
 		SeqNum:   2,
 		Snapshot: false,
 		ClosedTimestamps: []ctpb.Update_GroupUpdate{
-			{Policy: roachpb.LAG_BY_CLUSTER_SETTING, ClosedTimestamp: ts11},
-			{Policy: roachpb.LEAD_FOR_GLOBAL_READS, ClosedTimestamp: ts21},
+			{Policy: ctpb.LAG_BY_CLUSTER_SETTING, ClosedTimestamp: ts11},
+			{Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO, ClosedTimestamp: ts21},
 		},
 		AddedOrUpdated: []ctpb.Update_RangeUpdate{
-			{RangeID: 3, LAI: lai103, Policy: roachpb.LEAD_FOR_GLOBAL_READS},
+			{RangeID: 3, LAI: lai103, Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO},
 		},
 		Removed: []roachpb.RangeID{1},
 	}
@@ -144,12 +140,12 @@ func TestIncomingStreamProcessUpdateBasic(t *testing.T) {
 		SeqNum:   3,
 		Snapshot: true,
 		ClosedTimestamps: []ctpb.Update_GroupUpdate{
-			{Policy: roachpb.LAG_BY_CLUSTER_SETTING, ClosedTimestamp: ts12},
-			{Policy: roachpb.LEAD_FOR_GLOBAL_READS, ClosedTimestamp: ts22},
+			{Policy: ctpb.LAG_BY_CLUSTER_SETTING, ClosedTimestamp: ts12},
+			{Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO, ClosedTimestamp: ts22},
 		},
 		AddedOrUpdated: []ctpb.Update_RangeUpdate{
-			{RangeID: 3, LAI: lai102, Policy: roachpb.LEAD_FOR_GLOBAL_READS},
-			{RangeID: 4, LAI: lai100, Policy: roachpb.LAG_BY_CLUSTER_SETTING},
+			{RangeID: 3, LAI: lai102, Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO},
+			{RangeID: 4, LAI: lai100, Policy: ctpb.LAG_BY_CLUSTER_SETTING},
 		},
 		Removed: nil,
 	}
@@ -190,10 +186,10 @@ func TestIncomingStreamCallsIntoStoresDontHoldLock(t *testing.T) {
 	msg := &ctpb.Update{
 		NodeID: 1, SeqNum: 1, Snapshot: true,
 		ClosedTimestamps: []ctpb.Update_GroupUpdate{
-			{Policy: roachpb.LEAD_FOR_GLOBAL_READS, ClosedTimestamp: ts10},
+			{Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO, ClosedTimestamp: ts10},
 		},
 		AddedOrUpdated: []ctpb.Update_RangeUpdate{
-			{RangeID: 1, LAI: lai100, Policy: roachpb.LEAD_FOR_GLOBAL_READS},
+			{RangeID: 1, LAI: lai100, Policy: ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO},
 		},
 		Removed: nil,
 	}

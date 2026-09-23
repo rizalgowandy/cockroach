@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -16,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RaduBerinde/btreemap"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -25,25 +21,25 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
-	"github.com/google/btree"
 )
 
 func makeAmbCtx() log.AmbientContext {
-	return log.AmbientContext{Tracer: tracing.NewTracer()}
+	return log.MakeTestingAmbientCtxWithNewTracer()
 }
 
 // Test implementation of a range set backed by btree.BTree.
 type testRangeSet struct {
 	syncutil.Mutex
-	replicasByKey *btree.BTree
+	replicasByKey *btreemap.BTreeMap[roachpb.RKey, *Replica]
 	visited       int
 }
 
 // newTestRangeSet creates a new range set that has the count number of ranges.
 func newTestRangeSet(count int, t *testing.T) *testRangeSet {
-	rs := &testRangeSet{replicasByKey: btree.New(64 /* degree */)}
+	rs := &testRangeSet{
+		replicasByKey: btreemap.New[roachpb.RKey, *Replica](64 /* degree */, roachpb.RKey.Compare),
+	}
 	for i := 0; i < count; i++ {
 		desc := &roachpb.RangeDescriptor{
 			RangeID:  roachpb.RangeID(i),
@@ -54,15 +50,15 @@ func newTestRangeSet(count int, t *testing.T) *testRangeSet {
 		repl := &Replica{
 			RangeID: desc.RangeID,
 		}
-		repl.mu.state.Stats = &enginepb.MVCCStats{
+		repl.shMu.state.Stats = &enginepb.MVCCStats{
 			KeyBytes:  1,
 			ValBytes:  2,
 			KeyCount:  1,
 			LiveCount: 1,
 		}
-		repl.mu.state.Desc = desc
+		repl.shMu.state.Desc = desc
 		repl.startKey = desc.StartKey // actually used by replicasByKey
-		if exRngItem := rs.replicasByKey.ReplaceOrInsert((*btreeReplica)(repl)); exRngItem != nil {
+		if _, exRngItem, _ := rs.replicasByKey.ReplaceOrInsert(repl.startKey, repl); exRngItem != nil {
 			t.Fatalf("failed to insert range %s", repl)
 		}
 	}
@@ -73,12 +69,15 @@ func (rs *testRangeSet) Visit(visitor func(*Replica) bool) {
 	rs.Lock()
 	defer rs.Unlock()
 	rs.visited = 0
-	rs.replicasByKey.Ascend(func(i btree.Item) bool {
-		rs.visited++
-		rs.Unlock()
-		defer rs.Lock()
-		return visitor((*Replica)(i.(*btreeReplica)))
-	})
+	rs.replicasByKey.AscendFunc(
+		btreemap.Min[roachpb.RKey](), btreemap.Max[roachpb.RKey](),
+		func(_ roachpb.RKey, r *Replica) bool {
+			rs.visited++
+			rs.Unlock()
+			defer rs.Lock()
+			return visitor(r)
+		},
+	)
 }
 
 func (rs *testRangeSet) EstimatedCount() int {
@@ -93,14 +92,14 @@ func (rs *testRangeSet) EstimatedCount() int {
 
 // removeRange removes the i-th range from the range set.
 func (rs *testRangeSet) remove(index int, t *testing.T) *Replica {
-	endKey := roachpb.Key(fmt.Sprintf("%03d", index+1))
+	endKey := roachpb.RKey(fmt.Sprintf("%03d", index+1))
 	rs.Lock()
 	defer rs.Unlock()
-	repl := rs.replicasByKey.Delete((rangeBTreeKey)(endKey))
+	_, repl, _ := rs.replicasByKey.Delete(endKey)
 	if repl == nil {
 		t.Fatalf("failed to delete range of end key %s", endKey)
 	}
-	return (*Replica)(repl.(*btreeReplica))
+	return repl
 }
 
 // Test implementation of a range queue which adds range to an
@@ -113,8 +112,8 @@ type testQueue struct {
 	disabled       bool
 }
 
-// setDisabled suspends processing of items from the queue.
-func (tq *testQueue) setDisabled(d bool) {
+// SetDisabled suspends processing of items from the queue.
+func (tq *testQueue) SetDisabled(d bool) {
 	tq.Lock()
 	defer tq.Unlock()
 	tq.disabled = d
@@ -151,6 +150,17 @@ func (tq *testQueue) Start(stopper *stop.Stopper) {
 func (tq *testQueue) MaybeAddAsync(
 	ctx context.Context, replI replicaInQueue, now hlc.ClockTimestamp,
 ) {
+	repl := replI.(*Replica)
+
+	tq.Lock()
+	defer tq.Unlock()
+	if index := tq.indexOf(repl.RangeID); index == -1 {
+		tq.ranges = append(tq.ranges, repl)
+	}
+}
+
+// NB: AddAsync on a testQueue is actually synchronous.
+func (tq *testQueue) AddAsync(ctx context.Context, replI replicaInQueue, prio float64) {
 	repl := replI.(*Replica)
 
 	tq.Lock()
@@ -206,10 +216,9 @@ func TestScannerAddToQueues(t *testing.T) {
 	ranges := newTestRangeSet(count, t)
 	q1, q2 := &testQueue{}, &testQueue{}
 	// We don't want to actually consume entries from the queues during this test.
-	q1.setDisabled(true)
-	q2.setDisabled(true)
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	q1.SetDisabled(true)
+	q2.SetDisabled(true)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q1, q2)
 	s.stopper = stop.NewStopper()
@@ -261,8 +270,7 @@ func TestScannerTiming(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			ranges := newTestRangeSet(count, t)
 			q := &testQueue{}
-			mc := hlc.NewManualClock(123)
-			clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+			clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 			s := newReplicaScanner(makeAmbCtx(), clock, duration, 0, 0, ranges)
 			s.AddQueues(q)
 			s.stopper = stop.NewStopper()
@@ -271,7 +279,7 @@ func TestScannerTiming(t *testing.T) {
 			s.stopper.Stop(context.Background())
 
 			avg := s.avgScan()
-			log.Infof(context.Background(), "%d: average scan: %s", i, avg)
+			log.KvExec.Infof(context.Background(), "%d: average scan: %s", i, avg)
 			if avg.Nanoseconds()-duration.Nanoseconds() > maxError.Nanoseconds() ||
 				duration.Nanoseconds()-avg.Nanoseconds() > maxError.Nanoseconds() {
 				return errors.Errorf("expected %s, got %s: exceeds max error of %s", duration, avg, maxError)
@@ -345,8 +353,7 @@ func TestScannerDisabled(t *testing.T) {
 	const count = 3
 	ranges := newTestRangeSet(count, t)
 	q := &testQueue{}
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, 1*time.Millisecond, 0, 0, ranges)
 	s.AddQueues(q)
 	s.stopper = stop.NewStopper()
@@ -410,8 +417,7 @@ func TestScannerEmptyRangeSet(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ranges := newTestRangeSet(0, t)
 	q := &testQueue{}
-	mc := hlc.NewManualClock(123)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
 	s := newReplicaScanner(makeAmbCtx(), clock, time.Hour, 0, 0, ranges)
 	s.AddQueues(q)
 	s.stopper = stop.NewStopper()

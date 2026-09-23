@@ -1,26 +1,32 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/metadata"
 )
 
+// stmtDiagnosticsRequest contains a subset of columns that are stored in
+// system.statement_diagnostics_requests and are exposed in
+// serverpb.StatementDiagnosticsReport.
 type stmtDiagnosticsRequest struct {
 	ID                     int
 	StatementFingerprint   string
@@ -67,10 +73,10 @@ func (diagnostics *stmtDiagnostics) toProto() serverpb.StatementDiagnostics {
 func (s *statusServer) CreateStatementDiagnosticsReport(
 	ctx context.Context, req *serverpb.CreateStatementDiagnosticsReportRequest,
 ) (*serverpb.CreateStatementDiagnosticsReportResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
@@ -78,8 +84,23 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 		Report: &serverpb.StatementDiagnosticsReport{},
 	}
 
+	var username string
+	if user, err := authserver.UserFromIncomingRPCContext(ctx); err != nil {
+		return nil, srverrors.ServerError(ctx, err)
+	} else {
+		username = user.Normalized()
+	}
 	err := s.stmtDiagnosticsRequester.InsertRequest(
-		ctx, req.StatementFingerprint, req.MinExecutionLatency, req.ExpiresAfter,
+		ctx,
+		req.StatementFingerprint,
+		req.PlanGist,
+		req.AntiPlanGist,
+		req.SamplingProbability,
+		req.MinExecutionLatency,
+		0, // maxExecutionLatency - not yet exposed in API
+		req.ExpiresAfter,
+		req.Redacted,
+		username,
 	)
 	if err != nil {
 		return nil, err
@@ -89,25 +110,46 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 	return response, nil
 }
 
-// StatementDiagnosticsRequests retrieves all of the statement
-// diagnostics requests in the `system.statement_diagnostics_requests` table.
-func (s *statusServer) StatementDiagnosticsRequests(
-	ctx context.Context, req *serverpb.StatementDiagnosticsReportsRequest,
-) (*serverpb.StatementDiagnosticsReportsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+// CancelStatementDiagnosticsReport cancels the statement diagnostics request by
+// updating the corresponding row from the system.statement_diagnostics_requests
+// table to be expired.
+func (s *statusServer) CancelStatementDiagnosticsReport(
+	ctx context.Context, req *serverpb.CancelStatementDiagnosticsReportRequest,
+) (*serverpb.CancelStatementDiagnosticsReportResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
-	var err error
+	var response serverpb.CancelStatementDiagnosticsReportResponse
+	err := s.stmtDiagnosticsRequester.CancelRequest(ctx, req.RequestID)
+	if err != nil {
+		response.Canceled = false
+		response.Error = err.Error()
+	} else {
+		response.Canceled = true
+	}
+	return &response, nil
+}
+
+// StatementDiagnosticsRequests retrieves all statement diagnostics
+// requests in the `system.statement_diagnostics_requests` table that
+// have either completed or have not yet expired.
+func (s *statusServer) StatementDiagnosticsRequests(
+	ctx context.Context, _ *serverpb.StatementDiagnosticsReportsRequest,
+) (*serverpb.StatementDiagnosticsReportsResponse, error) {
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
+	ctx = s.AnnotateCtx(ctx)
+
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
+		return nil, err
+	}
 
 	// TODO(davidh): Add pagination to this request.
 	it, err := s.internalExecutor.QueryIteratorEx(ctx, "stmt-diag-get-all", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
-		},
+		sessiondata.NodeUserSessionDataOverride,
 		`SELECT
 			id,
 			statement_fingerprint,
@@ -146,8 +188,11 @@ func (s *statusServer) StatementDiagnosticsRequests(
 		}
 		if expiresAt, ok := row[6].(*tree.DTimestampTZ); ok {
 			req.ExpiresAt = expiresAt.Time
+			// Don't return already expired requests.
+			if !completed && req.ExpiresAt.Before(timeutil.Now()) {
+				continue
+			}
 		}
-
 		requests = append(requests, req)
 	}
 	if err != nil {
@@ -174,18 +219,16 @@ func (s *statusServer) StatementDiagnosticsRequests(
 func (s *statusServer) StatementDiagnostics(
 	ctx context.Context, req *serverpb.StatementDiagnosticsRequest,
 ) (*serverpb.StatementDiagnosticsResponse, error) {
-	ctx = propagateGatewayMetadata(ctx)
+	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
 	ctx = s.AnnotateCtx(ctx)
 
-	if _, err := s.privilegeChecker.requireViewActivityPermission(ctx); err != nil {
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(ctx); err != nil {
 		return nil, err
 	}
 
 	var err error
 	row, err := s.internalExecutor.QueryRowEx(ctx, "stmt-diag-get-one", nil, /* txn */
-		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
-		},
+		sessiondata.NodeUserSessionDataOverride,
 		`SELECT
 			id,
 			statement_fingerprint,
@@ -222,4 +265,76 @@ func (s *statusServer) StatementDiagnostics(
 	}
 
 	return response, nil
+}
+
+func (s *adminServer) buildBundle(
+	ctx context.Context, chunkIds *tree.DArray,
+) (bytes.Buffer, error) {
+	var bundle bytes.Buffer
+	for _, chunkID := range chunkIds.Array {
+		chunkRow, err := s.internalExecutor.QueryRowEx(
+			ctx, "admin-stmt-bundle", nil, /* txn */
+			sessiondata.NodeUserSessionDataOverride,
+			"SELECT data FROM system.statement_bundle_chunks WHERE id=$1",
+			chunkID,
+		)
+		if err != nil {
+			return bytes.Buffer{}, err
+		}
+		if chunkRow == nil {
+			return bytes.Buffer{}, errors.Newf("No bundle chunks found for id: %s", chunkID.String())
+		}
+		data := chunkRow[0].(*tree.DBytes)
+		bundle.WriteString(string(*data))
+	}
+
+	return bundle, nil
+}
+
+func (s *adminServer) StmtBundleHandler(w http.ResponseWriter, req *http.Request) {
+	idStr := req.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	// The privilege checks in the privilege checker below checks the user in the incoming
+	// gRPC metadata.
+	md := authserver.TranslateHTTPAuthInfoToGRPCMetadata(req.Context(), req)
+	authCtx := metadata.NewIncomingContext(req.Context(), md)
+	authCtx = s.AnnotateCtx(authCtx)
+	if err := s.privilegeChecker.RequireViewActivityAndNoViewActivityRedactedPermission(authCtx); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	row, err := s.sqlServer.internalExecutor.QueryRowEx(
+		authCtx, "admin-stmt-bundle", nil, /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		"SELECT bundle_chunks FROM system.statement_diagnostics WHERE id=$1 AND bundle_chunks IS NOT NULL",
+		id,
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if row == nil {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
+	// Put together the entire bundle. Ideally we would stream it in chunks,
+	// but it's hard to return errors once we start.
+	chunkIDs := row[0].(*tree.DArray)
+	bundle, err := s.buildBundle(authCtx, chunkIDs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set(
+		"Content-Disposition",
+		fmt.Sprintf("attachment; filename=stmt-bundle-%d.zip", id),
+	)
+
+	_, _ = io.Copy(w, &bundle)
 }

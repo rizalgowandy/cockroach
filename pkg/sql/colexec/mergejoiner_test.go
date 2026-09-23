@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -24,9 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -1659,10 +1655,11 @@ func TestMergeJoiner(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -1672,6 +1669,8 @@ func TestMergeJoiner(t *testing.T) {
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	defer closerRegistry.Close(ctx)
 	for _, tc := range getMJTestCases() {
 		for _, tc := range tc.mutateTypes() {
 			tc.init()
@@ -1693,19 +1692,19 @@ func TestMergeJoiner(t *testing.T) {
 			// We test all cases with the default memory limit (regular scenario) and a
 			// limit of 1 byte (to force the buffered groups to spill to disk).
 			for _, memoryLimit := range []int64{1, execinfra.DefaultMemoryLimit} {
-				log.Infof(context.Background(), "MemoryLimit=%s/%s", humanizeutil.IBytes(memoryLimit), tc.description)
+				log.Dev.Infof(context.Background(), "MemoryLimit=%s/%s", humanizeutil.IBytes(memoryLimit), tc.description)
 				runner(t, testAllocator, []colexectestutils.Tuples{tc.leftTuples, tc.rightTuples},
 					[][]*types.T{tc.leftTypes, tc.rightTypes},
 					tc.expected, verifier,
 					func(sources []colexecop.Operator) (colexecop.Operator, error) {
 						spec := createSpecForMergeJoiner(tc)
 						args := &colexecargs.NewColOperatorArgs{
-							Spec:                spec,
-							Inputs:              colexectestutils.MakeInputs(sources),
-							StreamingMemAccount: testMemAcc,
-							DiskQueueCfg:        queueCfg,
-							FDSemaphore:         colexecop.NewTestingSemaphore(mjFDLimit),
-							MonitorRegistry:     &monitorRegistry,
+							Spec:            spec,
+							Inputs:          colexectestutils.MakeInputs(sources),
+							DiskQueueCfg:    queueCfg,
+							FDSemaphore:     colexecop.NewTestingSemaphore(mjFDLimit),
+							MonitorRegistry: &monitorRegistry,
+							CloserRegistry:  &closerRegistry,
 						}
 						flowCtx.Cfg.TestingKnobs.MemoryLimitBytes = memoryLimit
 						result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
@@ -1732,14 +1731,16 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
 	nTuples := coldata.BatchSize() * 4
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	diskQueueMemAcc := testMemMonitor.MakeBoundAccount()
+	defer diskQueueMemAcc.Close(ctx)
 	typs := []*types.T{types.Int}
-	colsLeft := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
-	colsRight := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
+	colsLeft := []*coldata.Vec{testAllocator.NewVec(typs[0], nTuples)}
+	colsRight := []*coldata.Vec{testAllocator.NewVec(typs[0], nTuples)}
 	groupsLeft := colsLeft[0].Int64()
 	groupsRight := colsRight[0].Int64()
 	for i := range groupsLeft {
@@ -1748,17 +1749,17 @@ func TestFullOuterMergeJoinWithMaximumNumberOfGroups(t *testing.T) {
 	}
 	leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsLeft, nTuples)
 	rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsRight, nTuples)
-	a := colexecjoin.NewMergeJoinOp(
-		testAllocator, execinfra.DefaultMemoryLimit, queueCfg,
+	a, _ := colexecjoin.NewMergeJoinOp(
+		ctx, testAllocator, execinfra.DefaultMemoryLimit, queueCfg,
 		colexecop.NewTestingSemaphore(mjFDLimit), descpb.FullOuterJoin,
 		leftSource, rightSource, typs, typs,
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-		testDiskAcc, &evalCtx,
+		testDiskAcc, &diskQueueMemAcc, &evalCtx,
 	)
 	a.Init(ctx)
 	i, count, expVal := 0, 0, int64(0)
-	for b := a.Next(); b.Length() != 0; b = a.Next() {
+	for b := colexecop.NextNoMeta(a); b.Length() != 0; b = colexecop.NextNoMeta(a) {
 		count += b.Length()
 		leftOutCol := b.ColVec(0).Int64()
 		leftNulls := b.ColVec(0).Nulls()
@@ -1802,36 +1803,38 @@ func TestMergeJoinerMultiBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	diskQueueMemAcc := testMemMonitor.MakeBoundAccount()
+	defer diskQueueMemAcc.Close(ctx)
 	for _, numInputBatches := range []int{1, 2, 16} {
 		t.Run(fmt.Sprintf("numInputBatches=%d", numInputBatches),
 			func(t *testing.T) {
 				nTuples := coldata.BatchSize() * numInputBatches
 				typs := []*types.T{types.Int}
-				cols := []coldata.Vec{testAllocator.NewMemColumn(typs[0], nTuples)}
+				cols := []*coldata.Vec{testAllocator.NewVec(typs[0], nTuples)}
 				groups := cols[0].Int64()
 				for i := range groups {
 					groups[i] = int64(i)
 				}
 				leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
 				rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
-				a := colexecjoin.NewMergeJoinOp(
-					testAllocator, execinfra.DefaultMemoryLimit,
+				a, _ := colexecjoin.NewMergeJoinOp(
+					ctx, testAllocator, execinfra.DefaultMemoryLimit,
 					queueCfg, colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 					leftSource, rightSource, typs, typs,
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 					[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-					testDiskAcc, &evalCtx,
+					testDiskAcc, &diskQueueMemAcc, &evalCtx,
 				)
 				a.Init(ctx)
 				i := 0
 				count := 0
 				// Keep track of the last comparison value.
 				expVal := int64(0)
-				for b := a.Next(); b.Length() != 0; b = a.Next() {
+				for b := colexecop.NextNoMeta(a); b.Length() != 0; b = colexecop.NextNoMeta(a) {
 					count += b.Length()
 					outCol := b.ColVec(0).Int64()
 					for j := int64(0); j < int64(b.Length()); j++ {
@@ -1858,10 +1861,12 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	diskQueueMemAcc := testMemMonitor.MakeBoundAccount()
+	defer diskQueueMemAcc.Close(ctx)
 	for _, groupSize := range []int{coldata.BatchSize() / 8, coldata.BatchSize() / 4, coldata.BatchSize() / 2} {
 		if groupSize == 0 {
 			// We might be varying coldata.BatchSize() so that when it is divided by
@@ -1883,9 +1888,9 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 					lastGroupSize := nTuples % groupSize
 					expCount := nTuples/groupSize*(groupSize*groupSize) + lastGroupSize*lastGroupSize
 					typs := []*types.T{types.Int, types.Int}
-					cols := []coldata.Vec{
-						testAllocator.NewMemColumn(typs[0], nTuples),
-						testAllocator.NewMemColumn(typs[1], nTuples),
+					cols := []*coldata.Vec{
+						testAllocator.NewVec(typs[0], nTuples),
+						testAllocator.NewVec(typs[1], nTuples),
 					}
 					for i := range cols[0].Int64() {
 						cols[0].Int64()[i] = int64(i / groupSize)
@@ -1893,20 +1898,20 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 					}
 					leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
 					rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, cols, nTuples)
-					a := colexecjoin.NewMergeJoinOp(
-						testAllocator, execinfra.DefaultMemoryLimit,
+					a, _ := colexecjoin.NewMergeJoinOp(
+						ctx, testAllocator, execinfra.DefaultMemoryLimit,
 						queueCfg, colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 						leftSource, rightSource, typs, typs,
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}, {ColIdx: 1, Direction: execinfrapb.Ordering_Column_ASC}},
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}, {ColIdx: 1, Direction: execinfrapb.Ordering_Column_ASC}},
-						testDiskAcc, &evalCtx,
+						testDiskAcc, &diskQueueMemAcc, &evalCtx,
 					)
 					a.Init(ctx)
 					i := 0
 					count := 0
 					// Keep track of the last comparison value.
 					lastVal := int64(0)
-					for b := a.Next(); b.Length() != 0; b = a.Next() {
+					for b := colexecop.NextNoMeta(a); b.Length() != 0; b = colexecop.NextNoMeta(a) {
 						count += b.Length()
 						outCol := b.ColVec(0).Int64()
 						for j := int64(0); j < int64(b.Length()); j++ {
@@ -1930,13 +1935,6 @@ func TestMergeJoinerMultiBatchRuns(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 type expectedGroup struct {
 	val         int64
 	cardinality int
@@ -1944,11 +1942,11 @@ type expectedGroup struct {
 
 func newBatchesOfRandIntRows(
 	nTuples int, maxRunLength int64, skipValues bool, randomIncrement int64,
-) ([]coldata.Vec, []coldata.Vec, []expectedGroup) {
+) ([]*coldata.Vec, []*coldata.Vec, []expectedGroup) {
 	rng, _ := randutil.NewTestRand()
-	lCols := []coldata.Vec{testAllocator.NewMemColumn(types.Int, nTuples)}
+	lCols := []*coldata.Vec{testAllocator.NewVec(types.Int, nTuples)}
 	lCol := lCols[0].Int64()
-	rCols := []coldata.Vec{testAllocator.NewMemColumn(types.Int, nTuples)}
+	rCols := []*coldata.Vec{testAllocator.NewVec(types.Int, nTuples)}
 	rCol := rCols[0].Int64()
 	exp := make([]expectedGroup, nTuples)
 	val := int64(0)
@@ -2004,35 +2002,40 @@ func newBatchesOfRandIntRows(
 func TestMergeJoinerRandomized(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	if coldata.BatchSize() > 1024 {
+		skip.UnderStress(t, "too slow with large coldata.BatchSize()")
+	}
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	diskQueueMemAcc := testMemMonitor.MakeBoundAccount()
+	defer diskQueueMemAcc.Close(ctx)
 	for _, numInputBatches := range []int{1, 2, 16, 256} {
 		for _, maxRunLength := range []int64{2, 3, 100} {
 			for _, skipValues := range []bool{false, true} {
 				for _, randomIncrement := range []int64{0, 1} {
-					log.Infof(ctx, "numInputBatches=%d/maxRunLength=%d/skipValues=%t/randomIncrement=%d", numInputBatches, maxRunLength, skipValues, randomIncrement)
+					log.Dev.Infof(ctx, "numInputBatches=%d/maxRunLength=%d/skipValues=%t/randomIncrement=%d", numInputBatches, maxRunLength, skipValues, randomIncrement)
 					nTuples := coldata.BatchSize() * numInputBatches
 					typs := []*types.T{types.Int}
 					lCols, rCols, exp := newBatchesOfRandIntRows(nTuples, maxRunLength, skipValues, randomIncrement)
 					leftSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, lCols, nTuples)
 					rightSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, rCols, nTuples)
 
-					a := colexecjoin.NewMergeJoinOp(
-						testAllocator, execinfra.DefaultMemoryLimit,
+					a, _ := colexecjoin.NewMergeJoinOp(
+						ctx, testAllocator, execinfra.DefaultMemoryLimit,
 						queueCfg, colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 						leftSource, rightSource, typs, typs,
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 						[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-						testDiskAcc, &evalCtx,
+						testDiskAcc, &diskQueueMemAcc, &evalCtx,
 					)
 					a.Init(ctx)
 					i := 0
 					count := 0
 					cpIdx := 0
-					for b := a.Next(); b.Length() != 0; b = a.Next() {
+					for b := colexecop.NextNoMeta(a); b.Length() != 0; b = colexecop.NextNoMeta(a) {
 						count += b.Length()
 						outCol := b.ColVec(0).Int64()
 						for j := 0; j < b.Length(); j++ {

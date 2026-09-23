@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package memo
 
@@ -48,7 +43,6 @@ func NewExprNameGenerator(prefix string) *ExprNameGenerator {
 // was encountered during tree traversal. Thus, in order to generate a
 // consistent name, always call GenerateName in a pre-order traversal of the
 // expression tree.
-//
 func (g *ExprNameGenerator) GenerateName(op opt.Operator) string {
 	// Replace all instances of "-" in the operator name with "_" in order to
 	// create a legal table name.
@@ -60,16 +54,16 @@ func (g *ExprNameGenerator) GenerateName(op opt.Operator) string {
 // ColumnNameGenerator is used to generate a unique name for each column of a
 // relational expression. See GenerateName for details.
 type ColumnNameGenerator struct {
-	e    RelExpr
+	mem  *Memo
 	pres physical.Presentation
 	seen map[string]int
 }
 
 // NewColumnNameGenerator creates a new instance of ColumnNameGenerator,
 // initialized with the given relational expression.
-func NewColumnNameGenerator(e RelExpr) *ColumnNameGenerator {
+func NewColumnNameGenerator(mem *Memo, e RelExpr) *ColumnNameGenerator {
 	return &ColumnNameGenerator{
-		e:    e,
+		mem:  mem,
 		pres: e.RequiredPhysical().Presentation,
 		seen: make(map[string]int, e.Relational().OutputCols.Len()),
 	}
@@ -80,7 +74,7 @@ func NewColumnNameGenerator(e RelExpr) *ColumnNameGenerator {
 // for the columns in the table that will be created if the session
 // variable `save_tables_prefix` is non-empty.
 func (g *ColumnNameGenerator) GenerateName(col opt.ColumnID) string {
-	colMeta := g.e.Memo().Metadata().ColumnMeta(col)
+	colMeta := g.mem.Metadata().ColumnMeta(col)
 	colName := colMeta.Alias
 
 	// Check whether the presentation has a different name for this column, and

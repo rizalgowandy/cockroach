@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil_test
 
@@ -33,6 +28,13 @@ func TestManualTime(t *testing.T) {
 		require.Equal(t, t0, mt.Now())
 		mt.Advance(time.Second)
 		require.Equal(t, t1, mt.Now())
+	})
+
+	t.Run("Backwards", func(t *testing.T) {
+		mt := timeutil.NewManualTime(t1)
+		require.Equal(t, t1, mt.Now())
+		mt.Backwards(time.Second)
+		require.Equal(t, t0, mt.Now())
 	})
 
 	t.Run("AdvanceTo", func(t *testing.T) {
@@ -124,6 +126,9 @@ func TestManualTime(t *testing.T) {
 		advanceTo := func(d time.Duration) {
 			mt.AdvanceTo(t0.Add(d))
 		}
+		advanceToInOneTick := func(d time.Duration) {
+			mt.AdvanceToInOneTick(t0.Add(d))
+		}
 		t1 := mt.NewTicker(1 * time.Second)
 		t2 := mt.NewTicker(5 * time.Second)
 
@@ -147,6 +152,11 @@ func TestManualTime(t *testing.T) {
 		ensureSend(t, t1.Ch(), 6*time.Second)
 
 		ensureSend(t, t2.Ch(), 5*time.Second)
+
+		// 7s tick will be dropped.
+		advanceToInOneTick(8 * time.Second)
+		ensureSend(t, t1.Ch(), 8*time.Second)
+		ensureNoSend(t, t1.Ch())
 
 		t1.Stop()
 		advanceTo(12 * time.Second)

@@ -1,20 +1,21 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package clisqlshell
 
 import (
+	"bufio"
+	"context"
+	"io"
 	"os"
 	"time"
 
 	democlusterapi "github.com/cockroachdb/cockroach/pkg/cli/democluster/api"
+	"github.com/cockroachdb/cockroach/pkg/sql/scanner"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Context represents the external configuration of the interactive
@@ -36,12 +37,54 @@ type Context struct {
 	// `demo` command, if that is the command being run.
 	DemoCluster democlusterapi.DemoCluster
 
+	// DisableLineEditor, if set, causes the shell to use a dumb line editor
+	// (disable the interactive one), which simplifies testing by avoiding
+	// escape sequences in the output.
+	DisableLineEditor bool
+
 	// ParseURL is a custom URL parser.
 	//
 	// When left undefined, the code defaults to pgurl.Parse.
 	// CockroachDB's own CLI package has a more advanced URL
 	// parser that is used instead.
 	ParseURL URLParser
+
+	// CertsDir is an extra directory to look for client certs in,
+	// when the \c command is used.
+	CertsDir string
+
+	// DisableHistory, if true, suppresses persistent shell history.
+	// When set, no history file is created or read, even in
+	// interactive mode. Equivalent to (but more explicit than)
+	// leaving the internal histFile unset.
+	DisableHistory bool
+
+	// InterruptCh, if non-nil, replaces the SIGINT-based interrupt
+	// handler. The embedder writes to this channel to request
+	// cancellation of a running query. When no query is running, writes
+	// are silently ignored — the embedder is responsible for shell
+	// lifetime (e.g. closing the input). Mutually exclusive with the
+	// default signal handler: when set, signal.Notify is not called.
+	InterruptCh <-chan struct{}
+
+	// DisableUnsafeCmds, if true, restricts the dispatcher to the
+	// embedder-safe allow-list (see embedderSafeCmds in sql.go).
+	// Commands outside that set are rejected — most importantly the
+	// ones that touch the local filesystem or shell out (\!, \|, \i,
+	// \ir, \o, and \e for the external editor), but the gate is
+	// fail-closed and also rejects any future or unknown metacommand
+	// that has not been explicitly opted in. Embedders that run the
+	// shell inside a privileged service process must set this;
+	// otherwise any user who opens a session can execute commands
+	// with the service's UID and read or write its filesystem.
+	DisableUnsafeCmds bool
+
+	// DisablePasswordCmd, if true, causes the shell to refuse the
+	// \password metacommand. \password is harmless on the server side
+	// — it issues a SQL ALTER USER ... WITH PASSWORD statement — but
+	// the password is typed into the shell session, which is not
+	// always desirable in an embedded context.
+	DisablePasswordCmd bool
 }
 
 // internalContext represents the internal configuration state of the
@@ -51,6 +94,14 @@ type internalContext struct {
 	// stdout and stderr are where messages and errors/warnings go.
 	stdout *os.File
 	stderr *os.File
+
+	// queryOutputFile is the output file configured via \o.
+	// This can be the same as stdout (\o without argument).
+	// Note: we use .queryOutput for query execution, which
+	// is buffered (via queryOutputBuf).
+	queryOutputFile *os.File
+	queryOutputBuf  *bufio.Writer
+	queryOutput     io.Writer
 
 	// quitAfterExecStmts tells the shell whether to quit
 	// after processing the execStmts.
@@ -62,6 +113,18 @@ type internalContext struct {
 	// Determines whether to perform client-side syntax checking.
 	checkSyntax bool
 
+	// restricted, when true, blocks all backslash metacommands except
+	// \unrestrict. It is set by \restrict KEY and cleared by \unrestrict
+	// with the matching key. The state is shared across \i / \ir file
+	// inclusion because internalContext is reused across child cliState
+	// instances (see runIncludeInternal). This mirrors psql's restricted
+	// mode, which mitigates the dump-injection attack described in
+	// CVE-2025-8714: a hostile server can embed metacommands in plain-text
+	// dump output that would otherwise execute on the operator's machine
+	// when the dump is piped back through the shell.
+	restricted  bool
+	restrictKey string
+
 	// autoTrace, when non-empty, encloses the executed statements
 	// by suitable SET TRACING and SHOW TRACE FOR SESSION statements.
 	autoTrace string
@@ -69,6 +132,61 @@ type internalContext struct {
 	// The string used to produce the value of fullPrompt.
 	customPromptPattern string
 
+	// reflowMaxWidth is the maximum reflow width.
+	reflowMaxWidth int
+
+	// reflowAlignMode is the SQL prettify alignment mode.
+	reflowAlignMode int
+
+	// reflowCaseMode is the SQL prettify case mode.
+	reflowCaseMode int
+
+	// reflowTabWidth is the tab width used by the prettify_statement function.
+	reflowTabWidth int
+
 	// current database name, if known. This is maintained on a best-effort basis.
 	dbName string
+
+	// hook to run once, then clear, after running the next batch of statements.
+	afterRun func()
+
+	// file where the history is saved.
+	histFile string
+
+	statementWrappers []statementWrapper
+
+	// state about the current query.
+	mu struct {
+		syncutil.Mutex
+		cancelFn func(ctx context.Context) error
+		doneCh   chan struct{}
+	}
+}
+
+// StatementWrapper allows custom client-side logic to be executed when a statement
+// matches a given pattern.
+// The cli will call Pattern.FindStringSubmatch on every statement before
+// executing it. If it returns non-nil, execution will stop and Wrapper will
+// be called with the statement and match data.
+type statementWrapper struct {
+	Pattern statementType
+	Wrapper func(ctx context.Context, statement string, c *cliState) error
+}
+
+// AddStatementWrapper adds a StatementWrapper to the specified context.
+func (c *internalContext) addStatementWrapper(w statementWrapper) {
+	c.statementWrappers = append(c.statementWrappers, w)
+}
+
+func (c *internalContext) maybeWrapStatement(
+	ctx context.Context, statement string, state *cliState,
+) (err error) {
+	var s scanner.SQLScanner
+	for _, sw := range c.statementWrappers {
+		s.Init(statement)
+		if sw.Pattern.matches(s) {
+			err = errors.CombineErrors(err, sw.Wrapper(ctx, statement, state))
+		}
+	}
+	return
 }

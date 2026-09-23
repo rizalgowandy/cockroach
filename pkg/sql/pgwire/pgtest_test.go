@@ -1,14 +1,9 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-package pgwire
+package pgwire_test
 
 import (
 	"context"
@@ -16,8 +11,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl" // register cloud storage providers
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -33,6 +30,9 @@ func TestPGTest(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Enable enterprise features so READ COMMITTED can be tested.
+	defer ccl.TestingEnableEnterprise()()
+
 	if *flagAddr == "" {
 		newServer := func() (addr, user string, cleanup func()) {
 			ctx := context.Background()
@@ -42,16 +42,24 @@ func TestPGTest(t *testing.T) {
 			cleanup = func() {
 				s.Stopper().Stop(ctx)
 			}
-			addr = s.ServingSQLAddr()
-			user = security.RootUser
+			addr = s.ApplicationLayer().AdvSQLAddr()
+			user = username.RootUser
 			// None of the tests read that much data, so we hardcode the max message
 			// size to something small. This lets us test the handling of large
 			// query inputs. See the large_input test.
+			//
+			// In shared process mode, SQL connections come through the system
+			// tenant's pgwire listener, so we need to set the cluster setting on
+			// the system tenant as well as the application tenant. The pre-serve
+			// phase uses the system tenant's settings to validate message sizes
+			// before routing to the appropriate tenant.
 			_, _ = db.ExecContext(ctx, "SET CLUSTER SETTING sql.conn.max_read_buffer_message_size = '32 KiB'")
+			sysDB := s.SystemLayer().SQLConn(t)
+			_, _ = sysDB.ExecContext(ctx, "SET CLUSTER SETTING sql.conn.max_read_buffer_message_size = '32 KiB'")
 			return addr, user, cleanup
 		}
-		pgtest.WalkWithNewServer(t, "testdata/pgtest", newServer)
+		pgtest.WalkWithNewServer(t, datapathutils.TestDataPath(t, "pgtest"), newServer)
 	} else {
-		pgtest.WalkWithRunningServer(t, "testdata/pgtest", *flagAddr, *flagUser)
+		pgtest.WalkWithRunningServer(t, datapathutils.TestDataPath(t, "pgtest"), *flagAddr, *flagUser)
 	}
 }

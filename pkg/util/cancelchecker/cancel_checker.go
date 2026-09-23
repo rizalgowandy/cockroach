@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cancelchecker
 
@@ -16,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 )
 
 // CancelChecker is a helper object for repeatedly checking whether the associated context
@@ -28,18 +24,25 @@ type CancelChecker struct {
 	// Reference to associated context to check.
 	ctx context.Context
 
-	// Number of times Check() has been called since last context cancellation check.
+	// Number of times Check() has been called since last context cancellation
+	// check.
 	callsSinceLastCheck uint32
+
+	// The number of Check() calls to skip the context cancellation check.
+	checkInterval uint32
+
+	cpuHandle *admission.GoroutineCPUHandle
 }
+
+// The default interval of Check() calls to wait between checks for context
+// cancellation. The value is a power of 2 to allow the compiler to use
+// bitwise AND instead of division.
+const cancelCheckInterval = 1024
 
 // Check returns an error if the associated query has been canceled.
 func (c *CancelChecker) Check() error {
-	// Interval of Check() calls to wait between checks for context
-	// cancellation. The value is a power of 2 to allow the compiler to use
-	// bitwise AND instead of division.
-	const cancelCheckInterval = 1024
 
-	if atomic.LoadUint32(&c.callsSinceLastCheck)%cancelCheckInterval == 0 {
+	if atomic.LoadUint32(&c.callsSinceLastCheck)%c.checkInterval == 0 {
 		select {
 		case <-c.ctx.Done():
 			// Once the context is canceled, we no longer increment
@@ -47,6 +50,12 @@ func (c *CancelChecker) Check() error {
 			// to Check().
 			return QueryCanceledError
 		default:
+		}
+		if c.cpuHandle != nil {
+			err := c.cpuHandle.MeasureAndAdmit(c.ctx)
+			if err != nil {
+				return QueryCanceledError
+			}
 		}
 	}
 
@@ -56,10 +65,22 @@ func (c *CancelChecker) Check() error {
 	return nil
 }
 
-// Reset resets this cancel checker with a fresh context.
-func (c *CancelChecker) Reset(ctx context.Context) {
+// Reset resets this cancel checker with a fresh context. Parameter
+// checkInterval is optional and specifies an override for the default check
+// interval of 1024. Note that checkInterval is expected to be set to a power of
+// 2 by the caller, but Reset does no explicit checking of this.
+func (c *CancelChecker) Reset(ctx context.Context, checkInterval ...uint32) {
 	*c = CancelChecker{
 		ctx: ctx,
+	}
+	if len(checkInterval) > 0 {
+		c.checkInterval = checkInterval[0]
+	} else {
+		c.checkInterval = cancelCheckInterval
+	}
+	cpuHandle := admission.SQLCPUHandleFromContext(ctx)
+	if cpuHandle != nil {
+		c.cpuHandle = cpuHandle.RegisterGoroutine()
 	}
 }
 

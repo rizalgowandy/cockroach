@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package pretty prints documents based on a target line width.
 //
@@ -27,7 +22,6 @@
 //
 // For example code with SQL to experiment further, refer to
 // https://github.com/knz/prettier/
-//
 package pretty
 
 import "fmt"
@@ -43,6 +37,7 @@ func (text) isDoc()      {}
 func (line) isDoc()      {}
 func (softbreak) isDoc() {}
 func (hardline) isDoc()  {}
+func (failDoc) isDoc()   {}
 func (nilDoc) isDoc()    {}
 func (*concat) isDoc()   {}
 func (nestt) isDoc()     {}
@@ -82,8 +77,9 @@ var Line Doc = line{}
 //
 // For example, text "hello" <> softbreak <> text "world"
 // flattens to "helloworld" (one word) but splits across lines as:
-//     hello
-//     world
+//
+//	hello
+//	world
 //
 // This is a common extension to Wadler's printer.
 //
@@ -98,6 +94,11 @@ type hardline struct{}
 
 // HardLine is a newline and cannot be flattened.
 var HardLine Doc = hardline{}
+
+type failDoc struct{}
+
+// fail signals that a document cannot be flattened (laid out on a single line).
+var fail Doc = failDoc{}
 
 // concat represents (DOC <> DOC) :: DOC -- the concatenation of two docs.
 type concat struct {
@@ -150,9 +151,14 @@ type union struct {
 	x, y Doc
 }
 
-// Group will format d on one line if possible.
+// Group will format d on one line if possible. If d cannot be flattened,
+// d is returned unchanged.
 func Group(d Doc) Doc {
-	return &union{flatten(d), d}
+	f := flatten(d)
+	if f == fail {
+		return d
+	}
+	return &union{f, d}
 }
 
 var textSpace = Text(" ")
@@ -161,14 +167,34 @@ func flatten(d Doc) Doc {
 	switch t := d.(type) {
 	case nilDoc:
 		return Nil
+	case failDoc:
+		return fail
 	case *concat:
-		return Concat(flatten(t.a), flatten(t.b))
+		a := flatten(t.a)
+		if a == fail {
+			return fail
+		}
+		b := flatten(t.b)
+		if b == fail {
+			return fail
+		}
+		return Concat(a, b)
 	case nestt:
-		return NestT(flatten(t.d))
+		inner := flatten(t.d)
+		if inner == fail {
+			return fail
+		}
+		return NestT(inner)
 	case nests:
-		return NestS(t.n, flatten(t.d))
-	case text, keyword, hardline:
+		inner := flatten(t.d)
+		if inner == fail {
+			return fail
+		}
+		return NestS(t.n, inner)
+	case text, keyword:
 		return d
+	case hardline:
+		return fail
 	case line:
 		return textSpace
 	case softbreak:

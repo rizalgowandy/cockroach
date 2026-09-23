@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -18,69 +13,91 @@ import (
 	"fmt"
 	"hash"
 	"math"
+	"math/big"
 	"math/rand"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 	"github.com/cockroachdb/cockroach/pkg/workload/histogram"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/spf13/pflag"
 )
 
 const (
 	kvSchema = `(
-		k BIGINT NOT NULL PRIMARY KEY,
+		k %s NOT NULL PRIMARY KEY,
 		v BYTES NOT NULL
 	)`
 	kvSchemaWithIndex = `(
-		k BIGINT NOT NULL PRIMARY KEY,
+		k %s NOT NULL PRIMARY KEY,
 		v BYTES NOT NULL,
 		INDEX (v)
 	)`
-	// TODO(ajwerner): Change this to use the "easier" hash sharded index syntax once that
-	// is in.
 	shardedKvSchema = `(
-		k BIGINT NOT NULL,
-		v BYTES NOT NULL,
-		shard INT4 AS (mod(k, %d)) STORED CHECK (%s),
-		PRIMARY KEY (shard, k)
+		k %s NOT NULL PRIMARY KEY USING HASH WITH (bucket_count = %d),
+		v BYTES NOT NULL
 	)`
 	shardedKvSchemaWithIndex = `(
-		k BIGINT NOT NULL,
+		k %s NOT NULL PRIMARY KEY USING HASH WITH (bucket_count = %d),
 		v BYTES NOT NULL,
-		shard INT4 AS (mod(k, %d)) STORED CHECK (%s),
-		PRIMARY KEY (shard, k),
 		INDEX (v)
 	)`
 )
 
+var RandomSeed = workload.NewInt64RandomSeed()
+
+type keyRange struct {
+	min, max int64
+}
+
+func (r keyRange) totalKeys() uint64 {
+	return uint64(r.max - r.min)
+}
+
 type kv struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
+	timeout   time.Duration
 
 	batchSize                            int
 	minBlockSizeBytes, maxBlockSizeBytes int
 	cycleLength                          int64
 	readPercent                          int
+	followerReadPercent                  int
 	spanPercent                          int
+	delPercent                           int
 	spanLimit                            int
 	writesUseSelectForUpdate             bool
-	seed                                 int64
 	writeSeq                             string
 	sequential                           bool
 	zipfian                              bool
+	sfuDelay                             time.Duration
+	longRunningTxn                       bool
+	longRunningTxnPriority               string
+	longRunningTxnNumWrites              int
 	splits                               int
+	scatter                              bool
 	secondaryIndex                       bool
 	shards                               int
 	targetCompressionRatio               float64
 	enum                                 bool
+	keySize                              int
+	insertCount                          int
+	txnQoS                               string
+	prepareReadOnly                      bool
+	writesUseSelect1                     bool
+	alwaysIncKeySeq                      bool
 }
 
 func init() {
@@ -94,19 +111,32 @@ var kvMeta = workload.Meta{
 	By default, keys are picked uniformly at random across the cluster.
 	--concurrency workers alternate between doing selects and upserts (according
 	to a --read-percent ratio). Each select/upsert reads/writes a batch of --batch
-	rows. The write keys are randomly generated in a deterministic fashion (or
-	sequentially if --sequential is specified). Reads select a random batch of ids
-	out of the ones previously written.
+	rows. The write keys are randomly generated in a deterministic fashion
+	(alternatively it could changed to use --sequential or --zipfian distribution).
+	Reads select a random batch of ids out of the ones previously written.
 	--write-seq can be used to incorporate data produced by a previous run into
 	the current run.
 	`,
-	Version:      `1.0.0`,
-	PublicFacing: true,
+	Version:    `1.0.0`,
+	RandomSeed: RandomSeed,
 	New: func() workload.Generator {
 		g := &kv{}
 		g.flags.FlagSet = pflag.NewFlagSet(`kv`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`batch`: {RuntimeOnly: true},
+			`batch`:                       {RuntimeOnly: true},
+			`sfu-wait-delay`:              {RuntimeOnly: true},
+			`sfu-writes`:                  {RuntimeOnly: true},
+			`long-running-txn`:            {RuntimeOnly: true},
+			`long-running-txn-num-writes`: {RuntimeOnly: true},
+			`read-percent`:                {RuntimeOnly: true},
+			`span-percent`:                {RuntimeOnly: true},
+			`span-limit`:                  {RuntimeOnly: true},
+			`del-percent`:                 {RuntimeOnly: true},
+			`splits`:                      {RuntimeOnly: true},
+			`scatter`:                     {RuntimeOnly: true},
+			`timeout`:                     {RuntimeOnly: true},
+			`prepare-read-only`:           {RuntimeOnly: true},
+			`sel1-writes`:                 {RuntimeOnly: true},
 		}
 		g.flags.IntVar(&g.batchSize, `batch`, 1,
 			`Number of blocks to read/insert in a single SQL statement.`)
@@ -118,13 +148,16 @@ var kvMeta = workload.Meta{
 			`Number of keys repeatedly accessed by each writer through upserts.`)
 		g.flags.IntVar(&g.readPercent, `read-percent`, 0,
 			`Percent (0-100) of operations that are reads of existing keys.`)
+		g.flags.IntVar(&g.followerReadPercent, `follower-read-percent`, 0,
+			`Percent (0-100) of read operations that are follower reads.`)
 		g.flags.IntVar(&g.spanPercent, `span-percent`, 0,
 			`Percent (0-100) of operations that are spanning queries of all ranges.`)
+		g.flags.IntVar(&g.delPercent, `del-percent`, 0,
+			`Percent (0-100) of operations that delete existing keys.`)
 		g.flags.IntVar(&g.spanLimit, `span-limit`, 0,
 			`LIMIT count for each spanning query, or 0 for no limit`)
 		g.flags.BoolVar(&g.writesUseSelectForUpdate, `sfu-writes`, false,
 			`Use SFU and transactional writes with a sleep after SFU.`)
-		g.flags.Int64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.BoolVar(&g.zipfian, `zipfian`, false,
 			`Pick keys in a zipfian distribution instead of randomly.`)
 		g.flags.BoolVar(&g.sequential, `sequential`, false,
@@ -135,14 +168,42 @@ var kvMeta = workload.Meta{
 				`previous --sequential run and R implies a previous random run.`)
 		g.flags.IntVar(&g.splits, `splits`, 0,
 			`Number of splits to perform before starting normal operations.`)
+		g.flags.BoolVar(&g.scatter, `scatter`, false,
+			`Scatter ranges before starting normal operations.`)
 		g.flags.BoolVar(&g.secondaryIndex, `secondary-index`, false,
-			`Add a secondary index to the schema`)
+			`Add a secondary index to the schema.`)
 		g.flags.IntVar(&g.shards, `num-shards`, 0,
 			`Number of shards to create on the primary key.`)
 		g.flags.Float64Var(&g.targetCompressionRatio, `target-compression-ratio`, 1.0,
-			`Target compression ratio for data blocks. Must be >= 1.0`)
+			`Target compression ratio for data blocks. Must be >= 1.0.`)
 		g.flags.BoolVar(&g.enum, `enum`, false,
-			`Inject an enum column and use it`)
+			`Inject an enum column and use it.`)
+		g.flags.IntVar(&g.insertCount, `insert-count`, 0,
+			`Number of rows to insert before beginning the workload. Keys are inserted `+
+				`uniformly over the key range.`)
+		g.flags.DurationVar(&g.timeout, `timeout`, 0, `Client-side statement timeout.`)
+		RandomSeed.AddFlag(&g.flags)
+		g.flags.IntVar(&g.keySize, `key-size`, 0,
+			`Use string key of appropriate size instead of int`)
+		g.flags.DurationVar(&g.sfuDelay, `sfu-wait-delay`, 10*time.Millisecond,
+			`Delay after SFU when using --sfu-writes (or after SELECT 1 when using --sel1-writes).`)
+		g.flags.StringVar(&g.txnQoS, `txn-qos`, `regular`,
+			`Set default_transaction_quality_of_service session variable, accepted`+
+				`values are 'background', 'regular' and 'critical'.`)
+		g.flags.BoolVar(&g.prepareReadOnly, `prepare-read-only`, false, `Prepare and perform only read statements.`)
+		g.flags.BoolVar(&g.writesUseSelect1, `sel1-writes`, false,
+			`Use SELECT 1 as the first statement of transactional writes with a sleep after SELECT 1.`)
+		g.flags.BoolVar(&g.longRunningTxn, `long-running-txn`, false,
+			`Use a long-running transaction for running lock contention scenarios. If run with `+
+				`--sfu-writes or --sel1-writes, it will use those writes in the long-running transaction; `+
+				`otherwise, it will use regular writes. Each long-running write transaction counts for a`+
+				`single write, as measured by --read-percent.`)
+		g.flags.StringVar(&g.longRunningTxnPriority, `long-running-txn-priority`, `normal`,
+			`Priority of the long-running transaction`)
+		g.flags.IntVar(&g.longRunningTxnNumWrites, `long-running-txn-num-writes`, 10,
+			`Number of writes in the long-running transaction when using --long-running-txn.`)
+		g.flags.BoolVar(&g.alwaysIncKeySeq, `always-inc-key-seq`, false,
+			`Increment the random key seq num for all operations, not just writes.`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -154,76 +215,273 @@ func (*kv) Meta() workload.Meta { return kvMeta }
 // Flags implements the Flagser interface.
 func (w *kv) Flags() workload.Flags { return w.flags }
 
+// ConnFlags implements the ConnFlagser interface.
+func (w *kv) ConnFlags() *workload.ConnFlags { return w.connFlags }
+
 // Hooks implements the Hookser interface.
 func (w *kv) Hooks() workload.Hooks {
 	return workload.Hooks{
-		PostLoad: func(db *gosql.DB) error {
-			if !w.enum {
-				return nil
-			}
-			_, err := db.Exec(`
+		PostLoad: func(_ context.Context, db *gosql.DB) error {
+			if w.enum {
+				_, err := db.Exec(`
 CREATE TYPE enum_type AS ENUM ('v');
 ALTER TABLE kv ADD COLUMN e enum_type NOT NULL AS ('v') STORED;`)
-			return err
-		},
-		Validate: func() error {
-			if w.maxBlockSizeBytes < w.minBlockSizeBytes {
-				return errors.Errorf("Value of 'max-block-bytes' (%d) must be greater than or equal to value of 'min-block-bytes' (%d)",
-					w.maxBlockSizeBytes, w.minBlockSizeBytes)
+				if err != nil {
+					return err
+				}
 			}
-			if w.sequential && w.splits > 0 {
-				return errors.New("'sequential' and 'splits' cannot both be enabled")
-			}
-			if w.sequential && w.zipfian {
-				return errors.New("'sequential' and 'zipfian' cannot both be enabled")
-			}
-			if w.readPercent+w.spanPercent > 100 {
-				return errors.New("'read-percent' and 'span-percent' higher than 100")
-			}
-			if w.targetCompressionRatio < 1.0 || math.IsNaN(w.targetCompressionRatio) {
-				return errors.New("'target-compression-ratio' must be a number >= 1.0")
+			if w.scatter {
+				if _, err := db.Exec(`ALTER TABLE kv SCATTER`); err != nil {
+					return err
+				}
 			}
 			return nil
 		},
+		Validate: w.validateConfig,
 	}
+}
+
+func (w *kv) validateConfig() (err error) {
+	if w.maxBlockSizeBytes < w.minBlockSizeBytes {
+		return errors.Errorf("Value of 'max-block-bytes' (%d) must be greater than or equal to value of 'min-block-bytes' (%d)",
+			w.maxBlockSizeBytes, w.minBlockSizeBytes)
+	}
+	if w.splits < 0 {
+		return errors.Errorf("Value of `--splits` (%d) must not be negative",
+			w.splits)
+	}
+	if w.cycleLength < 1 {
+		return errors.Errorf("Value of `--cycle-length` (%d) must be greater than 0",
+			w.cycleLength)
+	}
+	if w.sequential && w.cycleLength <= int64(w.splits) {
+		return errors.Errorf("Value of `--splits` (%d) must be less than the value of `--cycle-length` (%d) if --sequential is used",
+			w.splits, w.cycleLength)
+	}
+	if w.sequential && w.zipfian {
+		return errors.New("'sequential' and 'zipfian' cannot both be enabled")
+	}
+	if w.shards > 0 && !(w.sequential || w.zipfian) {
+		return errors.New("'num-shards' only work with 'sequential' or 'zipfian' key distributions")
+	}
+	if w.readPercent+w.spanPercent+w.delPercent > 100 {
+		return errors.New("'read-percent', 'span-percent' and 'del-precent' combined exceed 100%")
+	}
+	if w.prepareReadOnly && w.readPercent < 100 {
+		return errors.New("'prepare-read-only' can only be used with 'read-percent' set to 100")
+	}
+	if w.targetCompressionRatio < 1.0 || math.IsNaN(w.targetCompressionRatio) {
+		return errors.New("'target-compression-ratio' must be a number >= 1.0")
+	}
+	if w.keySize != 0 && w.keySize < minStringKeyDigits {
+		return errors.Errorf("key size must be >= %d to fit integer part, requested %d",
+			minStringKeyDigits, w.keySize)
+	}
+	if w.writeSeq != "" {
+		first := w.writeSeq[0]
+		if len(w.writeSeq) < 2 || (first != 'R' && first != 'S' && first != 'Z') {
+			return fmt.Errorf("--write-seq has to be of the form '(R|S|Z)<num>'")
+		}
+		rest := w.writeSeq[1:]
+		var err error
+		_, err = strconv.Atoi(rest)
+		if err != nil {
+			return errors.Errorf("--write-seq has to be of the form '(R|S|Z)<num>'")
+		}
+		if first == 'R' && (w.sequential || w.zipfian) {
+			return errors.Errorf("random --write-seq incompatible with a --sequential and --zipfian")
+		}
+		if first == 'S' && !w.sequential {
+			return errors.Errorf(
+				"sequential --write-seq is incompatible with a --zipfian and default (random) key sequence")
+		}
+		if first == 'Z' && !w.zipfian {
+			return errors.Errorf(
+				"zipfian --write-seq is incompatible with a --sequential or default (random) key sequence")
+		}
+	}
+	if w.txnQoS != "" && w.txnQoS != "background" &&
+		w.txnQoS != "regular" && w.txnQoS != "critical" {
+		return errors.Errorf(
+			"--txn-qos must be one of 'background', 'regular' or 'critical', found %s", w.txnQoS,
+		)
+	}
+	// We create generator and discard it to have a single piece of code that
+	// handles generator type which affects target key range.
+	kg := w.createKeyGenerator()
+	if kg.kr.totalKeys() < uint64(w.insertCount) {
+		return errors.Errorf(
+			"`--insert-count` (%d) is greater than the number of unique keys that could be possibly generated [%d,%d)",
+			w.insertCount, kg.kr.min, kg.kr.max)
+	}
+	return nil
+}
+
+// Note that sequence is only exposed for testing purposes and is used by
+// returned keyGenerators.
+func (w *kv) createKeyGenerator() keyGeneratorConfig {
+	var writeSeq atomic.Int64
+	if w.writeSeq != "" {
+		writeSeqVal, err := strconv.Atoi(w.writeSeq[1:])
+		if err != nil {
+			panic("creating generator from unvalidated workload")
+		}
+		writeSeq.Store(int64(writeSeqVal))
+	}
+
+	var kg keyGeneratorConfig
+	kg.seq = &sequence{max: w.cycleLength, val: &writeSeq}
+
+	switch {
+	case w.zipfian:
+		kg.seqPrefix = 'Z'
+		kg.newState = func() *keyGeneratorState {
+			return &keyGeneratorState{
+				rand:   rand.New(rand.NewSource(timeutil.Now().UnixNano())),
+				mapKey: &zipfKeyMapper{zipf: newZipf(1.1, 1, uint64(math.MaxInt64))},
+			}
+		}
+		kg.kr = keyRange{
+			min: 0,
+			max: math.MaxInt64,
+		}
+	case w.sequential:
+		kg.seqPrefix = 'S'
+		kg.newState = func() *keyGeneratorState {
+			return &keyGeneratorState{
+				rand:   rand.New(rand.NewSource(timeutil.Now().UnixNano())),
+				mapKey: sequentialKeyMapper{},
+			}
+		}
+		kg.kr = keyRange{
+			min: 0,
+			max: w.cycleLength,
+		}
+	default:
+		kg.seqPrefix = 'R'
+		kg.newState = func() *keyGeneratorState {
+			return &keyGeneratorState{
+				rand:   rand.New(rand.NewSource(timeutil.Now().UnixNano())),
+				mapKey: &hashKeyMapper{hasher: sha1.New()},
+			}
+		}
+		kg.kr = keyRange{
+			min: math.MinInt64,
+			max: math.MaxInt64,
+		}
+	}
+
+	if w.keySize == 0 {
+		kg.transformer = intKeyTransformer{}
+	} else {
+		kg.transformer = stringKeyTransformer{
+			startOffset: kg.kr.min,
+			fillerSize:  w.keySize - minStringKeyDigits,
+		}
+	}
+	return kg
+}
+
+func splitFinder(i, splits int, r keyRange, k keyTransformer) interface{} {
+	if splits < 0 || i >= splits {
+		panic(fmt.Sprintf("programming error: split index (%d) cannot be less than 0, "+
+			"greater than or equal to the total splits (%d)",
+			i, splits,
+		))
+	}
+
+	stride := r.max/int64(splits+1) - r.min/int64(splits+1)
+	splitPoint := r.min + int64(i+1)*stride
+	return k.getKey(splitPoint)
+}
+
+func insertCountKey(idx, count int64, kr keyRange) int64 {
+	stride := kr.max/(count+1) - kr.min/(count+1)
+	key := kr.min + (idx+1)*stride
+	return key
 }
 
 // Tables implements the Generator interface.
 func (w *kv) Tables() []workload.Table {
-	table := workload.Table{
-		Name: `kv`,
-		// TODO(dan): Support initializing kv with data.
-		Splits: workload.Tuples(
-			w.splits,
-			func(splitIdx int) []interface{} {
-				stride := (float64(w.cycleLength) - float64(math.MinInt64)) / float64(w.splits+1)
-				splitPoint := int(math.MinInt64 + float64(splitIdx+1)*stride)
-				return []interface{}{splitPoint}
-			},
-		),
-	}
+	// Tables should only run on initialized workload, safe to call create without
+	// having a panic. We don't need to defer this to the actual table callbacks
+	// like Splits or InitialRows.
+	kg := w.createKeyGenerator()
+
+	table := workload.Table{Name: `kv`}
+	table.Splits = workload.Tuples(
+		w.splits,
+		func(splitIdx int) []interface{} {
+			return []interface{}{splitFinder(splitIdx, w.splits, kg.kr, kg.transformer)}
+		},
+	)
+
 	if w.shards > 0 {
 		schema := shardedKvSchema
 		if w.secondaryIndex {
 			schema = shardedKvSchemaWithIndex
 		}
-		checkConstraint := strings.Builder{}
-		checkConstraint.WriteString(`shard IN (`)
-		for i := 0; i < w.shards; i++ {
-			if i != 0 {
-				checkConstraint.WriteString(",")
-			}
-			fmt.Fprintf(&checkConstraint, "%d", i)
-		}
-		checkConstraint.WriteString(")")
-		table.Schema = fmt.Sprintf(schema, w.shards, checkConstraint.String())
+		table.Schema = fmt.Sprintf(schema, kg.transformer.keySQLType(), w.shards)
 	} else {
+		schema := kvSchema
 		if w.secondaryIndex {
-			table.Schema = kvSchemaWithIndex
-		} else {
-			table.Schema = kvSchema
+			schema = kvSchemaWithIndex
+		}
+		table.Schema = fmt.Sprintf(schema, kg.transformer.keySQLType())
+	}
+
+	if w.insertCount > 0 {
+		const batchSize = 1000
+		table.InitialRows = workload.BatchedTuples{
+			NumBatches: (w.insertCount + batchSize - 1) / batchSize,
+			// If the key sequence is not sequential, duplicates are possible.
+			// The zipfian distribution produces duplicates by design, and the
+			// hash key mapper can also produce duplicates at larger insert
+			// counts (it's at least inevitable at ~1b rows). Marking that the
+			// keys may contain duplicates will cause the data loader to use
+			// INSERT ... ON CONFLICT DO NOTHING statements.
+			MayContainDuplicates: !w.sequential,
+			FillBatch: func(batchIdx int, cb coldata.Batch, a *bufalloc.ByteAllocator) {
+				rowBegin, rowEnd := batchIdx*batchSize, (batchIdx+1)*batchSize
+				if rowEnd > w.insertCount {
+					rowEnd = w.insertCount
+				}
+
+				var kvtableTypes = []*types.T{
+					kg.transformer.getColumnType(),
+					types.Bytes,
+				}
+
+				cb.Reset(kvtableTypes, rowEnd-rowBegin, coldata.StandardColumnFactory)
+
+				{
+					seq := rowBegin
+					kg.transformer.fillColumnBatch(cb, a, func() (s int64, ok bool) {
+						if seq < rowEnd {
+							seq++
+							return insertCountKey(int64(seq-1), int64(w.insertCount), kg.kr), true
+						}
+						return 0, false
+					})
+				}
+
+				valCol := cb.ColVec(1).Bytes()
+				// coldata.Bytes only allows appends so we have to reset it.
+				valCol.Reset()
+				rndBlock := rand.New(rand.NewSource(RandomSeed.Seed()))
+
+				for rowIdx := rowBegin; rowIdx < rowEnd; rowIdx++ {
+					rowOffset := rowIdx - rowBegin
+					var payload []byte
+					blockSize, uniqueSize := w.randBlockSize(rndBlock)
+					*a, payload = a.Alloc(blockSize)
+					w.randFillBlock(rndBlock, payload, uniqueSize)
+					valCol.Set(rowOffset, payload)
+				}
+			},
 		}
 	}
+
 	return []workload.Table{table}
 }
 
@@ -231,34 +489,8 @@ func (w *kv) Tables() []workload.Table {
 func (w *kv) Ops(
 	ctx context.Context, urls []string, reg *histogram.Registry,
 ) (workload.QueryLoad, error) {
-	writeSeq := 0
-	if w.writeSeq != "" {
-		first := w.writeSeq[0]
-		if len(w.writeSeq) < 2 || (first != 'R' && first != 'S') {
-			return workload.QueryLoad{}, fmt.Errorf("--write-seq has to be of the form '(R|S)<num>'")
-		}
-		rest := w.writeSeq[1:]
-		var err error
-		writeSeq, err = strconv.Atoi(rest)
-		if err != nil {
-			return workload.QueryLoad{}, fmt.Errorf("--write-seq has to be of the form '(R|S)<num>'")
-		}
-		if first == 'R' && w.sequential {
-			return workload.QueryLoad{}, fmt.Errorf("--sequential incompatible with a Random --write-seq")
-		}
-		if first == 'S' && !w.sequential {
-			return workload.QueryLoad{}, fmt.Errorf(
-				"--sequential=false incompatible with a Sequential --write-seq")
-		}
-	}
-
-	sqlDatabase, err := workload.SanitizeUrls(w, w.connFlags.DBOverride, urls)
-	if err != nil {
-		return workload.QueryLoad{}, err
-	}
-	cfg := workload.MultiConnPoolCfg{
-		MaxTotalConnections: w.connFlags.Concurrency + 1,
-	}
+	cfg := workload.NewMultiConnPoolCfgFromFlags(w.connFlags)
+	cfg.MaxTotalConnections = w.connFlags.Concurrency + 1
 	mcp, err := workload.NewMultiConnPool(ctx, cfg, urls...)
 	if err != nil {
 		return workload.QueryLoad{}, err
@@ -266,38 +498,27 @@ func (w *kv) Ops(
 
 	// Read statement
 	var buf strings.Builder
-	if w.shards == 0 {
-		buf.WriteString(`SELECT k, v FROM kv WHERE k IN (`)
-		for i := 0; i < w.batchSize; i++ {
-			if i > 0 {
-				buf.WriteString(", ")
-			}
-			fmt.Fprintf(&buf, `$%d`, i+1)
-		}
-	} else if w.enum {
+	var folBuf strings.Builder
+	if w.enum {
 		buf.WriteString(`SELECT k, v, e FROM kv WHERE k IN (`)
-		for i := 0; i < w.batchSize; i++ {
-			if i > 0 {
-				buf.WriteString(", ")
-			}
-			fmt.Fprintf(&buf, `$%d`, i+1)
-		}
+		folBuf.WriteString(`SELECT k, v, e FROM kv AS OF SYSTEM TIME follower_read_timestamp() WHERE k IN (`)
 	} else {
-		// TODO(ajwerner): We're currently manually plumbing down the computed shard column
-		// since the optimizer doesn't yet support deriving values of computed columns
-		// when all the columns they reference are available. See
-		// https://github.com/cockroachdb/cockroach/issues/39340#issuecomment-535338071
-		// for details. Remove this once that functionality is added.
-		buf.WriteString(`SELECT k, v FROM kv WHERE (shard, k) in (`)
-		for i := 0; i < w.batchSize; i++ {
-			if i > 0 {
-				buf.WriteString(", ")
-			}
-			fmt.Fprintf(&buf, `(mod($%d, %d), $%d)`, i+1, w.shards, i+1)
+		buf.WriteString(`SELECT k, v FROM kv WHERE k IN (`)
+		folBuf.WriteString(`SELECT k, v FROM kv AS OF SYSTEM TIME follower_read_timestamp() WHERE k IN (`)
+	}
+	for i := 0; i < w.batchSize; i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+			folBuf.WriteString(", ")
 		}
+		fmt.Fprintf(&buf, `$%d`, i+1)
+		fmt.Fprintf(&folBuf, `$%d`, i+1)
 	}
 	buf.WriteString(`)`)
+	folBuf.WriteString(`)`)
+
 	readStmtStr := buf.String()
+	followerReadStmtStr := folBuf.String()
 
 	// Write statement
 	buf.Reset()
@@ -314,9 +535,6 @@ func (w *kv) Ops(
 	// Select for update statement
 	var sfuStmtStr string
 	if w.writesUseSelectForUpdate {
-		if w.shards != 0 {
-			return workload.QueryLoad{}, fmt.Errorf("select for update in kv requires shard=0")
-		}
 		buf.Reset()
 		buf.WriteString(`SELECT k, v FROM kv WHERE k IN (`)
 		for i := 0; i < w.batchSize; i++ {
@@ -333,37 +551,63 @@ func (w *kv) Ops(
 	buf.Reset()
 	buf.WriteString(`SELECT count(v) FROM [SELECT v FROM kv`)
 	if w.spanLimit > 0 {
-		fmt.Fprintf(&buf, ` ORDER BY k LIMIT %d`, w.spanLimit)
+		// Span statements without a limit query all ranges. However, if there's
+		// a span limit specified, we want to randomly choose the range from which
+		// the limited scan starts at. We do this by introducing the k >= $1
+		// predicate.
+		fmt.Fprintf(&buf, ` WHERE k >= $1 ORDER BY k LIMIT %d`, w.spanLimit)
 	}
 	buf.WriteString(`]`)
 	spanStmtStr := buf.String()
 
-	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
-	seq := &sequence{config: w, val: int64(writeSeq)}
-	numEmptyResults := new(int64)
+	// Del statement
+	buf.Reset()
+	buf.WriteString(`DELETE FROM kv WHERE k IN (`)
+	for i := 0; i < w.batchSize; i++ {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		fmt.Fprintf(&buf, `$%d`, i+1)
+	}
+	buf.WriteString(`)`)
+	delStmtStr := buf.String()
+
+	kg := w.createKeyGenerator()
+	ql := workload.QueryLoad{}
+	var numEmptyResults atomic.Int64
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		op := &kvOp{
 			config:          w,
 			hists:           reg.GetHandle(),
-			numEmptyResults: numEmptyResults,
+			numEmptyResults: &numEmptyResults,
 		}
 		op.readStmt = op.sr.Define(readStmtStr)
-		op.writeStmt = op.sr.Define(writeStmtStr)
-		if len(sfuStmtStr) > 0 {
+		// Skip when unused to avoid startup AOST prepare churn.
+		if w.followerReadPercent > 0 {
+			op.followerReadStmt = op.sr.Define(followerReadStmtStr)
+		}
+		if !op.config.prepareReadOnly {
+			op.writeStmt = op.sr.Define(writeStmtStr)
+		}
+		if len(sfuStmtStr) > 0 && !op.config.prepareReadOnly {
 			op.sfuStmt = op.sr.Define(sfuStmtStr)
 		}
+		op.sel1Stmt = op.sr.Define("SELECT 1")
 		op.spanStmt = op.sr.Define(spanStmtStr)
-		if err := op.sr.Init(ctx, "kv", mcp, w.connFlags); err != nil {
+		if w.txnQoS != `regular` {
+			stmt := op.sr.Define(fmt.Sprintf(
+				" SET default_transaction_quality_of_service = %s", w.txnQoS))
+			op.qosStmt = &stmt
+		}
+		if !op.config.prepareReadOnly {
+			op.delStmt = op.sr.Define(delStmtStr)
+		}
+		if err := op.sr.Init(ctx, "kv", mcp); err != nil {
 			return workload.QueryLoad{}, err
 		}
 		op.mcp = mcp
-		if w.sequential {
-			op.g = newSequentialGenerator(seq)
-		} else if w.zipfian {
-			op.g = newZipfianGenerator(seq)
-		} else {
-			op.g = newHashGenerator(seq)
-		}
+		op.kg = kg
+		op.ks = kg.newState()
 		ql.WorkerFns = append(ql.WorkerFns, op.run)
 		ql.Close = op.close
 	}
@@ -371,27 +615,55 @@ func (w *kv) Ops(
 }
 
 type kvOp struct {
-	config          *kv
-	hists           *histogram.Histograms
-	sr              workload.SQLRunner
-	mcp             *workload.MultiConnPool
-	readStmt        workload.StmtHandle
-	writeStmt       workload.StmtHandle
-	spanStmt        workload.StmtHandle
-	sfuStmt         workload.StmtHandle
-	g               keyGenerator
-	numEmptyResults *int64 // accessed atomically
+	config           *kv
+	hists            *histogram.Histograms
+	sr               workload.SQLRunner
+	mcp              *workload.MultiConnPool
+	qosStmt          *workload.StmtHandle
+	readStmt         workload.StmtHandle
+	followerReadStmt workload.StmtHandle
+	writeStmt        workload.StmtHandle
+	spanStmt         workload.StmtHandle
+	sfuStmt          workload.StmtHandle
+	sel1Stmt         workload.StmtHandle
+	delStmt          workload.StmtHandle
+	kg               keyGeneratorConfig
+	ks               *keyGeneratorState
+	numEmptyResults  *atomic.Int64
 }
 
 func (o *kvOp) run(ctx context.Context) (retErr error) {
-	statementProbability := o.g.rand().Intn(100) // Determines what statement is executed.
+	if o.config.timeout > 0 {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, o.config.timeout)
+		defer cancel()
+	}
+
+	if o.qosStmt != nil {
+		_, err := o.qosStmt.Exec(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	statementProbability := o.ks.rand.Intn(100) // Determines what statement is executed.
 	if statementProbability < o.config.readPercent {
 		args := make([]interface{}, o.config.batchSize)
 		for i := 0; i < o.config.batchSize; i++ {
-			args[i] = o.g.readKey()
+			key := o.kg.readKey(o.ks)
+			if o.config.alwaysIncKeySeq {
+				key = o.kg.writeKey(o.ks)
+			}
+			args[i] = o.kg.transformer.getKey(key)
 		}
 		start := timeutil.Now()
-		rows, err := o.readStmt.Query(ctx, args...)
+		readStmt := o.readStmt
+		opName := `read`
+
+		if o.ks.rand.Intn(100) < o.config.followerReadPercent {
+			readStmt = o.followerReadStmt
+			opName = `follower-read`
+		}
+		rows, err := readStmt.Query(ctx, args...)
 		if err != nil {
 			return err
 		}
@@ -400,44 +672,80 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			empty = false
 		}
 		if empty {
-			atomic.AddInt64(o.numEmptyResults, 1)
+			o.numEmptyResults.Add(1)
 		}
 		elapsed := timeutil.Since(start)
-		o.hists.Get(`read`).Record(elapsed)
+		o.hists.Get(opName).Record(elapsed)
 		return rows.Err()
 	}
 	// Since we know the statement is not a read, we recalibrate
 	// statementProbability to only consider the other statements.
 	statementProbability -= o.config.readPercent
+	if statementProbability < o.config.delPercent {
+		start := timeutil.Now()
+		args := make([]interface{}, o.config.batchSize)
+		for i := 0; i < o.config.batchSize; i++ {
+			args[i] = o.kg.readKey(o.ks)
+			if o.config.alwaysIncKeySeq {
+				args[i] = o.kg.writeKey(o.ks)
+			}
+		}
+		_, err := o.delStmt.Exec(ctx, args...)
+		if err != nil {
+			return err
+		}
+		elapsed := timeutil.Since(start)
+		o.hists.Get(`del`).Record(elapsed)
+		return nil
+	}
+	statementProbability -= o.config.delPercent
 	if statementProbability < o.config.spanPercent {
 		start := timeutil.Now()
-		_, err := o.spanStmt.Exec(ctx)
+		var err error
+		if o.config.spanLimit > 0 {
+			arg := o.kg.readKey(o.ks)
+			if o.config.alwaysIncKeySeq {
+				arg = o.kg.writeKey(o.ks)
+			}
+			_, err = o.spanStmt.Exec(ctx, arg)
+		} else {
+			_, err = o.spanStmt.Exec(ctx)
+		}
+		if err != nil {
+			return err
+		}
 		elapsed := timeutil.Since(start)
 		o.hists.Get(`span`).Record(elapsed)
 		return err
 	}
-	const argCount = 2
-	writeArgs := make([]interface{}, argCount*o.config.batchSize)
-	var sfuArgs []interface{}
-	if o.config.writesUseSelectForUpdate {
-		sfuArgs = make([]interface{}, o.config.batchSize)
-	}
-	for i := 0; i < o.config.batchSize; i++ {
-		j := i * argCount
-		writeArgs[j+0] = o.g.writeKey()
-		if sfuArgs != nil {
-			sfuArgs[i] = writeArgs[j]
+	makeWriteBatchArgs := func() ([]interface{}, []interface{}) {
+		const argCount = 2
+		writeArgs := make([]interface{}, argCount*o.config.batchSize)
+		var sfuArgs []interface{}
+		if o.config.writesUseSelectForUpdate {
+			sfuArgs = make([]interface{}, o.config.batchSize)
 		}
-		writeArgs[j+1] = randomBlock(o.config, o.g.rand())
+		for i := 0; i < o.config.batchSize; i++ {
+			j := i * argCount
+			writeArgs[j+0] = o.kg.transformer.getKey(o.kg.writeKey(o.ks))
+			if sfuArgs != nil {
+				sfuArgs[i] = writeArgs[j]
+			}
+			writeArgs[j+1] = o.config.randBlock(o.ks.rand)
+		}
+		return writeArgs, sfuArgs
 	}
 	start := timeutil.Now()
 	var err error
-	if o.config.writesUseSelectForUpdate {
+	if o.config.writesUseSelect1 || o.config.writesUseSelectForUpdate || o.config.longRunningTxn {
 		// We could use crdb.ExecuteTx, but we avoid retries in this workload so
 		// that each run call makes 1 attempt, so that rate limiting in workerRun
 		// behaves as expected.
 		var tx pgx.Tx
-		if tx, err = o.mcp.Get().Begin(ctx); err != nil {
+		txnOptions := pgx.TxOptions{}
+		txnOptions.BeginQuery = fmt.Sprintf("BEGIN PRIORITY %s", o.config.longRunningTxnPriority)
+		tx, err := o.mcp.Get().BeginTx(ctx, txnOptions)
+		if err != nil {
 			return err
 		}
 		defer func() {
@@ -446,27 +754,50 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 				retErr = errors.CombineErrors(retErr, rollbackErr)
 			}
 		}()
-		rows, err := o.sfuStmt.QueryTx(ctx, tx, sfuArgs...)
-		if err != nil {
-			return err
+		iterations := 1
+		if o.config.longRunningTxn {
+			iterations = o.config.longRunningTxnNumWrites
 		}
-		rows.Close()
-		if err = rows.Err(); err != nil {
-			return err
-		}
-		// Simulate a transaction that does other work between the SFU and write.
-		// TODO(sumeer): this should be configurable.
-		time.Sleep(10 * time.Millisecond)
-		if _, err = o.writeStmt.ExecTx(ctx, tx, writeArgs...); err != nil {
-			// Multiple write transactions can contend and encounter
-			// a serialization failure. We swallow such an error.
-			return o.tryHandleWriteErr("write-write-err", start, err)
+		for i := 0; i < iterations; i++ {
+			writeArgs, sfuArgs := makeWriteBatchArgs()
+			if o.config.writesUseSelect1 {
+				rows, err := o.sel1Stmt.QueryTx(ctx, tx)
+				if err != nil {
+					return err
+				}
+				rows.Close()
+				if err = rows.Err(); err != nil {
+					return err
+				}
+			}
+			if o.config.writesUseSelectForUpdate {
+				rows, err := o.sfuStmt.QueryTx(ctx, tx, sfuArgs...)
+				if err != nil {
+					return err
+				}
+				rows.Close()
+				if err = rows.Err(); err != nil {
+					// The transaction may have experienced an error in the meantime.
+					return o.tryHandleWriteErr("write-write-err", start, err)
+				}
+			}
+			// Simulate a transaction that does other work between the sel1 / SFU and write.
+			time.Sleep(o.config.sfuDelay)
+			if _, err = o.writeStmt.ExecTx(ctx, tx, writeArgs...); err != nil {
+				// Multiple write transactions can contend and encounter
+				// a serialization failure. We swallow such an error.
+				return o.tryHandleWriteErr("write-write-err", start, err)
+			}
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return o.tryHandleWriteErr("write-commit-err", start, err)
 		}
 	} else {
+		writeArgs, _ := makeWriteBatchArgs()
 		_, err = o.writeStmt.Exec(ctx, writeArgs...)
+	}
+	if err != nil {
+		return err
 	}
 	elapsed := timeutil.Since(start)
 	o.hists.Get(`write`).Record(elapsed)
@@ -489,180 +820,220 @@ func (o *kvOp) tryHandleWriteErr(name string, start time.Time, err error) error 
 	return err
 }
 
-func (o *kvOp) close(context.Context) {
-	if empty := atomic.LoadInt64(o.numEmptyResults); empty != 0 {
+func (o *kvOp) close(context.Context) error {
+	if empty := o.numEmptyResults.Load(); empty != 0 {
 		fmt.Printf("Number of reads that didn't return any results: %d.\n", empty)
 	}
-	seq := o.g.sequence()
-	var ch string
-	if o.config.sequential {
-		ch = "S"
-	} else {
-		ch = "R"
-	}
-	fmt.Printf("Highest sequence written: %d. Can be passed as --write-seq=%s%d to the next run.\n",
-		seq, ch, seq)
+	fmt.Printf("Write sequence could be resumed by passing --write-seq=%s to the next run.\n",
+		o.kg.cursor())
+	return nil
 }
 
 type sequence struct {
-	config *kv
-	val    int64
+	val *atomic.Int64
+	max int64
 }
 
 func (s *sequence) write() int64 {
-	return (atomic.AddInt64(&s.val, 1) - 1) % s.config.cycleLength
+	return (s.val.Add(1) - 1) % s.max
 }
 
 // read returns the last key index that has been written. Note that the returned
 // index might not actually have been written yet, so a read operation cannot
 // require that the key is present.
 func (s *sequence) read() int64 {
-	return atomic.LoadInt64(&s.val) % s.config.cycleLength
+	return s.val.Load() % s.max
 }
 
-// keyGenerator generates read and write keys. Read keys may not yet exist and
-// write keys may already exist.
-type keyGenerator interface {
-	writeKey() int64
-	readKey() int64
-	rand() *rand.Rand
-	sequence() int64
+// Converts int64 based keys into database keys. Workload uses int64 based
+// keyspace to allow predictable sharding and splitting. Transformer allows
+// mapping integer key into string of arbitrary size for testing keys size.
+// First two methods are used in table creation and ops, while last ones are
+// only needed for import. If transformer doesn't support import, it should
+// be rejected when parsing flags and methods doesn't need to be implemented.
+type keyTransformer interface {
+	// getKey transforms int keys into table keys for read and write operations.
+	getKey(int64) interface{}
+	// keySQLType returns an SQL type used by create table for key column.
+	keySQLType() string
+
+	// getColumnType returns a key type for inserting initial data.
+	getColumnType() *types.T
+	// fillColumnBatch needs to populate key column with sequence of keys returned by
+	// next.
+	fillColumnBatch(cb coldata.Batch, a *bufalloc.ByteAllocator, next func() (seq int64, ok bool))
 }
 
-type hashGenerator struct {
-	seq    *sequence
-	random *rand.Rand
+// intKeyTransformer is a noop transformer that passes int keys as is.
+type intKeyTransformer struct{}
+
+func (e intKeyTransformer) getKey(key int64) interface{} {
+	return key
+}
+
+func (e intKeyTransformer) keySQLType() string {
+	return "BIGINT"
+}
+
+func (e intKeyTransformer) getColumnType() *types.T {
+	return types.Int
+}
+
+func (e intKeyTransformer) fillColumnBatch(
+	cb coldata.Batch, a *bufalloc.ByteAllocator, next func() (seq int64, ok bool),
+) {
+	keyCol := cb.ColVec(0).Int64()
+	var i int
+	for key, ok := next(); ok; key, ok = next() {
+		keyCol.Set(i, key)
+		i++
+	}
+}
+
+// Minimum size of keys is set to fit base 10 representation of max uint64.
+const minStringKeyDigits = 20
+
+// stringKeyTransformer turns int into a zero padded string representation (for
+// 64 bit unsigned integers) and appends a random characters up to desired
+// length. Note that filler is number of extra bytes on top of 20 digits and
+// the the key size parameter as passed to workload.
+type stringKeyTransformer struct {
+	fillerSize  int
+	startOffset int64
+}
+
+func (s stringKeyTransformer) getKey(i int64) interface{} {
+	return s.getKeyInternal(i)
+}
+
+func (s stringKeyTransformer) getKeyInternal(i int64) string {
+	filler := randutil.RandString(randutil.NewTestRandWithSeed(i), s.fillerSize, randutil.PrintableKeyAlphabet)
+	var bigKey big.Int
+	bigKey.Sub(big.NewInt(i), big.NewInt(s.startOffset))
+	strKey := bigKey.String()
+	prefix := strings.Repeat("0", minStringKeyDigits-len(strKey))
+	return fmt.Sprintf("%s%s%s", prefix, strKey, filler)
+}
+
+func (s stringKeyTransformer) keySQLType() string {
+	return "STRING"
+}
+
+func (e stringKeyTransformer) getColumnType() *types.T {
+	return types.String
+}
+
+func (e stringKeyTransformer) fillColumnBatch(
+	cb coldata.Batch, a *bufalloc.ByteAllocator, next func() (seq int64, ok bool),
+) {
+	keyCol := cb.ColVec(0).Bytes()
+	keyCol.Reset()
+	var i int
+	for intKey, ok := next(); ok; intKey, ok = next() {
+		key := e.getKeyInternal(intKey)
+		keyCol.Set(i, []byte(key))
+		i++
+	}
+}
+
+// keyGeneratorConfig holds the key generation configuration necessary for
+// generating read and write keys. All the fields of a keyGeneratorConfig may be
+// accessed concurrently, but each *keyGeneratorState constructed by newState
+// must be accessed sequentially (eg, one state per worker).
+//
+// Read keys may not yet exist and write keys may already exist.
+type keyGeneratorConfig struct {
+	kr          keyRange
+	seq         *sequence
+	seqPrefix   rune
+	newState    func() *keyGeneratorState
+	transformer keyTransformer
+}
+
+// keyGeneratorState holds state for a key generator. Any given state must not
+// be accessed concurrently. Every worker may be given its own state to avoid
+// synchronization.
+type keyGeneratorState struct {
+	rand   *rand.Rand
+	mapKey keyMapper
+}
+
+func (g *keyGeneratorConfig) cursor() string {
+	return fmt.Sprintf("%s%d", string(g.seqPrefix), g.seq.read())
+}
+
+func (g *keyGeneratorConfig) writeKey(state *keyGeneratorState) int64 {
+	return state.mapKey.mapKey(g.seq.write())
+}
+
+func (g *keyGeneratorConfig) readKey(state *keyGeneratorState) int64 {
+	v := g.seq.read()
+	if v == 0 {
+		return 0
+	}
+	return state.mapKey.mapKey(state.rand.Int63n(v))
+}
+
+type keyMapper interface {
+	mapKey(v int64) int64
+}
+
+type hashKeyMapper struct {
 	hasher hash.Hash
 	buf    [sha1.Size]byte
 }
 
-func newHashGenerator(seq *sequence) *hashGenerator {
-	return &hashGenerator{
-		seq:    seq,
-		random: rand.New(rand.NewSource(timeutil.Now().UnixNano())),
-		hasher: sha1.New(),
-	}
+func (h *hashKeyMapper) mapKey(v int64) int64 {
+	binary.BigEndian.PutUint64(h.buf[:8], uint64(v))
+	binary.BigEndian.PutUint64(h.buf[8:16], uint64(RandomSeed.Seed()))
+	h.hasher.Reset()
+	_, _ = h.hasher.Write(h.buf[:16])
+	h.hasher.Sum(h.buf[:0])
+	return int64(binary.BigEndian.Uint64(h.buf[:8]))
 }
 
-func (g *hashGenerator) hash(v int64) int64 {
-	binary.BigEndian.PutUint64(g.buf[:8], uint64(v))
-	binary.BigEndian.PutUint64(g.buf[8:16], uint64(g.seq.config.seed))
-	g.hasher.Reset()
-	_, _ = g.hasher.Write(g.buf[:16])
-	g.hasher.Sum(g.buf[:0])
-	return int64(binary.BigEndian.Uint64(g.buf[:8]))
+type sequentialKeyMapper struct{}
+
+func (sequentialKeyMapper) mapKey(v int64) int64 { return v }
+
+type zipfKeyMapper struct {
+	zipf *zipf
 }
 
-func (g *hashGenerator) writeKey() int64 {
-	return g.hash(g.seq.write())
-}
-
-func (g *hashGenerator) readKey() int64 {
-	v := g.seq.read()
-	if v == 0 {
-		return 0
-	}
-	return g.hash(g.random.Int63n(v))
-}
-
-func (g *hashGenerator) rand() *rand.Rand {
-	return g.random
-}
-
-func (g *hashGenerator) sequence() int64 {
-	return atomic.LoadInt64(&g.seq.val)
-}
-
-type sequentialGenerator struct {
-	seq    *sequence
-	random *rand.Rand
-}
-
-func newSequentialGenerator(seq *sequence) *sequentialGenerator {
-	return &sequentialGenerator{
-		seq:    seq,
-		random: rand.New(rand.NewSource(timeutil.Now().UnixNano())),
-	}
-}
-
-func (g *sequentialGenerator) writeKey() int64 {
-	return g.seq.write()
-}
-
-func (g *sequentialGenerator) readKey() int64 {
-	v := g.seq.read()
-	if v == 0 {
-		return 0
-	}
-	return g.random.Int63n(v)
-}
-
-func (g *sequentialGenerator) rand() *rand.Rand {
-	return g.random
-}
-
-func (g *sequentialGenerator) sequence() int64 {
-	return atomic.LoadInt64(&g.seq.val)
-}
-
-type zipfGenerator struct {
-	seq    *sequence
-	random *rand.Rand
-	zipf   *zipf
-}
-
-// Creates a new zipfian generator.
-func newZipfianGenerator(seq *sequence) *zipfGenerator {
-	random := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
-	return &zipfGenerator{
-		seq:    seq,
-		random: random,
-		zipf:   newZipf(1.1, 1, uint64(math.MaxInt64)),
-	}
-}
-
-// Get a random number seeded by v that follows the
-// zipfian distribution.
-func (g *zipfGenerator) zipfian(seed int64) int64 {
+func (g *zipfKeyMapper) mapKey(seed int64) int64 {
 	randomWithSeed := rand.New(rand.NewSource(seed))
 	return int64(g.zipf.Uint64(randomWithSeed))
 }
 
-// Get a zipf write key appropriately.
-func (g *zipfGenerator) writeKey() int64 {
-	return g.zipfian(g.seq.write())
+// randBlock returns a sequence of random bytes according to the kv
+// configuration.
+func (w *kv) randBlock(r *rand.Rand) []byte {
+	blockSize, uniqueSize := w.randBlockSize(r)
+	block := make([]byte, blockSize)
+	w.randFillBlock(r, block, uniqueSize)
+	return block
 }
 
-// Get a zipf read key appropriately.
-func (g *zipfGenerator) readKey() int64 {
-	v := g.seq.read()
-	if v == 0 {
-		return 0
+// randBlockSize returns two integers, for a random integer to use for inserts
+// according to min/max block bytes and the unique bytes given the
+// targetCompressionRatio.
+func (w *kv) randBlockSize(r *rand.Rand) (block int, unique int) {
+	block = r.Intn(w.maxBlockSizeBytes-w.minBlockSizeBytes+1) + w.minBlockSizeBytes
+	unique = int(float64(block) / w.targetCompressionRatio)
+	if unique < 1 {
+		unique = 1
 	}
-	return g.zipfian(g.random.Int63n(v))
+	return block, unique
 }
 
-func (g *zipfGenerator) rand() *rand.Rand {
-	return g.random
-}
-
-func (g *zipfGenerator) sequence() int64 {
-	return atomic.LoadInt64(&g.seq.val)
-}
-
-func randomBlock(config *kv, r *rand.Rand) []byte {
-	blockSize := r.Intn(config.maxBlockSizeBytes-config.minBlockSizeBytes+1) + config.minBlockSizeBytes
-	blockData := make([]byte, blockSize)
-	uniqueSize := int(float64(blockSize) / config.targetCompressionRatio)
-	if uniqueSize < 1 {
-		uniqueSize = 1
-	}
-	for i := range blockData {
+// randFillBlock fills the provided buffer with random bytes. len(buf) -
+// uniqueSize entries are repeated.
+func (w *kv) randFillBlock(r *rand.Rand, buf []byte, uniqueSize int) {
+	for i := range buf {
 		if i >= uniqueSize {
-			blockData[i] = blockData[i-uniqueSize]
+			buf[i] = buf[i-uniqueSize]
 		} else {
-			blockData[i] = byte(r.Int() & 0xff)
+			buf[i] = byte(r.Int() & 0xff)
 		}
 	}
-	return blockData
 }

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
@@ -23,7 +18,8 @@ import (
 const (
 	offsetBoundSecs = 167*60*60 + 59*60
 	// PG supports UTC hour offsets in the range [-167, 167].
-	maxUTCHourOffset = 167
+	maxUTCHourOffset          = 167
+	maxUTCHourOffsetInSeconds = maxUTCHourOffset * 60 * 60
 )
 
 var timezoneOffsetRegex = regexp.MustCompile(`(?i)^(GMT|UTC)?([+-])?(\d{1,3}(:[0-5]?\d){0,2})$`)
@@ -31,7 +27,8 @@ var timezoneOffsetRegex = regexp.MustCompile(`(?i)^(GMT|UTC)?([+-])?(\d{1,3}(:[0
 // FixedTimeZoneOffsetToLocation creates a time.Location with an offset and a
 // time zone string.
 func FixedTimeZoneOffsetToLocation(offset int, origRepr string) *time.Location {
-	return time.FixedZone(origRepr, offset)
+	// The offset name always should be normalized to upper-case for UTC/GMT.
+	return time.FixedZone(strings.ToUpper(origRepr), offset)
 }
 
 // TimeZoneOffsetToLocation takes an offset and name that can be marshaled by
@@ -67,22 +64,40 @@ const (
 func TimeZoneStringToLocation(
 	locStr string, std TimeZoneStringToLocationStandard,
 ) (*time.Location, error) {
-	offset, _, parsed := ParseTimeZoneOffset(locStr, std)
-	if parsed {
-		return TimeZoneOffsetToLocation(offset), nil
+	// ParseTimeZoneOffset uses strconv.ParseFloat, which returns an error when
+	// parsing fails that is expensive to construct. We first check if the string
+	// contains any non-numeric characters to see if we can skip attempting to
+	// parse it as a timezone offset. `/` is also checked since that character
+	// appears in most timezone names. Since UTC is the most commonly used
+	// timezone, we also check for that explicitly to avoid calling ContainsAny if
+	// possible.
+	containsNonNumeric := strings.EqualFold(locStr, "utc") || strings.ContainsAny(locStr, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ/")
+	if !containsNonNumeric {
+		offset, _, parsed := ParseTimeZoneOffset(locStr, std)
+		if parsed {
+			if offset < -maxUTCHourOffsetInSeconds || offset > maxUTCHourOffsetInSeconds {
+				return nil, errors.New("UTC timezone offset is out of range.")
+			}
+			return TimeZoneOffsetToLocation(offset), nil
+		}
 	}
 
-	// The time may just be a raw int value.
-	intVal, err := strconv.ParseInt(locStr, 10, 64)
-	if err == nil {
-		// Parsing an int has different behavior for POSIX and ISO8601.
-		if std == TimeZoneStringToLocationPOSIXStandard {
-			intVal *= -1
+	// The time may just be a raw int value. Similar to the above, in order to
+	// avoid constructing an expensive error, we first check if the string
+	// contains any non-numeric characters to see if we can skip attempting to
+	// parse it as an int.
+	if !containsNonNumeric {
+		intVal, err := strconv.ParseInt(locStr, 10, 64)
+		if err == nil {
+			// Parsing an int has different behavior for POSIX and ISO8601.
+			if std == TimeZoneStringToLocationPOSIXStandard {
+				intVal *= -1
+			}
+			if intVal < -maxUTCHourOffset || intVal > maxUTCHourOffset {
+				return nil, errors.New("UTC timezone offset is out of range.")
+			}
+			return TimeZoneOffsetToLocation(int(intVal) * 60 * 60), nil
 		}
-		if intVal < -maxUTCHourOffset || intVal > maxUTCHourOffset {
-			return nil, errors.New("UTC timezone offset is out of range.")
-		}
-		return TimeZoneOffsetToLocation(int(intVal) * 60 * 60), nil
 	}
 
 	locTransforms := []func(string) string{
@@ -200,9 +215,10 @@ func timeZoneOffsetStringConversion(
 }
 
 // The timestamp must be of one of the following formats:
-//   HH
-//   HH:MM
-//   HH:MM:SS
+//
+//	HH
+//	HH:MM
+//	HH:MM:SS
 func hoursMinutesSecondsToSeconds(timeString string) int {
 	var (
 		hoursString   = "0"
@@ -226,9 +242,10 @@ func hoursMinutesSecondsToSeconds(timeString string) int {
 }
 
 // secondsToHoursMinutesSeconds converts seconds to a timestamp of the format
-//   HH
-//   HH:MM
-//   HH:MM:SS
+//
+//	HH
+//	HH:MM
+//	HH:MM:SS
 func secondsToHoursMinutesSeconds(totalSeconds int) string {
 	secondsPerHour := 60 * 60
 	secondsPerMinute := 60
@@ -253,9 +270,10 @@ func secondsToHoursMinutesSeconds(totalSeconds int) string {
 // The minutes and seconds sections are only included in the precision is
 // necessary.
 // For example:
-//    11.00 -> 11
-//    11.5 -> 11:30
-//    11.51 -> 11:30:36
+//
+//	11.00 -> 11
+//	11.5 -> 11:30
+//	11.51 -> 11:30:36
 func floatToHoursMinutesSeconds(f float64) string {
 	hours := int(f)
 	remaining := f - float64(hours)

@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stop_test
 
@@ -19,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -27,7 +22,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/petermattis/goid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -182,7 +179,7 @@ func TestStopperQuiesce(t *testing.T) {
 			// Wait until Quiesce() is called.
 			<-qc
 			err := thisStopper.RunTask(ctx, "inner", func(context.Context) {})
-			if !errors.HasType(err, (*roachpb.NodeUnavailableError)(nil)) {
+			if !errors.HasType(err, (*kvpb.NodeUnavailableError)(nil)) {
 				t.Error(err)
 			}
 			// Make the stoppers call Stop().
@@ -229,12 +226,13 @@ func (tc *testCloser) Close() {
 func TestStopperClosers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	var tc1, tc2 testCloser
-	s.AddCloser(&tc1)
-	s.AddCloser(&tc2)
+	x := 1
+	s.AddCloser(stop.CloserFn(func() { x++ }))
+	s.AddCloser(stop.CloserFn(func() { x *= 10 }))
 	s.Stop(context.Background())
-	if !bool(tc1) || !bool(tc2) {
-		t.Errorf("expected true & true; got %t & %t", tc1, tc2)
+	// Both closers should run in LIFO order, so we should get 11 (and not 20).
+	if expected := 11; x != expected {
+		t.Errorf("expected %d, got %d", expected, x)
 	}
 }
 
@@ -270,12 +268,13 @@ func TestStopperCloserConcurrent(t *testing.T) {
 func TestStopperNumTasks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	s := stop.NewStopper()
-	defer s.Stop(context.Background())
+	ctx := context.Background()
+	defer s.Stop(ctx)
 	var tasks []chan bool
 	for i := 0; i < 3; i++ {
 		c := make(chan bool)
 		tasks = append(tasks, c)
-		if err := s.RunAsyncTask(context.Background(), "test", func(_ context.Context) {
+		if err := s.RunAsyncTask(ctx, "test", func(_ context.Context) {
 			// Wait for channel to close
 			<-c
 		}); err != nil {
@@ -295,46 +294,6 @@ func TestStopperNumTasks(t *testing.T) {
 			}
 			return nil
 		})
-	}
-}
-
-// TestStopperRunTaskPanic ensures that a panic handler can recover panicking
-// tasks, and that no tasks are leaked when they panic.
-func TestStopperRunTaskPanic(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ch := make(chan interface{})
-	s := stop.NewStopper(stop.OnPanic(func(v interface{}) {
-		ch <- v
-	}))
-	defer s.Stop(context.Background())
-	// If RunTask were not panic-safe, Stop() would deadlock.
-	type testFn func()
-	explode := func(context.Context) { panic(ch) }
-	ctx := context.Background()
-	for i, test := range []testFn{
-		func() {
-			_ = s.RunTask(ctx, "test", explode)
-		},
-		func() {
-			_ = s.RunAsyncTask(ctx, "test", func(ctx context.Context) { explode(ctx) })
-		},
-		func() {
-			_ = s.RunAsyncTaskEx(
-				context.Background(),
-				stop.TaskOpts{
-					TaskName:   "test",
-					Sem:        quotapool.NewIntPool("test", 1),
-					WaitForSem: true,
-				},
-				func(ctx context.Context) { explode(ctx) },
-			)
-		},
-	} {
-		go test()
-		recovered := <-ch
-		if recovered != ch {
-			t.Errorf("%d: unexpected recovered value: %+v", i, recovered)
-		}
 	}
 }
 
@@ -612,59 +571,6 @@ func TestStopperRunLimitedAsyncTaskCancelContext(t *testing.T) {
 	}
 }
 
-func maybePrint(context.Context) {
-	if testing.Verbose() { // This just needs to be complicated enough not to inline.
-		fmt.Println("blah")
-	}
-}
-
-func BenchmarkDirectCall(b *testing.B) {
-	defer leaktest.AfterTest(b)()
-	s := stop.NewStopper()
-	ctx := context.Background()
-	defer s.Stop(ctx)
-	for i := 0; i < b.N; i++ {
-		maybePrint(ctx)
-	}
-}
-
-func BenchmarkStopper(b *testing.B) {
-	defer leaktest.AfterTest(b)()
-	ctx := context.Background()
-	s := stop.NewStopper()
-	defer s.Stop(ctx)
-	for i := 0; i < b.N; i++ {
-		if err := s.RunTask(ctx, "test", maybePrint); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-func BenchmarkDirectCallPar(b *testing.B) {
-	defer leaktest.AfterTest(b)()
-	s := stop.NewStopper()
-	ctx := context.Background()
-	defer s.Stop(ctx)
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			maybePrint(ctx)
-		}
-	})
-}
-
-func BenchmarkStopperPar(b *testing.B) {
-	defer leaktest.AfterTest(b)()
-	ctx := context.Background()
-	s := stop.NewStopper()
-	defer s.Stop(ctx)
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			if err := s.RunTask(ctx, "test", maybePrint); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-}
-
 func TestCancelInCloser(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
@@ -687,12 +593,7 @@ func (cf closerFunc) Close() { cf() }
 // the ChildSpan option.
 func TestStopperRunAsyncTaskTracing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	tr := tracing.NewTracerWithOpt(context.Background(), tracing.WithTestingKnobs(
-		tracing.TracerTestingKnobs{
-			// We want the tracer to generate real spans so that we can test that the
-			// RootSpan option produces a root span.
-			ForceRealSpans: true,
-		}))
+	tr := tracing.NewTracerWithOpt(context.Background(), tracing.WithTracingMode(tracing.TracingModeActiveSpansRegistry))
 	s := stop.NewStopper(stop.WithTracer(tr))
 
 	ctx, getRecAndFinish := tracing.ContextWithRecordingSpan(context.Background(), tr, "parent")
@@ -728,13 +629,14 @@ func TestStopperRunAsyncTaskTracing(t *testing.T) {
 		},
 			func(ctx context.Context) {
 				log.Event(ctx, "async 3")
-				sp := tracing.SpanFromContext(ctx)
-				if sp == nil {
+				sp1 := tracing.SpanFromContext(ctx)
+				if sp1 == nil {
 					errC <- errors.Errorf("missing span")
 					return
 				}
-				sp = tr.StartSpan("child", tracing.WithParent(sp))
-				if sp.TraceID() == traceID {
+				sp2 := tr.StartSpan("child", tracing.WithParent(sp1))
+				defer sp2.Finish()
+				if sp2.TraceID() == traceID {
 					errC <- errors.Errorf("expected different trace")
 				}
 				close(errC)
@@ -752,19 +654,124 @@ func TestStopperRunAsyncTaskTracing(t *testing.T) {
 				event: async 2`))
 }
 
-// Test that RunAsyncTask creates root spans when the caller doesn't have a
+// Test that RunAsyncTask creates root spans only if the caller has a
 // span.
 func TestStopperRunAsyncTaskCreatesRootSpans(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	testutils.RunTrueAndFalse(t, "hasSpan", func(t *testing.T, hasSpan bool) {
+		tr := tracing.NewTracer()
+		ctx := context.Background()
+		s := stop.NewStopper(stop.WithTracer(tr))
+		defer s.Stop(ctx)
+		c := make(chan *tracing.Span)
+		if hasSpan {
+			var sp *tracing.Span
+			ctx, sp = tr.StartSpanCtx(ctx, "root", tracing.WithForceRealSpan())
+			defer sp.Finish()
+		}
+		require.NoError(t, s.RunAsyncTask(ctx, "test",
+			func(ctx context.Context) {
+				c <- tracing.SpanFromContext(ctx)
+			},
+		))
+		require.Equal(t, hasSpan, <-c != nil)
+	})
+}
+
+// TestHandleOnFinishedTraceSpan shows that we can successfully use the Stopper
+// in situations in which the trace span gets finished after creating the Handle
+// but before launching the task.
+func TestHandleOnFinishedTraceSpan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	tr := tracing.NewTracer()
 	ctx := context.Background()
 	s := stop.NewStopper(stop.WithTracer(tr))
 	defer s.Stop(ctx)
-	c := make(chan *tracing.Span)
-	require.NoError(t, s.RunAsyncTask(ctx, "test",
-		func(ctx context.Context) {
-			c <- tracing.SpanFromContext(ctx)
-		},
-	))
-	require.NotNil(t, <-c)
+
+	ctx, sp := tr.StartSpanCtx(ctx, "root", tracing.WithForceRealSpan())
+	// NB: can't `defer sp.Finish()` here since we'd then double-finish the span
+	// in this test and trip the assertion.
+	ctx, hdl, err := s.GetHandle(ctx, stop.TaskOpts{
+		TaskName: "test",
+		SpanOpt:  stop.ChildSpan,
+	})
+	require.NoError(t, err)
+
+	sp.Finish()
+	go func(ctx context.Context, hdl *stop.Handle) {
+		defer hdl.Activate(ctx).Release(ctx)
+	}(ctx, hdl)
+}
+
+// TestHandleWithoutActivateOrRelease demonstrates that acquiring a Handle
+// without releasing it blocks the stopper on drain, meaning that such mistakes
+// are likely to be caught quickly.
+func TestHandleWithoutActivateOrRelease(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	testutils.RunTrueAndFalse(t, "activate", func(t *testing.T, activate bool) {
+		s := stop.NewStopper()
+		defer s.Stop(ctx)
+
+		ctx, hdl, err := s.GetHandle(ctx, stop.TaskOpts{})
+		require.NoError(t, err)
+
+		relCh := make(chan stop.ActiveHandle, 1)
+		go func() {
+			if activate {
+				relCh <- hdl.Activate(ctx)
+				// Oops, forgot release!
+			} // otherwise, forgot Activate too
+		}()
+
+		stopCh := make(chan struct{})
+		go func() {
+			s.Quiesce(ctx)
+			close(stopCh)
+		}()
+		select {
+		case <-time.After(time.Millisecond):
+			// Expected: we acquired a handle, but never released it.
+		case <-stopCh:
+			t.Fatal("stopper unexpectedly quiesced")
+		}
+		// Release the handle, allowing the deferred Stop to work.
+		if !activate {
+			hdl.Activate(ctx).Release(ctx)
+		} else {
+			(<-relCh).Release(ctx)
+		}
+	})
+}
+
+func TestHandleSetsGoroutineOnSpan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	s := stop.NewStopper()
+	defer s.Stop(ctx)
+
+	tracer := tracing.NewTracer()
+	sp := tracer.StartSpan("test span")
+	sp.SetRecordingType(tracingpb.RecordingVerbose)
+	ctx = tracing.ContextWithSpan(ctx, sp)
+
+	ctx, hdl, err := s.GetHandle(ctx, stop.TaskOpts{
+		SpanOpt:  stop.ChildSpan,
+		TaskName: "async task",
+	})
+	require.NoError(t, err)
+
+	endCh := make(chan struct{})
+	var goroutineID int64
+	go func() {
+		defer hdl.Activate(ctx).Release(ctx)
+		goroutineID = goid.Get()
+		close(endCh)
+	}()
+	<-endCh
+	rec := sp.FinishAndGetRecording(tracingpb.RecordingVerbose)
+	require.Contains(t, rec.String(), fmt.Sprintf("gid:%d", goroutineID))
 }

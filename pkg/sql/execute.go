@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,7 +11,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/prep"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/errors"
 )
 
@@ -25,7 +22,7 @@ import (
 // the referenced prepared statement and correctly updated placeholder info.
 // See https://www.postgresql.org/docs/current/static/sql-execute.html for details.
 func (p *planner) fillInPlaceholders(
-	ctx context.Context, ps *PreparedStatement, name string, params tree.Exprs,
+	ctx context.Context, ps *prep.Statement, name string, params tree.Exprs,
 ) (*tree.PlaceholderInfo, error) {
 	if len(ps.Types) != len(params) {
 		return nil, pgerror.Newf(pgcode.Syntax,
@@ -34,7 +31,6 @@ func (p *planner) fillInPlaceholders(
 	}
 
 	qArgs := make(tree.QueryArguments, len(params))
-	var semaCtx tree.SemaContext
 	for i, e := range params {
 		idx := tree.PlaceholderIdx(i)
 
@@ -53,7 +49,7 @@ func (p *planner) fillInPlaceholders(
 			}
 		}
 		typedExpr, err := schemaexpr.SanitizeVarFreeExpr(
-			ctx, e, typ, "EXECUTE parameter" /* context */, &semaCtx, tree.VolatilityVolatile,
+			ctx, e, typ, "EXECUTE parameter" /* context */, p.SemaCtx(), volatility.Volatile, true, /*allowAssignmentCast*/
 		)
 		if err != nil {
 			return nil, pgerror.WithCandidateCode(err, pgcode.WrongObjectType)

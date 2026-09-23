@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -14,11 +9,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/clienturl"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
+	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -39,11 +39,6 @@ subcommands: e.g. "cockroach demo startrek". See --help for a full list.
 
 By default, the 'movr' dataset is pre-loaded. You can also use --no-example-database
 to avoid pre-loading a dataset.
-
-cockroach demo attempts to connect to a Cockroach Labs server to obtain a
-temporary enterprise license for demoing enterprise features and enable
-telemetry back to Cockroach Labs. In order to disable this behavior, set the
-environment variable "COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING" to true.
 `,
 	Example: `  cockroach demo`,
 	Args:    cobra.NoArgs,
@@ -60,15 +55,6 @@ func init() {
 const defaultGeneratorName = "movr"
 
 var defaultGenerator workload.Generator
-
-var demoNodeCacheSizeValue = newBytesOrPercentageValue(
-	&demoCtx.CacheSize,
-	memoryPercentResolver,
-)
-var demoNodeSQLMemSizeValue = newBytesOrPercentageValue(
-	&demoCtx.SQLPoolMemorySize,
-	memoryPercentResolver,
-)
 
 func init() {
 	for _, meta := range workload.Registered() {
@@ -88,13 +74,14 @@ func init() {
 		genDemoCmd := &cobra.Command{
 			Use:   meta.Name,
 			Short: meta.Description,
+			Long:  meta.Description + meta.Details,
 			Args:  cobra.ArbitraryArgs,
 			RunE: clierrorplus.MaybeDecorateError(func(cmd *cobra.Command, _ []string) error {
 				return runDemo(cmd, gen)
 			}),
 		}
-		if !meta.PublicFacing {
-			genDemoCmd.Hidden = true
+		if meta.TestInfraOnly {
+			demoCmd.Long = "THIS COMMAND WAS DEVELOPED FOR INTERNAL TESTING ONLY.\n\n" + demoCmd.Long
 		}
 		demoCmd.AddCommand(genDemoCmd)
 		genDemoCmd.Flags().AddFlagSet(genFlags)
@@ -103,7 +90,7 @@ func init() {
 
 func incrementTelemetryCounters(cmd *cobra.Command) {
 	incrementDemoCounter(demo)
-	if flagSetForCmd(cmd).Lookup(cliflags.DemoNodes.Name).Changed {
+	if cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.DemoNodes.Name).Changed {
 		incrementDemoCounter(nodes)
 	}
 	if demoCtx.Localities != nil {
@@ -120,14 +107,14 @@ func incrementTelemetryCounters(cmd *cobra.Command) {
 func checkDemoConfiguration(
 	cmd *cobra.Command, gen workload.Generator,
 ) (workload.Generator, error) {
-	f := flagSetForCmd(cmd)
-	if gen == nil && !demoCtx.NoExampleDatabase {
+	f := cliflagcfg.FlagSetForCmd(cmd)
+	if gen == nil && !demoCtx.UseEmptyDatabase {
 		// Use a default dataset unless prevented by --no-example-database.
 		gen = defaultGenerator
 	}
 
 	// Make sure that the user didn't request a workload and an empty database.
-	if demoCtx.RunWorkload && demoCtx.NoExampleDatabase {
+	if demoCtx.RunWorkload && demoCtx.UseEmptyDatabase {
 		return nil, errors.New("cannot run a workload when generation of the example database is disabled")
 	}
 
@@ -141,21 +128,18 @@ func checkDemoConfiguration(
 		return nil, errors.Newf("--%s cannot be used with --%s", cliflags.Global.Name, cliflags.DemoNodeLocality.Name)
 	}
 
-	demoCtx.DisableTelemetry = cluster.TelemetryOptOut()
-	// disableLicenseAcquisition can also be set by the user as an
-	// input flag, so make sure it include it when considering the final
-	// value of disableLicenseAcquisition.
-	demoCtx.DisableLicenseAcquisition =
-		demoCtx.DisableTelemetry || (democluster.GetAndApplyLicense == nil) || demoCtx.DisableLicenseAcquisition
+	// The user can disable enterprise features explicitly with --no-license,
+	// e.g. for testing what errors come up if no license is available.
+	// demoCtx.disableEnterpriseFeatures is already set from flags.
 
 	if demoCtx.GeoPartitionedReplicas {
 		geoFlag := "--" + cliflags.DemoGeoPartitionedReplicas.Name
-		if demoCtx.DisableLicenseAcquisition {
+		if demoCtx.disableEnterpriseFeatures {
 			return nil, errors.Newf("enterprise features are needed for this demo (%s)", geoFlag)
 		}
 
 		// Make sure that the user didn't request to have a topology and disable the example database.
-		if demoCtx.NoExampleDatabase {
+		if demoCtx.UseEmptyDatabase {
 			return nil, errors.New("cannot setup geo-partitioned replicas topology without generating an example database")
 		}
 
@@ -170,7 +154,7 @@ func checkDemoConfiguration(
 		}
 
 		// If the geo-partitioned replicas flag was given and the nodes have changed, throw an error.
-		if f.Lookup(cliflags.DemoNodes.Name).Changed {
+		if fl := f.Lookup(cliflags.DemoNodes.Name); fl != nil && fl.Changed {
 			if demoCtx.NumNodes != 9 {
 				return nil, errors.Newf("--nodes with a value different from 9 cannot be used with %s", geoFlag)
 			}
@@ -199,7 +183,15 @@ func checkDemoConfiguration(
 	return gen, nil
 }
 
-func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
+func runDemo(cmd *cobra.Command, gen workload.Generator) error {
+	return runDemoInternal(cmd, gen, func(context.Context, clisqlclient.Conn) error { return nil })
+}
+
+func runDemoInternal(
+	cmd *cobra.Command,
+	gen workload.Generator,
+	extraInit func(context.Context, clisqlclient.Conn) error,
+) (resErr error) {
 	closeFn, err := sqlCtx.Open(os.Stdin)
 	if err != nil {
 		return err
@@ -215,10 +207,12 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	ctx := context.Background()
 
 	demoCtx.WorkloadGenerator = gen
+	// Copy the DRPC flag from baseCfg to demoCtx so it's available to the demo cluster.
+	demoCtx.UseDRPC = baseCfg.UseDRPC
 
-	c, err := democluster.NewDemoCluster(ctx, &demoCtx,
-		log.Infof,
-		log.Warningf,
+	c, err := democluster.NewDemoCluster(ctx, &demoCtx.Context,
+		log.Dev.Infof,
+		log.Dev.Warningf,
 		log.Ops.Shoutf,
 		func(ctx context.Context) (*stop.Stopper, error) {
 			// Override the default server store spec.
@@ -228,8 +222,9 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 			serverCfg.Stores.Specs = nil
 			return setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
 		},
-		getAdminClient,
-		drainAndShutdown,
+		func(ctx context.Context, ac serverpb.RPCAdminClient) error {
+			return drainAndShutdown(ctx, ac, "local" /* targetNode */)
+		},
 	)
 	if err != nil {
 		c.Close(ctx)
@@ -239,10 +234,16 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 
 	initGEOS(ctx)
 
-	if err := c.Start(ctx, runInitialSQL); err != nil {
+	if err := c.Start(ctx); err != nil {
 		return clierrorplus.CheckAndMaybeShout(err)
 	}
 	sqlCtx.ShellCtx.DemoCluster = c
+
+	if demoCtx.DefaultEnableRangefeeds {
+		if err = c.SetClusterSetting(ctx, "kv.rangefeed.enabled", true); err != nil {
+			return clierrorplus.CheckAndMaybeShout(err)
+		}
+	}
 
 	if cliCtx.IsInteractive {
 		cliCtx.PrintfUnlessEmbedded(`#
@@ -253,9 +254,9 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 
 		if demoCtx.Multitenant {
 			cliCtx.PrintfUnlessEmbedded(`#
-# You are connected to tenant 1, but can connect to the system tenant with
-# \connect and the SQL url below.
-`)
+# You are connected to tenant %q, but can connect to the system tenant with
+# '\connect' and the SQL url printed via '\demo ls'.
+`, c.TenantName())
 		}
 
 		if demoCtx.SimulateLatency {
@@ -270,26 +271,28 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 
 		// Only print details about the telemetry configuration if the
 		// user has control over it.
-		if demoCtx.DisableTelemetry {
-			cliCtx.PrintlnUnlessEmbedded("#\n# Telemetry and automatic license acquisition disabled by configuration.")
-		} else if demoCtx.DisableLicenseAcquisition {
-			cliCtx.PrintlnUnlessEmbedded("#\n# Enterprise features disabled by OSS-only build.")
+		if cluster.TelemetryOptOut {
+			cliCtx.PrintlnUnlessEmbedded("#\n# Telemetry disabled by configuration.")
 		} else {
-			cliCtx.PrintlnUnlessEmbedded("#\n# This demo session will attempt to enable enterprise features\n" +
-				"# by acquiring a temporary license from Cockroach Labs in the background.\n" +
+			cliCtx.PrintlnUnlessEmbedded("#\n" +
+				"# This demo session will send telemetry to Cockroach Labs in the background.\n" +
 				"# To disable this behavior, set the environment variable\n" +
 				"# COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING=true.")
 		}
+
+		if demoCtx.disableEnterpriseFeatures {
+			cliCtx.PrintlnUnlessEmbedded("#\n# Enterprise features are disabled by configuration.\n")
+		}
 	}
 
-	// Start license acquisition in the background.
-	licenseDone, err := c.AcquireDemoLicense(ctx)
-	if err != nil {
-		return clierrorplus.CheckAndMaybeShout(err)
+	if !demoCtx.disableEnterpriseFeatures {
+		if err := c.EnableEnterprise(ctx); err != nil {
+			return clierrorplus.CheckAndMaybeShout(err)
+		}
 	}
 
 	// Initialize the workload, if requested.
-	if err := c.SetupWorkload(ctx, licenseDone); err != nil {
+	if err := c.SetupWorkload(ctx); err != nil {
 		return clierrorplus.CheckAndMaybeShout(err)
 	}
 
@@ -303,7 +306,7 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 # Reminder: your changes to data stored in the demo session will not be saved!`)
 
 		var nodeList strings.Builder
-		c.ListDemoNodes(&nodeList, stderr, true /* justOne */)
+		c.ListDemoNodes(&nodeList, stderr, true /* justOne */, false /* verbose */)
 		cliCtx.PrintlnUnlessEmbedded(
 			// Only print the server details when the shell is not embedded;
 			// if embedded, the embedding platform owns the network
@@ -322,27 +325,28 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 			fmt.Printf(`#   - Username: %q, password: %q
 #   - Directory with certificate files (for certain SQL drivers/tools): %s
 #
+# You can enter \info to print these details again.
+#
 `,
 				adminUser,
 				adminPassword,
 				certsDir,
 			)
 		}
-
-		// It's ok to do this twice (if workload setup already waited) because
-		// then the error return is guaranteed to be nil.
-		go func() {
-			if err := waitForLicense(licenseDone); err != nil {
-				_ = clierrorplus.CheckAndMaybeShout(err)
-			}
-		}()
-	} else {
-		// If we are not running an interactive shell, we need to wait to ensure
-		// that license acquisition is successful. If license acquisition is
-		// disabled, then a read on this channel will return immediately.
-		if err := waitForLicense(licenseDone); err != nil {
-			return clierrorplus.CheckAndMaybeShout(err)
+	} else if demoCtx.background {
+		// In non-interactive background mode, print connection info since
+		// the interactive block above was skipped.
+		var nodeList strings.Builder
+		c.ListDemoNodes(&nodeList, stderr, false /* justOne */, true /* verbose */)
+		fmt.Fprintf(stderr, "#\n# Connection parameters:\n#\n#   %s",
+			strings.ReplaceAll(
+				strings.TrimSuffix(nodeList.String(), "\n"), "\n", "\n#   "))
+		if !demoCtx.Insecure {
+			adminUser, adminPassword, certsDir := c.GetSQLCredentials()
+			fmt.Fprintf(stderr, "\n#\n#   Username: %q, password: %q\n", adminUser, adminPassword)
+			fmt.Fprintf(stderr, "#   Certificate directory: %s\n", certsDir)
 		}
+		fmt.Fprintln(stderr)
 	}
 
 	conn, err := sqlCtx.MakeConn(c.GetConnURL())
@@ -351,11 +355,44 @@ func runDemo(cmd *cobra.Command, gen workload.Generator) (resErr error) {
 	}
 	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
-	sqlCtx.ShellCtx.ParseURL = makeURLParser(cmd)
-	return sqlCtx.Run(conn)
-}
+	_, _, certsDir := c.GetSQLCredentials()
+	sqlCtx.ShellCtx.CertsDir = certsDir
+	sqlCtx.ShellCtx.ParseURL = clienturl.MakeURLParserFn(cmd, cliCtx.clientOpts)
 
-func waitForLicense(licenseDone <-chan error) error {
-	err := <-licenseDone
-	return err
+	if err := extraInit(ctx, conn); err != nil {
+		return err
+	}
+
+	// Report the PID of the process in a configured PID file. Used in tests.
+	if demoCtx.pidFile != "" {
+		if err := os.WriteFile(demoCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
+			return err
+		}
+	}
+
+	// Enable the latency as late in the process of starting the cluster as we
+	// can to minimize the startup time.
+	if demoCtx.SimulateLatency {
+		c.SetSimulatedLatency(true /* on */)
+		defer c.SetSimulatedLatency(false /* on */)
+	}
+
+	// Ensure the last few entries in the log files are flushed at the end.
+	defer log.FlushFiles()
+
+	if demoCtx.background {
+		// In background mode, skip the interactive SQL shell and block
+		// until signaled. Connection info was already printed above.
+		fmt.Fprintf(stderr, "# Demo cluster running in background.\n")
+		fmt.Fprintf(stderr, "# To shut down, send SIGINT or SIGTERM (Ctrl+C).\n#\n")
+
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, DrainSignals...)
+		<-ch
+
+		fmt.Fprintf(stderr, "\n# Shutting down demo cluster...\n")
+		return nil
+	}
+
+	return sqlCtx.Run(ctx, conn)
 }

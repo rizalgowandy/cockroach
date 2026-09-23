@@ -1,55 +1,101 @@
 # This file contains telemetry tests for counters triggered by errors.
 
-feature-allowlist
+feature-list
 othererror.*
 errorcodes.*
 unimplemented.*
 sql.schema.validation_errors.*
 ----
 
-# TODO(richardjcai): Support "let" command to programmatically grab descriptor ids.
+rewrite
+((relation|type) "\w*") \(\d+\)
+${1} (...)
+----
+
+# We are injecting a corrupt descriptors below, so lease on first creation
+# will not work.
+exec
+SET CLUSTER SETTING sql.catalog.descriptor_wait_for_initial_version.enabled=false
+----
+
+
+exec
+CREATE TABLE fktbl (id INT PRIMARY KEY);
+----
+
+exec
+CREATE TABLE tbl (customer INT NOT NULL REFERENCES fktbl (id));
+----
+
+exec
+WITH base AS (
+                SELECT id, crdb_internal.pb_to_json('desc', descriptor) AS d
+                  FROM system.descriptor
+                 WHERE id = 'fktbl'::REGCLASS
+            ),
+       updated AS (
+                SELECT id,
+                       json_set(
+                        json_remove_path(d, ARRAY['table', 'inboundFks', '0']),
+                        ARRAY['table', 'version'],
+                        ((d->'table'->>'version')::INT8 + 1)::STRING::JSONB
+                       ) AS d
+                  FROM base
+               )
+SELECT crdb_internal.unsafe_upsert_descriptor(id, crdb_internal.json_to_pb('desc', d)), d
+  FROM updated;
+----
 
 # Table descriptor validation failure on read.
 feature-usage
-CREATE TABLE fktbl (id INT PRIMARY KEY);
-CREATE TABLE tbl (customer INT NOT NULL REFERENCES fktbl (id));
-INSERT INTO system.users VALUES ('node', NULL, true);
-GRANT node TO root;
-UPDATE system.descriptor
-  SET descriptor=crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', '{"table": {"columns": [{"id": 1, "name": "id", "type": {"arrayContents": {"oid": 16}, "family": "IntFamily", "oid": 20, "width": 64}}], "createAsOfTime": {"wallTime": "1617223938180347000"}, "families": [{"columnIds": [1], "columnNames": ["id"], "name": "primary"}], "formatVersion": 3, "id": 54, "modificationTime": {}, "name": "fktbl", "nextColumnId": 2, "nextFamilyId": 1, "nextIndexId": 2, "nextMutationId": 1, "parentId": 50, "primaryIndex": {"foreignKey": {}, "geoConfig": {}, "id": 1, "interleave": {}, "keyColumnDirections": ["ASC"], "keyColumnIds": [1], "keyColumnNames": ["id"], "name": "primary", "partitioning": {}, "sharded": {}, "unique": true, "version": 2}, "privileges": {"ownerProto": "root", "users": [{"privileges": 2, "userProto": "admin"}, {"privileges": 2, "userProto": "root"}], "version": 1}, "replacementOf": {"time": {}}, "unexposedParentSchemaId": 29, "version": "2"}}')
-  WHERE id IN (SELECT id FROM system.namespace WHERE name='fktbl');
-REVOKE node FROM root;
-DELETE FROM system.users WHERE username = 'node';
-SELECT * FROM tbl;
+DROP TABLE tbl CASCADE;
 ----
-error: pq: internal error: relation "tbl" (55): missing fk back reference "tbl_customer_fkey" to "tbl" from "fktbl"
+error: pq: internal error: executing declarative schema change StatementPhase stage 1 of 1 with 52 MutationType ops (rollback=false) for DROP TABLE: error executing StatementPhase stage 1 of 1 with 52 MutationType ops: *scop.MakePublicForeignKeyConstraintValidated: &{{{}} 105 2}: relation "tbl" (...): missing fk back reference "tbl_customer_fkey" to "tbl" from "fktbl"
 errorcodes.XX000
-sql.schema.validation_errors.read.cross_references.relation
+sql.schema.validation_errors.read.backward_references.relation
+
+exec
+CREATE TYPE greeting AS ENUM('hello', 'hi');
+----
+
+exec
+WITH base AS (
+              SELECT id, crdb_internal.pb_to_json('desc', descriptor) AS d
+                FROM system.descriptor
+               WHERE id IN (SELECT id FROM system.namespace WHERE name = 'greeting')
+          ),
+       updated AS (
+                SELECT id,
+                       json_set(
+                        json_set(d, ARRAY['type', 'name'], '""'::JSONB),
+                        ARRAY['type', 'version'],
+                        ((d->'type'->>'version')::INT8 + 1)::STRING::JSONB
+                       ) AS d
+                  FROM base
+               )
+SELECT crdb_internal.unsafe_upsert_descriptor(id, crdb_internal.json_to_pb('desc', d), true)
+  FROM updated;
+----
 
 # Type descriptor validation failure on read.
 feature-usage
-CREATE TYPE greeting AS ENUM('hello', 'hi');
-INSERT INTO system.users VALUES ('node', NULL, true);
-GRANT node TO root;
-UPDATE system.descriptor
-  SET descriptor=crdb_internal.json_to_pb('cockroach.sql.sqlbase.Descriptor', '  {"type": {"arrayTypeId": 57, "enumMembers": [{"logicalRepresentation": "hello", "physicalRepresentation": "QA=="}, {"logicalRepresentation": "hi", "physicalRepresentation": "gA=="}], "id": 56, "modificationTime": {}, "parentId": 50, "parentSchemaId": 29, "privileges": {"ownerProto": "root", "users": [{"privileges": 2, "userProto": "admin"}, {"privileges": 512, "userProto": "public"}, {"privileges": 2, "userProto": "root"}], "version": 1}, "version": "1"}}')
-  WHERE id IN (SELECT id FROM system.namespace WHERE name='greeting');
-REVOKE node FROM root;
-DELETE FROM system.users WHERE username = 'node';
 SELECT 'hi'::greeting
 ----
-error: pq: type "" (56): empty type name
+error: pq: type "" (...): empty type name
 errorcodes.42601
 sql.schema.validation_errors.read.self.type
 
+exec
+CREATE TABLE t (x INT PRIMARY KEY) WITH (schema_locked=false);
+----
+
 # Table descriptor validation failure on transaction commit.
 feature-usage
-CREATE TABLE t (x INT PRIMARY KEY);
 BEGIN;
 ALTER TABLE t DROP CONSTRAINT t_pkey;
 COMMIT;
 ----
-error: pq: relation "t" (58): unimplemented: primary key dropped without subsequent addition of new primary key in same transaction
+error: pq: relation "t" (...): unimplemented: primary key dropped without subsequent addition of new primary key in same transaction
 errorcodes.0A000
 sql.schema.validation_errors.write.pre_txn_commit.relation
 unimplemented.#48026
@@ -79,17 +125,16 @@ othererror.XXUUU
 feature-usage
 SELECT crdb_internal.force_assertion_error('woo')
 ----
-error: pq: internal error: crdb_internal.force_assertion_error(): woo
+error: pq: internal error: woo
 errorcodes.XX000
 
 # XXUUU is pgcode.Uncategorized.
 feature-usage
 SELECT crdb_internal.set_vmodule('invalid')
 ----
-error: pq: crdb_internal.set_vmodule(): syntax error: expect comma-separated list of filename=N
+error: pq: syntax error: expect comma-separated list of filename=N
 errorcodes.XXUUU
 othererror.XXUUU
-othererror.XXUUU.crdb_internal.set_vmodule()
 
 # 22012 is pgcode.DivisionByZero.
 feature-usage
@@ -97,3 +142,11 @@ SELECT 2/0
 ----
 error: pq: division by zero
 errorcodes.22012
+
+feature-usage
+ALTER AGGREGATE foo
+----
+error: pq: at or near "foo": syntax error: unimplemented: this syntax
+errorcodes.0A000
+unimplemented.#74775.alter aggregate
+unimplemented.syntax.#74775.alter aggregate

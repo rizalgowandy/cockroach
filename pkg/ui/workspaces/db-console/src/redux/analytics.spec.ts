@@ -1,99 +1,75 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { assert } from "chai";
-import * as sinon from "sinon";
-
-import Analytics from "analytics-node";
-import { Location, createLocation, createHashHistory } from "history";
-import _ from "lodash";
-import { Store } from "redux";
-
-import { history } from "src/redux/state";
-import { AnalyticsSync, defaultRedactions } from "./analytics";
-import { clusterReducerObj, nodesReducerObj } from "./apiReducers";
-import { AdminUIState, createAdminUIStore } from "./state";
+import { Analytics } from "@segment/analytics-node";
+import { Location, createLocation } from "history";
+import each from "lodash/each";
 
 import * as protos from "src/js/protos";
 
-const sandbox = sinon.createSandbox();
+import { AnalyticsSync, defaultRedactions } from "./analytics";
+import { history } from "./history";
 
-describe("analytics listener", function() {
+describe("analytics listener", function () {
   const clusterID = "a49f0ced-7ada-4135-af37-8acf6b548df0";
-  const setClusterData = (
-    store: Store<AdminUIState>,
-    enabled = true,
-    enterprise = true,
-  ) => {
-    store.dispatch(
-      clusterReducerObj.receiveData(
-        new protos.cockroach.server.serverpb.ClusterResponse({
-          cluster_id: clusterID,
-          reporting_enabled: enabled,
-          enterprise_enabled: enterprise,
-        }),
-      ),
-    );
-  };
 
-  describe("page method", function() {
-    let store: Store<AdminUIState>;
-    let analytics: Analytics;
-    let pageSpy: sinon.SinonSpy;
+  function makeClusterData(enabled = true, enterprise = true) {
+    return new protos.cockroach.server.serverpb.ClusterResponse({
+      cluster_id: clusterID,
+      reporting_enabled: enabled,
+      enterprise_enabled: enterprise,
+    });
+  }
 
-    beforeEach(function() {
-      store = createAdminUIStore(createHashHistory());
-      pageSpy = sandbox.spy();
+  describe("page method", function () {
+    let analyticsService: Analytics;
+    const pageSpy = jest.fn();
 
+    beforeEach(function () {
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
-      analytics = {
+      analyticsService = {
         page: pageSpy,
       } as any;
     });
 
     afterEach(() => {
-      sandbox.reset();
+      pageSpy.mockRestore();
     });
 
-    it("does nothing if cluster info is not available", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
+    it("does nothing if cluster info is not available", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
 
       sync.page({
         pathname: "/test/path",
       } as Location);
 
-      assert.isTrue(pageSpy.notCalled);
+      expect(pageSpy).not.toHaveBeenCalled();
     });
 
-    it("does nothing if reporting is not explicitly enabled", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
-      setClusterData(store, false);
+    it("does nothing if reporting is not explicitly enabled", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData(false));
 
       sync.page({
         pathname: "/test/path",
       } as Location);
 
-      assert.isTrue(pageSpy.notCalled);
+      expect(pageSpy).not.toHaveBeenCalled();
     });
 
-    it("correctly calls segment on a page call", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
-      setClusterData(store);
+    it("correctly calls segment on a page call", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData());
 
       sync.page({
         pathname: "/test/path",
       } as Location);
 
-      assert.isTrue(pageSpy.calledOnce);
-      assert.deepEqual(pageSpy.args[0][0], {
+      expect(pageSpy).toHaveBeenCalledTimes(1);
+      expect(pageSpy.mock.lastCall[0]).toEqual({
         userId: clusterID,
         name: "/test/path",
         properties: {
@@ -103,22 +79,22 @@ describe("analytics listener", function() {
       });
     });
 
-    it("correctly queues calls before cluster ID is available", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
+    it("correctly queues calls before cluster ID is available", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
 
       sync.page({
         pathname: "/test/path",
       } as Location);
 
-      setClusterData(store);
-      assert.isTrue(pageSpy.notCalled);
+      sync.updateCluster(makeClusterData());
+      expect(pageSpy).not.toHaveBeenCalled();
 
       sync.page({
         pathname: "/test/path/2",
       } as Location);
 
-      assert.equal(pageSpy.callCount, 2);
-      assert.deepEqual(pageSpy.args[0][0], {
+      expect(pageSpy.mock.calls.length).toBe(2);
+      expect(pageSpy.mock.calls[0][0]).toEqual({
         userId: clusterID,
         name: "/test/path",
         properties: {
@@ -126,7 +102,7 @@ describe("analytics listener", function() {
           search: "",
         },
       });
-      assert.deepEqual(pageSpy.args[1][0], {
+      expect(pageSpy.mock.calls[1][0]).toEqual({
         userId: clusterID,
         name: "/test/path/2",
         properties: {
@@ -136,21 +112,21 @@ describe("analytics listener", function() {
       });
     });
 
-    it("correctly applies redaction to matched paths", function() {
-      setClusterData(store);
-      const sync = new AnalyticsSync(analytics, store, [
+    it("correctly applies redaction to matched paths", function () {
+      const sync = new AnalyticsSync(analyticsService, [
         {
           match: RegExp("/test/.*/path"),
           replace: "/test/[redacted]/path",
         },
       ]);
+      sync.updateCluster(makeClusterData());
 
       sync.page({
         pathname: "/test/username/path",
       } as Location);
 
-      assert.isTrue(pageSpy.calledOnce);
-      assert.deepEqual(pageSpy.args[0][0], {
+      expect(pageSpy).toHaveBeenCalledTimes(1);
+      expect(pageSpy.mock.lastCall[0]).toEqual({
         userId: clusterID,
         name: "/test/[redacted]/path",
         properties: {
@@ -216,17 +192,17 @@ describe("analytics listener", function() {
         "/statement/SELECT * FROM database.table",
         "/statement/[statement]",
       ),
-    ].map(function({ title, input, expected }) {
-      it(`applies a redaction for ${title}`, function() {
-        setClusterData(store);
-        const sync = new AnalyticsSync(analytics, store, defaultRedactions);
+    ].map(function ({ title, input, expected }) {
+      it(`applies a redaction for ${title}`, function () {
+        const sync = new AnalyticsSync(analyticsService, defaultRedactions);
+        sync.updateCluster(makeClusterData());
         const expectedLocation = createLocation(expected);
 
         sync.page(createLocation(input));
 
-        assert.isTrue(pageSpy.calledOnce);
+        expect(pageSpy).toHaveBeenCalledTimes(1);
 
-        const actualArgs = pageSpy.args[0][0];
+        const actualArgs = pageSpy.mock.lastCall[0];
         const expectedArgs = {
           userId: clusterID,
           name: expectedLocation.pathname,
@@ -235,90 +211,65 @@ describe("analytics listener", function() {
             search: expectedLocation.search,
           },
         };
-        assert.deepEqual(
-          actualArgs,
-          expectedArgs,
-          `Expected:\n${JSON.stringify(
-            expectedArgs,
-            null,
-            2,
-          )}\nActual:\n${JSON.stringify(actualArgs, null, 2)}\n`,
-        );
+        expect(actualArgs).toEqual(expectedArgs);
       });
     });
   });
 
-  describe("identify method", function() {
-    let store: Store<AdminUIState>;
-    let analytics: Analytics;
-    let identifySpy: sinon.SinonSpy;
+  describe("identify method", function () {
+    let analyticsService: Analytics;
+    const identifySpy = jest.fn();
 
-    beforeEach(function() {
-      store = createAdminUIStore(createHashHistory());
-      identifySpy = sandbox.spy();
-
+    beforeEach(function () {
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
-      analytics = {
+      analyticsService = {
         identify: identifySpy,
       } as any;
     });
 
     afterEach(() => {
-      sandbox.reset();
+      identifySpy.mockReset();
     });
 
-    const setVersionData = function() {
-      store.dispatch(
-        nodesReducerObj.receiveData([
-          {
-            build_info: {
-              tag: "0.1",
-            },
-          },
-        ]),
-      );
-    };
-
-    it("does nothing if cluster info is not available", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
-      setVersionData();
+    it("does nothing if cluster info is not available", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateVersions(["0.1"]);
 
       sync.identify();
 
-      assert.isTrue(identifySpy.notCalled);
+      expect(identifySpy).not.toHaveBeenCalled();
     });
 
-    it("does nothing if version info is not available", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
-      setClusterData(store, true, true);
+    it("does nothing if version info is not available", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData(true, true));
 
       sync.identify();
 
-      assert.isTrue(identifySpy.notCalled);
+      expect(identifySpy).not.toHaveBeenCalled();
     });
 
-    it("does nothing if reporting is not explicitly enabled", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
-      setClusterData(store, false, true);
-      setVersionData();
+    it("does nothing if reporting is not explicitly enabled", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData(false, true));
+      sync.updateVersions(["0.1"]);
 
       sync.identify();
 
-      assert.isTrue(identifySpy.notCalled);
+      expect(identifySpy).not.toHaveBeenCalled();
     });
 
-    it("sends the correct value of clusterID, version and enterprise", function() {
-      setVersionData();
-
-      _.each([false, true], enterpriseSetting => {
-        sandbox.reset();
-        setClusterData(store, true, enterpriseSetting);
-        const sync = new AnalyticsSync(analytics, store, []);
+    it("sends the correct value of clusterID, version and enterprise", function () {
+      each([false, true], enterpriseSetting => {
+        identifySpy.mockReset();
+        const sync = new AnalyticsSync(analyticsService, []);
+        sync.updateCluster(makeClusterData(true, enterpriseSetting));
+        sync.updateVersions(["0.1"]);
         sync.identify();
 
-        assert.isTrue(identifySpy.calledOnce);
-        assert.deepEqual(identifySpy.args[0][0], {
+        expect(identifySpy).toHaveBeenCalledTimes(1);
+        expect(identifySpy.mock.lastCall[0]).toEqual({
           userId: clusterID,
           traits: {
             version: "0.1",
@@ -329,50 +280,47 @@ describe("analytics listener", function() {
       });
     });
 
-    it("only reports once", function() {
-      const sync = new AnalyticsSync(analytics, store, []);
-      setClusterData(store, true, true);
-      setVersionData();
+    it("only reports once", function () {
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData(true, true));
+      sync.updateVersions(["0.1"]);
 
       sync.identify();
       sync.identify();
 
-      assert.isTrue(identifySpy.calledOnce);
+      expect(identifySpy).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe("track method", function() {
-    const store: Store<AdminUIState> = createAdminUIStore(createHashHistory());
-    let analytics: Analytics;
-    let trackSpy: sinon.SinonSpy;
+  describe("track method", function () {
+    let analyticsService: Analytics;
+    const trackSpy = jest.fn();
 
     beforeEach(() => {
-      trackSpy = sandbox.spy();
-
       // Analytics is a completely fake object, we don't want to call
       // segment if an unexpected method is called.
-      analytics = {
+      analyticsService = {
         track: trackSpy,
       } as any;
     });
 
     afterEach(() => {
-      sandbox.reset();
+      trackSpy.mockReset();
     });
 
     it("does nothing if cluster info is not available", () => {
-      const sync = new AnalyticsSync(analytics, store, []);
+      const sync = new AnalyticsSync(analyticsService, []);
 
       sync.track({
         event: "test",
       });
 
-      assert.isTrue(trackSpy.notCalled);
+      expect(trackSpy).not.toHaveBeenCalled();
     });
 
     it("add userId to track calls using the cluster_id", () => {
-      setClusterData(store);
-      const sync = new AnalyticsSync(analytics, store, []);
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData());
 
       sync.track({
         event: "test",
@@ -385,15 +333,15 @@ describe("analytics listener", function() {
         },
         event: "test",
       };
-      const message = trackSpy.args[0][0];
+      const message = trackSpy.mock.lastCall[0];
 
-      assert.isTrue(trackSpy.calledOnce);
-      assert.deepEqual(message, expected);
+      expect(trackSpy).toHaveBeenCalledTimes(1);
+      expect(message).toEqual(expected);
     });
 
     it("add the page path to properties", () => {
-      setClusterData(store);
-      const sync = new AnalyticsSync(analytics, store, []);
+      const sync = new AnalyticsSync(analyticsService, []);
+      sync.updateCluster(makeClusterData());
       const testPagePath = "/test/page/path";
 
       history.push(testPagePath);
@@ -413,10 +361,10 @@ describe("analytics listener", function() {
         },
         event: "test",
       };
-      const message = trackSpy.args[0][0];
+      const message = trackSpy.mock.lastCall[0];
 
-      assert.isTrue(trackSpy.calledOnce);
-      assert.deepEqual(message, expected);
+      expect(trackSpy).toHaveBeenCalledTimes(1);
+      expect(message).toEqual(expected);
     });
   });
 });

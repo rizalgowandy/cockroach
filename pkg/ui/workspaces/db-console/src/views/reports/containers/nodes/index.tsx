@@ -1,40 +1,41 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { useNodesSummary, util } from "@cockroachlabs/cluster-ui";
 import classNames from "classnames";
-import _ from "lodash";
+import flow from "lodash/flow";
+import get from "lodash/get";
+import has from "lodash/has";
+import isEmpty from "lodash/isEmpty";
+import isNil from "lodash/isNil";
+import join from "lodash/join";
+import map from "lodash/map";
+import orderBy from "lodash/orderBy";
+import uniq from "lodash/uniq";
 import Long from "long";
-import moment from "moment";
-import React from "react";
+import moment from "moment-timezone";
+import React, { useState } from "react";
 import { Helmet } from "react-helmet";
-import { connect } from "react-redux";
 import { withRouter, RouteComponentProps } from "react-router-dom";
-import { InlineAlert } from "src/components";
 
+import { InlineAlert } from "src/components";
 import * as protos from "src/js/protos";
-import { refreshLiveness, refreshNodes } from "src/redux/apiReducers";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
-import { AdminUIState } from "src/redux/state";
-import { LongToMoment } from "src/util/convert";
+import { LivenessStatus } from "src/redux/nodes";
 import { FixLong } from "src/util/fixLong";
 import {
   getFilters,
   localityToString,
   NodeFilterList,
 } from "src/views/reports/components/nodeFilterList";
+import Dropdown, { DropdownOption } from "src/views/shared/components/dropdown";
+import {
+  PageConfig,
+  PageConfigItem,
+} from "src/views/shared/components/pageconfig";
 
-interface NodesOwnProps {
-  nodesSummary: NodesSummary;
-  refreshNodes: typeof refreshNodes;
-  refreshLiveness: typeof refreshLiveness;
-}
+import { BackToAdvanceDebug } from "../util";
 
 interface NodesTableRowParams {
   title: string;
@@ -48,8 +49,6 @@ interface NodesTableRowParams {
     ns: protos.cockroach.server.status.statuspb.INodeStatus,
   ) => string;
 }
-
-type NodesProps = NodesOwnProps & RouteComponentProps;
 
 const dateFormat = "Y-MM-DD HH:mm:ss";
 const detailTimeFormat = "Y/MM/DD HH:mm:ss";
@@ -78,8 +77,10 @@ function printNodeID(
 }
 
 function printSingleValue(value: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    return _.get(status, value, null);
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    return get(status, value, null);
   };
 }
 
@@ -87,67 +88,81 @@ function printSingleValueWithFunction(
   value: string,
   fn: (item: any) => string,
 ) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    return fn(_.get(status, value, null));
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    return fn(get(status, value, null));
   };
 }
 
 function printMultiValue(value: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    return _.join(_.get(status, value, []), "\n");
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    return join(get(status, value, []), "\n");
   };
 }
 
 function printDateValue(value: string, inputDateFormat: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    if (!_.has(status, value)) {
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    if (!has(status, value)) {
       return null;
     }
-    return moment(_.get(status, value), inputDateFormat).format(dateFormat);
+    return moment(get(status, value), inputDateFormat).format(dateFormat);
   };
 }
 
 function printTimestampValue(value: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    if (!_.has(status, value)) {
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    if (!has(status, value)) {
       return null;
     }
-    return LongToMoment(FixLong(_.get(status, value) as Long)).format(
-      dateFormat,
-    );
+    return util
+      .LongToMoment(FixLong(get(status, value) as Long))
+      .format(dateFormat);
   };
 }
 
 // Functions starting with "title" are used exclusively to print the cell
 // titles. They always return a single string.
 function titleDateValue(value: string, inputDateFormat: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    if (!_.has(status, value)) {
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    if (!has(status, value)) {
       return null;
     }
-    const raw = _.get(status, value);
+    const raw = get(status, value);
     return `${moment(raw, inputDateFormat).format(dateFormat)}\n${raw}`;
   };
 }
 
 function titleTimestampValue(value: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    if (!_.has(status, value)) {
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    if (!has(status, value)) {
       return null;
     }
-    const raw = FixLong(_.get(status, value) as Long);
-    return `${LongToMoment(raw).format(dateFormat)}\n${raw.toString()}`;
+    const raw = FixLong(get(status, value) as Long);
+    return `${util.LongToMoment(raw).format(dateFormat)}\n${raw.toString()}`;
   };
 }
 
 // Functions starting with "extract" are used exclusively for for extracting
 // the main content of a cell.
 function extractMultiValue(value: string) {
-  return function(status: protos.cockroach.server.status.statuspb.INodeStatus) {
-    const items = _.map(_.get(status, value, []), item => item.toString());
+  return function (
+    status: protos.cockroach.server.status.statuspb.INodeStatus,
+  ) {
+    const items = map(get(status, value, []), item => item.toString());
     return (
       <ul className="nodes-entries-list">
-        {_.map(items, (item, key) => (
+        {map(items, (item, key) => (
           <li key={key} className="nodes-entries-list--item">
             {item}
           </li>
@@ -265,24 +280,22 @@ const nodesTableRows: NodesTableRowParams[] = [
 /**
  * Renders the Nodes Diagnostics Report page.
  */
-export class Nodes extends React.Component<NodesProps, {}> {
-  refresh(props = this.props) {
-    props.refreshLiveness();
-    props.refreshNodes();
-  }
+export function Nodes({
+  location,
+  history,
+}: RouteComponentProps): React.ReactElement {
+  const {
+    nodeIDs: nodeIds,
+    nodeStatusByID,
+    livenessStatusByNodeID,
+    error: nodeLastError,
+  } = useNodesSummary();
 
-  componentDidMount() {
-    // Refresh nodes status query when mounting.
-    this.refresh();
-  }
+  const [selectFilter, setSelectFilter] = useState<number | null>(
+    isEmpty(getFilters(location)) ? LivenessStatus.NODE_STATUS_LIVE : null,
+  );
 
-  componentDidUpdate(prevProps: NodesProps) {
-    if (!_.isEqual(this.props.location, prevProps.location)) {
-      this.refresh(this.props);
-    }
-  }
-
-  renderNodesTableRow(
+  const renderNodesTableRow = (
     orderedNodeIDs: string[],
     key: number,
     title: string,
@@ -295,14 +308,15 @@ export class Nodes extends React.Component<NodesProps, {}> {
     cellTitle?: (
       ns: protos.cockroach.server.status.statuspb.INodeStatus,
     ) => string,
-  ) {
+  ) => {
     const inconsistent =
-      !_.isNil(equality) &&
-      _.chain(orderedNodeIDs)
-        .map(nodeID => this.props.nodesSummary.nodeStatusByID[nodeID])
-        .map(status => equality(status))
-        .uniq()
-        .value().length > 1;
+      !isNil(equality) &&
+      flow(
+        (nodeIdsList: string[]) =>
+          map(nodeIdsList, nodeID => nodeStatusByID[nodeID]),
+        statuses => map(statuses, status => equality(status)),
+        uniq,
+      )(orderedNodeIDs).length > 1;
     const headerClassName = classNames(
       "nodes-table__cell",
       "nodes-table__cell--header",
@@ -312,92 +326,122 @@ export class Nodes extends React.Component<NodesProps, {}> {
     return (
       <tr className="nodes-table__row" key={key}>
         <th className={headerClassName}>{title}</th>
-        {_.map(orderedNodeIDs, nodeID => {
-          const status = this.props.nodesSummary.nodeStatusByID[nodeID];
+        {map(orderedNodeIDs, nodeID => {
+          const status = nodeStatusByID[nodeID];
           return (
             <NodeTableCell
               key={nodeID}
               value={extract(status)}
-              title={_.isNil(cellTitle) ? null : cellTitle(status)}
+              title={isNil(cellTitle) ? null : cellTitle(status)}
             />
           );
         })}
       </tr>
     );
-  }
+  };
 
-  requiresAdmin() {
-    const {
-      nodesSummary: { nodeLastError },
-    } = this.props;
-
-    return nodeLastError?.message === "this operation requires admin privilege";
-  }
-
-  render() {
-    const { nodesSummary } = this.props;
-    const { nodeStatusByID } = nodesSummary;
-
-    if (this.requiresAdmin()) {
-      return (
-        <InlineAlert title="" message="This page requires admin privileges." />
-      );
-    }
-
-    if (_.isEmpty(nodesSummary.nodeIDs)) {
-      return loading;
-    }
-
-    const filters = getFilters(this.props.location);
-
-    let nodeIDsContext = _.chain(nodesSummary.nodeIDs).map((nodeID: string) =>
-      Number.parseInt(nodeID, 10),
+  if (nodeLastError?.message === "this operation requires admin privilege") {
+    return (
+      <InlineAlert title="" message="This page requires admin privileges." />
     );
-    if (!_.isNil(filters.nodeIDs) && filters.nodeIDs.size > 0) {
-      nodeIDsContext = nodeIDsContext.filter(nodeID =>
-        filters.nodeIDs.has(nodeID),
-      );
-    }
-    if (!_.isNil(filters.localityRegex)) {
-      nodeIDsContext = nodeIDsContext.filter(nodeID =>
-        filters.localityRegex.test(
-          localityToString(nodeStatusByID[nodeID.toString()].desc.locality),
-        ),
-      );
-    }
+  }
 
-    // Sort the node IDs and then convert them back to string for lookups.
-    const orderedNodeIDs = nodeIDsContext
-      .orderBy(nodeID => nodeID)
-      .map(nodeID => nodeID.toString())
-      .value();
+  if (isEmpty(nodeIds)) {
+    return loading;
+  }
 
-    if (_.isEmpty(orderedNodeIDs)) {
+  const filters = getFilters(location);
+
+  let nodeIDsContext = nodeIds.map((nodeID: string) =>
+    Number.parseInt(nodeID, 10),
+  );
+  if (!isNil(filters.nodeIDs) && filters.nodeIDs.size > 0) {
+    nodeIDsContext = nodeIDsContext.filter(nodeID =>
+      filters.nodeIDs.has(nodeID),
+    );
+  }
+  if (!isNil(filters.localityRegex)) {
+    nodeIDsContext = nodeIDsContext.filter(nodeID =>
+      filters.localityRegex.test(
+        localityToString(nodeStatusByID[nodeID.toString()].desc.locality),
+      ),
+    );
+  }
+  if (selectFilter !== null) {
+    nodeIDsContext = nodeIDsContext.filter(nodeID => {
+      // For this context, if the user chooses active nodes,
+      // only include nodes with a liveness status of DEAD, LIVE
+      // or UNAVAILABLE (suspect).
+      if (selectFilter === LivenessStatus.NODE_STATUS_LIVE) {
+        return [
+          LivenessStatus.NODE_STATUS_DEAD,
+          LivenessStatus.NODE_STATUS_LIVE,
+          LivenessStatus.NODE_STATUS_UNAVAILABLE,
+        ].includes(livenessStatusByNodeID[nodeID]);
+      }
       return (
+        livenessStatusByNodeID[nodeID] ===
+        LivenessStatus.NODE_STATUS_DECOMMISSIONED
+      );
+    });
+  }
+
+  // Sort the node IDs and then convert them back to string for lookups.
+  const orderedNodeIDs = orderBy(nodeIDsContext, nodeID => nodeID).map(nodeID =>
+    nodeID.toString(),
+  );
+
+  const dropdownOptions: DropdownOption[] = [
+    {
+      value: LivenessStatus.NODE_STATUS_LIVE.toString(),
+      label: "Active Nodes",
+    },
+    {
+      value: LivenessStatus.NODE_STATUS_DECOMMISSIONED.toString(),
+      label: "Decomissioned Nodes",
+    },
+    { value: "", label: "All Nodes" },
+  ];
+
+  return (
+    <section className="section">
+      <Helmet title="Node Diagnostics | Debug" />
+      <BackToAdvanceDebug history={history} />
+      <h1 className="base-heading">Node Diagnostics</h1>
+      <NodeFilterList
+        nodeIDs={filters.nodeIDs}
+        localityRegex={filters.localityRegex}
+      />
+      {!isEmpty(orderedNodeIDs) && <h2 className="base-heading">Nodes</h2>}
+      {isEmpty(filters) && (
+        <PageConfig>
+          <PageConfigItem>
+            <Dropdown
+              title="Node Selection"
+              options={dropdownOptions}
+              selected={selectFilter === null ? "" : selectFilter.toString()}
+              onChange={selected =>
+                setSelectFilter(
+                  selected.value === "" ? null : parseInt(selected.value),
+                )
+              }
+            />
+          </PageConfigItem>
+        </PageConfig>
+      )}
+      {isEmpty(orderedNodeIDs) ? (
         <section className="section">
-          <h1 className="base-heading">Node Diagnostics</h1>
           <NodeFilterList
             nodeIDs={filters.nodeIDs}
             localityRegex={filters.localityRegex}
           />
           <h2 className="base-heading">No nodes match the filters</h2>
         </section>
-      );
-    }
-
-    return (
-      <section className="section">
-        <Helmet title="Node Diagnostics | Debug" />
-        <h1 className="base-heading">Node Diagnostics</h1>
-        <NodeFilterList
-          nodeIDs={filters.nodeIDs}
-          localityRegex={filters.localityRegex}
-        />
-        <h2 className="base-heading">Nodes</h2>
+      ) : (
         <table className="nodes-table">
           <tbody>
-            {_.map(nodesTableRows, (row, key) => {
-              return this.renderNodesTableRow(
+            {map(nodesTableRows, (row, key) => {
+              return renderNodesTableRow(
                 orderedNodeIDs,
                 key,
                 row.title,
@@ -408,18 +452,9 @@ export class Nodes extends React.Component<NodesProps, {}> {
             })}
           </tbody>
         </table>
-      </section>
-    );
-  }
+      )}
+    </section>
+  );
 }
 
-const mapStateToProps = (state: AdminUIState) => ({
-  nodesSummary: nodesSummarySelector(state),
-});
-
-const mapDispatchToProps = {
-  refreshNodes,
-  refreshLiveness,
-};
-
-export default withRouter(connect(mapStateToProps, mapDispatchToProps)(Nodes));
+export default withRouter(Nodes);

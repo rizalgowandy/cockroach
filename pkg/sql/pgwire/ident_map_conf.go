@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
@@ -24,19 +19,21 @@ import (
 // holds the pg_ident configuration.
 const serverIdentityMapSetting = "server.identity_map.configuration"
 
-var connIdentityMapConf = func() *settings.StringSetting {
-	s := settings.RegisterValidatedStringSetting(
-		serverIdentityMapSetting,
-		"system-identity to database-username mappings",
-		"",
-		func(values *settings.Values, s string) error {
-			_, err := identmap.From(strings.NewReader(s))
-			return err
-		},
-	)
-	s.SetVisibility(settings.Public)
-	return s
-}()
+// ConnIdentityMapConf maps system-identities to database-usernames using the pg_ident.conf format.
+var ConnIdentityMapConf = settings.RegisterStringSetting(
+	settings.ApplicationLevel,
+	serverIdentityMapSetting,
+	"system-identity to database-username mappings",
+	"",
+	settings.WithValidateString(func(values *settings.Values, s string) error {
+		_, err := identmap.From(strings.NewReader(s))
+		return err
+	},
+	),
+	settings.WithPublic,
+	settings.WithReportable(false),
+	settings.Sensitive,
+)
 
 // loadLocalIdentityMapUponRemoteSettingChange initializes the local
 // node's cache of the identity map configuration each time the cluster
@@ -44,7 +41,7 @@ var connIdentityMapConf = func() *settings.StringSetting {
 func loadLocalIdentityMapUponRemoteSettingChange(
 	ctx context.Context, server *Server, st *cluster.Settings,
 ) {
-	val := connIdentityMapConf.Get(&st.SV)
+	val := ConnIdentityMapConf.Get(&st.SV)
 	idMap, err := identmap.From(strings.NewReader(val))
 	if err != nil {
 		log.Ops.Warningf(ctx, "invalid %s: %v", serverIdentityMapSetting, err)

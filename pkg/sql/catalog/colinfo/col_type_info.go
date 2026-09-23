@@ -1,22 +1,22 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colinfo
 
 import (
+	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/docs"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
@@ -69,7 +69,7 @@ func (ti ColTypeInfo) Type(idx int) *types.T {
 
 // ValidateColumnDefType returns an error if the type of a column definition is
 // not valid. It is checked when a column is created or altered.
-func ValidateColumnDefType(t *types.T) error {
+func ValidateColumnDefType(ctx context.Context, st *cluster.Settings, t *types.T) error {
 	switch t.Family() {
 	case types.StringFamily, types.CollatedStringFamily:
 		if t.Family() == types.CollatedStringFamily {
@@ -98,16 +98,46 @@ func ValidateColumnDefType(t *types.T) error {
 			return unimplemented.NewWithIssueDetailf(23468, t.String(),
 				"arrays of JSON unsupported as column type")
 		}
+		if t.ArrayContents().Family() == types.JsonpathFamily {
+			return unimplemented.NewWithIssueDetailf(144910, t.String(),
+				"arrays of jsonpath unsupported as column type")
+		}
 		if err := types.CheckArrayElementType(t.ArrayContents()); err != nil {
 			return err
 		}
-		return ValidateColumnDefType(t.ArrayContents())
+		return ValidateColumnDefType(ctx, st, t.ArrayContents())
 
 	case types.BitFamily, types.IntFamily, types.FloatFamily, types.BoolFamily, types.BytesFamily, types.DateFamily,
 		types.INetFamily, types.IntervalFamily, types.JsonFamily, types.OidFamily, types.TimeFamily,
 		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily, types.TimeTZFamily,
-		types.GeographyFamily, types.GeometryFamily, types.EnumFamily, types.Box2DFamily:
-		// These types are OK.
+		types.GeographyFamily, types.GeometryFamily, types.EnumFamily, types.Box2DFamily,
+		types.TSQueryFamily, types.TSVectorFamily, types.PGLSNFamily, types.PGVectorFamily, types.RefCursorFamily:
+	// These types are OK.
+
+	case types.JsonpathFamily:
+		return unimplemented.NewWithIssueDetailf(144910, t.String(),
+			"jsonpath unsupported as column type")
+
+	case types.LTreeFamily:
+		if !st.Version.IsActive(ctx, clusterversion.V25_4) {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"ltree not supported until version 25.4",
+			)
+		}
+
+	case types.TupleFamily:
+		if !t.UserDefined() {
+			return pgerror.New(pgcode.InvalidTableDefinition, "cannot use anonymous record type as table column")
+		}
+		if t.TypeMeta.ImplicitRecordType {
+			return unimplemented.NewWithIssue(70099, "cannot use table record type as table column")
+		}
+		for _, typ := range t.TupleContents() {
+			if err := ValidateColumnDefType(ctx, st, typ); err != nil {
+				return err
+			}
+		}
 
 	default:
 		return pgerror.Newf(pgcode.InvalidTableDefinition,
@@ -117,25 +147,72 @@ func ValidateColumnDefType(t *types.T) error {
 	return nil
 }
 
-// ColumnTypeIsIndexable returns whether the type t is valid as an indexed column.
+// ColumnTypeIsIndexable returns whether the type t is valid as an indexed
+// column in a regular FORWARD index.
 func ColumnTypeIsIndexable(t *types.T) bool {
-	if t.IsAmbiguous() || t.Family() == types.TupleFamily {
+	// NB: .IsAmbiguous checks the content type of array types.
+	if t.IsAmbiguous() {
 		return false
 	}
+
+	switch t.Family() {
+	case types.TupleFamily, types.RefCursorFamily, types.JsonpathFamily:
+		return false
+	}
+
+	// If the type is an array, check its content type as well.
+	if unwrapped := t.ArrayContents(); unwrapped != nil {
+		switch unwrapped.Family() {
+		case types.TupleFamily, types.RefCursorFamily, types.JsonpathFamily:
+			return false
+		}
+	}
+
 	// Some inverted index types also have a key encoding, but we don't
 	// want to support those yet. See #50659.
-	return !MustBeValueEncoded(t) && !ColumnTypeIsInvertedIndexable(t)
+	return !MustBeValueEncoded(t) && !ColumnTypeIsOnlyInvertedIndexable(t)
 }
 
 // ColumnTypeIsInvertedIndexable returns whether the type t is valid to be indexed
 // using an inverted index.
 func ColumnTypeIsInvertedIndexable(t *types.T) bool {
+	switch t.Family() {
+	case types.ArrayFamily:
+		switch t.ArrayContents().Family() {
+		case types.RefCursorFamily, types.JsonpathFamily:
+			return false
+		default:
+			return true
+		}
+	case types.JsonFamily, types.StringFamily:
+		return true
+	}
+	return ColumnTypeIsOnlyInvertedIndexable(t)
+}
+
+// ColumnTypeIsOnlyInvertedIndexable returns true if the type t is only
+// indexable via an inverted index.
+func ColumnTypeIsOnlyInvertedIndexable(t *types.T) bool {
 	if t.IsAmbiguous() || t.Family() == types.TupleFamily {
 		return false
 	}
-	family := t.Family()
-	return family == types.JsonFamily || family == types.ArrayFamily ||
-		family == types.GeographyFamily || family == types.GeometryFamily
+	if t.Family() == types.ArrayFamily {
+		t = t.ArrayContents()
+	}
+	switch t.Family() {
+	case types.GeographyFamily:
+	case types.GeometryFamily:
+	case types.TSVectorFamily:
+	default:
+		return false
+	}
+	return true
+}
+
+// ColumnTypeIsVectorIndexable returns true if the type t can be indexed using a
+// vector index.
+func ColumnTypeIsVectorIndexable(t *types.T) bool {
+	return t.Family() == types.PGVectorFamily
 }
 
 // MustBeValueEncoded returns true if columns of the given kind can only be value
@@ -149,54 +226,83 @@ func MustBeValueEncoded(semanticType *types.T) bool {
 		default:
 			return MustBeValueEncoded(semanticType.ArrayContents())
 		}
-	case types.JsonFamily, types.TupleFamily, types.GeographyFamily, types.GeometryFamily:
+	case types.TupleFamily, types.GeographyFamily, types.GeometryFamily:
 		return true
+	case types.TSVectorFamily, types.TSQueryFamily:
+		return true
+	case types.PGVectorFamily:
+		return true
+		// NB: if you're adding a new type here, you probably also want to
+		// include it into rowenc.mustUseValueEncodingForFingerprinting.
 	}
 	return false
 }
 
-// GetColumnTypes populates the types of the columns with the given IDs into the
-// outTypes slice, returning it. You must use the returned slice, as this
-// function might allocate a new slice.
-func GetColumnTypes(
-	desc catalog.TableDescriptor, columnIDs []descpb.ColumnID, outTypes []*types.T,
-) ([]*types.T, error) {
-	if cap(outTypes) < len(columnIDs) {
-		outTypes = make([]*types.T, len(columnIDs))
-	} else {
-		outTypes = outTypes[:len(columnIDs)]
-	}
-	for i, id := range columnIDs {
-		col, err := desc.FindColumnWithID(id)
-		if err != nil {
-			return nil, err
-		}
-		if !col.Public() {
-			return nil, fmt.Errorf("column-id \"%d\" does not exist", id)
-		}
-		outTypes[i] = col.GetType()
-	}
-	return outTypes, nil
-}
-
-// GetColumnTypesFromColDescs populates the types of the columns with the given
-// IDs into the outTypes slice, returning it. You must use the returned slice,
-// as this function might allocate a new slice.
-func GetColumnTypesFromColDescs(
-	cols []catalog.Column, columnIDs []descpb.ColumnID, outTypes []*types.T,
-) []*types.T {
-	if cap(outTypes) < len(columnIDs) {
-		outTypes = make([]*types.T, len(columnIDs))
-	} else {
-		outTypes = outTypes[:len(columnIDs)]
-	}
-	for i, id := range columnIDs {
-		for j := range cols {
-			if id == cols[j].GetID() {
-				outTypes[i] = cols[j].GetType()
-				break
+// ValidateColumnForIndex checks that the given column type is allowed in the
+// given index. If "isLastCol" is true, then it is the last column in the index.
+// "colDesc" can either be a column name or an expression in the form (a + b).
+func ValidateColumnForIndex(
+	indexType idxtype.T, colDesc string, colType *types.T, isLastCol bool,
+) error {
+	// Inverted and vector indexes only allow certain types for the last column.
+	if isLastCol {
+		switch indexType {
+		case idxtype.INVERTED:
+			if !ColumnTypeIsInvertedIndexable(colType) {
+				return sqlerrors.NewInvalidLastColumnError(colDesc, colType.Name(), indexType)
 			}
+			return nil
+
+		case idxtype.VECTOR:
+			if !ColumnTypeIsVectorIndexable(colType) {
+				return sqlerrors.NewInvalidLastColumnError(colDesc, colType.Name(), indexType)
+			} else if colType.Width() <= 0 {
+				return errors.WithDetail(
+					pgerror.Newf(
+						pgcode.FeatureNotSupported,
+						"%s column %s does not have a fixed number of dimensions, so it cannot be indexed",
+						colType.Name(), colDesc,
+					),
+					"specify the number of dimensions in the type, like VECTOR(128) for 128 dimensions",
+				)
+			}
+			return nil
 		}
 	}
-	return outTypes
+
+	if !ColumnTypeIsIndexable(colType) {
+		// If the column is indexable as the last column in the right kind of
+		// index, then use a more descriptive error message.
+		if ColumnTypeIsInvertedIndexable(colType) {
+			if indexType == idxtype.INVERTED {
+				// Column type is allowed, but only as the last column.
+				return sqlerrors.NewColumnOnlyIndexableError(colDesc, colType.Name(), idxtype.INVERTED)
+			}
+
+			// Column type is allowed in an inverted index.
+			return errors.WithHint(pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"column %s has type %s, which is not indexable in a non-inverted index",
+				colDesc, colType),
+				"you may want to create an inverted index instead. See the documentation for inverted indexes: "+docs.URL("inverted-indexes.html"))
+		}
+
+		if ColumnTypeIsVectorIndexable(colType) {
+			if indexType == idxtype.VECTOR {
+				// Column type is allowed, but only as the last column.
+				return sqlerrors.NewColumnOnlyIndexableError(colDesc, colType.Name(), idxtype.VECTOR)
+			}
+
+			// Column type is allowed in a vector index.
+			return errors.WithHint(pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"column %s has type %s, which is not indexable in a non-vector index",
+				colDesc, colType),
+				"you may want to create a vector index instead")
+		}
+
+		return sqlerrors.NewColumnNotIndexableError(colDesc, colType.Name(), colType.DebugString())
+	}
+
+	return nil
 }

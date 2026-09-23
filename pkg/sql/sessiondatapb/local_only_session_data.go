@@ -1,18 +1,16 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessiondatapb
 
 import (
 	"fmt"
 	"strings"
+
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/errors"
 )
 
 // ExperimentalDistSQLPlanningMode controls if and when the opt-driven DistSQL
@@ -130,13 +128,20 @@ const (
 	// can impact performance negatively.
 	SerialUsesSQLSequences SerialNormalizationMode = 2
 	// SerialUsesCachedSQLSequences is identical to SerialUsesSQLSequences with
-	// the exception that nodes can cache sequence values. This significantly
+	// the exception that sessions can cache sequence values. This significantly
 	// reduces contention and distributed calls to kv, which results in better
 	// performance. Gaps between sequences may be larger as a result of cached
 	// values being lost to errors and/or node failures.
 	SerialUsesCachedSQLSequences SerialNormalizationMode = 3
 	// SerialUsesUnorderedRowID means use INT NOT NULL DEFAULT unordered_unique_rowid().
 	SerialUsesUnorderedRowID SerialNormalizationMode = 4
+	// SerialUsesCachedNodeSQLSequences is identical to
+	// SerialUsesCachedSQLSequences, except the sequence values are cached per
+	// node instead of per session.
+	SerialUsesCachedNodeSQLSequences SerialNormalizationMode = 5
+	// maxSerialNormalizationMode should always be one larger than the last
+	// public value.
+	maxSerialNormalizationMode = 6
 )
 
 func (m SerialNormalizationMode) String() string {
@@ -151,6 +156,8 @@ func (m SerialNormalizationMode) String() string {
 		return "sql_sequence"
 	case SerialUsesCachedSQLSequences:
 		return "sql_sequence_cached"
+	case SerialUsesCachedNodeSQLSequences:
+		return "sql_sequence_cached_node"
 	default:
 		return fmt.Sprintf("invalid (%d)", m)
 	}
@@ -169,6 +176,8 @@ func SerialNormalizationModeFromString(val string) (_ SerialNormalizationMode, o
 		return SerialUsesSQLSequences, true
 	case "SQL_SEQUENCE_CACHED":
 		return SerialUsesCachedSQLSequences, true
+	case "SQL_SEQUENCE_CACHED_NODE":
+		return SerialUsesCachedNodeSQLSequences, true
 	default:
 		return 0, false
 	}
@@ -221,6 +230,310 @@ func NewSchemaChangerModeFromString(val string) (_ NewSchemaChangerMode, ok bool
 		return UseNewSchemaChangerUnsafe, true
 	case "UNSAFE_ALWAYS":
 		return UseNewSchemaChangerUnsafeAlways, true
+	default:
+		return 0, false
+	}
+}
+
+// DescriptorValidationMode controls if and when descriptors are validated.
+type DescriptorValidationMode int64
+
+const (
+	// DescriptorValidationOn means that we always validate descriptors,
+	// both when reading from storage and when writing to storage.
+	DescriptorValidationOn DescriptorValidationMode = iota
+	// DescriptorValidationOff means that we never validate descriptors.
+	DescriptorValidationOff
+	// DescriptorValidationReadOnly means that we validate descriptors when
+	// reading from storage, but not when writing to storage.
+	DescriptorValidationReadOnly
+)
+
+func (m DescriptorValidationMode) String() string {
+	switch m {
+	case DescriptorValidationOn:
+		return "on"
+	case DescriptorValidationOff:
+		return "off"
+	case DescriptorValidationReadOnly:
+		return "read_only"
+	default:
+		return fmt.Sprintf("invalid (%d)", m)
+	}
+}
+
+// DescriptorValidationModeFromString converts a string into a
+// DescriptorValidationMode.
+func DescriptorValidationModeFromString(val string) (_ DescriptorValidationMode, ok bool) {
+	switch strings.ToUpper(val) {
+	case "ON":
+		return DescriptorValidationOn, true
+	case "OFF":
+		return DescriptorValidationOff, true
+	case "READ_ONLY":
+		return DescriptorValidationReadOnly, true
+	default:
+		return 0, false
+	}
+}
+
+// QoSLevel controls the level of admission control to use for new SQL requests.
+type QoSLevel admissionpb.WorkPriority
+
+const (
+	// SystemLow denotes the minimum system QoS level, which is not settable as a
+	// session default_transaction_quality_of_service value.
+	SystemLow = QoSLevel(admissionpb.LowPri)
+
+	// BulkLow denotes a QoS level used internally by the bulk operations (like
+	// LDR ingestion and TTL), which is not settable as a session
+	// default_transaction_quality_of_service value.
+	BulkLow = QoSLevel(admissionpb.BulkLowPri)
+
+	// UserLow denotes an end user QoS level lower than the default.
+	UserLow = QoSLevel(admissionpb.UserLowPri)
+
+	// Normal denotes an end user QoS level unchanged from the default.
+	Normal = QoSLevel(admissionpb.NormalPri)
+
+	// LockingNormal denotes an internal increased priority for normal
+	// transactions that are acquiring locks.
+	LockingNormal = QoSLevel(admissionpb.LockingNormalPri)
+
+	// UserHigh denotes an end user QoS level higher than the default.
+	UserHigh = QoSLevel(admissionpb.UserHighPri)
+
+	// LockingHigh denotes an internal increased priority for UserHigh
+	// transactions that are acquiring locks.
+	LockingHigh = QoSLevel(admissionpb.LockingUserHighPri)
+
+	// SystemHigh denotes the maximum system QoS level, which is not settable as a
+	// session default_transaction_quality_of_service value.
+	SystemHigh = QoSLevel(admissionpb.HighPri)
+)
+
+const (
+	// NormalName is the external session setting string value to use to mean
+	// Normal QoS level.
+	NormalName = "regular"
+
+	// UserHighName is the external session setting string value to use to mean
+	// UserHigh QoS level.
+	UserHighName = "critical"
+
+	// UserLowName is the external session setting string value to use to mean
+	// UserLow QoS level.
+	UserLowName = "background"
+
+	// SystemHighName is the string value to display indicating a SystemHigh
+	// QoS level.
+	SystemHighName = "maximum"
+
+	// SystemLowName is the string value to display indicating a SystemLow
+	// QoS level.
+	SystemLowName = "minimum"
+
+	// BulkLowName is the string value to display indicating a BulkLow QoS level.
+	BulkLowName = "bulk_low"
+
+	// LockingNormalName is the string value to display indicating a
+	// LockingNormal QoS level.
+	LockingNormalName = "locking-normal"
+
+	// LockingHighName is the string value to display indicating a LockingHigh
+	// QoS level.
+	LockingHighName = "locking-high"
+)
+
+// When providing SessionData overrides to the internal executor,
+// we need to use pointers to specify the QoSLevel. Since we can't
+// use pointers to constants, we define these variables to use in
+// those cases.
+var (
+	SystemLowQoS = SystemLow
+	BulkLowQoS   = BulkLow
+	UserLowQoS   = UserLow
+)
+
+var qosLevelsDict = map[QoSLevel]string{
+	SystemLow:     SystemLowName,
+	BulkLow:       BulkLowName,
+	UserLow:       UserLowName,
+	Normal:        NormalName,
+	LockingNormal: LockingNormalName,
+	UserHigh:      UserHighName,
+	LockingHigh:   LockingHighName,
+	SystemHigh:    SystemHighName,
+}
+
+func init() {
+	// Sanity check that all names for QoS levels use lower case (this
+	// assumption is used in ParseQoSLevelFromString).
+	for _, val := range qosLevelsDict {
+		if strings.ToLower(val) != val {
+			panic(errors.AssertionFailedf(
+				"expected only lower case letters in QoS level name %s", val,
+			))
+		}
+	}
+}
+
+// ParseQoSLevelFromString converts a string into a QoSLevel
+func ParseQoSLevelFromString(val string) (_ QoSLevel, ok bool) {
+	switch strings.ToLower(val) {
+	case UserHighName:
+		return UserHigh, true
+	case UserLowName:
+		return UserLow, true
+	case NormalName:
+		return Normal, true
+	case BulkLowName:
+		return BulkLow, true
+	default:
+		return 0, false
+	}
+}
+
+// String prints the string representation of the
+// default_transaction_quality_of_service session setting.
+func (e QoSLevel) String() string {
+	if name, ok := qosLevelsDict[e]; ok {
+		return name
+	}
+	return fmt.Sprintf("%d", int(e))
+}
+
+// ToQoSLevelString interprets an int32 value as a QoSLevel and returns its
+// String representation.
+func ToQoSLevelString(value int32) string {
+	if value > int32(SystemHigh) || value < int32(SystemLow) {
+		return fmt.Sprintf("%d", value)
+	}
+	qosLevel := QoSLevel(value)
+	return qosLevel.String()
+}
+
+// Validate checks for a valid user QoSLevel setting before returning it.
+func (e QoSLevel) Validate() QoSLevel {
+	switch e {
+	case Normal, UserHigh, UserLow, BulkLow:
+		return e
+	default:
+		panic(errors.AssertionFailedf("use of illegal user QoSLevel: %s", e.String()))
+	}
+}
+
+// ValidateInternal checks for a valid internal QoSLevel setting before
+// returning it.
+func (e QoSLevel) ValidateInternal() QoSLevel {
+	if _, ok := qosLevelsDict[e]; ok {
+		return e
+	}
+	panic(errors.AssertionFailedf("use of illegal internal QoSLevel: %s", e.String()))
+}
+
+// PgDumpCompatibility values for the pg_dump_compatibility session setting.
+const (
+	// PgDumpCompatibilityOff disables all pg_dump compatibility adjustments.
+	// pg_catalog reports CockroachDB's native OIDs and objects.
+	PgDumpCompatibilityOff = "off"
+	// PgDumpCompatibilityPostgres remaps pg_catalog OIDs to match PostgreSQL,
+	// hides CockroachDB-internal objects, and suppresses CRDB-specific storage
+	// parameters so that pg_dump output can run on non-CockroachDB servers.
+	PgDumpCompatibilityPostgres = "postgres"
+	// PgDumpCompatibilityCockroachDB applies the same pg_catalog OID fixes as
+	// "postgres" mode but retains CockroachDB-specific syntax and objects so
+	// the dump is intended for import into another CockroachDB cluster.
+	PgDumpCompatibilityCockroachDB = "cockroachdb"
+)
+
+// IsPgDumpCompatibilityEnabled returns true if the pg_dump_compatibility
+// setting is set to anything other than "off" (or the zero value).
+func IsPgDumpCompatibilityEnabled(val string) bool {
+	return val != "" && val != PgDumpCompatibilityOff
+}
+
+// PgDumpCompatibilityFromString converts a string into a validated
+// pg_dump_compatibility value. Returns false if the input is not recognized.
+func PgDumpCompatibilityFromString(val string) (_ string, ok bool) {
+	switch strings.ToLower(val) {
+	case PgDumpCompatibilityOff:
+		return PgDumpCompatibilityOff, true
+	case PgDumpCompatibilityPostgres:
+		return PgDumpCompatibilityPostgres, true
+	case PgDumpCompatibilityCockroachDB:
+		return PgDumpCompatibilityCockroachDB, true
+	default:
+		return "", false
+	}
+}
+
+// PgDumpClientAppNames are the application_name values reported by the
+// PostgreSQL dump/restore client tools (pg_dump, pg_restore, pg_dumpall) via
+// libpq's fallback_application_name. The match is exact and case-sensitive,
+// since that is precisely what those tools send.
+var PgDumpClientAppNames = []string{"pg_dump", "pg_restore", "pg_dumpall"}
+
+// DefaultPgDumpCompatibilityForAppName returns the pg_dump_compatibility value
+// to apply by default for a connection whose application_name is appName, along
+// with whether such a default applies. A default is returned only for the
+// PostgreSQL dump/restore client tools (see PgDumpClientAppNames). The chosen
+// value is PgDumpCompatibilityCockroachDB so that dumps round-trip into another
+// CockroachDB cluster without further configuration.
+//
+// Callers are responsible for applying this default only when the client has
+// not explicitly configured pg_dump_compatibility, so that an explicit value
+// (including "off") is always respected.
+func DefaultPgDumpCompatibilityForAppName(appName string) (_ string, ok bool) {
+	for _, name := range PgDumpClientAppNames {
+		if appName == name {
+			return PgDumpCompatibilityCockroachDB, true
+		}
+	}
+	return "", false
+}
+
+// CanaryStatsMode controls which table statistics the optimizer uses for
+// query planning in this session. See the comments on each mode for details.
+type CanaryStatsMode int64
+
+const (
+	// CanaryStatsModeAuto means that the system will automatically decide
+	// to use the canary stats or the stable stats for each query in this
+	// session, based on the sql.stats.canary_fraction cluster setting.
+	CanaryStatsModeAuto CanaryStatsMode = iota
+	// CanaryStatsModeForceStable means that the optimizer always uses the
+	// stable (second-newest) stats for all queries in this session,
+	// regardless of the sql.stats.canary_fraction cluster setting.
+	CanaryStatsModeForceStable
+	// CanaryStatsModeForceCanary means that the optimizer always uses the
+	// canary (newest) stats for all queries in this session, regardless
+	// of the sql.stats.canary_fraction cluster setting.
+	CanaryStatsModeForceCanary
+)
+
+func (m CanaryStatsMode) String() string {
+	switch m {
+	case CanaryStatsModeAuto:
+		return "auto"
+	case CanaryStatsModeForceStable:
+		return "force_stable"
+	case CanaryStatsModeForceCanary:
+		return "force_canary"
+	default:
+		return fmt.Sprintf("invalid (%d)", m)
+	}
+}
+
+// CanaryStatsModeFromString converts a string into a CanaryStatsMode.
+func CanaryStatsModeFromString(val string) (_ CanaryStatsMode, ok bool) {
+	switch strings.ToUpper(val) {
+	case "AUTO":
+		return CanaryStatsModeAuto, true
+	case "FORCE_STABLE":
+		return CanaryStatsModeForceStable, true
+	case "FORCE_CANARY":
+		return CanaryStatsModeForceCanary, true
 	default:
 		return 0, false
 	}

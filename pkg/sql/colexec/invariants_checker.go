@@ -1,23 +1,20 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
 import (
 	"context"
+	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -29,21 +26,23 @@ type invariantsChecker struct {
 	colexecop.InitHelper
 	colexecop.NonExplainable
 
+	rng            *rand.Rand
 	metadataSource colexecop.MetadataSource
 }
 
-var _ colexecop.DrainableOperator = &invariantsChecker{}
-var _ colexecop.ClosableOperator = &invariantsChecker{}
+var _ colexecop.DrainableClosableOperator = &invariantsChecker{}
 
 // NewInvariantsChecker creates a new invariantsChecker.
-func NewInvariantsChecker(input colexecop.Operator) colexecop.DrainableOperator {
+func NewInvariantsChecker(input colexecop.Operator) colexecop.DrainableClosableOperator {
 	if !buildutil.CrdbTestBuild {
 		colexecerror.InternalError(errors.AssertionFailedf(
 			"an invariantsChecker is attempted to be created in non-test build",
 		))
 	}
+	rng, _ := randutil.NewTestRand()
 	c := &invariantsChecker{
 		OneInputNode: colexecop.OneInputNode{Input: input},
+		rng:          rng,
 	}
 	if ms, ok := input.(colexecop.MetadataSource); ok {
 		c.metadataSource = ms
@@ -87,20 +86,23 @@ func (i *invariantsChecker) assertInitWasCalled() bool {
 }
 
 // Next implements the colexecop.Operator interface.
-func (i *invariantsChecker) Next() coldata.Batch {
+func (i *invariantsChecker) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if shortCircuit := i.assertInitWasCalled(); shortCircuit {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
-	b := i.Input.Next()
+	// Inject test-only metadata with 1% probability.
+	if i.rng.Float64() < 0.01 {
+		return nil, &execinfrapb.ProducerMetadata{
+			RowNum: &execinfrapb.RemoteProducerMetadata_RowNum{},
+		}
+	}
+	b, meta := i.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	n := b.Length()
 	if n == 0 {
-		return b
-	}
-	for colIdx := 0; colIdx < b.Width(); colIdx++ {
-		v := b.ColVec(colIdx)
-		if v.IsBytesLike() {
-			coldata.AssertOffsetsAreNonDecreasing(v, n)
-		}
+		return b, nil
 	}
 	if sel := b.Selection(); sel != nil {
 		for i := 1; i < n; i++ {
@@ -112,7 +114,7 @@ func (i *invariantsChecker) Next() coldata.Batch {
 			}
 		}
 	}
-	return b
+	return b, nil
 }
 
 // DrainMeta implements the colexecop.MetadataSource interface.
@@ -127,10 +129,10 @@ func (i *invariantsChecker) DrainMeta() []execinfrapb.ProducerMetadata {
 }
 
 // Close is part of the colexecop.ClosableOperator interface.
-func (i *invariantsChecker) Close() error {
+func (i *invariantsChecker) Close(ctx context.Context) error {
 	c, ok := i.Input.(colexecop.Closer)
 	if !ok {
 		return nil
 	}
-	return c.Close()
+	return c.Close(ctx)
 }

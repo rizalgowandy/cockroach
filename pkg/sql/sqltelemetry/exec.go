@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqltelemetry
 
@@ -34,16 +29,18 @@ func VecModeCounter(mode string) telemetry.Counter {
 // cascade for a single query is exceeded.
 var CascadesLimitReached = telemetry.GetCounterOnce("sql.exec.cascade-limit-reached")
 
+// RecursionDepthLimitReached is to be incremented whenever the limit of nested
+// triggers and/or recursive UDFs for a single query is exceeded.
+var RecursionDepthLimitReached = telemetry.GetCounterOnce("sql.exec.recursion-depth-limit-reached")
+
 // HashAggregationDiskSpillingDisabled is to be incremented whenever the disk
 // spilling of the vectorized hash aggregator is disabled.
 var HashAggregationDiskSpillingDisabled = telemetry.GetCounterOnce("sql.exec.hash-agg-spilling-disabled")
 
-// DistSQLFlowsScheduled is to be incremented whenever a remote DistSQL flow is
-// scheduled for running (regardless of whether it is being run right away or
-// queued).
-var DistSQLFlowsScheduled = telemetry.GetCounterOnce("sql.distsql.flows.scheduled")
+// DistributedErrorLocalRetryAttempt is to be incremented whenever a distributed
+// query error results in a local rerun.
+var DistributedErrorLocalRetryAttempt = telemetry.GetCounterOnce("sql.exec.dist-query-rerun-locally-attempt")
 
-// DistSQLFlowsQueued is to be incremented whenever a remote DistSQL flow is
-// queued rather is run right away (because the node has reached
-// 'sql.distsql.max_running_flows' limit).
-var DistSQLFlowsQueued = telemetry.GetCounterOnce("sql.distsql.flows.queued")
+// DistributedErrorLocalRetrySuccess is to be incremented whenever the local
+// rerun - of a distributed query that hit SQL retryable error - failed itself.
+var DistributedErrorLocalRetryFailure = telemetry.GetCounterOnce("sql.exec.dist-query-rerun-locally-failure")

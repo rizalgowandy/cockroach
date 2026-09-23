@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -14,7 +9,6 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
-	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/errors"
@@ -28,6 +22,8 @@ func (d *delegator) delegateShowCreate(n *tree.ShowCreate) (tree.Statement, erro
 		return d.delegateShowCreateTable(n)
 	case tree.ShowCreateModeDatabase:
 		return d.delegateShowCreateDatabase(n)
+	case tree.ShowCreateModeIndexes, tree.ShowCreateModeSecondaryIndexes:
+		return d.delegateShowCreateIndexes(n)
 	default:
 		return nil, errors.Newf("unknown show create mode: %d", n.Mode)
 	}
@@ -49,11 +45,19 @@ WHERE name = %s
 		return nil, err
 	}
 
-	return parse(fmt.Sprintf(showCreateQuery, lexbase.EscapeSQLString(n.Name.Object())))
+	return d.parse(fmt.Sprintf(showCreateQuery, lexbase.EscapeSQLString(n.Name.Object())))
 }
 
 func (d *delegator) delegateShowCreateTable(n *tree.ShowCreate) (tree.Statement, error) {
-	const showCreateQuery = `
+	createField := "create_statement"
+	switch n.FmtOpt {
+	case tree.ShowCreateFormatOptionRedactedValues:
+		createField = "crdb_internal.redact(create_redactable)"
+	case tree.ShowCreateFormatOptionIgnoreFKs:
+		createField = "create_nofks"
+	}
+
+	showCreateQuery := `
 WITH zone_configs AS (
 		SELECT
 			string_agg(
@@ -75,7 +79,7 @@ WITH zone_configs AS (
 )
 SELECT
     %[3]s AS table_name,
-    concat(create_statement,
+    concat(` + createField + `,
         CASE
 				WHEN is_multi_region THEN
 					CASE
@@ -87,8 +91,14 @@ SELECT
         WHEN NOT has_partitions
           THEN NULL
 				ELSE
-					e'\n-- Warning: Partitioned table with no zone configurations.'
-        END
+					e'\n-- Warning: Partitioned table with no zone configurations.\n'
+        END,
+        CASE
+            WHEN array_length(rls_statements, 1) > 0 THEN
+                concat(e';\n', array_to_string(rls_statements, e';\n'))
+            ELSE NULL
+        END,
+        e';'
     ) AS create_statement
 FROM
     %[4]s.crdb_internal.create_statements
@@ -100,6 +110,32 @@ ORDER BY
 	return d.showTableDetails(n.Name, showCreateQuery)
 }
 
+func (d *delegator) delegateShowCreateIndexes(n *tree.ShowCreate) (tree.Statement, error) {
+	sqltelemetry.IncrementShowCounter(sqltelemetry.Indexes)
+
+	showCreateIndexesQuery := `
+SELECT
+	index_name,
+	create_statement
+FROM %[4]s.crdb_internal.table_indexes
+WHERE descriptor_id = %[3]s::regclass::int`
+
+	// Add additional conditions based on desired index types.
+	switch n.Mode {
+	// This case is intentionally empty since it should return all types of indexes.
+	case tree.ShowCreateModeIndexes:
+	case tree.ShowCreateModeSecondaryIndexes:
+		showCreateIndexesQuery += `
+	AND index_type != 'primary'`
+	default:
+		return nil, errors.Newf("unknown show create indexes mode: %d", n.Mode)
+	}
+
+	return d.showTableDetails(n.Name, showCreateIndexesQuery)
+}
+
+// delegateShowIndexes implements SHOW INDEX FROM, SHOW INDEXES FROM, SHOW KEYS
+// FROM which returns all the indexes in the given table.
 func (d *delegator) delegateShowIndexes(n *tree.ShowIndexes) (tree.Statement, error) {
 	sqltelemetry.IncrementShowCounter(sqltelemetry.Indexes)
 	getIndexesQuery := `
@@ -109,25 +145,36 @@ SELECT
     non_unique::BOOL,
     seq_in_index,
     column_name,
+    CASE
+      -- array_positions(i.indkey, 0) returns the 1-based indexes of the indkey elements that are 0.
+      -- array_position(arr, seq_in_index) returns the 1-based index of the value seq_in_index in arr.
+      -- indkey is an int2vector, which is accessed with 0-based indexes.
+      -- indexprs is a string[], which is accessed with 1-based indexes.
+      -- To put this all together, for the k-th 0 value inside of indkey, this will find the k-th indexpr.
+      WHEN i.indkey[seq_in_index-1] = 0 THEN (indexprs::STRING[])[array_position(array_positions(i.indkey, 0), seq_in_index)]
+      ELSE column_name
+    END AS definition,
     direction,
     storing::BOOL,
-    implicit::BOOL`
+    implicit::BOOL,
+    is_visible::BOOL AS visible,
+    visibility`
 
 	if n.WithComment {
 		getIndexesQuery += `,
-    obj_description(pg_indexes.crdb_oid) AS comment`
+    obj_description(c.oid) AS comment`
 	}
 
 	getIndexesQuery += `
 FROM
-    %[4]s.information_schema.statistics AS s`
-
-	if n.WithComment {
-		getIndexesQuery += `
-    LEFT JOIN pg_indexes ON
-        pg_indexes.tablename = s.table_name AND
-        pg_indexes.indexname = s.index_name`
-	}
+    %[4]s.information_schema.statistics AS s
+    -- Use an index hint to avoid an incomplete virtual index lookup join that
+    -- degrades to a full scan.
+    JOIN %[4]s.pg_catalog.pg_class@primary AS c ON c.relname = s.index_name
+    JOIN %[4]s.pg_catalog.pg_class c_table ON c_table.relname = s.table_name
+    JOIN %[4]s.pg_catalog.pg_namespace n ON c.relnamespace = n.oid AND c_table.relnamespace = n.oid AND n.nspname = s.index_schema
+    JOIN %[4]s.pg_catalog.pg_index i ON i.indexrelid = c.oid AND i.indrelid = c_table.oid
+`
 
 	getIndexesQuery += `
 WHERE
@@ -135,7 +182,7 @@ WHERE
     AND table_schema=%[5]s
     AND table_name=%[2]s
 ORDER BY
-    1, 2, 3, 4, 5, 6, 7, 8;`
+    1, 2, 4;`
 
 	return d.showTableDetails(n.Table, getIndexesQuery)
 }
@@ -204,6 +251,7 @@ func (d *delegator) delegateShowConstraints(n *tree.ShowConstraints) (tree.State
            WHEN 'u' THEN 'UNIQUE'
            WHEN 'c' THEN 'CHECK'
            WHEN 'f' THEN 'FOREIGN KEY'
+           WHEN 'n' THEN 'NOT NULL'
            ELSE c.contype::TEXT
         END AS constraint_type,
         c.condef AS details,
@@ -214,7 +262,7 @@ func (d *delegator) delegateShowConstraints(n *tree.ShowConstraints) (tree.State
 	obj_description(c.oid) AS comment`
 	}
 	getConstraintsQuery += `
-FROM
+	FROM
        %[4]s.pg_catalog.pg_class t,
        %[4]s.pg_catalog.pg_namespace n,
        %[4]s.pg_catalog.pg_constraint c
@@ -238,33 +286,27 @@ func (d *delegator) delegateShowCreateAllTables() (tree.Statement, error) {
 		lexbase.EscapeSQLString(databaseLiteral),
 	)
 
-	return parse(query)
+	return d.parse(query)
 }
 
 // showTableDetails returns the AST of a query which extracts information about
 // the given table using the given query patterns in SQL. The query pattern must
 // accept the following formatting parameters:
-//   %[1]s the database name as SQL string literal.
-//   %[2]s the unqualified table name as SQL string literal.
-//   %[3]s the given table name as SQL string literal.
-//   %[4]s the database name as SQL identifier.
-//   %[5]s the schema name as SQL string literal.
-//   %[6]s the table ID.
+//
+//	%[1]s the database name as SQL string literal.
+//	%[2]s the unqualified table name as SQL string literal.
+//	%[3]s the given table name as SQL string literal.
+//	%[4]s the database name as SQL identifier.
+//	%[5]s the schema name as SQL string literal.
+//	%[6]s the table ID.
 func (d *delegator) showTableDetails(
 	name *tree.UnresolvedObjectName, query string,
 ) (tree.Statement, error) {
-	// We avoid the cache so that we can observe the details without
-	// taking a lease, like other SHOW commands.
-	flags := cat.Flags{AvoidDescriptorCaches: true, NoTableStats: true}
-	tn := name.ToTableName()
-	dataSource, resName, err := d.catalog.ResolveDataSource(d.ctx, flags, &tn)
+
+	dataSource, resName, err := d.resolveAndModifyUnresolvedObjectName(name)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.catalog.CheckAnyPrivilege(d.ctx, dataSource); err != nil {
-		return nil, err
-	}
-
 	fullQuery := fmt.Sprintf(query,
 		lexbase.EscapeSQLString(resName.Catalog()),
 		lexbase.EscapeSQLString(resName.Table()),
@@ -274,5 +316,5 @@ func (d *delegator) showTableDetails(
 		dataSource.PostgresDescriptorID(),
 	)
 
-	return parse(fullQuery)
+	return d.parse(fullQuery)
 }

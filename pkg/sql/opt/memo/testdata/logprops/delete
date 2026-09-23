@@ -40,6 +40,7 @@ delete abcde
       │    │              │    ├── variable: b:10 [type=int]
       │    │              │    └── variable: c:11 [type=int]
       │    │              └── const: 1 [type=int]
+      │    ├── flags: avoid-full-scan
       │    ├── key: (13)
       │    ├── fd: (13)-->(9-12,14-16), (10,11)-->(12)
       │    ├── prune: (9-16)
@@ -61,6 +62,12 @@ project
  └── delete abcde
       ├── columns: a:1(int!null) b:2(int) c:3(int!null) d:4(int) rowid:5(int!null)
       ├── fetch columns: a:9(int) b:10(int) c:11(int) d:12(int) rowid:13(int) e:14(int)
+      ├── return-mapping:
+      │    ├── a:9 => a:1
+      │    ├── b:10 => b:2
+      │    ├── c:11 => c:3
+      │    ├── d:12 => d:4
+      │    └── rowid:13 => rowid:5
       ├── volatile, mutations
       ├── key: (5)
       ├── fd: ()-->(1), (5)-->(2-4), (2,3)-->(4)
@@ -79,6 +86,7 @@ project
            │    │              │    ├── variable: b:10 [type=int]
            │    │              │    └── variable: c:11 [type=int]
            │    │              └── const: 1 [type=int]
+           │    ├── flags: avoid-full-scan
            │    ├── key: (13)
            │    ├── fd: (13)-->(9-12,14-16), (10,11)-->(12)
            │    ├── prune: (9-16)
@@ -102,6 +110,12 @@ project
  └── delete abcde
       ├── columns: a:1(int!null) b:2(int) c:3(int!null) d:4(int) rowid:5(int!null)
       ├── fetch columns: a:9(int) b:10(int) c:11(int) d:12(int) rowid:13(int) e:14(int)
+      ├── return-mapping:
+      │    ├── a:9 => a:1
+      │    ├── b:10 => b:2
+      │    ├── c:11 => c:3
+      │    ├── d:12 => d:4
+      │    └── rowid:13 => rowid:5
       ├── cardinality: [0 - 1]
       ├── volatile, mutations
       ├── key: ()
@@ -121,6 +135,7 @@ project
            │    │              │    ├── variable: b:10 [type=int]
            │    │              │    └── variable: c:11 [type=int]
            │    │              └── const: 1 [type=int]
+           │    ├── flags: avoid-full-scan
            │    ├── key: (13)
            │    ├── fd: (13)-->(9-12,14-16), (10,11)-->(12)
            │    ├── prune: (9-16)
@@ -137,14 +152,20 @@ DELETE FROM abcde WHERE b=c RETURNING *;
 project
  ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(int)
  ├── volatile, mutations
- ├── fd: (2)==(3), (3)==(2), (2)-->(4)
+ ├── fd: (2)-->(4), (2)==(3), (3)==(2)
  ├── prune: (1-4)
  └── delete abcde
       ├── columns: a:1(int!null) b:2(int!null) c:3(int!null) d:4(int) rowid:5(int!null)
       ├── fetch columns: a:9(int) b:10(int) c:11(int) d:12(int) rowid:13(int) e:14(int)
+      ├── return-mapping:
+      │    ├── a:9 => a:1
+      │    ├── b:10 => b:2
+      │    ├── c:11 => c:3
+      │    ├── d:12 => d:4
+      │    └── rowid:13 => rowid:5
       ├── volatile, mutations
       ├── key: (5)
-      ├── fd: (2)==(3), (3)==(2), (5)-->(1-4), (2)-->(4)
+      ├── fd: (5)-->(1-4), (2)-->(4), (2)==(3), (3)==(2)
       └── select
            ├── columns: a:9(int!null) b:10(int!null) c:11(int!null) d:12(int) rowid:13(int!null) e:14(int) crdb_internal_mvcc_timestamp:15(decimal) tableoid:16(oid)
            ├── key: (13)
@@ -160,6 +181,7 @@ project
            │    │              │    ├── variable: b:10 [type=int]
            │    │              │    └── variable: c:11 [type=int]
            │    │              └── const: 1 [type=int]
+           │    ├── flags: avoid-full-scan
            │    ├── key: (13)
            │    ├── fd: (13)-->(9-12,14-16), (10,11)-->(12)
            │    ├── prune: (9-16)

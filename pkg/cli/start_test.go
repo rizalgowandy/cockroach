@@ -1,17 +1,17 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -19,8 +19,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
+	"github.com/cockroachdb/crlib/crstrings"
+	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -74,6 +78,57 @@ func TestInitInsecure(t *testing.T) {
 	}
 }
 
+func TestExternalIODirSpec(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Avoid leaking configuration changes after the tests end.
+	// In addition to the usual initCLIDefaults, we need to reset
+	// the serverCfg because --store modifies it in a way that
+	// initCLIDefaults does not restore.
+	defer func(save server.Config) { serverCfg = save }(serverCfg)
+	defer initCLIDefaults()
+
+	f := startCmd.Flags()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := filepath.Join
+	defaultStoreDir := j(cwd, "cockroach-data")
+
+	testCases := []struct {
+		args     []string
+		expected string
+	}{
+		{[]string{}, j(defaultStoreDir, "extern")},
+		{[]string{`--store=type=mem,size=1G`}, ``},
+		{[]string{`--store=type=mem,size=1G`, `--store=path=foo`}, j(j(cwd, "foo"), "extern")},
+		{[]string{`--store=path=foo`, `--store=type=mem,size=1G`}, j(j(cwd, "foo"), "extern")},
+		{[]string{`--store=path=foo`, `--store=path=bar`}, j(j(cwd, "foo"), "extern")},
+		{[]string{`--external-io-dir=`}, ``},
+		{[]string{`--external-io-dir=foo`}, j(cwd, "foo")},
+		{[]string{`--external-io-dir=disabled`}, j(cwd, "disabled")},
+		{[]string{`--external-io-dir=`, `--store=path=foo`}, ``},
+	}
+	for i, c := range testCases {
+		// Reset the context and insecure flag for every test case.
+		initCLIDefaults()
+		if err := f.Parse(c.args); err != nil {
+			t.Error(err)
+			continue
+		}
+		if err := extraStoreFlagInit(startCmd); err != nil {
+			t.Error(err)
+			continue
+		}
+		if startCtx.externalIODir != c.expected {
+			t.Errorf("%d: expected:\n%q\ngot:\n%s", i, c.expected, startCtx.externalIODir)
+		}
+	}
+}
+
 func TestStartArgChecking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -97,21 +152,21 @@ func TestStartArgChecking(t *testing.T) {
 		{[]string{`--store=path=blah,path=blih`}, `field was used twice`},
 		{[]string{`--store=path=~/blah`}, `path cannot start with '~': ~/blah`},
 		{[]string{`--store=path=./~/blah`}, ``},
-		{[]string{`--store=size=blih`}, `could not parse store size`},
-		{[]string{`--store=size=0.005`}, `store size \(0.005\) must be between 1.000000% and 100.000000%`},
-		{[]string{`--store=size=100.5`}, `store size \(100.5\) must be between 1.000000% and 100.000000%`},
-		{[]string{`--store=size=0.5%`}, `store size \(0.5%\) must be between 1.000000% and 100.000000%`},
-		{[]string{`--store=size=0.5%`}, `store size \(0.5%\) must be between 1.000000% and 100.000000%`},
-		{[]string{`--store=size=500.0%`}, `store size \(500.0%\) must be between 1.000000% and 100.000000%`},
+		{[]string{`--store=size=blih`}, `could not parse size`},
+		{[]string{`--store=size=0.005`}, `store size \(0.5%\) must be at least 1%`},
+		{[]string{`--store=size=100.5`}, `size \(100.5\) must be between 0% and 100%`},
+		{[]string{`--store=size=0.5%`}, `size \(0.5%\) must be at least 1%`},
+		{[]string{`--store=size=0.5%`}, `size \(0.5%\) must be at least 1%`},
+		{[]string{`--store=size=500.0%`}, `size \(500.0%\) must be between 0% and 100%`},
 		{[]string{`--store=size=.5,path=.`}, ``},
 		{[]string{`--store=size=50.%,path=.`}, ``},
 		{[]string{`--store=size=50%,path=.`}, ``},
 		{[]string{`--store=size=50.5%,path=.`}, ``},
-		{[]string{`--store=size=-1231MB`}, `store size \(-1231MB\) must be larger than`},
-		{[]string{`--store=size=1231B`}, `store size \(1231B\) must be larger than`},
-		{[]string{`--store=size=1231BLA`}, `unhandled size name: bla`},
-		{[]string{`--store=ballast-size=60.0`}, `ballast size \(60.0\) must be between 0.000000% and 50.000000%`},
-		{[]string{`--store=ballast-size=1231BLA`}, `unhandled size name: bla`},
+		{[]string{`--store=size=-1231MB`}, `size \(-1,231,000,000 B\) must be at least`},
+		{[]string{`--store=size=1231B`}, `size \(1,231 B\) must be at least`},
+		{[]string{`--store=size=1231BLA`}, `unknown unit "BLA"`},
+		{[]string{`--store=ballast-size=60.0`}, `ballast: size \(60.0\) must be between 0% and 100%`},
+		{[]string{`--store=ballast-size=1231BLA`}, `unknown unit "BLA"`},
 		{[]string{`--store=ballast-size=0.5%,path=.`}, ``},
 		{[]string{`--store=ballast-size=.5,path=.`}, ``},
 		{[]string{`--store=ballast-size=50.%,path=.`}, ``},
@@ -127,9 +182,14 @@ func TestStartArgChecking(t *testing.T) {
 	}
 	for i, c := range testCases {
 		// Reset the context and insecure flag for every test case.
+		initCLIDefaults()
 		err := f.Parse(c.args)
-		if !testutils.IsError(err, c.expected) {
-			t.Errorf("%d: expected %q, but found %v", i, c.expected, err)
+		var err2 error
+		if err == nil {
+			err2 = extraStoreFlagInit(startCmd)
+		}
+		if !testutils.IsError(err, c.expected) && !testutils.IsError(err2, c.expected) {
+			t.Errorf("%d: expected %q, but found %v / %v", i, c.expected, err, err2)
 		}
 	}
 }
@@ -148,7 +208,7 @@ func TestAddrWithDefaultHost(t *testing.T) {
 	}
 
 	for _, test := range testData {
-		addr, err := addrWithDefaultHost(test.inAddr)
+		addr, err := addr.AddrWithDefaultLocalhost(test.inAddr)
 		if err != nil {
 			t.Error(err)
 		} else if addr != test.outAddr {
@@ -161,9 +221,8 @@ func TestExitIfDiskFull(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	err := exitIfDiskFull(mockDiskSpaceFS{FS: vfs.NewMem()}, []base.StoreSpec{
-		{},
-	})
+	err := exitIfDiskFull(t.Context(), &mockDiskSpaceFS{FS: vfs.NewMem()},
+		[]base.StoreSpec{{}})
 	require.Error(t, err)
 	var cliErr *clierror.Error
 	require.True(t, errors.As(err, &cliErr))
@@ -172,12 +231,88 @@ func TestExitIfDiskFull(t *testing.T) {
 
 type mockDiskSpaceFS struct {
 	vfs.FS
+	diskUsages map[string]vfs.DiskUsage
 }
 
-func (fs mockDiskSpaceFS) GetDiskUsage(path string) (vfs.DiskUsage, error) {
+func (fs *mockDiskSpaceFS) Unwrap() vfs.FS { return fs.FS }
+
+func (fs *mockDiskSpaceFS) GetDiskUsage(path string) (vfs.DiskUsage, error) {
+	if fs.diskUsages != nil {
+		for usagePath, usage := range fs.diskUsages {
+			if strings.HasPrefix(path, usagePath) {
+				return usage, nil
+			}
+		}
+	}
 	return vfs.DiskUsage{
 		AvailBytes: 10 << 20,
 		TotalBytes: 100 << 30,
 		UsedBytes:  100<<30 - 10<<20,
 	}, nil
+}
+
+func TestExitIfDiskFullDatadriven(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	var buf bytes.Buffer
+	var fs vfs.FS = vfs.NewMem()
+	require.NoError(t, fs.MkdirAll("/mnt", 0755))
+	mockDiskUsage := &mockDiskSpaceFS{FS: fs, diskUsages: make(map[string]vfs.DiskUsage)}
+	fs = vfs.WithLogging(mockDiskUsage, func(format string, args ...interface{}) {
+		fmt.Fprint(&buf, "# ")
+		fmt.Fprintf(&buf, format, args...)
+		fmt.Fprintln(&buf)
+	})
+	datadriven.RunTestAny(t, "testdata/exit_if_disk_full", func(t testing.TB, td *datadriven.TestData) string {
+		buf.Reset()
+		switch td.Cmd {
+		case "run":
+			var specs []base.StoreSpec
+			clear(mockDiskUsage.diskUsages)
+			for _, line := range crstrings.Lines(td.Input) {
+				switch {
+				case strings.HasPrefix(line, "disk-usage:"):
+					// disk-usage: <path> <avail> <total>
+					line = strings.TrimSpace(strings.TrimPrefix(line, "disk-usage:"))
+					fields := strings.Fields(line)
+					if len(fields) != 3 {
+						return fmt.Sprintf("invalid disk-usage line: %q", line)
+					}
+					path := fields[0]
+					avail, err := humanizeutil.ParseBytes(fields[1])
+					if err != nil {
+						return fmt.Sprintf("invalid disk-usage line: %q", line)
+					}
+					total, err := humanizeutil.ParseBytes(fields[2])
+					if err != nil {
+						return fmt.Sprintf("invalid disk-usage line: %q", line)
+					}
+					mockDiskUsage.diskUsages[path] = vfs.DiskUsage{
+						AvailBytes: uint64(avail),
+						TotalBytes: uint64(total),
+						UsedBytes:  uint64(total - avail),
+					}
+				case strings.HasPrefix(line, "store:"):
+					line = strings.TrimSpace(strings.TrimPrefix(line, "store:"))
+					spec, err := base.NewStoreSpec(line)
+					if err != nil {
+						return fmt.Sprintf("failed to parse store spec: %v", err)
+					}
+					specs = append(specs, spec)
+				default:
+					return fmt.Sprintf("unknown line: %q", line)
+				}
+			}
+			err := exitIfDiskFull(t.Context(), fs, specs)
+			if err == nil {
+				fmt.Fprint(&buf, "<no-error>")
+			} else {
+				fmt.Fprintf(&buf, "<error:%s>", err)
+			}
+			return buf.String()
+		default:
+			return fmt.Sprintf("unknown command: %s", td.Cmd)
+		}
+	})
 }

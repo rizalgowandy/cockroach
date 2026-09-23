@@ -1,126 +1,32 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfrapb
 
 import (
-	"strings"
+	"unicode/utf8"
+	"unsafe"
 
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/duration"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/errors"
 )
 
 // GetAggregateFuncIdx converts the aggregate function name to the enum value
 // with the same string representation.
 func GetAggregateFuncIdx(funcName string) (int32, error) {
-	funcStr := strings.ToUpper(funcName)
+	var ub upperBuffer //gcassert:noescape
+	funcStr, ok := ub.ToUpper(funcName)
+	if !ok {
+		return 0, errors.Errorf("unknown aggregate %s", funcName)
+	}
 	funcIdx, ok := AggregatorSpec_Func_value[funcStr]
 	if !ok {
-		return 0, errors.Errorf("unknown aggregate %s", funcStr)
+		return 0, errors.Errorf("unknown aggregate %s", funcName)
 	}
 	return funcIdx, nil
-}
-
-// AggregateConstructor is a function that creates an aggregate function.
-type AggregateConstructor func(*tree.EvalContext, tree.Datums) tree.AggregateFunc
-
-// GetAggregateInfo returns the aggregate constructor and the return type for
-// the given aggregate function when applied on the given type.
-func GetAggregateInfo(
-	fn AggregatorSpec_Func, inputTypes ...*types.T,
-) (aggregateConstructor AggregateConstructor, returnType *types.T, err error) {
-	if fn == AnyNotNull {
-		// The ANY_NOT_NULL builtin does not have a fixed return type;
-		// handle it separately.
-		if len(inputTypes) != 1 {
-			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
-		}
-		return builtins.NewAnyNotNullAggregate, inputTypes[0], nil
-	}
-
-	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(fn.String()))
-	for _, b := range builtins {
-		typs := b.Types.Types()
-		if len(typs) != len(inputTypes) {
-			continue
-		}
-		match := true
-		for i, t := range typs {
-			if !inputTypes[i].Equivalent(t) {
-				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
-					continue
-				}
-				match = false
-				break
-			}
-		}
-		if match {
-			// Found!
-			constructAgg := func(evalCtx *tree.EvalContext, arguments tree.Datums) tree.AggregateFunc {
-				return b.AggregateFunc(inputTypes, evalCtx, arguments)
-			}
-			colTyp := b.InferReturnTypeFromInputArgTypes(inputTypes)
-			return constructAgg, colTyp, nil
-		}
-	}
-	return nil, nil, errors.Errorf(
-		"no builtin aggregate for %s on %+v", fn, inputTypes,
-	)
-}
-
-// GetAggregateConstructor processes the specification of a single aggregate
-// function.
-//
-// evalCtx will not be mutated.
-func GetAggregateConstructor(
-	evalCtx *tree.EvalContext,
-	semaCtx *tree.SemaContext,
-	aggInfo *AggregatorSpec_Aggregation,
-	inputTypes []*types.T,
-) (constructor AggregateConstructor, arguments tree.Datums, outputType *types.T, err error) {
-	argTypes := make([]*types.T, len(aggInfo.ColIdx)+len(aggInfo.Arguments))
-	for j, c := range aggInfo.ColIdx {
-		if c >= uint32(len(inputTypes)) {
-			err = errors.Errorf("ColIdx out of range (%d)", aggInfo.ColIdx)
-			return
-		}
-		argTypes[j] = inputTypes[c]
-	}
-	arguments = make(tree.Datums, len(aggInfo.Arguments))
-	var d tree.Datum
-	for j, argument := range aggInfo.Arguments {
-		h := ExprHelper{}
-		// Pass nil types and row - there are no variables in these expressions.
-		if err = h.Init(argument, nil /* types */, semaCtx, evalCtx); err != nil {
-			err = errors.Wrapf(err, "%s", argument)
-			return
-		}
-		d, err = h.Eval(nil /* row */)
-		if err != nil {
-			err = errors.Wrapf(err, "%s", argument)
-			return
-		}
-		argTypes[len(aggInfo.ColIdx)+j] = d.ResolvedType()
-		arguments[j] = d
-	}
-	constructor, outputType, err = GetAggregateInfo(aggInfo.Func, argTypes...)
-	return
 }
 
 // Equals returns true if two aggregation specifiers are identical (and thus
@@ -175,285 +81,60 @@ func (spec *AggregatorSpec) IsRowCount() bool {
 // GetWindowFuncIdx converts the window function name to the enum value with
 // the same string representation.
 func GetWindowFuncIdx(funcName string) (int32, error) {
-	funcStr := strings.ToUpper(funcName)
+	var ub upperBuffer //gcassert:noescape
+	funcStr, ok := ub.ToUpper(funcName)
+	if !ok {
+		return 0, errors.Errorf("unknown window function %s", funcName)
+	}
 	funcIdx, ok := WindowerSpec_WindowFunc_value[funcStr]
 	if !ok {
-		return 0, errors.Errorf("unknown window function %s", funcStr)
+		return 0, errors.Errorf("unknown window function %s", funcName)
 	}
 	return funcIdx, nil
 }
 
-// GetWindowFunctionInfo returns windowFunc constructor and the return type
-// when given fn is applied to given inputTypes.
-func GetWindowFunctionInfo(
-	fn WindowerSpec_Func, inputTypes ...*types.T,
-) (windowConstructor func(*tree.EvalContext) tree.WindowFunc, returnType *types.T, err error) {
-	if fn.AggregateFunc != nil && *fn.AggregateFunc == AnyNotNull {
-		// The ANY_NOT_NULL builtin does not have a fixed return type;
-		// handle it separately.
-		if len(inputTypes) != 1 {
-			return nil, nil, errors.Errorf("any_not_null aggregate needs 1 input")
-		}
-		return builtins.NewAggregateWindowFunc(builtins.NewAnyNotNullAggregate), inputTypes[0], nil
-	}
-
-	var funcStr string
-	if fn.AggregateFunc != nil {
-		funcStr = fn.AggregateFunc.String()
-	} else if fn.WindowFunc != nil {
-		funcStr = fn.WindowFunc.String()
-	} else {
-		return nil, nil, errors.Errorf(
-			"function is neither an aggregate nor a window function",
-		)
-	}
-	props, builtins := builtins.GetBuiltinProperties(strings.ToLower(funcStr))
-	for _, b := range builtins {
-		typs := b.Types.Types()
-		if len(typs) != len(inputTypes) {
-			continue
-		}
-		match := true
-		for i, t := range typs {
-			if !inputTypes[i].Equivalent(t) {
-				if props.NullableArgs && inputTypes[i].IsAmbiguous() {
-					continue
-				}
-				match = false
-				break
-			}
-		}
-		if match {
-			// Found!
-			constructAgg := func(evalCtx *tree.EvalContext) tree.WindowFunc {
-				return b.WindowFunc(inputTypes, evalCtx)
-			}
-			colTyp := b.InferReturnTypeFromInputArgTypes(inputTypes)
-			return constructAgg, colTyp, nil
-		}
-	}
-	return nil, nil, errors.Errorf(
-		"no builtin aggregate/window function for %s on %v", funcStr, inputTypes,
-	)
-}
-
-func (spec *WindowerSpec_Frame_Mode) initFromAST(w tree.WindowFrameMode) error {
-	switch w {
-	case tree.RANGE:
-		*spec = WindowerSpec_Frame_RANGE
-	case tree.ROWS:
-		*spec = WindowerSpec_Frame_ROWS
-	case tree.GROUPS:
-		*spec = WindowerSpec_Frame_GROUPS
-	default:
-		return errors.AssertionFailedf("unexpected WindowFrameMode")
-	}
-	return nil
-}
-
-func (spec *WindowerSpec_Frame_BoundType) initFromAST(bt tree.WindowFrameBoundType) error {
-	switch bt {
-	case tree.UnboundedPreceding:
-		*spec = WindowerSpec_Frame_UNBOUNDED_PRECEDING
-	case tree.OffsetPreceding:
-		*spec = WindowerSpec_Frame_OFFSET_PRECEDING
-	case tree.CurrentRow:
-		*spec = WindowerSpec_Frame_CURRENT_ROW
-	case tree.OffsetFollowing:
-		*spec = WindowerSpec_Frame_OFFSET_FOLLOWING
-	case tree.UnboundedFollowing:
-		*spec = WindowerSpec_Frame_UNBOUNDED_FOLLOWING
-	default:
-		return errors.AssertionFailedf("unexpected WindowFrameBoundType")
-	}
-	return nil
-}
-
-func (spec *WindowerSpec_Frame_Exclusion) initFromAST(e tree.WindowFrameExclusion) error {
-	switch e {
-	case tree.NoExclusion:
-		*spec = WindowerSpec_Frame_NO_EXCLUSION
-	case tree.ExcludeCurrentRow:
-		*spec = WindowerSpec_Frame_EXCLUDE_CURRENT_ROW
-	case tree.ExcludeGroup:
-		*spec = WindowerSpec_Frame_EXCLUDE_GROUP
-	case tree.ExcludeTies:
-		*spec = WindowerSpec_Frame_EXCLUDE_TIES
-	default:
-		return errors.AssertionFailedf("unexpected WindowerFrameExclusion")
-	}
-	return nil
-}
-
-// If offset exprs are present, we evaluate them and save the encoded results
-// in the spec.
-func (spec *WindowerSpec_Frame_Bounds) initFromAST(
-	b tree.WindowFrameBounds, m tree.WindowFrameMode, evalCtx *tree.EvalContext,
-) error {
-	if b.StartBound == nil {
-		return errors.Errorf("unexpected: Start Bound is nil")
-	}
-	spec.Start = WindowerSpec_Frame_Bound{}
-	if err := spec.Start.BoundType.initFromAST(b.StartBound.BoundType); err != nil {
-		return err
-	}
-	if b.StartBound.HasOffset() {
-		typedStartOffset := b.StartBound.OffsetExpr.(tree.TypedExpr)
-		dStartOffset, err := typedStartOffset.Eval(evalCtx)
-		if err != nil {
-			return err
-		}
-		if dStartOffset == tree.DNull {
-			return pgerror.Newf(pgcode.NullValueNotAllowed, "frame starting offset must not be null")
-		}
-		switch m {
-		case tree.ROWS:
-			startOffset := int64(tree.MustBeDInt(dStartOffset))
-			if startOffset < 0 {
-				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame starting offset must not be negative")
-			}
-			spec.Start.IntOffset = uint64(startOffset)
-		case tree.RANGE:
-			if isNegative(evalCtx, dStartOffset) {
-				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
-			}
-			typ := dStartOffset.ResolvedType()
-			spec.Start.OffsetType = DatumInfo{Encoding: descpb.DatumEncoding_VALUE, Type: typ}
-			var buf []byte
-			var a rowenc.DatumAlloc
-			datum := rowenc.DatumToEncDatum(typ, dStartOffset)
-			buf, err = datum.Encode(typ, &a, descpb.DatumEncoding_VALUE, buf)
-			if err != nil {
-				return err
-			}
-			spec.Start.TypedOffset = buf
-		case tree.GROUPS:
-			startOffset := int64(tree.MustBeDInt(dStartOffset))
-			if startOffset < 0 {
-				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame starting offset must not be negative")
-			}
-			spec.Start.IntOffset = uint64(startOffset)
-		}
-	}
-
-	if b.EndBound != nil {
-		spec.End = &WindowerSpec_Frame_Bound{}
-		if err := spec.End.BoundType.initFromAST(b.EndBound.BoundType); err != nil {
-			return err
-		}
-		if b.EndBound.HasOffset() {
-			typedEndOffset := b.EndBound.OffsetExpr.(tree.TypedExpr)
-			dEndOffset, err := typedEndOffset.Eval(evalCtx)
-			if err != nil {
-				return err
-			}
-			if dEndOffset == tree.DNull {
-				return pgerror.Newf(pgcode.NullValueNotAllowed, "frame ending offset must not be null")
-			}
-			switch m {
-			case tree.ROWS:
-				endOffset := int64(tree.MustBeDInt(dEndOffset))
-				if endOffset < 0 {
-					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame ending offset must not be negative")
-				}
-				spec.End.IntOffset = uint64(endOffset)
-			case tree.RANGE:
-				if isNegative(evalCtx, dEndOffset) {
-					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
-				}
-				typ := dEndOffset.ResolvedType()
-				spec.End.OffsetType = DatumInfo{Encoding: descpb.DatumEncoding_VALUE, Type: typ}
-				var buf []byte
-				var a rowenc.DatumAlloc
-				datum := rowenc.DatumToEncDatum(typ, dEndOffset)
-				buf, err = datum.Encode(typ, &a, descpb.DatumEncoding_VALUE, buf)
-				if err != nil {
-					return err
-				}
-				spec.End.TypedOffset = buf
-			case tree.GROUPS:
-				endOffset := int64(tree.MustBeDInt(dEndOffset))
-				if endOffset < 0 {
-					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame ending offset must not be negative")
-				}
-				spec.End.IntOffset = uint64(endOffset)
-			}
-		}
-	}
-
-	return nil
-}
-
-// isNegative returns whether offset is negative.
-func isNegative(evalCtx *tree.EvalContext, offset tree.Datum) bool {
-	switch o := offset.(type) {
-	case *tree.DInt:
-		return *o < 0
-	case *tree.DDecimal:
-		return o.Negative
-	case *tree.DFloat:
-		return *o < 0
-	case *tree.DInterval:
-		return o.Compare(evalCtx, &tree.DInterval{Duration: duration.Duration{}}) < 0
-	default:
-		panic("unexpected offset type")
-	}
-}
-
-// InitFromAST initializes the spec based on tree.WindowFrame. It will evaluate
-// offset expressions if present in the frame.
-func (spec *WindowerSpec_Frame) InitFromAST(f *tree.WindowFrame, evalCtx *tree.EvalContext) error {
-	if err := spec.Mode.initFromAST(f.Mode); err != nil {
-		return err
-	}
-	if err := spec.Exclusion.initFromAST(f.Exclusion); err != nil {
-		return err
-	}
-	return spec.Bounds.initFromAST(f.Bounds, f.Mode, evalCtx)
-}
-
-func (spec WindowerSpec_Frame_Mode) convertToAST() (tree.WindowFrameMode, error) {
+func (spec WindowerSpec_Frame_Mode) convertToAST() (treewindow.WindowFrameMode, error) {
 	switch spec {
 	case WindowerSpec_Frame_RANGE:
-		return tree.RANGE, nil
+		return treewindow.RANGE, nil
 	case WindowerSpec_Frame_ROWS:
-		return tree.ROWS, nil
+		return treewindow.ROWS, nil
 	case WindowerSpec_Frame_GROUPS:
-		return tree.GROUPS, nil
+		return treewindow.GROUPS, nil
 	default:
-		return tree.WindowFrameMode(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Mode")
+		return treewindow.WindowFrameMode(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Mode")
 	}
 }
 
-func (spec WindowerSpec_Frame_BoundType) convertToAST() (tree.WindowFrameBoundType, error) {
+func (spec WindowerSpec_Frame_BoundType) convertToAST() (treewindow.WindowFrameBoundType, error) {
 	switch spec {
 	case WindowerSpec_Frame_UNBOUNDED_PRECEDING:
-		return tree.UnboundedPreceding, nil
+		return treewindow.UnboundedPreceding, nil
 	case WindowerSpec_Frame_OFFSET_PRECEDING:
-		return tree.OffsetPreceding, nil
+		return treewindow.OffsetPreceding, nil
 	case WindowerSpec_Frame_CURRENT_ROW:
-		return tree.CurrentRow, nil
+		return treewindow.CurrentRow, nil
 	case WindowerSpec_Frame_OFFSET_FOLLOWING:
-		return tree.OffsetFollowing, nil
+		return treewindow.OffsetFollowing, nil
 	case WindowerSpec_Frame_UNBOUNDED_FOLLOWING:
-		return tree.UnboundedFollowing, nil
+		return treewindow.UnboundedFollowing, nil
 	default:
-		return tree.WindowFrameBoundType(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_BoundType")
+		return treewindow.WindowFrameBoundType(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_BoundType")
 	}
 }
 
-func (spec WindowerSpec_Frame_Exclusion) convertToAST() (tree.WindowFrameExclusion, error) {
+func (spec WindowerSpec_Frame_Exclusion) convertToAST() (treewindow.WindowFrameExclusion, error) {
 	switch spec {
 	case WindowerSpec_Frame_NO_EXCLUSION:
-		return tree.NoExclusion, nil
+		return treewindow.NoExclusion, nil
 	case WindowerSpec_Frame_EXCLUDE_CURRENT_ROW:
-		return tree.ExcludeCurrentRow, nil
+		return treewindow.ExcludeCurrentRow, nil
 	case WindowerSpec_Frame_EXCLUDE_GROUP:
-		return tree.ExcludeGroup, nil
+		return treewindow.ExcludeGroup, nil
 	case WindowerSpec_Frame_EXCLUDE_TIES:
-		return tree.ExcludeTies, nil
+		return treewindow.ExcludeTies, nil
 	default:
-		return tree.WindowFrameExclusion(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Exclusion")
+		return treewindow.WindowFrameExclusion(0), errors.AssertionFailedf("unexpected WindowerSpec_Frame_Exclusion")
 	}
 }
 
@@ -502,42 +183,109 @@ func (spec *WindowerSpec_Frame) ConvertToAST() (*tree.WindowFrame, error) {
 	}, nil
 }
 
-// BuildTableDescriptor returns a catalog.TableDescriptor wrapping the
-// underlying Table field.
-func (spec *TableReaderSpec) BuildTableDescriptor() catalog.TableDescriptor {
-	return tabledesc.NewUnsafeImmutable(&spec.Table)
+// IsIndexJoin returns true if spec defines an index join (as opposed to a
+// lookup join).
+func (spec *JoinReaderSpec) IsIndexJoin() bool {
+	return len(spec.LookupColumns) == 0 && spec.LookupExpr.Empty()
 }
 
-// BuildTableDescriptor returns a catalog.TableDescriptor wrapping the
-// underlying Table field.
-func (spec *JoinReaderSpec) BuildTableDescriptor() catalog.TableDescriptor {
-	return tabledesc.NewUnsafeImmutable(&spec.Table)
-}
-
-// BuildTableDescriptors returns a catalog.TableDescriptor slice wrapping the
-// underlying Tables field.
-func (spec *ZigzagJoinerSpec) BuildTableDescriptors() []catalog.TableDescriptor {
-	ret := make([]catalog.TableDescriptor, len(spec.Tables))
-	for i := range spec.Tables {
-		ret[i] = tabledesc.NewUnsafeImmutable(&spec.Tables[i])
+// init performs some sanity checks for the invariants required by the
+// upperBuffer type.
+func init() {
+	isAllASCII := func(s string) bool {
+		for i := range s {
+			if s[i] >= utf8.RuneSelf {
+				return false
+			}
+		}
+		return true
 	}
-	return ret
+	// Check that aggregate function names are not longer than upperBufferSize
+	// and that they do not have non-ASCII characters. If these invariants
+	// change in the future, upperBufferSize or ToUpper will need to be
+	// adjusted.
+	for funcStr := range AggregatorSpec_Func_value {
+		if len(funcStr) > upperBufferSize {
+			panic(errors.AssertionFailedf(
+				"aggregate function name length cannot exceed length %d: %q",
+				upperBufferSize, funcStr,
+			))
+		}
+		if !isAllASCII(funcStr) {
+			panic(errors.AssertionFailedf(
+				"aggregate function name cannot contain non-ASCII characters: %q", funcStr,
+			))
+		}
+	}
+
+	// Perform the same check for window function names.
+	for funcStr := range WindowerSpec_WindowFunc_value {
+		if len(funcStr) > upperBufferSize {
+			panic(errors.AssertionFailedf(
+				"window function name length cannot exceed length %d: %q",
+				upperBufferSize, funcStr,
+			))
+		}
+		if !isAllASCII(funcStr) {
+			panic(errors.AssertionFailedf(
+				"window function name cannot contain non-ASCII characters: %q", funcStr,
+			))
+		}
+	}
 }
 
-// BuildTableDescriptor returns a catalog.TableDescriptor wrapping the
-// underlying Table field.
-func (spec *InvertedJoinerSpec) BuildTableDescriptor() catalog.TableDescriptor {
-	return tabledesc.NewUnsafeImmutable(&spec.Table)
+const (
+	// upperBufferSize is large enough to accommodate the longest aggregate or
+	// window function name.
+	upperBufferSize = 31
+)
+
+// upperBuffer is a helper struct for creating a temporary upper-cased string
+// without performing a heap allocation. See ToUpper.
+type upperBuffer struct {
+	buf  [upperBufferSize]byte
+	used bool
 }
 
-// BuildTableDescriptor returns a catalog.TableDescriptor wrapping the
-// underlying Table field.
-func (spec *BackfillerSpec) BuildTableDescriptor() catalog.TableDescriptor {
-	return tabledesc.NewUnsafeImmutable(&spec.Table)
+// ToUpper returns a string where every lowercase ASCII character in "s" has
+// been converted to an uppercase character. If the length of "s" is greater
+// than upperBufferSize, ok=false is returned. If ToUpper returns ok=true, all
+// future invocations on the same upperBuffer will return ok=false.
+func (ub *upperBuffer) ToUpper(s string) (_ string, ok bool) {
+	if ub.used {
+		// Don't allow the buffer to be reused.
+		return "", false
+	}
+	if len(s) > upperBufferSize {
+		// The init function guarantees that no aggregate or window function has
+		// a name longer than upperBufferSize bytes. We can return ok=false here
+		// because upper-casing is pointless - the lookups in
+		// GetAggregateFuncIdx and GetWindowFuncIdx would fail anyway.
+		return "", false
+	}
+	ub.used = true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		ub.buf[i] = c
+	}
+	// Convert the buffer to a string without allocating.
+	return unsafe.String(noescape(&ub.buf[0]), len(s)), true
 }
 
-// BuildTableDescriptor returns a catalog.TableDescriptor wrapping the
-// underlying Table field.
-func (spec *BulkRowWriterSpec) BuildTableDescriptor() catalog.TableDescriptor {
-	return tabledesc.NewUnsafeImmutable(&spec.Table)
+// noescape hides a pointer from escape analysis.  noescape is the identity
+// function but escape analysis doesn't think the output depends on the input.
+// noescape is inlined and currently compiles down to zero instructions.
+// USE CAREFULLY!
+//
+// This was copied from the strings package.
+//
+//go:nosplit
+//go:nocheckptr
+func noescape(p *byte) *byte {
+	x := uintptr(unsafe.Pointer(p))
+	//lint:ignore SA4016 x ^ 0 is a no-op that fools escape analysis.
+	return (*byte)(unsafe.Pointer(x ^ 0)) // nolint:unsafeptr
 }

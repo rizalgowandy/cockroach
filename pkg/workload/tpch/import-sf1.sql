@@ -7,12 +7,12 @@
 --
 -- For faster import, the TPCH database can be restored from backup:
 --
---   RESTORE DATABASE tpch FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup';
+--   RESTORE DATABASE tpch FROM LATEST IN 'gs://cockroach-fixtures-us-east1/workload/tpch/scalefactor=1/backup_25_3?AUTH=implicit';
 --
 -- When re-generating all data (say after a schema change), a fresh backup can
 -- be created via:
 --
---   BACKUP DATABASE tpch TO 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup';
+--   BACKUP DATABASE tpch INTO 'gs://cockroach-fixtures-us-east1/workload/tpch/scalefactor=1/backup_25_3?AUTH=implicit';
 --
 
 CREATE TABLE region (
@@ -22,7 +22,7 @@ CREATE TABLE region (
 );
 
 IMPORT INTO region CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/region.tbl'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/region.tbl'
 ) WITH delimiter='|';
 
 CREATE TABLE nation (
@@ -34,7 +34,7 @@ CREATE TABLE nation (
 );
 
 IMPORT INTO nation CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/nation.tbl'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/nation.tbl'
 ) WITH delimiter='|';
 
 ALTER TABLE nation ADD CONSTRAINT nation_fkey_region FOREIGN KEY (n_regionkey) references region (r_regionkey);
@@ -52,14 +52,14 @@ CREATE TABLE part  (
 );
 
 IMPORT INTO part CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.1',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.2',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.3',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.4',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.5',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.6',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.7',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/part.tbl.8'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.1',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.2',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.3',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.4',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.5',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.6',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.7',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/part.tbl.8'
 ) WITH delimiter='|';
 
 CREATE TABLE supplier (
@@ -74,14 +74,14 @@ CREATE TABLE supplier (
 );
 
 IMPORT INTO supplier CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.1',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.2',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.3',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.4',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.5',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.6',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.7',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/supplier.tbl.8'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.1',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.2',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.3',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.4',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.5',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.6',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.7',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/supplier.tbl.8'
 ) WITH delimiter='|';
 
 ALTER TABLE supplier ADD CONSTRAINT supplier_fkey_nation FOREIGN KEY (s_nationkey) references nation (n_nationkey);
@@ -97,14 +97,14 @@ CREATE TABLE partsupp (
 );
 
 IMPORT INTO partsupp CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.1',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.2',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.3',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.4',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.5',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.6',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.7',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/partsupp.tbl.8'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.1',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.2',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.3',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.4',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.5',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.6',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.7',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/partsupp.tbl.8'
 ) WITH delimiter='|';
 
 ALTER TABLE partsupp ADD CONSTRAINT partsupp_fkey_part FOREIGN KEY (ps_partkey) references part (p_partkey);
@@ -123,14 +123,14 @@ CREATE TABLE customer (
 );
 
 IMPORT INTO customer CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.1',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.2',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.3',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.4',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.5',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.6',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.7',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/customer.tbl.8'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.1',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.2',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.3',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.4',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.5',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.6',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.7',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/customer.tbl.8'
 ) WITH delimiter='|';
 
 ALTER TABLE customer ADD CONSTRAINT customer_fkey_nation FOREIGN KEY (c_nationkey) references nation (n_nationkey);
@@ -150,14 +150,14 @@ CREATE TABLE orders (
 );
 
 IMPORT INTO orders CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.1',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.2',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.3',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.4',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.5',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.6',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.7',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/orders.tbl.8'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.1',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.2',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.3',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.4',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.5',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.6',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.7',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/orders.tbl.8'
 ) WITH delimiter='|';
 
 ALTER TABLE orders ADD CONSTRAINT orders_fkey_customer FOREIGN KEY (o_custkey) references customer (c_custkey);
@@ -191,20 +191,17 @@ CREATE TABLE lineitem (
 );
 
 IMPORT INTO lineitem CSV DATA(
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.1',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.2',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.3',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.4',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.5',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.6',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.7',
-  'gs://cockroach-fixtures/tpch-csv/sf-1/lineitem.tbl.8'
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.1',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.2',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.3',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.4',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.5',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.6',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.7',
+  'gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/lineitem.tbl.8'
 ) WITH delimiter='|';
 
 ALTER TABLE lineitem ADD CONSTRAINT lineitem_fkey_orders FOREIGN KEY (l_orderkey) references orders (o_orderkey);
 ALTER TABLE lineitem ADD CONSTRAINT lineitem_fkey_part FOREIGN KEY (l_partkey) references part (p_partkey);
 ALTER TABLE lineitem ADD CONSTRAINT lineitem_fkey_supplier FOREIGN KEY (l_suppkey) references supplier (s_suppkey);
-
--- TODO(andyk): This fails with `pq: column "l_partkey" cannot be used by multiple foreign key constraints`.
--- This limitation would appear to violate TPCH rules, as all foreign keys must be defined, or none at all.
--- ALTER TABLE lineitem ADD CONSTRAINT lineitem_fkey_partsupp FOREIGN KEY (l_partkey, l_suppkey) references partsupp (ps_partkey, ps_suppkey);
+ALTER TABLE lineitem ADD CONSTRAINT lineitem_fkey_partsupp FOREIGN KEY (l_partkey, l_suppkey) references partsupp (ps_partkey, ps_suppkey);

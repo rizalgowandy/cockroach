@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -16,17 +11,18 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
@@ -35,10 +31,15 @@ func TestAsOfTime(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error { select {} }}
+	ctx, cancel := context.WithCancel(context.Background())
+	var params base.TestServerArgs
+	params.Knobs.GCJob = &sql.GCJobTestingKnobs{RunBeforeResume: func(_ jobspb.JobID) error {
+		<-ctx.Done()
+		return nil
+	}}
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
+	defer cancel()
 
 	const val1 = 1
 	const val2 = 2
@@ -122,18 +123,19 @@ func TestAsOfTime(t *testing.T) {
 		}
 	})
 
-	// Future queries shouldn't work if not marked as synthetic.
-	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '2200-01-01'").Scan(&i); !testutils.IsError(err, "pq: AS OF SYSTEM TIME: cannot specify timestamp in the future") {
+	// We'll be querying against non-existent timestamps.
+	if _, err := db.Exec(" SET CLUSTER SETTING kv.gc_ttl.strict_enforcement.enabled = false"); err != nil {
 		t.Fatal(err)
 	}
 
 	// Future queries shouldn't work if too far in the future.
-	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '+10h?'").Scan(&i); !testutils.IsError(err, "pq: request timestamp .* too far in future") {
+	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '+10h'").Scan(&i); !testutils.IsError(err, `pq: AS OF SYSTEM TIME: interval value '\+10h' is in the future`) {
 		t.Fatal(err)
 	}
 
-	// Future queries work if marked as synthetic and only slightly in future.
-	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '+10ms?'").Scan(&i); err != nil {
+	// Even small future intervals (e.g., +10ms) are disallowed when using interval-based AS OF.
+	// Slight tolerance is only permitted when using a fixed timestamp.
+	if err := db.QueryRow("SELECT a FROM d.t AS OF SYSTEM TIME '+10ms'").Scan(&i); !testutils.IsError(err, `pq: AS OF SYSTEM TIME: interval value '\+10ms' is in the future`) {
 		t.Fatal(err)
 	}
 
@@ -143,11 +145,11 @@ func TestAsOfTime(t *testing.T) {
 	}
 
 	// Verify queries with large exponents error properly.
-	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1e40"); !testutils.IsError(err, "value out of range") {
+	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1e40"); !testutils.IsError(err, "greater than max int64") {
 		t.Fatal(err)
 	}
 	if _, err := db.Query("SELECT a FROM d.t AS OF SYSTEM TIME 1.4"); !testutils.IsError(err,
-		`parsing argument: strconv.ParseInt: parsing "4000000000": value out of range`) {
+		`logical clock too large: 4000000000`) {
 		t.Fatal(err)
 	}
 
@@ -263,7 +265,13 @@ func TestAsOfRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, cmdFilters := tests.CreateTestServerParams()
+	var cmdFilters tests.CommandFilters
+	params := base.TestServerArgs{}
+	params.Knobs.Store = &kvserver.StoreTestingKnobs{
+		EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+			TestingEvalFilter: cmdFilters.RunFilters,
+		},
+	}
 	s, sqlDB, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(context.Background())
 
@@ -306,28 +314,25 @@ func TestAsOfRetry(t *testing.T) {
 		name: 5,
 	}
 	cleanupFilter := cmdFilters.AppendFilter(
-		func(args kvserverbase.FilterArgs) *roachpb.Error {
+		func(args kvserverbase.FilterArgs) *kvpb.Error {
 			magicVals.Lock()
 			defer magicVals.Unlock()
 
 			switch req := args.Req.(type) {
-			case *roachpb.GetRequest:
-				if kv.TestingIsRangeLookupRequest(req) {
-					return nil
-				}
+			case *kvpb.GetRequest:
 				for key, count := range magicVals.restartCounts {
 					if err := checkCorrectTxn(string(req.Key), magicVals, args.Hdr.Txn); err != nil {
-						return roachpb.NewError(err)
+						return kvpb.NewError(err)
 					}
 					if count > 0 && bytes.Contains(req.Key, []byte(key)) {
 						magicVals.restartCounts[key]--
-						err := roachpb.NewTransactionRetryError(
-							roachpb.RETRY_REASON_UNKNOWN, "filter err")
+						err := kvpb.NewTransactionRetryError(
+							kvpb.RETRY_REASON_UNKNOWN, "filter err")
 						magicVals.failedValues[string(req.Key)] =
 							failureRecord{err, args.Hdr.Txn}
 						txn := args.Hdr.Txn.Clone()
 						txn.WriteTimestamp = txn.WriteTimestamp.Add(0, 1)
-						return roachpb.NewErrorWithTxn(err, txn)
+						return kvpb.NewErrorWithTxn(err, txn)
 					}
 				}
 			}
@@ -407,4 +412,39 @@ func TestShowTraceAsOfTime(t *testing.T) {
 	} else if i != 1 {
 		t.Fatalf("expected to find one matching row, got %v", i)
 	}
+}
+
+func TestAsOfResolveEnum(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	defer srv.Stopper().Stop(context.Background())
+	defer db.Close()
+
+	runner := sqlutils.MakeSQLRunner(db)
+	var tsBeforeTypExists string
+	runner.QueryRow(t, "SELECT cluster_logical_timestamp()").Scan(&tsBeforeTypExists)
+	runner.Exec(t, "CREATE TYPE typ AS ENUM('hi', 'hello')")
+
+	// Use a prepared statement.
+	runner.ExpectErr(
+		t,
+		"type with ID [0-9]+ does not exist",
+		fmt.Sprintf(
+			"SELECT $1::typ FROM generate_series(1,1) AS OF SYSTEM TIME %s",
+			tsBeforeTypExists,
+		),
+		"hi",
+	)
+
+	// Use a simple query.
+	runner.ExpectErr(
+		t,
+		"type \"typ\" does not exist",
+		fmt.Sprintf(
+			"SELECT 'hi'::typ FROM generate_series(1,1) AS OF SYSTEM TIME %s",
+			tsBeforeTypExists,
+		),
+	)
 }

@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package base
 
@@ -46,10 +41,11 @@ const (
 	// stores profiles when the periodic CPU profile dump is enabled.
 	CPUProfileDir = "pprof_dump"
 
+	// ExecutionTraceDir is the directory name that holds Go execution traces
+	// when the execution trace dumper is enabled.
+	ExecutionTraceDir = "executiontrace_dump"
+
 	// InflightTraceDir is the directory name where the job trace dumper stores traces
 	// when a job opts in to dumping its execution traces.
 	InflightTraceDir = "inflight_trace_dump"
-
-	// MinRangeMaxBytes is the minimum value for range max bytes.
-	MinRangeMaxBytes = 64 << 10 // 64 KB
 )

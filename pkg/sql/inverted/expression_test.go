@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package inverted
 
@@ -16,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
@@ -122,7 +118,7 @@ func getExprCopy(
 
 func toString(expr Expression) string {
 	tp := treeprinter.New()
-	formatExpression(tp, expr, true /* includeSpansToRead */)
+	formatExpression(tp, expr, true /* includeSpansToRead */, false /* redactable */)
 	return tp.String()
 }
 
@@ -139,7 +135,7 @@ func TestExpression(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	exprsByName := make(map[string]Expression)
 
-	datadriven.RunTest(t, "testdata/expression", func(t *testing.T, d *datadriven.TestData) string {
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "expression"), func(t *testing.T, d *datadriven.TestData) string {
 		switch d.Cmd {
 		case "new-span-leaf":
 			var name string
@@ -295,21 +291,21 @@ func TestSetIntersection(t *testing.T) {
 func TestSetSubtraction(t *testing.T) {
 	checkEqual(t,
 		nil,
-		subtractSpans(
+		SubtractSpans(
 			[]Span{single("b")},
 			[]Span{span("b", "c")},
 		),
 	)
 	checkEqual(t,
 		[]Span{span("b\x00", "d")},
-		subtractSpans(
+		SubtractSpans(
 			[]Span{span("b", "d")},
 			[]Span{span("b", "b\x00")},
 		),
 	)
 	checkEqual(t,
 		[]Span{span("b", "d"), span("e", "ea")},
-		subtractSpans(
+		SubtractSpans(
 			[]Span{span("b", "d"), span("e", "f")},
 			[]Span{span("ea", "f")},
 		),
@@ -317,7 +313,7 @@ func TestSetSubtraction(t *testing.T) {
 	checkEqual(t,
 		[]Span{span("d", "da"), span("db", "dc"),
 			span("dd", "df"), span("fa", "g")},
-		subtractSpans(
+		SubtractSpans(
 			[]Span{single("b"), span("d", "e"), span("f", "g")},
 			[]Span{span("b", "c"), span("da", "db"),
 				span("dc", "dd"), span("df", "e"), span("f", "fa")},

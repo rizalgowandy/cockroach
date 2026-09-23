@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -24,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -39,10 +34,11 @@ func TestExternalHashAggregator(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -53,6 +49,13 @@ func TestExternalHashAggregator(t *testing.T) {
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	defer closerRegistry.Close(ctx)
+
+	var diskSpillingState = struct {
+		numRuns                    int
+		numRunsWithExpectedClosers int
+	}{}
 
 	rng, _ := randutil.NewTestRand()
 	numForcedRepartitions := rng.Intn(5)
@@ -98,9 +101,9 @@ func TestExternalHashAggregator(t *testing.T) {
 				// aggregator in the fallback strategy.
 				continue
 			}
-			log.Infof(ctx, "diskSpillingEnabled=%t/spillForced=%t/memoryLimitBytes=%d/numRepartitions=%d/%s", cfg.diskSpillingEnabled, cfg.spillForced, cfg.memoryLimitBytes, numForcedRepartitions, tc.name)
+			log.Dev.Infof(ctx, "diskSpillingEnabled=%t/spillForced=%t/memoryLimitBytes=%d/numRepartitions=%d/%s", cfg.diskSpillingEnabled, cfg.spillForced, cfg.memoryLimitBytes, numForcedRepartitions, tc.name)
 			constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-				&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+				ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 			)
 			require.NoError(t, err)
 			verifier := colexectestutils.OrderedVerifier
@@ -109,29 +112,20 @@ func TestExternalHashAggregator(t *testing.T) {
 			} else if len(tc.orderedCols) > 0 {
 				verifier = colexectestutils.PartialOrderedVerifier
 			}
-			var numExpectedClosers int
-			if cfg.diskSpillingEnabled {
-				// The external sorter and the disk spiller should be added
-				// as Closers (the latter is responsible for closing the
-				// in-memory hash aggregator as well as the external one).
-				numExpectedClosers = 2
-				if len(tc.spec.OutputOrdering.Columns) > 0 {
-					// When the output ordering is required, we also plan
-					// another external sort.
-					numExpectedClosers++
-				}
-			} else {
-				// Only the in-memory hash aggregator should be added.
-				numExpectedClosers = 1
-			}
 			var semsToCheck []semaphore.Semaphore
+			var numRuns int
 			colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.input}, [][]*types.T{tc.typs}, tc.expected, verifier, func(input []colexecop.Operator) (colexecop.Operator, error) {
+				// ehaNumRequiredFDs is the minimum number of file descriptors
+				// that are needed for the machinery of the external aggregator
+				// (plus 1 is needed for the in-memory hash aggregator in order
+				// to track tuples in a spilling queue).
+				ehaNumRequiredFDs := 1 + colexecop.ExternalSorterMinPartitions
 				sem := colexecop.NewTestingSemaphore(ehaNumRequiredFDs)
 				semsToCheck = append(semsToCheck, sem)
-				op, closers, err := createExternalHashAggregator(
+				numRuns++
+				op, err := createExternalHashAggregator(
 					ctx, flowCtx, &colexecagg.NewAggregatorArgs{
 						Allocator:      testAllocator,
-						MemAccount:     testMemAcc,
 						Input:          input[0],
 						InputTypes:     tc.typs,
 						Spec:           tc.spec,
@@ -140,9 +134,8 @@ func TestExternalHashAggregator(t *testing.T) {
 						ConstArguments: constArguments,
 						OutputTypes:    outputTypes,
 					},
-					queueCfg, sem, numForcedRepartitions, &monitorRegistry,
+					queueCfg, sem, numForcedRepartitions, &monitorRegistry, &closerRegistry,
 				)
-				require.Equal(t, numExpectedClosers, len(closers))
 				if !cfg.diskSpillingEnabled {
 					// Sanity check that indeed only the in-memory hash
 					// aggregator was created.
@@ -151,11 +144,54 @@ func TestExternalHashAggregator(t *testing.T) {
 				}
 				return op, err
 			})
+			if cfg.diskSpillingEnabled {
+				diskSpillingState.numRuns++
+				// We always have the root diskSpiller (1) added to the closers.
+				// Then, when it spills to disk, _most commonly_ we will see the
+				// following:
+				// - the hash-based partitioner (2) for the external hash
+				// aggregator
+				// - the diskSpiller (3) and the external sort (4) that we use
+				// in the fallback strategy of the external hash aggregator
+				// - the diskSpiller (5) and the external sort (6) that we plan
+				// on top of the hash-based partitioner to maintain the output
+				// ordering.
+				expectedNumClosersPerRun := 6
+				if numForcedRepartitions == 0 {
+					// In this case we won't create the external sort (4) in the
+					// fallback strategy.
+					expectedNumClosersPerRun--
+				}
+				if len(tc.spec.OutputOrdering.Columns) == 0 {
+					// In this case we won't create the diskSpiller (5) and the
+					// external sort (6).
+					expectedNumClosersPerRun -= 2
+				}
+
+				if expectedNumClosersPerRun*numRuns == closerRegistry.NumClosers() {
+					diskSpillingState.numRunsWithExpectedClosers++
+				}
+			}
+			// Close all closers manually (in production this is done on the
+			// flow cleanup).
+			closerRegistry.Close(ctx)
+			closerRegistry.Reset()
 			for i, sem := range semsToCheck {
 				require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
 			}
 		}
 	}
+	// We have this sanity check to ensure that all expected closers in the
+	// _most common_ scenario were added as closers. Coming up with an exact
+	// formula for expected number of closers for each case proved quite
+	// difficult.
+	lowerBound := 0.5
+	if numForcedRepartitions == 1 || numForcedRepartitions == 2 {
+		// In these scenarios more internal operations might not spill to disk,
+		// so lower the bound.
+		lowerBound = 0.3
+	}
+	require.Less(t, lowerBound, float64(diskSpillingState.numRunsWithExpectedClosers)/float64(diskSpillingState.numRuns))
 }
 
 func BenchmarkExternalHashAggregator(b *testing.B) {
@@ -163,10 +199,11 @@ func BenchmarkExternalHashAggregator(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -176,25 +213,32 @@ func BenchmarkExternalHashAggregator(b *testing.B) {
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 	defer cleanup()
 	var monitorRegistry colexecargs.MonitorRegistry
-	defer monitorRegistry.Close(ctx)
+	var closerRegistry colexecargs.CloserRegistry
+	afterEachRun := func() {
+		closerRegistry.BenchmarkReset(ctx)
+		monitorRegistry.BenchmarkReset(ctx)
+	}
 
-	aggFn := execinfrapb.Min
 	numRows := []int{coldata.BatchSize(), 64 * coldata.BatchSize(), 4096 * coldata.BatchSize()}
 	groupSizes := []int{1, 2, 32, 128, coldata.BatchSize()}
 	if testing.Short() {
 		numRows = []int{64 * coldata.BatchSize()}
 		groupSizes = []int{1, coldata.BatchSize()}
 	}
+	// We choose any_not_null aggregate function because it is the simplest
+	// possible and, thus, its Compute function call will have the least impact
+	// when benchmarking the aggregator logic.
+	aggFn := execinfrapb.AnyNotNull
 	for _, spillForced := range []bool{false, true} {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
 		for _, numInputRows := range numRows {
 			for _, groupSize := range groupSizes {
 				benchmarkAggregateFunction(
 					b, aggType{
-						new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
-							op, _, err := createExternalHashAggregator(
+						new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+							op, err := createExternalHashAggregator(
 								ctx, flowCtx, args, queueCfg, &colexecop.TestingSemaphore{},
-								0 /* numForcedRepartitions */, &monitorRegistry,
+								0 /* numForcedRepartitions */, &monitorRegistry, &closerRegistry,
 							)
 							require.NoError(b, err)
 							// The hash-based partitioner is not a
@@ -204,11 +248,14 @@ func BenchmarkExternalHashAggregator(b *testing.B) {
 							// purposes of this benchmark.
 							return colexecop.NewNoop(op)
 						},
-						name:  fmt.Sprintf("spilled=%t", spillForced),
-						order: unordered,
+						afterEachRun: afterEachRun,
+						name:         fmt.Sprintf("spilled=%t", spillForced),
+						order:        unordered,
 					},
 					aggFn, []*types.T{types.Int}, 1 /* numGroupCol */, groupSize,
-					0 /* distinctProb */, numInputRows, 0 /* chunkSize */, 0 /* limit */)
+					0 /* distinctProb */, numInputRows, 0, /* chunkSize */
+					0 /* limit */, 0, /* numSameAggs */
+				)
 			}
 		}
 	}
@@ -224,7 +271,8 @@ func createExternalHashAggregator(
 	testingSemaphore semaphore.Semaphore,
 	numForcedRepartitions int,
 	monitorRegistry *colexecargs.MonitorRegistry,
-) (colexecop.Operator, []colexecop.Closer, error) {
+	closerRegistry *colexecargs.CloserRegistry,
+) (colexecop.Operator, error) {
 	spec := &execinfrapb.ProcessorSpec{
 		Input: []execinfrapb.InputSyncSpec{{ColumnTypes: newAggArgs.InputTypes}},
 		Core: execinfrapb.ProcessorCoreUnion{
@@ -234,14 +282,14 @@ func createExternalHashAggregator(
 		ResultTypes: newAggArgs.OutputTypes,
 	}
 	args := &colexecargs.NewColOperatorArgs{
-		Spec:                spec,
-		Inputs:              []colexecargs.OpWithMetaInfo{{Root: newAggArgs.Input}},
-		StreamingMemAccount: testMemAcc,
-		DiskQueueCfg:        diskQueueCfg,
-		FDSemaphore:         testingSemaphore,
-		MonitorRegistry:     monitorRegistry,
+		Spec:            spec,
+		Inputs:          []colexecargs.OpWithMetaInfo{{Root: newAggArgs.Input}},
+		DiskQueueCfg:    diskQueueCfg,
+		FDSemaphore:     testingSemaphore,
+		MonitorRegistry: monitorRegistry,
+		CloserRegistry:  closerRegistry,
 	}
 	args.TestingKnobs.NumForcedRepartitions = numForcedRepartitions
 	result, err := colexecargs.TestNewColOperator(ctx, flowCtx, args)
-	return result.Root, result.ToClose, err
+	return result.Root, err
 }

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
@@ -16,33 +11,34 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/stretchr/testify/require"
 )
 
 // runSampleTest feeds rows with the given ranks through a reservoir
 // of a given size and verifies the results are correct.
 func runSampleTest(
-	t *testing.T,
-	evalCtx *tree.EvalContext,
-	numSamples, expectedNumSamples int,
-	ranks []int,
-	memAcc *mon.BoundAccount,
+	t *testing.T, numSamples, expectedNumSamples int, ranks []int, memAcc *mon.BoundAccount,
 ) {
 	ctx := context.Background()
 	var sr SampleReservoir
-	sr.Init(numSamples, 1, []*types.T{types.Int}, memAcc, util.MakeFastIntSet(0))
+	var collationEnv tree.CollationEnvironment
+	sr.Init(numSamples, 1, []*types.T{types.Int}, memAcc, intsets.MakeFast(0))
 	for _, r := range ranks {
-		d := rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(r)))
+		d := rowenc.DatumToEncDatumUnsafe(types.Int, tree.NewDInt(tree.DInt(r)))
 		prevCapacity := sr.Cap()
-		if err := sr.SampleRow(ctx, evalCtx, rowenc.EncDatumRow{d}, uint64(r)); err != nil {
+		if err := sr.SampleRow(ctx, &collationEnv, rowenc.EncDatumRow{d}, uint64(r)); err != nil {
 			t.Fatal(err)
 		} else if sr.Cap() != prevCapacity {
 			t.Logf(
@@ -93,7 +89,6 @@ func runSampleTest(
 func TestSampleReservoir(t *testing.T) {
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
 
 	for _, n := range []int{10, 100, 1000, 10000} {
 		rng, _ := randutil.NewTestRand()
@@ -103,21 +98,17 @@ func TestSampleReservoir(t *testing.T) {
 		}
 		for _, k := range []int{1, 5, 10, 100} {
 			t.Run(fmt.Sprintf("n=%d/k=%d/mem=nolimit", n, k), func(t *testing.T) {
-				runSampleTest(t, &evalCtx, k, k, ranks, nil)
+				runSampleTest(t, k, k, ranks, mon.NewStandaloneUnlimitedAccount())
 			})
 			for _, mem := range []int64{1 << 8, 1 << 10, 1 << 12} {
 				t.Run(fmt.Sprintf("n=%d/k=%d/mem=%d", n, k, mem), func(t *testing.T) {
-					monitor := mon.NewMonitorWithLimit(
-						"test-monitor",
-						mon.MemoryResource,
-						mem,
-						nil,
-						nil,
-						1,
-						math.MaxInt64,
-						st,
-					)
-					monitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+					monitor := mon.NewMonitor(mon.Options{
+						Name:      mon.MakeName("test-monitor"),
+						Limit:     mem,
+						Increment: 1,
+						Settings:  st,
+					})
+					monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 					memAcc := monitor.MakeBoundAccount()
 					expectedK := k
 					if mem == 1<<8 && n > 1 && k > 1 {
@@ -127,7 +118,7 @@ func TestSampleReservoir(t *testing.T) {
 					} else if mem == 1<<12 && n > 10 && k > 10 {
 						expectedK = 25
 					}
-					runSampleTest(t, &evalCtx, k, expectedK, ranks, &memAcc)
+					runSampleTest(t, k, expectedK, ranks, &memAcc)
 				})
 			}
 		}
@@ -135,10 +126,14 @@ func TestSampleReservoir(t *testing.T) {
 }
 
 func TestTruncateDatum(t *testing.T) {
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	ctx := context.Background()
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	var collationEnv tree.CollationEnvironment
 	runTest := func(d, expected tree.Datum) {
-		actual := truncateDatum(&evalCtx, d, 10 /* maxBytes */)
-		if actual.Compare(&evalCtx, expected) != 0 {
+		actual := truncateDatum(&collationEnv, d, 10 /* maxBytes */)
+		if cmp, err := actual.Compare(ctx, &evalCtx, expected); err != nil {
+			t.Fatal(err)
+		} else if cmp != 0 {
 			t.Fatalf("expected %s but found %s", expected.String(), actual.String())
 		}
 	}
@@ -174,4 +169,47 @@ corn, the green oats, and the haystacks piled up in the meadows looked beautiful
 		t.Fatal(err)
 	}
 	runTest(original4, expected4)
+}
+
+// TestSampleReservoirMemAccounting is a regression test for a bug in the memory
+// accounting that could lead to "no bytes in account to release" error
+// (#128241).
+//
+// In particular, it constructs such sequence of events that we hit the memory
+// budget error in the middle of copying a new row into the reservoir, and then
+// later (before the fix was applied) we pop the partially modified row from it,
+// deviating from the accounting done so far.
+func TestSampleReservoirMemAccounting(t *testing.T) {
+	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	var collationEnv tree.CollationEnvironment
+
+	getStringDatum := func(l int) rowenc.EncDatum {
+		d := tree.DString(strings.Repeat("a", l))
+		return rowenc.DatumToEncDatumUnsafe(types.String, &d)
+	}
+	// First two rows need 152 bytes each. The third row has the smallest rank,
+	// so it wants to replace one of the other rows, but it has a large datum
+	// exceeding the memory limit altogether.
+	const memLimit = 304
+	rows := []rowenc.EncDatumRow{
+		{getStringDatum(0), getStringDatum(0)},                 // rank 3
+		{getStringDatum(0), getStringDatum(0)},                 // rank 2
+		{getStringDatum(maxBytesPerSample), getStringDatum(0)}, // rank 1
+	}
+	monitor := mon.NewMonitor(mon.Options{
+		Name:      mon.MakeName("test-monitor"),
+		Limit:     memLimit,
+		Increment: 1,
+		Settings:  st,
+	})
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
+	memAcc := monitor.MakeBoundAccount()
+	var sr SampleReservoir
+	sr.Init(2, 1, []*types.T{types.String, types.String}, &memAcc, intsets.MakeFast(0, 1))
+	require.NoError(t, sr.SampleRow(ctx, &collationEnv, rows[0], 3))
+	require.NoError(t, sr.SampleRow(ctx, &collationEnv, rows[1], 2))
+	err := sr.SampleRow(ctx, &collationEnv, rows[2], 1)
+	require.Error(t, err)
+	require.True(t, testutils.IsError(err, "memory budget exceeded"))
 }

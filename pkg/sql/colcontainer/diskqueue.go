@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colcontainer
 
@@ -14,18 +9,20 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
-	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/golang/snappy"
 )
 
@@ -64,18 +61,25 @@ type file struct {
 // compressAndFlush is called, which compresses all bytes and writes them to the
 // wrapped io.Writer.
 type diskQueueWriter struct {
+	// ctx is captured so that diskQueueWriter.Write signature is preserved.
+	ctx context.Context
 	// testingKnobAlwaysCompress specifies whether the writer should always
 	// compress writes (i.e. don't bother measuring whether compression passes
 	// a certain threshold of size improvement before writing compressed bytes).
 	testingKnobAlwaysCompress bool
 	buffer                    bytes.Buffer
 	wrapped                   io.Writer
+	memAcc                    *mon.BoundAccount
 	scratch                   struct {
 		// blockType is a single byte that specifies whether the following block on
 		// disk (i.e. compressedBuf in memory) is compressed or not. It is an array
 		// due to having to pass this byte in as a slice to Write.
 		blockType     [1]byte
 		compressedBuf []byte
+	}
+	accountedFor struct {
+		buffer        int64
+		compressedBuf int64
 	}
 }
 
@@ -84,7 +88,16 @@ const (
 	snappyCompressedBlock   byte = 1
 )
 
-func (w *diskQueueWriter) Write(p []byte) (int, error) {
+func (w *diskQueueWriter) Write(p []byte) (_ int, retErr error) {
+	defer func() {
+		if retErr == nil && w.accountedFor.buffer != int64(w.buffer.Cap()) {
+			newAccountedFor := int64(w.buffer.Cap())
+			retErr = w.memAcc.Resize(w.ctx, w.accountedFor.buffer, newAccountedFor)
+			if retErr == nil {
+				w.accountedFor.buffer = newAccountedFor
+			}
+		}
+	}()
 	return w.buffer.Write(p)
 }
 
@@ -98,10 +111,16 @@ func (w *diskQueueWriter) reset(wrapped io.Writer) {
 // compressAndFlush compresses all buffered bytes and writes them to the wrapped
 // io.Writer. The number of total bytes written to the wrapped writer is
 // returned if no error occurred, otherwise 0, err is returned.
-func (w *diskQueueWriter) compressAndFlush() (int, error) {
+func (w *diskQueueWriter) compressAndFlush(ctx context.Context) (int, error) {
 	b := w.buffer.Bytes()
 	compressed := snappy.Encode(w.scratch.compressedBuf, b)
 	w.scratch.compressedBuf = compressed[:cap(compressed)]
+	if newAccountedFor := int64(cap(compressed)); newAccountedFor != w.accountedFor.compressedBuf {
+		if err := w.memAcc.Resize(ctx, w.accountedFor.compressedBuf, newAccountedFor); err != nil {
+			return 0, err
+		}
+		w.accountedFor.compressedBuf = newAccountedFor
+	}
 
 	blockType := snappyUncompressedBlock
 	// Discard result if < 12.5% size reduction. All code that uses snappy
@@ -181,7 +200,7 @@ type diskQueue struct {
 	// written before a compress and flush.
 	writeBufferLimit  int
 	writeFileIdx      int
-	writeFile         fs.File
+	writeFile         vfs.File
 	deserializerState struct {
 		*colserde.FileDeserializer
 		curBatch int
@@ -189,18 +208,12 @@ type diskQueue struct {
 	// readFileIdx is an index into the current file in files the deserializer is
 	// reading from.
 	readFileIdx                  int
-	readFile                     fs.File
+	readFile                     vfs.File
 	scratchDecompressedReadBytes []byte
 
-	diskAcc *mon.BoundAccount
-
-	// diskSpillingMetricsHelper keeps track of various disk spilling metrics.
-	diskSpillingMetricsHelper struct {
-		mu struct {
-			syncutil.Mutex
-			querySpilled bool
-		}
-	}
+	diskAcc             *mon.BoundAccount
+	memAcc              *mon.BoundAccount
+	scratchAccountedFor int64
 }
 
 var _ RewindableQueue = &diskQueue{}
@@ -233,7 +246,7 @@ type RewindableQueue interface {
 	Queue
 	// Rewind resets the Queue so that it Dequeues all Enqueued batches from the
 	// start.
-	Rewind() error
+	Rewind(context.Context) error
 }
 
 const (
@@ -305,10 +318,7 @@ func GetPatherFunc(f func(ctx context.Context) string) GetPather {
 // DiskQueueCfg is a struct holding the configuration options for a DiskQueue.
 type DiskQueueCfg struct {
 	// FS is the filesystem interface to use.
-	FS fs.FS
-	// DistSQLMetrics contains metrics for monitoring DistSQL processing. This
-	// can be nil if these metrics are not needed.
-	DistSQLMetrics *execinfra.DistSQLMetrics
+	FS vfs.FS
 	// GetPather returns where the temporary directory that will contain this
 	// DiskQueue's files has been created. The directory name will be a UUID.
 	// Note that the directory is created lazily on the first call to GetPath.
@@ -322,6 +332,12 @@ type DiskQueueCfg struct {
 	// MaxFileSizeBytes is the maximum size an on-disk file should reach before
 	// rolling over to a new one.
 	MaxFileSizeBytes int
+
+	// SpilledBytesWritten and SpilledBytesRead are the metrics for monitoring
+	// the volume of data being written/read to/from the temporary disk storage.
+	// Both can be nil when these metrics are not needed.
+	SpilledBytesWritten *metric.Counter
+	SpilledBytesRead    *metric.Counter
 
 	// TestingKnobs are used to test the queue implementation.
 	TestingKnobs struct {
@@ -366,16 +382,24 @@ func (cfg *DiskQueueCfg) setDefaultBufferSizeBytesForCacheMode() {
 
 // NewDiskQueue creates a Queue that spills to disk.
 func NewDiskQueue(
-	ctx context.Context, typs []*types.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
+	ctx context.Context,
+	typs []*types.T,
+	cfg DiskQueueCfg,
+	diskAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 ) (Queue, error) {
-	return newDiskQueue(ctx, typs, cfg, diskAcc)
+	return newDiskQueue(ctx, typs, cfg, diskAcc, diskQueueMemAcc)
 }
 
 // NewRewindableDiskQueue creates a RewindableQueue that spills to disk.
 func NewRewindableDiskQueue(
-	ctx context.Context, typs []*types.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
+	ctx context.Context,
+	typs []*types.T,
+	cfg DiskQueueCfg,
+	diskAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 ) (RewindableQueue, error) {
-	d, err := newDiskQueue(ctx, typs, cfg, diskAcc)
+	d, err := newDiskQueue(ctx, typs, cfg, diskAcc, diskQueueMemAcc)
 	if err != nil {
 		return nil, err
 	}
@@ -383,55 +407,68 @@ func NewRewindableDiskQueue(
 	return d, nil
 }
 
-func (d *diskQueue) querySpilled() {
-	d.diskSpillingMetricsHelper.mu.Lock()
-	defer d.diskSpillingMetricsHelper.mu.Unlock()
-	if d.cfg.DistSQLMetrics != nil && !d.diskSpillingMetricsHelper.mu.querySpilled {
-		d.diskSpillingMetricsHelper.mu.querySpilled = true
-		d.cfg.DistSQLMetrics.QueriesSpilled.Inc(1)
-	}
-}
-
 func newDiskQueue(
-	ctx context.Context, typs []*types.T, cfg DiskQueueCfg, diskAcc *mon.BoundAccount,
+	ctx context.Context,
+	typs []*types.T,
+	cfg DiskQueueCfg,
+	diskAcc *mon.BoundAccount,
+	memAcc *mon.BoundAccount,
 ) (*diskQueue, error) {
 	if err := cfg.EnsureDefaults(); err != nil {
 		return nil, err
 	}
 	d := &diskQueue{
-		dirName:          uuid.FastMakeV4().String(),
+		dirName:          uuid.MakeV4().String(),
 		typs:             typs,
 		cfg:              cfg,
 		files:            make([]file, 0, 4),
 		writeBufferLimit: cfg.BufferSizeBytes / 3,
 		diskAcc:          diskAcc,
+		memAcc:           memAcc,
 	}
 	// Refer to the DiskQueueCacheMode comment for why this division of
 	// BufferSizeBytes.
 	if d.cfg.CacheMode != DiskQueueCacheModeIntertwinedCalls {
 		d.writeBufferLimit = d.cfg.BufferSizeBytes / 2
 	}
-	if err := cfg.FS.MkdirAll(filepath.Join(cfg.GetPather.GetPath(ctx), d.dirName)); err != nil {
+	if err := cfg.FS.MkdirAll(filepath.Join(cfg.GetPather.GetPath(ctx), d.dirName), os.ModePerm); err != nil {
 		return nil, err
 	}
-	d.querySpilled()
 	// rotateFile will create a new file to write to.
 	return d, d.rotateFile(ctx)
 }
 
+// CloseRead closes the read file descriptor.
+//
+// No-op if the read file is not open. readFile is guaranteed to be nil-ed out
+// on return.
 func (d *diskQueue) CloseRead() error {
-	if d.readFile != nil {
-		if err := d.readFile.Close(); err != nil {
-			return err
-		}
-		d.readFile = nil
+	if d.readFile == nil {
+		return nil
 	}
-	return nil
+	defer func() {
+		d.readFile = nil
+	}()
+	return d.readFile.Close()
 }
 
-func (d *diskQueue) closeFileDeserializer() error {
+// closeWriteFile closes the write file descriptor.
+//
+// No-op if the write file is not open. writeFile is guaranteed to be nil-ed out
+// on return.
+func (d *diskQueue) closeWriteFile() error {
+	if d.writeFile == nil {
+		return nil
+	}
+	defer func() {
+		d.writeFile = nil
+	}()
+	return d.writeFile.Close()
+}
+
+func (d *diskQueue) closeFileDeserializer(ctx context.Context) error {
 	if d.deserializerState.FileDeserializer != nil {
-		if err := d.deserializerState.Close(); err != nil {
+		if err := d.deserializerState.Close(ctx); err != nil {
 			return err
 		}
 	}
@@ -439,8 +476,15 @@ func (d *diskQueue) closeFileDeserializer() error {
 	return nil
 }
 
-func (d *diskQueue) Close(ctx context.Context) error {
+func (d *diskQueue) Close(ctx context.Context) (retErr error) {
 	defer func() {
+		// Ensure that we always attempt to close the file in case we
+		// short-circuit the method due to an error.
+		if err := d.closeWriteFile(); err != nil {
+			retErr = errors.CombineErrors(retErr, err)
+		}
+		d.writer.memAcc.Shrink(ctx, d.writer.accountedFor.buffer+d.writer.accountedFor.compressedBuf)
+		d.memAcc.Shrink(ctx, d.scratchAccountedFor)
 		// Zero out the structure completely upon return. If users of this diskQueue
 		// retain a pointer to it, and we don't remove all references to large
 		// backing slices (various scratch spaces in this struct and children),
@@ -451,16 +495,14 @@ func (d *diskQueue) Close(ctx context.Context) error {
 		if err := d.writeFooterAndFlush(ctx); err != nil {
 			return err
 		}
+		d.serializer.Close(ctx)
 		d.serializer = nil
 	}
-	if err := d.closeFileDeserializer(); err != nil {
+	if err := d.closeFileDeserializer(ctx); err != nil {
 		return err
 	}
-	if d.writeFile != nil {
-		if err := d.writeFile.Close(); err != nil {
-			return err
-		}
-		d.writeFile = nil
+	if err := d.closeWriteFile(); err != nil {
+		return err
 	}
 	// The readFile will be removed below in DeleteDirAndFiles.
 	if err := d.CloseRead(); err != nil {
@@ -490,17 +532,31 @@ func (d *diskQueue) Close(ctx context.Context) error {
 // It is valid to call rotateFile when the diskQueue is not currently writing to
 // any file (i.e. during initialization). This will simply create the first file
 // to write to.
-func (d *diskQueue) rotateFile(ctx context.Context) error {
+func (d *diskQueue) rotateFile(ctx context.Context) (retErr error) {
 	fName := filepath.Join(d.cfg.GetPather.GetPath(ctx), d.dirName, strconv.Itoa(d.seqNo))
-	f, err := d.cfg.FS.CreateWithSync(fName, bytesPerSync)
+	f, err := fs.CreateWithSync(d.cfg.FS, fName, bytesPerSync, fs.SQLColumnSpillWriteCategory)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if retErr != nil {
+			// If we hit an error, then we lose the reference to newly created
+			// file - ensure that it is closed if so.
+			if err = f.Close(); err != nil {
+				retErr = errors.CombineErrors(retErr, err)
+			}
+		}
+	}()
 	d.seqNo++
 
 	if d.serializer == nil {
-		writer := &diskQueueWriter{testingKnobAlwaysCompress: d.cfg.TestingKnobs.AlwaysCompress, wrapped: f}
-		d.serializer, err = colserde.NewFileSerializer(writer, d.typs)
+		writer := &diskQueueWriter{
+			ctx:                       ctx,
+			testingKnobAlwaysCompress: d.cfg.TestingKnobs.AlwaysCompress,
+			wrapped:                   f,
+			memAcc:                    d.memAcc,
+		}
+		d.serializer, err = colserde.NewFileSerializer(writer, d.typs, d.memAcc)
 		if err != nil {
 			return err
 		}
@@ -516,7 +572,7 @@ func (d *diskQueue) rotateFile(ctx context.Context) error {
 
 	if d.writeFile != nil {
 		d.files[d.writeFileIdx].finishedWriting = true
-		if err := d.writeFile.Close(); err != nil {
+		if err = d.closeWriteFile(); err != nil {
 			return err
 		}
 	}
@@ -527,7 +583,7 @@ func (d *diskQueue) rotateFile(ctx context.Context) error {
 	return nil
 }
 
-func (d *diskQueue) resetWriters(f fs.File) error {
+func (d *diskQueue) resetWriters(f vfs.File) error {
 	d.writer.reset(f)
 	return d.serializer.Reset(d.writer)
 }
@@ -541,17 +597,23 @@ func (d *diskQueue) writeFooterAndFlush(ctx context.Context) (err error) {
 			d.serializer = nil
 		}
 	}()
+	if d.writer != nil {
+		// The context that we captured when we created the diskQueueWriter
+		// might have a tracing span that has already been finished. To go
+		// around this, we capture the fresh context.
+		d.writer.ctx = ctx
+	}
 	if err := d.serializer.Finish(); err != nil {
 		return err
 	}
-	written, err := d.writer.compressAndFlush()
+	written, err := d.writer.compressAndFlush(ctx)
 	if err != nil {
 		return err
 	}
 	d.numBufferedBatches = 0
 	d.files[d.writeFileIdx].totalSize += written
-	if d.cfg.DistSQLMetrics != nil {
-		d.cfg.DistSQLMetrics.SpilledBytesWritten.Inc(int64(written))
+	if d.cfg.SpilledBytesWritten != nil {
+		d.cfg.SpilledBytesWritten.Inc(int64(written))
 	}
 	if err := d.diskAcc.Grow(ctx, int64(written)); err != nil {
 		return err
@@ -561,16 +623,29 @@ func (d *diskQueue) writeFooterAndFlush(ctx context.Context) (err error) {
 	return nil
 }
 
+//gcassert:inline
+func checkCancellation(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return cancelchecker.QueryCanceledError
+	default:
+		return nil
+	}
+}
+
 func (d *diskQueue) Enqueue(ctx context.Context, b coldata.Batch) error {
+	if err := checkCancellation(ctx); err != nil {
+		return err
+	}
 	if d.state == diskQueueStateDequeueing {
 		if d.cfg.CacheMode != DiskQueueCacheModeIntertwinedCalls {
-			return errors.Errorf(
+			return errors.AssertionFailedf(
 				"attempted to Enqueue to DiskQueue after Dequeueing "+
 					"in mode that disallows it: %d", d.cfg.CacheMode,
 			)
 		}
 		if d.rewindable {
-			return errors.Errorf("attempted to Enqueue to RewindableDiskQueue after Dequeue has been called")
+			return errors.AssertionFailedf("attempted to Enqueue to RewindableDiskQueue after Dequeue has been called")
 		}
 	}
 	d.state = diskQueueStateEnqueueing
@@ -582,13 +657,13 @@ func (d *diskQueue) Enqueue(ctx context.Context, b coldata.Batch) error {
 		if err := d.writeFooterAndFlush(ctx); err != nil {
 			return err
 		}
-		if err := d.writeFile.Close(); err != nil {
+		if err := d.closeWriteFile(); err != nil {
 			return err
 		}
 		d.files[d.writeFileIdx].finishedWriting = true
-		d.writeFile = nil
-		// Done with the serializer. Not setting this will cause us to attempt to
-		// flush the serializer on Close.
+		// Done with the serializer - close it and set it to nil. Not setting
+		// this will cause us to attempt to flush the serializer on Close.
+		d.serializer.Close(ctx)
 		d.serializer = nil
 		// The write file will be closed in Close.
 		d.done = true
@@ -596,13 +671,17 @@ func (d *diskQueue) Enqueue(ctx context.Context, b coldata.Batch) error {
 			// Clear the cache. d.scratchDecompressedReadBytes should already be nil
 			// since we don't allow writes once reads happen in this mode.
 			d.scratchDecompressedReadBytes = nil
+			d.memAcc.Shrink(ctx, d.scratchAccountedFor)
+			d.scratchAccountedFor = 0
 			// Clear the write side of the cache.
 			d.writer.buffer = bytes.Buffer{}
 			d.writer.scratch.compressedBuf = nil
+			d.writer.memAcc.Shrink(ctx, d.writer.accountedFor.buffer+d.writer.accountedFor.compressedBuf)
+			d.writer.accountedFor.buffer, d.writer.accountedFor.compressedBuf = 0, 0
 		}
 		return nil
 	}
-	if err := d.serializer.AppendBatch(b); err != nil {
+	if err := d.serializer.AppendBatch(ctx, b); err != nil {
 		return err
 	}
 	d.numBufferedBatches++
@@ -652,7 +731,6 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 				}
 				d.diskAcc.Shrink(ctx, fileSize)
 			}
-			d.readFile = nil
 			// Read next file.
 			d.readFileIdx++
 			return d.maybeInitDeserializer(ctx)
@@ -673,6 +751,11 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 	if cap(d.writer.scratch.compressedBuf) < readRegionLength {
 		// Not enough capacity, we have to allocate a new compressedBuf.
 		d.writer.scratch.compressedBuf = make([]byte, readRegionLength)
+		newAccountedFor := int64(cap(d.writer.scratch.compressedBuf))
+		if err := d.writer.memAcc.Resize(ctx, d.writer.accountedFor.compressedBuf, newAccountedFor); err != nil {
+			return false, err
+		}
+		d.writer.accountedFor.compressedBuf = newAccountedFor
 	}
 	// Slice the compressedBuf to be of the desired length, encoded in
 	// readRegionLength.
@@ -682,11 +765,11 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 	if err != nil && err != io.EOF {
 		return false, err
 	}
-	if d.cfg.DistSQLMetrics != nil {
-		d.cfg.DistSQLMetrics.SpilledBytesRead.Inc(int64(n))
+	if d.cfg.SpilledBytesRead != nil {
+		d.cfg.SpilledBytesRead.Inc(int64(n))
 	}
 	if n != len(d.writer.scratch.compressedBuf) {
-		return false, errors.Errorf("expected to read %d bytes but read %d", len(d.writer.scratch.compressedBuf), n)
+		return false, errors.AssertionFailedf("expected to read %d bytes but read %d", len(d.writer.scratch.compressedBuf), n)
 	}
 
 	blockType := d.writer.scratch.compressedBuf[0]
@@ -704,6 +787,10 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 		// calls of the same buffered coldata.Batches to return, the memory would
 		// be corrupted. The following code ensures that
 		// scratchDecompressedReadBytes is of the required capacity.
+		// TODO(yuzefovich): we reuse the compressed write buffer when not in
+		// DiskQueueCacheModeIntertwinedCalls, in which case no Enqueue calls
+		// are allowed after the first Dequeue. In other words, either the
+		// comment is stale or the copy is not needed.
 		if cap(d.scratchDecompressedReadBytes) < len(compressedBytes) {
 			d.scratchDecompressedReadBytes = make([]byte, len(compressedBytes))
 		}
@@ -712,6 +799,12 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 		d.scratchDecompressedReadBytes = d.scratchDecompressedReadBytes[:len(compressedBytes)]
 		copy(d.scratchDecompressedReadBytes, compressedBytes)
 		decompressedBytes = d.scratchDecompressedReadBytes
+	}
+	if newAccountedFor := int64(cap(d.scratchDecompressedReadBytes)); newAccountedFor != d.scratchAccountedFor {
+		if err = d.memAcc.Resize(ctx, d.scratchAccountedFor, newAccountedFor); err != nil {
+			return false, err
+		}
+		d.scratchAccountedFor = newAccountedFor
 	}
 
 	deserializer, err := colserde.NewFileDeserializerFromBytes(d.typs, decompressedBytes)
@@ -723,7 +816,7 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 	if d.deserializerState.NumBatches() == 0 {
 		// Zero batches to deserialize in this region. This shouldn't happen but we
 		// might as well handle it.
-		if err := d.closeFileDeserializer(); err != nil {
+		if err := d.closeFileDeserializer(ctx); err != nil {
 			return false, err
 		}
 		d.files[d.readFileIdx].curOffsetIdx++
@@ -735,6 +828,9 @@ func (d *diskQueue) maybeInitDeserializer(ctx context.Context) (bool, error) {
 // Dequeue dequeues a batch from disk and deserializes it into b. Note that the
 // deserialized batch is only valid until the next call to Dequeue.
 func (d *diskQueue) Dequeue(ctx context.Context, b coldata.Batch) (bool, error) {
+	if err := checkCancellation(ctx); err != nil {
+		return false, err
+	}
 	if d.serializer != nil && d.numBufferedBatches > 0 {
 		if err := d.writeFooterAndFlush(ctx); err != nil {
 			return false, err
@@ -750,13 +846,19 @@ func (d *diskQueue) Dequeue(ctx context.Context, b coldata.Batch) (bool, error) 
 		// that.
 		d.writer.buffer.Reset()
 		d.scratchDecompressedReadBytes = d.writer.buffer.Bytes()
+		// Move accounting from the writer into the disk queue. Note that we
+		// don't actually need to update the memory account because it is shared
+		// between two components.
+		d.scratchAccountedFor, d.writer.accountedFor.buffer = d.writer.accountedFor.buffer, 0
+		// We won't need the write cache anymore, so reset it explicitly.
+		d.writer.buffer = bytes.Buffer{}
 	}
 	d.state = diskQueueStateDequeueing
 
 	if d.deserializerState.FileDeserializer != nil && d.deserializerState.curBatch >= d.deserializerState.NumBatches() {
 		// Finished all the batches, set the deserializer to nil to initialize a new
 		// one to read the next region.
-		if err := d.closeFileDeserializer(); err != nil {
+		if err := d.closeFileDeserializer(ctx); err != nil {
 			return false, err
 		}
 		d.files[d.readFileIdx].curOffsetIdx++
@@ -783,15 +885,14 @@ func (d *diskQueue) Dequeue(ctx context.Context, b coldata.Batch) (bool, error) 
 }
 
 // Rewind is part of the RewindableQueue interface.
-func (d *diskQueue) Rewind() error {
-	if err := d.closeFileDeserializer(); err != nil {
+func (d *diskQueue) Rewind(ctx context.Context) error {
+	if err := d.closeFileDeserializer(ctx); err != nil {
 		return err
 	}
 	if err := d.CloseRead(); err != nil {
 		return err
 	}
 	d.deserializerState.curBatch = 0
-	d.readFile = nil
 	d.readFileIdx = 0
 	for i := range d.files {
 		d.files[i].curOffsetIdx = 0

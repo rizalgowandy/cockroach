@@ -1,19 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package fs
 
 import (
 	"bytes"
-	"context"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -21,31 +14,22 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors/oserror"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 func TestCreateTempDir(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
 	// Temporary parent directory to test this.
-	dir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			t.Fatal(err)
-		}
-	}()
+	dir := t.TempDir()
 
-	tempDir, err := CreateTempDir(dir, "test-create-temp", stopper)
+	tempDir, unlockDirFn, err := CreateTempDir(dir, "test-create-temp")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer unlockDirFn()
 
 	if dir != filepath.Dir(tempDir) {
 		t.Fatalf("unexpected parent directory of temp subdirectory.\nexpected: %s\nactual: %s", dir, filepath.Dir(tempDir))
@@ -65,7 +49,7 @@ func TestRecordTempDir(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	recordFile := "foobar"
 
-	f, err := ioutil.TempFile("", "record-file")
+	f, err := os.CreateTemp("", "record-file")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +68,7 @@ func TestRecordTempDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	actual, err := ioutil.ReadFile(f.Name())
+	actual, err := os.ReadFile(f.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,12 +83,12 @@ func TestCleanupTempDirs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	recordFile, err := ioutil.TempFile("", "record-file")
+	recordFile, err := os.CreateTemp("", "record-file")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		if err := os.Remove(recordFile.Name()); err != nil {
+		if err := os.Remove(recordFile.Name()); err != nil && !oserror.IsNotExist(err) {
 			t.Fatal(err)
 		}
 	}()
@@ -112,17 +96,7 @@ func TestCleanupTempDirs(t *testing.T) {
 	// Generate some temporary directories.
 	var tempDirs []string
 	for i := 0; i < 5; i++ {
-		tempDir, err := ioutil.TempDir("", "temp-dir")
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Not strictly necessary, but good form to clean up temporary
-		// directories independent of test case.
-		defer func() {
-			if err := os.RemoveAll(tempDir); err != nil {
-				t.Fatal(err)
-			}
-		}()
+		tempDir := t.TempDir()
 		tempDirs = append(tempDirs, tempDir)
 		// Record the temporary directories to the file.
 		if _, err = recordFile.Write(append([]byte(tempDir), '\n')); err != nil {
@@ -139,7 +113,7 @@ func TestCleanupTempDirs(t *testing.T) {
 	content := []byte("whatisthemeaningoflife\n")
 	for i := 0; i < 10; i++ {
 		dir := tempDirs[rand.Intn(len(tempDirs))]
-		tempFile, err := ioutil.TempFile(dir, "temp-file")
+		tempFile, err := os.CreateTemp(dir, "temp-file")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -151,7 +125,7 @@ func TestCleanupTempDirs(t *testing.T) {
 		}
 	}
 
-	if err = CleanupTempDirs(recordFile.Name()); err != nil {
+	if err = CleanupTempDirs(t.Context(), vfs.Default, recordFile.Name()); err != nil {
 		t.Fatal(err)
 	}
 

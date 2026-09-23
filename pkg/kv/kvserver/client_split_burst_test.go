@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -19,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -74,11 +70,11 @@ func setupSplitBurstTest(t *testing.T, delay time.Duration) *splitBurstTest {
 	numSplitsSeenOnSlowFollower := new(int32) // atomic
 	var quiesceCh <-chan struct{}
 	knobs := base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
-		TestingApplyFilter: func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+		TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 			if args.Split == nil || delay == 0 {
 				return 0, nil
 			}
-			if args.Split.RightDesc.GetStickyBit() != magicStickyBit {
+			if args.Split.RightDesc.StickyBit != magicStickyBit {
 				return 0, nil
 			}
 			select {
@@ -164,9 +160,9 @@ func TestSplitBurstWithSlowFollower(t *testing.T) {
 		// even though there is a slow follower, `splitDelayHelper` isn't interested in
 		// delaying this here (which would imply that it's trying to check that every-
 		// one is "caught up").
-		// We set a 100s timeout so that below we can assert that `splitDelayHelper`
+		// We set a 200s timeout so that below we can assert that `splitDelayHelper`
 		// isn't somehow forcing us to wait here.
-		infiniteDelay := 100 * time.Second
+		infiniteDelay := 200 * time.Second
 		sbt := setupSplitBurstTest(t, infiniteDelay)
 		defer sbt.Stopper().Stop(ctx)
 

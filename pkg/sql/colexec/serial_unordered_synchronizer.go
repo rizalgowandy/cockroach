@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -15,9 +10,14 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -29,35 +29,65 @@ import (
 // we want to run it in the RootTxn.
 type SerialUnorderedSynchronizer struct {
 	colexecop.InitHelper
-	span *tracing.Span
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
+	span        *tracing.Span
+
+	// outputBatch is the output batch emitted by the synchronizer.
+	//
+	// The contract of Operator.Next encourages emitting the same batch across
+	// Next calls, so batches coming from the inputs are decomposed into vectors
+	// which are inserted into this batch.
+	outputBatch coldata.Batch
 
 	inputs []colexecargs.OpWithMetaInfo
 	// curSerialInputIdx indicates the index of the current input being consumed.
 	curSerialInputIdx int
+
+	// serialInputIdxExclusiveUpperBound indicates the InputIdx to error out on
+	// should execution fail to halt prior to this input. This is only valid if
+	// non-zero.
+	serialInputIdxExclusiveUpperBound uint32
+
+	// exceedsInputIdxExclusiveUpperBoundError is the error to return when
+	// curSerialInputIdx has incremented to match
+	// serialInputIdxExclusiveUpperBound.
+	exceedsInputIdxExclusiveUpperBoundError error
 }
 
 var (
 	_ colexecop.Operator = &SerialUnorderedSynchronizer{}
-	_ execinfra.OpNode   = &SerialUnorderedSynchronizer{}
+	_ execopnode.OpNode  = &SerialUnorderedSynchronizer{}
 	_ colexecop.Closer   = &SerialUnorderedSynchronizer{}
 )
 
-// ChildCount implements the execinfra.OpNode interface.
+// ChildCount implements the execopnode.OpNode interface.
 func (s *SerialUnorderedSynchronizer) ChildCount(verbose bool) int {
 	return len(s.inputs)
 }
 
-// Child implements the execinfra.OpNode interface.
-func (s *SerialUnorderedSynchronizer) Child(nth int, verbose bool) execinfra.OpNode {
+// Child implements the execopnode.OpNode interface.
+func (s *SerialUnorderedSynchronizer) Child(nth int, verbose bool) execopnode.OpNode {
 	return s.inputs[nth].Root
 }
 
 // NewSerialUnorderedSynchronizer creates a new SerialUnorderedSynchronizer.
 func NewSerialUnorderedSynchronizer(
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	allocator *colmem.Allocator,
+	inputTypes []*types.T,
 	inputs []colexecargs.OpWithMetaInfo,
+	serialInputIdxExclusiveUpperBound uint32,
+	exceedsInputIdxExclusiveUpperBoundError error,
 ) *SerialUnorderedSynchronizer {
 	return &SerialUnorderedSynchronizer{
-		inputs: inputs,
+		flowCtx:                                 flowCtx,
+		processorID:                             processorID,
+		outputBatch:                             allocator.NewMemBatchNoCols(inputTypes, coldata.BatchSize() /* capacity */),
+		inputs:                                  inputs,
+		serialInputIdxExclusiveUpperBound:       serialInputIdxExclusiveUpperBound,
+		exceedsInputIdxExclusiveUpperBoundError: exceedsInputIdxExclusiveUpperBoundError,
 	}
 }
 
@@ -66,23 +96,33 @@ func (s *SerialUnorderedSynchronizer) Init(ctx context.Context) {
 	if !s.InitHelper.Init(ctx) {
 		return
 	}
-	s.Ctx, s.span = execinfra.ProcessorSpan(s.Ctx, "serial unordered sync")
+	s.Ctx, s.span = execinfra.ProcessorSpan(s.Ctx, s.flowCtx, "serial unordered sync", s.processorID)
 	for _, input := range s.inputs {
 		input.Root.Init(s.Ctx)
 	}
 }
 
 // Next is part of the colexecop.Operator interface.
-func (s *SerialUnorderedSynchronizer) Next() coldata.Batch {
+func (s *SerialUnorderedSynchronizer) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	for {
 		if s.curSerialInputIdx == len(s.inputs) {
-			return coldata.ZeroBatch
+			return coldata.ZeroBatch, nil
 		}
-		b := s.inputs[s.curSerialInputIdx].Root.Next()
+		b, meta := s.inputs[s.curSerialInputIdx].Root.Next()
+		if meta != nil {
+			return nil, meta
+		}
 		if b.Length() == 0 {
 			s.curSerialInputIdx++
+			if s.serialInputIdxExclusiveUpperBound > 0 && s.curSerialInputIdx >= int(s.serialInputIdxExclusiveUpperBound) {
+				colexecerror.ExpectedError(s.exceedsInputIdxExclusiveUpperBoundError)
+			}
 		} else {
-			return b
+			for i, vec := range b.ColVecs() {
+				s.outputBatch.ReplaceCol(vec, i)
+			}
+			colexecutils.UpdateBatchState(s.outputBatch, b.Length(), b.Selection() != nil /* usesSel */, b.Selection())
+			return s.outputBatch, nil
 		}
 	}
 }
@@ -96,7 +136,7 @@ func (s *SerialUnorderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata
 				s.span.RecordStructured(stats.GetStats())
 			}
 		}
-		if meta := execinfra.GetTraceDataAsMetadata(s.span); meta != nil {
+		if meta := execinfra.GetTraceDataAsMetadata(s.flowCtx, s.span); meta != nil {
 			bufferedMeta = append(bufferedMeta, *meta)
 		}
 	}
@@ -107,12 +147,10 @@ func (s *SerialUnorderedSynchronizer) DrainMeta() []execinfrapb.ProducerMetadata
 }
 
 // Close is part of the colexecop.ClosableOperator interface.
-func (s *SerialUnorderedSynchronizer) Close() error {
-	for _, input := range s.inputs {
-		input.ToClose.CloseAndLogOnErr(s.EnsureCtx(), "serial unordered synchronizer")
-	}
+func (s *SerialUnorderedSynchronizer) Close(context.Context) error {
 	if s.span != nil {
 		s.span.Finish()
+		s.span = nil
 	}
 	return nil
 }

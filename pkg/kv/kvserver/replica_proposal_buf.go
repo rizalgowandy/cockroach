@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -14,9 +9,16 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/leases"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
@@ -24,8 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // propBuf is a multi-producer, single-consumer buffer for Raft proposals on a
@@ -72,7 +72,7 @@ type propBuf struct {
 
 	// assignedLAI represents the highest LAI that was assigned to a proposal.
 	// This is set at the same time as assignedClosedTimestamp.
-	assignedLAI uint64
+	assignedLAI kvpb.LeaseAppliedIndex
 	// assignedClosedTimestamp is the largest "closed timestamp" - i.e. the
 	// largest timestamp that was communicated to other replicas as closed,
 	// representing a promise that this leaseholder will not evaluate writes with
@@ -94,7 +94,13 @@ type propBuf struct {
 	testing struct {
 		// leaseIndexFilter can be used by tests to override the max lease index
 		// assigned to a proposal by returning a non-zero lease index.
-		leaseIndexFilter func(*ProposalData) (indexOverride uint64)
+		//
+		// If this filter is set, the lease index 1 is reserved for out-of-order
+		// proposals, and propBuf will never submit "real" proposals at index 1.
+		// Returning indices > 1 here is generally unsafe because this may cause
+		// unintended proposal reordering and closed timestamp regressions, as in
+		// https://github.com/cockroachdb/cockroach/issues/118017
+		leaseIndexFilter func(*ProposalData) kvpb.LeaseAppliedIndex
 		// insertFilter allows tests to inject errors at Insert() time.
 		insertFilter func(*ProposalData) error
 		// submitProposalFilter can be used by tests to observe and optionally
@@ -102,62 +108,45 @@ type propBuf struct {
 		// process of replication. Dropped proposals are still eligible to be
 		// reproposed due to ticks.
 		submitProposalFilter func(*ProposalData) (drop bool, err error)
-		// allowLeaseProposalWhenNotLeader, if set, makes the proposal buffer allow
-		// lease request proposals even when the replica inserting that proposal is
-		// not the Raft leader. This can be used in tests to allow a replica to
-		// acquire a lease without first moving the Raft leadership to it (e.g. it
-		// allows tests to expire leases by stopping the old leaseholder's liveness
-		// heartbeats and then expect other replicas to take the lease without
-		// worrying about Raft).
-		allowLeaseProposalWhenNotLeader bool
 		// dontCloseTimestamps inhibits the closing of timestamps.
 		dontCloseTimestamps bool
 	}
 }
 
-type rangeLeaderInfo struct {
-	// leaderKnown is set if the local Raft machinery knows who the leader is. If
-	// not set, all other fields are empty.
-	leaderKnown bool
-
-	// leader represents the Raft group's leader. Not set if leaderKnown is not
-	// set.
-	leader roachpb.ReplicaID
-	// iAmTheLeader is set if the local replica is the leader.
-	iAmTheLeader bool
-	// leaderEligibleForLease is set if the leader is known and its type of
-	// replica allows it to acquire a lease.
-	leaderEligibleForLease bool
+type singleBatchProposer interface {
+	getReplicaID() roachpb.ReplicaID
+	onErrProposalDropped([]raftpb.Entry, []*ProposalData, raftpb.StateType)
+	registerForTracing(*ProposalData, raftpb.Entry) bool
 }
 
 // A proposer is an object that uses a propBuf to coordinate Raft proposals.
 type proposer interface {
 	locker() sync.Locker
 	rlocker() sync.Locker
+
 	// The following require the proposer to hold (at least) a shared lock.
-	replicaID() roachpb.ReplicaID
+	singleBatchProposer
 	destroyed() destroyStatus
-	leaseAppliedIndex() uint64
+	leaseAppliedIndex() kvpb.LeaseAppliedIndex
 	enqueueUpdateCheck()
 	closedTimestampTarget() hlc.Timestamp
+	shouldCampaignOnRedirect(raftGroup proposerRaft, leaseType roachpb.LeaseType) bool
 
 	// The following require the proposer to hold an exclusive lock.
 	withGroupLocked(func(proposerRaft) error) error
 	registerProposalLocked(*ProposalData)
-	leaderStatusRLocked(raftGroup proposerRaft) rangeLeaderInfo
-	ownsValidLeaseRLocked(ctx context.Context, now hlc.ClockTimestamp) bool
-	// rejectProposalWithRedirectLocked rejects a proposal and redirects the
-	// proposer to try it on another node. This is used to sometimes reject lease
-	// acquisitions when another replica is the leader; the intended consequence
-	// of the rejection is that the request that caused the lease acquisition
-	// attempt is tried on the leader, at which point it should result in a lease
-	// acquisition attempt by that node (or, perhaps by then the leader will have
-	// already gotten a lease and the request can be serviced directly).
-	rejectProposalWithRedirectLocked(
+	campaignLocked(ctx context.Context)
+	rejectProposalWithErrLocked(ctx context.Context, prop *ProposalData, err error)
+
+	// verifyLeaseRequestSafetyRLocked checks whether a lease acquisition or
+	// transfer is safe to be proposed. Returns an error if the proposal should
+	// be rejected.
+	verifyLeaseRequestSafetyRLocked(
 		ctx context.Context,
-		prop *ProposalData,
-		redirectTo roachpb.ReplicaID,
-	)
+		raftGroup proposerRaft,
+		prevLease, nextLease roachpb.Lease,
+		bypassSafetyChecks bool,
+	) error
 
 	// leaseDebugRLocked returns info on the current lease.
 	leaseDebugRLocked() string
@@ -167,8 +156,9 @@ type proposer interface {
 // testing.
 type proposerRaft interface {
 	Step(raftpb.Message) error
+	Status() raft.Status
 	BasicStatus() raft.BasicStatus
-	ProposeConfChange(raftpb.ConfChangeI) error
+	Campaign() error
 }
 
 // Init initializes the proposal buffer and binds it to the provided proposer.
@@ -180,7 +170,7 @@ func (b *propBuf) Init(
 	b.clock = clock
 	b.evalTracker = tracker
 	b.settings = settings
-	b.assignedLAI = p.leaseAppliedIndex()
+	b.assignedLAI = max(p.leaseAppliedIndex(), kvstorage.InitialLeaseAppliedIndex)
 }
 
 // AllocatedIdx returns the highest index that was allocated. This generally
@@ -225,6 +215,13 @@ func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedReques
 	b.p.rlocker().Lock()
 	defer b.p.rlocker().Unlock()
 
+	if p.v2SeenDuringApplication {
+		// We should never see a proposal that has already been on the apply loop
+		// passed to `Insert`. The only place where such proposals can be seen is
+		// `ReinsertLocked`.
+		return errors.AssertionFailedf("proposal that was already applied passed to propBuf.Insert: %+v", p)
+	}
+
 	if filter := b.testing.insertFilter; filter != nil {
 		if err := filter(p); err != nil {
 			return err
@@ -239,7 +236,7 @@ func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedReques
 	}
 
 	if log.V(4) {
-		log.Infof(p.ctx, "submitting proposal %x", p.idKey)
+		log.KvExec.Infof(p.Context(), "submitting proposal %x", p.idKey)
 	}
 
 	// Insert the proposal into the buffer's array. The buffer now takes ownership
@@ -253,6 +250,13 @@ func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedReques
 // buffer back into the buffer to be reproposed at a new Raft log index. Unlike
 // Insert, it does not modify the command.
 func (b *propBuf) ReinsertLocked(ctx context.Context, p *ProposalData) error {
+	// NB: we can see proposals here that have already been applied
+	// (v2SeenDuringApplication==true). We want those to not be flushed again.
+	// However, we can also see a proposal here that is not applied yet while
+	// inserting but is applied by the time we flush. So we don't drop the
+	// proposal here, but instead in FlushLockedWithRaftGroup, to unify the two
+	// cases.
+
 	// Update the proposal buffer counter and determine which index we should
 	// insert at.
 	idx, err := b.allocateIndex(ctx, true /* wLocked */)
@@ -386,22 +390,20 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 	// at once. Building up batches of entries and proposing them with a single
 	// Step can dramatically reduce the number of messages required to commit
 	// and apply them.
-	buf := b.arr.asSlice()[:used]
+
 	ents := make([]raftpb.Entry, 0, used)
-
-	// Figure out leadership info. We'll use it to conditionally drop some
-	// requests.
-	var leaderInfo rangeLeaderInfo
-	if raftGroup != nil {
-		leaderInfo = b.p.leaderStatusRLocked(raftGroup)
-		// Sanity check.
-		if leaderInfo.leaderKnown && leaderInfo.leader == b.p.replicaID() && !leaderInfo.iAmTheLeader {
-			log.Fatalf(ctx,
-				"inconsistent Raft state: state %s while the current replica is also the lead: %d",
-				raftGroup.BasicStatus().RaftState, leaderInfo.leader)
+	// INVARIANT: buf[firstProp:nextProp] lines up with the ents slice.
+	firstProp, nextProp := 0, 0
+	buf := b.arr.asSlice()[:used]
+	defer func() {
+		// Clear buffer.
+		for i := range buf {
+			buf[i] = nil
 		}
-	}
+	}()
 
+	// Compute the closed timestamp target, which will be used to assign a closed
+	// timestamp to all proposals in this batch.
 	closedTSTarget := b.p.closedTimestampTarget()
 
 	// Remember the first error that we see when proposing the batch. We don't
@@ -411,64 +413,15 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 	var firstErr error
 	for i, p := range buf {
 		if p == nil {
-			log.Fatalf(ctx, "unexpected nil proposal in buffer")
+			log.KvExec.Fatalf(ctx, "unexpected nil proposal in buffer")
 			return 0, nil // unreachable, for linter
 		}
-		buf[i] = nil // clear buffer
 		reproposal := !p.tok.stillTracked()
 
-		// Handle an edge case about lease acquisitions: we don't want to forward
-		// lease acquisitions to another node (which is what happens when we're not
-		// the leader) because:
-		// a) if there is a different leader, that leader should acquire the lease
-		// itself and thus avoid a change of leadership caused by the leaseholder
-		// and leader being different (Raft leadership follows the lease), and
-		// b) being a follower, it's possible that this replica is behind in
-		// applying the log. Thus, there might be another lease in place that this
-		// follower doesn't know about, in which case the lease we're proposing here
-		// would be rejected. Not only would proposing such a lease be wasted work,
-		// but we're trying to protect against pathological cases where it takes a
-		// long time for this follower to catch up (for example because it's waiting
-		// for a snapshot, and the snapshot is queued behind many other snapshots).
-		// In such a case, we don't want all requests arriving at this node to be
-		// blocked on this lease acquisition (which is very likely to eventually
-		// fail anyway).
-		//
-		// Thus, we do one of two things:
-		// - if the leader is known, we reject this proposal and make sure the
-		// request that needed the lease is redirected to the leaseholder;
-		// - if the leader is not known, we don't do anything special here to
-		// terminate the proposal, but we know that Raft will reject it with a
-		// ErrProposalDropped. We'll eventually re-propose it once a leader is
-		// known, at which point it will either go through or be rejected based on
-		// whether or not it is this replica that became the leader.
-		//
-		// A special case is when the leader is known, but is ineligible to get the
-		// lease. In that case, we have no choice but to continue with the proposal.
-		//
-		// Lease extensions for a currently held lease always go through, to
-		// keep the lease alive until the normal lease transfer mechanism can
-		// colocate it with the leader.
-		if !leaderInfo.iAmTheLeader && p.Request.IsLeaseRequest() {
-			leaderKnownAndEligible := leaderInfo.leaderKnown && leaderInfo.leaderEligibleForLease
-			ownsCurrentLease := b.p.ownsValidLeaseRLocked(ctx, b.clock.NowAsClockTimestamp())
-			if leaderKnownAndEligible && !ownsCurrentLease && !b.testing.allowLeaseProposalWhenNotLeader {
-				log.VEventf(ctx, 2, "not proposing lease acquisition because we're not the leader; replica %d is",
-					leaderInfo.leader)
-				b.p.rejectProposalWithRedirectLocked(ctx, p, leaderInfo.leader)
-				p.tok.doneIfNotMovedLocked(ctx)
-				continue
-			}
-			// If the leader is not known, or if it is known but it's ineligible
-			// for the lease, continue with the proposal as explained above. We
-			// also send lease extensions for an existing leaseholder.
-			if ownsCurrentLease {
-				log.VEventf(ctx, 2, "proposing lease extension even though we're not the leader; we hold the current lease")
-			} else if !leaderInfo.leaderKnown {
-				log.VEventf(ctx, 2, "proposing lease acquisition even though we're not the leader; the leader is unknown")
-			} else {
-				log.VEventf(ctx, 2, "proposing lease acquisition even though we're not the leader; the leader is ineligible")
-			}
+		// Conditionally reject the proposal based on the state of the raft group.
+		if b.maybeRejectUnsafeProposalLocked(ctx, raftGroup, p) {
+			p.tok.doneIfNotMovedLocked(ctx)
+			continue
 		}
 
 		// Raft processing bookkeeping.
@@ -483,7 +436,7 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 			lb := b.evalTracker.LowerBound(ctx)
 			if wts.Less(lb) {
 				wts, lb := wts, lb // copies escape to heap
-				log.Fatalf(ctx, "%v", errorutil.UnexpectedWithIssueErrorf(72428,
+				log.KvExec.Fatalf(ctx, "%v", errorutil.UnexpectedWithIssueErrorf(72428,
 					"request writing below tracked lower bound: wts: %s < lb: %s; ba: %s; lease: %s.",
 					wts, lb, p.Request, b.p.leaseDebugRLocked()))
 			}
@@ -503,7 +456,8 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 		// If this is a reproposal, we don't reassign the LAI. We also don't
 		// reassign the closed timestamp: we could, in principle, but we'd have to
 		// make a copy of the encoded command as to not modify the copy that's
-		// already stored in the local replica's raft entry cache.
+		// already stored in the local replica's raft entry cache. We would rather
+		// have the proposal be immutable.
 		if !reproposal {
 			lai, closedTimestamp, err := b.allocateLAIAndClosedTimestampLocked(ctx, p, closedTSTarget)
 			if err != nil {
@@ -531,13 +485,16 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 			// Flush any previously batched (non-conf change) proposals to
 			// preserve the correct ordering or proposals. Later proposals
 			// will start a new batch.
-			if err := proposeBatch(raftGroup, b.p.replicaID(), ents); err != nil {
-				firstErr = err
+			propErr := proposeBatch(b.p, raftGroup, ents, buf[firstProp:nextProp])
+			if propErr != nil {
+				firstErr = propErr
 				continue
 			}
-			ents = ents[len(ents):]
 
-			confChangeCtx := ConfChangeContext{
+			ents = ents[len(ents):]
+			firstProp, nextProp = i+1, i+1
+
+			confChangeCtx := kvserverpb.ConfChangeContext{
 				CommandID: string(p.idKey),
 				Payload:   p.encodedCommand,
 			}
@@ -553,8 +510,19 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 				continue
 			}
 
-			if err := raftGroup.ProposeConfChange(
-				cc,
+			typ, data, err := raftpb.MarshalConfChange(cc)
+			if err != nil {
+				firstErr = err
+				continue
+			}
+			sl := []raftpb.Entry{{Type: typ, Data: data}}
+			// Config change entries must be proposed alone in a MsgProp, not
+			// batched with other entries. The raft leader relies on this
+			// invariant to reject invalid config changes via ErrProposalDropped
+			// (see stepLeader in pkg/raft/raft.go). We go through proposeBatch
+			// since there's observability in there.
+			if err := proposeBatch(
+				b.p, raftGroup, sl, []*ProposalData{p},
 			); err != nil && !errors.Is(err, raft.ErrProposalDropped) {
 				// Silently ignore dropped proposals (they were always silently
 				// ignored prior to the introduction of ErrProposalDropped).
@@ -576,12 +544,96 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 			ents = append(ents, raftpb.Entry{
 				Data: p.encodedCommand,
 			})
+			nextProp++
+			log.VEvent(p.Context(), 2, "flushing proposal to Raft")
 		}
 	}
 	if firstErr != nil {
 		return 0, firstErr
 	}
-	return used, proposeBatch(raftGroup, b.p.replicaID(), ents)
+
+	propErr := proposeBatch(b.p, raftGroup, ents, buf[firstProp:nextProp])
+	return used, propErr
+}
+
+var logCampaignOnRejectLease = log.Every(10 * time.Second)
+
+// maybeRejectUnsafeProposalLocked conditionally rejects proposals that are
+// deemed unsafe, given the current state of the raft group. Requests that may
+// be deemed unsafe and rejected at this level are those whose safety has some
+// dependency on raft leadership, follower progress, leadership term, commit
+// index, or other properties of raft. By rejecting these requests on the
+// "flushing" side of the proposal buffer (i.e. while holding the raftMu), we
+// can perform the safety checks without risk of the state of the raft group
+// changing before the proposal is passed to etcd/raft.
+//
+// Currently, the request types which may be rejected by this function are:
+//   - RequestLease when the proposer is not the raft leader (with caveats).
+//   - TransferLease when the proposer cannot guarantee that the lease transfer
+//     target does not currently need a Raft snapshot to catch up on its Raft log.
+//     In such cases, the proposer cannot guarantee that the lease transfer target
+//     will not need a Raft snapshot to catch up to and apply the lease transfer.
+//     This requires that the proposer is the raft leader.
+//
+// The function returns true if the proposal was rejected, and false if not.
+// If the proposal was rejected and true is returned, it will have been cleaned
+// up (passed to Replica.cleanupFailedProposalLocked) and finished
+// (ProposalData.finishApplication called).
+func (b *propBuf) maybeRejectUnsafeProposalLocked(
+	ctx context.Context, raftGroup proposerRaft, p *ProposalData,
+) (rejected bool) {
+	if raftGroup == nil {
+		// If we do not have a raft group, we won't try to propose this proposal.
+		// Instead, we will register the proposal so that it can be reproposed later
+		// with a raft group. Wait until that point to determine whether to reject
+		// the proposal or not.
+		return false
+	}
+	if p.v2SeenDuringApplication {
+		// Due to `refreshProposalsLocked`, we can end up with proposals that are
+		// already applied. We just want to drop those on the floor as we know
+		// that they have fully been taken care of.
+		return true
+	}
+	if p.Request.IsSingleRequestLeaseRequest() || p.Request.IsSingleTransferLeaseRequest() {
+		var prevLease roachpb.Lease
+		var bypassSafetyChecks bool
+		req := p.Request.Requests[0].GetInner()
+		switch t := req.(type) {
+		case *kvpb.RequestLeaseRequest:
+			prevLease = t.PrevLease
+			// Bypass safety checks for lease requests that are not for the proposer.
+			// These are only proposed by tests that want to mock out a remote lease
+			// acquisition.
+			bypassSafetyChecks = t.Lease.Replica.ReplicaID != b.p.getReplicaID()
+		case *kvpb.TransferLeaseRequest:
+			prevLease = t.PrevLease
+			bypassSafetyChecks = t.BypassSafetyChecks
+		default:
+			panic("unexpected")
+		}
+		nextLease := *p.command.ReplicatedEvalResult.State.Lease
+
+		err := b.p.verifyLeaseRequestSafetyRLocked(ctx, raftGroup, prevLease, nextLease, bypassSafetyChecks)
+		if err != nil {
+			b.p.rejectProposalWithErrLocked(ctx, p, err)
+
+			// TODO(nvanbenschoten): move this to replica_range_lease.go when we
+			// support build-time verification for lease acquisition. See #118435.
+			if p.Request.IsSingleRequestLeaseRequest() && b.p.shouldCampaignOnRedirect(raftGroup, nextLease.Type()) {
+				const format = "campaigning because Raft leader (id=%d) not live in node liveness map"
+				lead := raftGroup.BasicStatus().Lead
+				if logCampaignOnRejectLease.ShouldLog() {
+					log.KvExec.Infof(ctx, format, lead)
+				} else {
+					log.VEventf(ctx, 2, format, lead)
+				}
+				b.p.campaignLocked(ctx)
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // allocateLAIAndClosedTimestampLocked computes a LAI and closed timestamp to be
@@ -598,15 +650,29 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 // in the local replica's raft entry cache).
 func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 	ctx context.Context, p *ProposalData, closedTSTarget hlc.Timestamp,
-) (uint64, hlc.Timestamp, error) {
+) (kvpb.LeaseAppliedIndex, hlc.Timestamp, error) {
 
-	// Request a new max lease applied index for any request that isn't itself
-	// a lease request. Lease requests don't need unique max lease index values
-	// because their max lease indexes are ignored. See checkForcedErr.
-	if !p.Request.IsLeaseRequest() {
+	// Assign a LeaseAppliedIndex (see checkForcedErr). These provide replay
+	// protection.
+	//
+	// Proposals coming from lease requests (not transfers) have their own replay
+	// protection, via the lease sequence and the previous lease's proposal
+	// timestamp; this is necessary as lease requests are proposed while not
+	// holding the lease (and so the proposed does not know a valid LAI to use).
+	// They will not check the lease applied index proposed from followers). While
+	// it would be legal to still assign a LAI to lease requests, historically it
+	// has been mildly inconvenient in testing, and might belie the fact that
+	// LAI-related concepts just don't apply. Instead, we assign a zero LAI to
+	// lease proposals, with a condition that matches that used in
+	// checkForcedError to identify lease requests. Note that lease *transfers*
+	// are only ever proposed by leaseholders, and they use the LAI to prevent
+	// replays (though they could in principle also be handled like lease
+	// requests).
+	var lai kvpb.LeaseAppliedIndex
+	if !p.Request.IsSingleRequestLeaseRequest() {
 		b.assignedLAI++
+		lai = b.assignedLAI
 	}
-	lai := b.assignedLAI
 
 	if filter := b.testing.leaseIndexFilter; filter != nil {
 		if override := filter(p); override != 0 {
@@ -627,6 +693,7 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 	// applies. The command application side doesn't bother protecting against
 	// such regressions. Besides, the considerations for brand new leases below
 	// also apply.
+	//
 	// - For a brand new lease, one might think that the lease start time can be
 	// considered a closed timestamp(*) since, if this replica gets the lease, it
 	// will not evaluate writes at lower timestamps. Unfortunately, there's a
@@ -635,14 +702,24 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 	// happen that the range is in the process of merging with its left neighbor.
 	// If this range has already been Subsumed as the RHS of a merge then, after
 	// merge, the joint range will allow writes to the former RHS's key space at
-	// timestamps above the RHS's freeze start (which is below the start time of
-	// this lease). Thus, if this lease were to close its start timestamp while
-	// subsumed, then it'd be possible for follower reads to be served before the
-	// merge finalizes at timestamps that would become un-closed after the merge.
+	// timestamps above the RHS's closed timestamp (say t1) at freeze start
+	// (which is below the start time of this lease, say t2). Thus, if this
+	// lease were to close its start timestamp (t2) while subsumed, then it'd be
+	// possible for follower reads to be served before the merge finalizes at
+	// timestamps that would become un-closed after the merge, i.e., interval
+	// (t1, t2].
+	//
 	// Since this scenario is about subsumed ranges, we could make a distinction
 	// between brand new leases for subsumed ranges versus other brand new leases,
 	// and let the former category close the lease start time. But, for
 	// simplicity, we don't close timestamps on any lease requests.
+	//
+	// The same logic applies to SubsumeRequest (when it performs a write): the
+	// closed timestamp it gathers in SubsumeResponse.ClosedTimestamp is t1, but
+	// if the proposal of the SubsumeRequest advances the closed timestamp to
+	// t2, reads would be allowed over the interval (t1, t2] which would
+	// subsequently become un-closed. So SubsumeRequests also don't advance the
+	// closed timestamp.
 	//
 	// As opposed to lease requests, lease transfers behave like regular
 	// proposals: they get a closed timestamp based on closedTSTarget. Note that
@@ -658,7 +735,7 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 	// timestamps carried by lease requests, make sure to resurrect the old
 	// TestRejectedLeaseDoesntDictateClosedTimestamp and protect against that
 	// scenario.
-	if p.Request.IsLeaseRequest() {
+	if p.Request.IsSingleRequestLeaseRequest() || p.Request.IsSingleSubsumeRequest() {
 		return lai, hlc.Timestamp{}, nil
 	}
 
@@ -700,7 +777,7 @@ func (b *propBuf) allocateLAIAndClosedTimestampLocked(
 // marshallLAIAndClosedTimestampToProposalLocked modifies p.encodedCommand,
 // adding the LAI and closed timestamp.
 func (b *propBuf) marshallLAIAndClosedTimestampToProposalLocked(
-	ctx context.Context, p *ProposalData, lai uint64, closedTimestamp hlc.Timestamp,
+	ctx context.Context, p *ProposalData, lai kvpb.LeaseAppliedIndex, closedTimestamp hlc.Timestamp,
 ) error {
 	buf := &b.scratchFooter
 	buf.MaxLeaseIndex = lai
@@ -724,11 +801,11 @@ func (b *propBuf) marshallLAIAndClosedTimestampToProposalLocked(
 	// capacity for this footer.
 	preLen := len(p.encodedCommand)
 	p.encodedCommand = p.encodedCommand[:preLen+buf.Size()]
-	_, err := protoutil.MarshalTo(buf, p.encodedCommand[preLen:])
+	_, err := protoutil.MarshalToSizedBuffer(buf, p.encodedCommand[preLen:])
 	return err
 }
 
-func (b *propBuf) forwardAssignedLAILocked(v uint64) {
+func (b *propBuf) forwardAssignedLAILocked(v kvpb.LeaseAppliedIndex) {
 	if b.assignedLAI < v {
 		b.assignedLAI = v
 	}
@@ -739,22 +816,43 @@ func (b *propBuf) forwardClosedTimestampLocked(closedTS hlc.Timestamp) bool {
 	return b.assignedClosedTimestamp.Forward(closedTS)
 }
 
-func proposeBatch(raftGroup proposerRaft, replID roachpb.ReplicaID, ents []raftpb.Entry) error {
+func proposeBatch(
+	p singleBatchProposer, raftGroup proposerRaft, ents []raftpb.Entry, props []*ProposalData,
+) (_ error) {
+	if len(ents) != len(props) {
+		return errors.AssertionFailedf("ents and props don't match up: %v and %v", ents, props)
+	}
 	if len(ents) == 0 {
 		return nil
 	}
-	if err := raftGroup.Step(raftpb.Message{
+	replID := p.getReplicaID()
+	err := raftGroup.Step(raftpb.Message{
 		Type:    raftpb.MsgProp,
-		From:    uint64(replID),
+		From:    raftpb.PeerID(replID),
 		Entries: ents,
-	}); errors.Is(err, raft.ErrProposalDropped) {
+	})
+	if err != nil && errors.Is(err, raft.ErrProposalDropped) {
 		// Silently ignore dropped proposals (they were always silently
 		// ignored prior to the introduction of ErrProposalDropped).
 		// TODO(bdarnell): Handle ErrProposalDropped better.
 		// https://github.com/cockroachdb/cockroach/issues/21849
-		return nil
-	} else if err != nil {
+		for _, p := range props {
+			log.Event(p.Context(), "entry dropped")
+		}
+		p.onErrProposalDropped(ents, props, raftGroup.BasicStatus().RaftState)
+		return nil //nolint:returnerrcheck
+	}
+	if err != nil {
 		return err
+	}
+
+	// Register the proposal with rafttrace. This will add the trace to the raft
+	// lifecycle. We trace at most one entry per batch, so break after the first
+	// one is successfully registered.
+	for i := range ents {
+		if p.registerForTracing(props[i], ents[i]) {
+			break
+		}
 	}
 	return nil
 }
@@ -769,7 +867,7 @@ func proposeBatch(raftGroup proposerRaft, replID roachpb.ReplicaID, ents []raftp
 // into the proposals map before canceling all proposals.
 func (b *propBuf) FlushLockedWithoutProposing(ctx context.Context) {
 	if _, err := b.FlushLockedWithRaftGroup(ctx, nil /* raftGroup */); err != nil {
-		log.Fatalf(ctx, "unexpected error: %+v", err)
+		log.KvExec.Fatalf(ctx, "unexpected error: %+v", err)
 	}
 }
 
@@ -779,7 +877,7 @@ func (b *propBuf) FlushLockedWithoutProposing(ctx context.Context) {
 // Similarly, appliedLAI is the highest LAI of an applied command; the propBuf
 // will propose commands with higher LAIs.
 func (b *propBuf) OnLeaseChangeLocked(
-	leaseOwned bool, appliedClosedTS hlc.Timestamp, appliedLAI uint64,
+	leaseOwned bool, appliedClosedTS hlc.Timestamp, appliedLAI kvpb.LeaseAppliedIndex,
 ) {
 	if leaseOwned {
 		b.forwardClosedTimestampLocked(appliedClosedTS)
@@ -858,7 +956,7 @@ func (t *TrackedRequestToken) stillTracked() bool {
 // neutered; calling DoneIfNotMoved on it becomes a no-op.
 func (t *TrackedRequestToken) Move(ctx context.Context) TrackedRequestToken {
 	if t.done {
-		log.Fatalf(ctx, "attempting to Move() after Done() call")
+		log.KvExec.Fatalf(ctx, "attempting to Move() after Done() call")
 	}
 	cpy := *t
 	t.done = true
@@ -893,13 +991,13 @@ func (b *propBuf) TrackEvaluatingRequest(
 // ensuring that no future writes ever write below it.
 //
 // Returns false in the following cases:
-// 1) target is below the propBuf's closed timestamp. This ensures that the
-//    side-transport (the caller) is prevented from publishing closed timestamp
-//    regressions. In other words, for a given LAI, the side-transport only
-//    publishes closed timestamps higher than what Raft published.
-// 2) There are requests evaluating at timestamps equal to or below target (as
-//    tracked by the evalTracker). We can't close timestamps at or above these
-//    requests' write timestamps.
+//  1. target is below the propBuf's closed timestamp. This ensures that the
+//     side-transport (the caller) is prevented from publishing closed timestamp
+//     regressions. In other words, for a given LAI, the side-transport only
+//     publishes closed timestamps higher than what Raft published.
+//  2. There are requests evaluating at timestamps equal to or below target (as
+//     tracked by the evalTracker). We can't close timestamps at or above these
+//     requests' write timestamps.
 func (b *propBuf) MaybeForwardClosedLocked(ctx context.Context, target hlc.Timestamp) bool {
 	if lb := b.evalTracker.LowerBound(ctx); !lb.IsEmpty() && lb.LessEq(target) {
 		return false
@@ -976,23 +1074,23 @@ type replicaProposer Replica
 var _ proposer = &replicaProposer{}
 
 func (rp *replicaProposer) locker() sync.Locker {
-	return &rp.mu.RWMutex
+	return &rp.mu.ReplicaMutex
 }
 
 func (rp *replicaProposer) rlocker() sync.Locker {
-	return rp.mu.RWMutex.RLocker()
+	return rp.mu.ReplicaMutex.RLocker()
 }
 
-func (rp *replicaProposer) replicaID() roachpb.ReplicaID {
-	return rp.mu.replicaID
+func (rp *replicaProposer) getReplicaID() roachpb.ReplicaID {
+	return rp.replicaID
 }
 
 func (rp *replicaProposer) destroyed() destroyStatus {
-	return rp.mu.destroyStatus
+	return rp.shMu.destroyStatus
 }
 
-func (rp *replicaProposer) leaseAppliedIndex() uint64 {
-	return rp.mu.state.LeaseAppliedIndex
+func (rp *replicaProposer) leaseAppliedIndex() kvpb.LeaseAppliedIndex {
+	return rp.shMu.state.LeaseAppliedIndex
 }
 
 func (rp *replicaProposer) enqueueUpdateCheck() {
@@ -1003,79 +1101,120 @@ func (rp *replicaProposer) closedTimestampTarget() hlc.Timestamp {
 	return (*Replica)(rp).closedTimestampTargetRLocked()
 }
 
+func (rp *replicaProposer) registerForTracing(p *ProposalData, e raftpb.Entry) bool {
+	return (*Replica)(rp).mu.raftTracer.MaybeRegister(p.Context(), e)
+}
+
 func (rp *replicaProposer) withGroupLocked(fn func(raftGroup proposerRaft) error) error {
-	// Pass true for mayCampaignOnWake because we're about to propose a command.
-	return (*Replica)(rp).withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
+	return (*Replica)(rp).withRaftGroupLocked(func(raftGroup *raft.RawNode) (bool, error) {
 		// We're proposing a command here so there is no need to wake the leader
 		// if we were quiesced. However, we should make sure we are unquiesced.
-		(*Replica)(rp).unquiesceLocked()
-		return false /* unquiesceLocked */, fn(raftGroup)
+		(*Replica)(rp).maybeUnquiesceLocked(false /* wakeLeader */, true /* mayCampaign */)
+		return false /* maybeUnquiesceLocked */, fn(raftGroup)
 	})
 }
 
+func (rp *replicaProposer) onErrProposalDropped(
+	ents []raftpb.Entry, _ []*ProposalData, stateType raftpb.StateType,
+) {
+	n := int64(len(ents))
+	rp.store.metrics.RaftProposalsDropped.Inc(n)
+	if stateType == raftpb.StateLeader {
+		rp.store.metrics.RaftProposalsDroppedLeader.Inc(n)
+	}
+}
+
 func (rp *replicaProposer) leaseDebugRLocked() string {
-	return rp.mu.state.Lease.String()
+	return rp.shMu.state.Lease.String()
 }
 
 func (rp *replicaProposer) registerProposalLocked(p *ProposalData) {
 	// Record when the proposal was submitted to Raft so that we can later
 	// decide if/when to re-propose it.
 	p.proposedAtTicks = rp.mu.ticks
+	if p.createdAtTicks == 0 {
+		p.createdAtTicks = rp.mu.ticks
+	}
+	rp.mu.lastProposalAtTicks = rp.mu.ticks // monotonically increasing
+	if prev := rp.mu.proposals[p.idKey]; prev != nil && prev != p {
+		log.KvExec.Fatalf(rp.store.AnnotateCtx(context.Background()), "two proposals under same ID:\n%+v,\n%+v", prev, p)
+	}
+	// NB: we can see finished proposals inserted here. We don't like it but
+	// it's currently possible.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/97605
 	rp.mu.proposals[p.idKey] = p
 }
 
-func (rp *replicaProposer) leaderStatusRLocked(raftGroup proposerRaft) rangeLeaderInfo {
+func (rp *replicaProposer) shouldCampaignOnRedirect(
+	raftGroup proposerRaft, leaseType roachpb.LeaseType,
+) bool {
 	r := (*Replica)(rp)
+	livenessMap, _ := r.store.livenessMap.Load().(livenesspb.IsLiveMap)
+	return shouldCampaignOnLeaseRequestRedirect(
+		raftGroup.BasicStatus(),
+		livenessMap,
+		r.descRLocked(),
+		leaseType,
+		r.store.Clock().Now(),
+	)
+}
 
-	status := raftGroup.BasicStatus()
-	iAmTheLeader := status.RaftState == raft.StateLeader
-	leader := status.Lead
-	leaderKnown := leader != raft.None
-	var leaderEligibleForLease bool
-	rangeDesc := r.descRLocked()
-	if leaderKnown {
-		// Figure out if the leader is eligible for getting a lease.
-		leaderRep, ok := rangeDesc.GetReplicaDescriptorByID(roachpb.ReplicaID(leader))
-		if !ok {
-			// There is a leader, but it's not part of our descriptor. The descriptor
-			// must be stale, so we are behind in applying the log. We don't want the
-			// lease ourselves (as we're behind), so let's assume that the leader is
-			// eligible. If it proves that it isn't, we might be asked to get the
-			// lease again, and by then hopefully we will have caught up.
-			leaderEligibleForLease = true
+func (rp *replicaProposer) campaignLocked(ctx context.Context) {
+	(*Replica)(rp).campaignLocked(ctx)
+}
+
+func (rp *replicaProposer) verifyLeaseRequestSafetyRLocked(
+	ctx context.Context,
+	raftGroup proposerRaft,
+	prevLease, nextLease roachpb.Lease,
+	bypassSafetyChecks bool,
+) error {
+	r := (*Replica)(rp)
+	st := r.leaseSettings(ctx)
+	raftStatus := raftGroup.Status()
+	in := leases.VerifyInput{
+		LocalStoreID:       r.StoreID(),
+		LocalReplicaID:     r.ReplicaID(),
+		Desc:               r.descRLocked(),
+		RaftStatus:         &raftStatus,
+		RaftCompacted:      r.raftCompactedIndexRLocked(),
+		PrevLease:          prevLease,
+		PrevLeaseExpired:   !r.ownsValidLeaseRLocked(ctx, r.Clock().NowAsClockTimestamp()),
+		NextLeaseHolder:    nextLease.Replica,
+		BypassSafetyChecks: bypassSafetyChecks,
+		DesiredLeaseType:   r.desiredLeaseType(r.descRLocked()),
+	}
+	// NOTE: we do NOT check send-queue status here. Calling SendStreamStats
+	// is unsafe under repl.mu (lock ordering: rcReferenceUpdateMu < repl.mu).
+	// The above-raft check in InitOrJoinRequest handles the send-queue check
+	// before lease revocation. The proposal buffer retains the airtight
+	// snapshot check via ReplicaMayNeedSnapshot in leases.Verify.
+	if err := leases.Verify(ctx, st, in); err != nil {
+		if in.Transfer() {
+			// The lease transfer is deemed to be unsafe. The intended consequence of
+			// the rejection is that the lease transfer attempt will be rejected.
+			// Higher levels that decide whether or not to attempt a lease transfer
+			// have weaker versions of the same check, so we don't expect to see
+			// repeated lease transfer rejections.
+			r.store.metrics.LeaseTransferErrorCount.Inc(1)
 		} else {
-			err := roachpb.CheckCanReceiveLease(leaderRep, rangeDesc)
-			leaderEligibleForLease = err == nil
+			// The lease acquisition is deemed to be unsafe. the intended consequence
+			// of the rejection is that the request that caused the lease acquisition
+			// attempt is redirected and tried on the leader, at which point it should
+			// result in a lease acquisition attempt by that node (or, perhaps by then
+			// the leader will have already gotten a lease and the request can be
+			// serviced directly).
+			r.store.metrics.LeaseRequestErrorCount.Inc(1)
 		}
+		return err
 	}
-	return rangeLeaderInfo{
-		leaderKnown:            leaderKnown,
-		leader:                 roachpb.ReplicaID(leader),
-		iAmTheLeader:           iAmTheLeader,
-		leaderEligibleForLease: leaderEligibleForLease,
-	}
+	return nil
 }
 
-func (rp *replicaProposer) ownsValidLeaseRLocked(ctx context.Context, now hlc.ClockTimestamp) bool {
-	return (*Replica)(rp).ownsValidLeaseRLocked(ctx, now)
-}
-
-// rejectProposalWithRedirectLocked is part of the proposer interface.
-func (rp *replicaProposer) rejectProposalWithRedirectLocked(
-	ctx context.Context, prop *ProposalData, redirectTo roachpb.ReplicaID,
+func (rp *replicaProposer) rejectProposalWithErrLocked(
+	ctx context.Context, prop *ProposalData, err error,
 ) {
-	r := (*Replica)(rp)
-	rangeDesc := r.descRLocked()
-	storeID := r.store.StoreID()
-	r.store.metrics.LeaseRequestErrorCount.Inc(1)
-	redirectRep, _ /* ok */ := rangeDesc.GetReplicaDescriptorByID(redirectTo)
-	speculativeLease := roachpb.Lease{
-		Replica: redirectRep,
-	}
-	log.VEventf(ctx, 2, "redirecting proposal to node %s; request: %s", redirectRep.NodeID, prop.Request)
-	r.cleanupFailedProposalLocked(prop)
-	prop.finishApplication(ctx, proposalResult{
-		Err: roachpb.NewError(newNotLeaseHolderError(
-			speculativeLease, storeID, rangeDesc, "refusing to acquire lease on follower")),
-	})
+	(*Replica)(rp).cleanupFailedProposalLocked(prop)
+	prop.finishApplication(ctx, makeProposalResultPErr(kvpb.NewError(err)))
 }

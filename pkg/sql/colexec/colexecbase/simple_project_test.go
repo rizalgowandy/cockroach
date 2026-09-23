@@ -1,16 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecbase_test
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -19,9 +15,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,9 +90,9 @@ func TestSimpleProjectOp(t *testing.T) {
 // TestSimpleProjectOpWithUnorderedSynchronizer sets up the following
 // structure:
 //
-//  input 1 --
-//            | --> unordered synchronizer --> simpleProjectOp --> constInt64Op
-//  input 2 --
+//	input 1 --
+//	          | --> unordered synchronizer --> simpleProjectOp --> constInt64Op
+//	input 2 --
 //
 // and makes sure that the output is as expected. The idea is to test
 // simpleProjectOp in case when it receives multiple "different internally"
@@ -101,6 +100,21 @@ func TestSimpleProjectOp(t *testing.T) {
 func TestSimpleProjectOpWithUnorderedSynchronizer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	// Simulate the production vectorized flow setup where each input gets its
+	// own streaming allocator, etc.
+	memAccs := [2]mon.BoundAccount{
+		testMemMonitor.MakeBoundAccount(),
+		testMemMonitor.MakeBoundAccount(),
+	}
+	defer memAccs[0].Close(ctx)
+	defer memAccs[1].Close(ctx)
+	allocators := [2]*colmem.Allocator{
+		colmem.NewAllocator(ctx, &memAccs[0], testColumnFactory),
+		colmem.NewAllocator(ctx, &memAccs[1], testColumnFactory),
+	}
+
 	inputTypes := []*types.T{types.Bytes, types.Float}
 	constVal := int64(42)
 	var wg sync.WaitGroup
@@ -119,9 +133,14 @@ func TestSimpleProjectOpWithUnorderedSynchronizer(t *testing.T) {
 			var input colexecop.Operator
 			parallelUnorderedSynchronizerInputs := make([]colexecargs.OpWithMetaInfo, len(inputs))
 			for i := range parallelUnorderedSynchronizerInputs {
+				// Currently, both inputs as well as the root of the operator
+				// tree reference the testAllocator, but that will lead to the
+				// data race. In production, each would have their own allocator
+				// so we update the inputs with their separate ones.
+				inputs[i].(colexectestutils.AllocatorHolder).SetAllocator(allocators[i])
 				parallelUnorderedSynchronizerInputs[i].Root = inputs[i]
 			}
-			input = colexec.NewParallelUnorderedSynchronizer(parallelUnorderedSynchronizerInputs, &wg)
+			input = colexec.NewParallelUnorderedSynchronizer(&execinfra.FlowCtx{Local: true, Gateway: true}, 0 /* processorID */, testAllocator, inputTypes, parallelUnorderedSynchronizerInputs, &wg)
 			input = colexecbase.NewSimpleProjectOp(input, len(inputTypes), []uint32{0})
 			return colexecbase.NewConstOp(testAllocator, input, types.Int, constVal, 1)
 		})

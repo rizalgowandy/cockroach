@@ -1,43 +1,37 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package mutations
 
 import (
 	"sync/atomic"
 
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 )
 
 const productionMaxBatchSize = 10000
 
 var maxBatchSize = defaultMaxBatchSize
 
-var defaultMaxBatchSize = int64(util.ConstantWithMetamorphicTestRange(
+var defaultMaxBatchSize = int64(metamorphic.ConstantWithTestRange(
 	"max-batch-size",
 	productionMaxBatchSize, /* defaultValue */
 	1,                      /* min */
 	productionMaxBatchSize, /* max */
 ))
 
-var testingMaxBatchByteSize = util.ConstantWithMetamorphicTestRange(
+var testingMaxBatchByteSize = metamorphic.ConstantWithTestRange(
 	"max-batch-byte-size",
 	0,      // we'll use the cluster setting instead if we see zero.
 	1,      /* min */
 	32<<20, /* max */
 )
 
-// MaxBatchSize returns the max number of entries in the KV batch for a
-// mutation operation (delete, insert, update, upsert) - including secondary
-// index updates, FK cascading updates, etc - before the current KV batch is
-// executed and a new batch is started.
+// MaxBatchSize returns the max number of rows in the SQL-level batch for a
+// mutation operation (delete, insert, update, upsert). This only includes
+// modified rows from the primary index, not any secondary index rows.
 //
 // If forceProductionMaxBatchSize is true, then the "production" value will be
 // returned regardless of whether the build is metamorphic or not. This should

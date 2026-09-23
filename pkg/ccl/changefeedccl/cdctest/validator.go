@@ -1,32 +1,38 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdctest
 
 import (
 	"bytes"
+	"context"
 	gosql "database/sql"
 	gojson "encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // Validator checks for violations of our changefeed ordering and delivery
 // guarantees in a single table.
 type Validator interface {
 	// NoteRow accepts a changed row entry.
-	NoteRow(partition string, key, value string, updated hlc.Timestamp) error
+	NoteRow(partition, key, value string, updated hlc.Timestamp, topic string) error
 	// NoteResolved accepts a resolved timestamp entry.
 	NoteResolved(partition string, resolved hlc.Timestamp) error
 	// Failures returns any violations seen so far.
@@ -67,7 +73,7 @@ var _ StreamValidator = &orderValidator{}
 type noOpValidator struct{}
 
 // NoteRow accepts a changed row entry.
-func (v *noOpValidator) NoteRow(string, string, string, hlc.Timestamp) error { return nil }
+func (v *noOpValidator) NoteRow(string, string, string, hlc.Timestamp, string) error { return nil }
 
 // NoteResolved accepts a resolved timestamp entry.
 func (v *noOpValidator) NoteResolved(string, hlc.Timestamp) error { return nil }
@@ -128,7 +134,9 @@ func (v *orderValidator) GetValuesForKeyBelowTimestamp(
 }
 
 // NoteRow implements the Validator interface.
-func (v *orderValidator) NoteRow(partition string, key, value string, updated hlc.Timestamp) error {
+func (v *orderValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
 	if prev, ok := v.partitionForKey[key]; ok && prev != partition {
 		v.failures = append(v.failures, fmt.Sprintf(
 			`key [%s] received on two partitions: %s and %s`, key, prev, partition,
@@ -143,8 +151,11 @@ func (v *orderValidator) NoteRow(partition string, key, value string, updated hl
 	})
 	seen := timestampsIdx < len(timestampValueTuples) &&
 		timestampValueTuples[timestampsIdx].ts == updated
+	if seen {
+		return nil
+	}
 
-	if !seen && len(timestampValueTuples) > 0 &&
+	if len(timestampValueTuples) > 0 &&
 		updated.Less(timestampValueTuples[len(timestampValueTuples)-1].ts) {
 		v.failures = append(v.failures, fmt.Sprintf(
 			`topic %s partition %s: saw new row timestamp %s after %s was seen`,
@@ -153,21 +164,20 @@ func (v *orderValidator) NoteRow(partition string, key, value string, updated hl
 			timestampValueTuples[len(timestampValueTuples)-1].ts.AsOfSystemTime(),
 		))
 	}
-	if !seen && updated.Less(v.resolved[partition]) {
+	latestResolved := v.resolved[partition]
+	if updated.Less(latestResolved) {
 		v.failures = append(v.failures, fmt.Sprintf(
 			`topic %s partition %s: saw new row timestamp %s after %s was resolved`,
-			v.topic, partition, updated.AsOfSystemTime(), v.resolved[partition].AsOfSystemTime(),
+			v.topic, partition, updated.AsOfSystemTime(), latestResolved.AsOfSystemTime(),
 		))
 	}
 
-	if !seen {
-		v.keyTimestampAndValues[key] = append(
-			append(timestampValueTuples[:timestampsIdx], timestampValue{
-				ts:    updated,
-				value: value,
-			}),
-			timestampValueTuples[timestampsIdx:]...)
-	}
+	v.keyTimestampAndValues[key] = append(
+		append(timestampValueTuples[:timestampsIdx], timestampValue{
+			ts:    updated,
+			value: value,
+		}),
+		timestampValueTuples[timestampsIdx:]...)
 	return nil
 }
 
@@ -190,6 +200,7 @@ type beforeAfterValidator struct {
 	table          string
 	primaryKeyCols []string
 	resolved       map[string]hlc.Timestamp
+	diff           bool
 
 	failures []string
 }
@@ -197,7 +208,7 @@ type beforeAfterValidator struct {
 // NewBeforeAfterValidator returns a Validator verifies that the "before" and
 // "after" fields in each row agree with the source table when performing AS OF
 // SYSTEM TIME lookups before and at the row's timestamp.
-func NewBeforeAfterValidator(sqlDB *gosql.DB, table string) (Validator, error) {
+func NewBeforeAfterValidator(sqlDB *gosql.DB, table string, diff bool) (Validator, error) {
 	primaryKeyCols, err := fetchPrimaryKeyCols(sqlDB, table)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetchPrimaryKeyCols failed")
@@ -206,6 +217,7 @@ func NewBeforeAfterValidator(sqlDB *gosql.DB, table string) (Validator, error) {
 	return &beforeAfterValidator{
 		sqlDB:          sqlDB,
 		table:          table,
+		diff:           diff,
 		primaryKeyCols: primaryKeyCols,
 		resolved:       make(map[string]hlc.Timestamp),
 	}, nil
@@ -213,33 +225,50 @@ func NewBeforeAfterValidator(sqlDB *gosql.DB, table string) (Validator, error) {
 
 // NoteRow implements the Validator interface.
 func (v *beforeAfterValidator) NoteRow(
-	partition string, key, value string, updated hlc.Timestamp,
+	partition, key, value string, updated hlc.Timestamp, topic string,
 ) error {
-	var primaryKeyDatums []interface{}
-	if err := gojson.Unmarshal([]byte(key), &primaryKeyDatums); err != nil {
+	keyJSON, err := json.ParseJSON(key)
+	if err != nil {
 		return err
 	}
-	if len(primaryKeyDatums) != len(v.primaryKeyCols) {
+	keyJSONAsArray, notArray := keyJSON.AsArray()
+	if !notArray || len(keyJSONAsArray) != len(v.primaryKeyCols) {
 		return errors.Errorf(
-			`expected primary key columns %s got datums %s`, v.primaryKeyCols, primaryKeyDatums)
+			`notArray: %t expected primary key columns %s got datums %s`,
+			notArray, v.primaryKeyCols, keyJSONAsArray)
 	}
 
-	type wrapper struct {
-		After  map[string]interface{} `json:"after"`
-		Before map[string]interface{} `json:"before"`
+	valueJSON, err := json.ParseJSON(value)
+	if err != nil {
+		return err
 	}
-	var rowJSON wrapper
-	if err := gojson.Unmarshal([]byte(value), &rowJSON); err != nil {
+
+	afterJSON, err := valueJSON.FetchValKey("after")
+	if err != nil {
+		return err
+	}
+
+	beforeJson, err := valueJSON.FetchValKey("before")
+	if err != nil {
 		return err
 	}
 
 	// Check that the "after" field agrees with the row in the table at the
 	// updated timestamp.
-	if err := v.checkRowAt("after", primaryKeyDatums, rowJSON.After, updated); err != nil {
+	if err := v.checkRowAt("after", keyJSONAsArray, afterJSON, updated); err != nil {
 		return err
 	}
 
-	if v.resolved[partition].IsEmpty() && rowJSON.Before == nil {
+	if !v.diff {
+		// If the diff option is not specified in the change feed,
+		// we don't expect the rows to contain a "before" field.
+		if beforeJson != nil {
+			return errors.Errorf(`expected before to be nil, got %s`, beforeJson.String())
+		}
+		return nil
+	}
+
+	if v.resolved[partition].IsEmpty() && (beforeJson == nil || beforeJson.Type() == json.NullJSONType) {
 		// If the initial scan hasn't completed for this partition,
 		// we don't require the rows to contain a "before" field.
 		return nil
@@ -247,15 +276,15 @@ func (v *beforeAfterValidator) NoteRow(
 
 	// Check that the "before" field agrees with the row in the table immediately
 	// before the updated timestamp.
-	return v.checkRowAt("before", primaryKeyDatums, rowJSON.Before, updated.Prev())
+	return v.checkRowAt("before", keyJSONAsArray, beforeJson, updated.Prev())
 }
 
 func (v *beforeAfterValidator) checkRowAt(
-	field string, primaryKeyDatums []interface{}, rowDatums map[string]interface{}, ts hlc.Timestamp,
+	field string, primaryKeyDatums []json.JSON, rowDatums json.JSON, ts hlc.Timestamp,
 ) error {
 	var stmtBuf bytes.Buffer
 	var args []interface{}
-	if rowDatums == nil {
+	if rowDatums == nil || rowDatums.Type() == json.NullJSONType {
 		// We expect the row to be missing ...
 		stmtBuf.WriteString(`SELECT count(*) = 0 `)
 	} else {
@@ -263,28 +292,45 @@ func (v *beforeAfterValidator) checkRowAt(
 		stmtBuf.WriteString(`SELECT count(*) = 1 `)
 	}
 	fmt.Fprintf(&stmtBuf, `FROM %s AS OF SYSTEM TIME '%s' WHERE `, v.table, ts.AsOfSystemTime())
-	if rowDatums == nil {
+	if rowDatums == nil || rowDatums.Type() == json.NullJSONType {
 		// ... with the primary key.
 		for i, datum := range primaryKeyDatums {
 			if len(args) != 0 {
 				stmtBuf.WriteString(` AND `)
 			}
-			fmt.Fprintf(&stmtBuf, `%s = $%d`, v.primaryKeyCols[i], i+1)
-			args = append(args, datum)
+			if datum == nil || datum.Type() == json.NullJSONType {
+				fmt.Fprintf(&stmtBuf, `%s IS NULL`, v.primaryKeyCols[i])
+			} else {
+				fmt.Fprintf(&stmtBuf, `to_json(%s)::TEXT = $%d`, v.primaryKeyCols[i], i+1)
+				args = append(args, datum.String())
+			}
 		}
 	} else {
 		// ... and match the specified datums.
-		colNames := make([]string, 0, len(rowDatums))
-		for col := range rowDatums {
-			colNames = append(colNames, col)
+		iter, err := rowDatums.ObjectIter()
+		if err != nil {
+			return err
+		}
+
+		colNames := make([]string, 0)
+		for iter.Next() {
+			colNames = append(colNames, iter.Key())
 		}
 		sort.Strings(colNames)
 		for i, col := range colNames {
 			if len(args) != 0 {
 				stmtBuf.WriteString(` AND `)
 			}
-			fmt.Fprintf(&stmtBuf, `%s = $%d`, col, i+1)
-			args = append(args, rowDatums[col])
+			jsonCol, err := rowDatums.FetchValKey(col)
+			if err != nil {
+				return err
+			}
+			if jsonCol == nil || jsonCol.Type() == json.NullJSONType {
+				fmt.Fprintf(&stmtBuf, `%s IS NULL`, col)
+			} else {
+				fmt.Fprintf(&stmtBuf, `to_json(%s)::TEXT = $%d`, col, i+1)
+				args = append(args, jsonCol.String())
+			}
 		}
 	}
 
@@ -315,21 +361,192 @@ func (v *beforeAfterValidator) Failures() []string {
 	return v.failures
 }
 
+type mvccTimestampValidator struct {
+	failures []string
+}
+
+// NewMvccTimestampValidator returns a Validator that verifies that the emitted
+// row includes the mvcc_timestamp field and that its value is not later than
+// the updated timestamp
+func NewMvccTimestampValidator() Validator {
+	return &mvccTimestampValidator{}
+}
+
+// NoteRow implements the Validator interface.
+func (v *mvccTimestampValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
+	valueJSON, err := json.ParseJSON(value)
+	if err != nil {
+		return err
+	}
+
+	mvccJSON, err := valueJSON.FetchValKey("mvcc_timestamp")
+	if err != nil {
+		return err
+	}
+	if mvccJSON == nil {
+		v.failures = append(v.failures, "expected MVCC timestamp, got nil")
+		return nil
+	}
+
+	mvccJSONText, err := mvccJSON.AsText()
+	if err != nil {
+		return err
+	}
+
+	if *mvccJSONText > updated.AsOfSystemTime() {
+		v.failures = append(v.failures, fmt.Sprintf(
+			`expected MVCC timestamp to be earlier or equal to updated timestamp (%s), got %s`,
+			updated.AsOfSystemTime(), *mvccJSONText))
+	}
+
+	// This check is primarily a sanity check. Even in tests, we see the mvcc
+	// timestamp regularly differ from the updated timestamp by over 5 seconds.
+	// Asserting that the two are within an hour of each other should always pass.
+	if *mvccJSONText < updated.AddDuration(-time.Hour).AsOfSystemTime() {
+		v.failures = append(v.failures, fmt.Sprintf(
+			`expected MVCC timestamp to be within an hour of updated timestamp (%s), got %s`,
+			updated.AsOfSystemTime(), *mvccJSONText))
+	}
+
+	return nil
+}
+
+// NoteResolved implements the Validator interface.
+func (v *mvccTimestampValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
+	return nil
+}
+
+// Failures implements the Validator interface.
+func (v *mvccTimestampValidator) Failures() []string {
+	return v.failures
+}
+
+type keyInValueValidator struct {
+	primaryKeyCols []string
+	failures       []string
+}
+
+// NewKeyInValueValidator returns a Validator that verifies that the emitted row
+// includes the key inside a field named "key" inside the value. It should be
+// used only when key_in_value is specified in the changefeed.
+func NewKeyInValueValidator(sqlDB *gosql.DB, table string) (Validator, error) {
+	primaryKeyCols, err := fetchPrimaryKeyCols(sqlDB, table)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetchPrimaryKeyCols failed")
+	}
+
+	return &keyInValueValidator{
+		primaryKeyCols: primaryKeyCols,
+	}, nil
+}
+
+// NoteRow implements the Validator interface.
+func (v *keyInValueValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
+	keyJSON, err := json.ParseJSON(key)
+	if err != nil {
+		return err
+	}
+
+	valueJSON, err := json.ParseJSON(value)
+	if err != nil {
+		return err
+	}
+
+	keyString := keyJSON.String()
+	keyInValueJSON, err := valueJSON.FetchValKey("key")
+	if err != nil {
+		return err
+	}
+
+	if keyInValueJSON == nil {
+		v.failures = append(v.failures, fmt.Sprintf(
+			"no key in value, expected key value %s", keyString))
+	} else {
+		keyInValueString := keyInValueJSON.String()
+		if keyInValueString != keyString {
+			v.failures = append(v.failures, fmt.Sprintf(
+				"key in value %s does not match expected key value %s",
+				keyInValueString, keyString))
+		}
+	}
+
+	return nil
+}
+
+// NoteResolved implements the Validator interface.
+func (v *keyInValueValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
+	return nil
+}
+
+// Failures implements the Validator interface.
+func (v *keyInValueValidator) Failures() []string {
+	return v.failures
+}
+
+type topicValidator struct {
+	table         string
+	fullTableName bool
+
+	failures []string
+}
+
+// NewTopicValidator returns a Validator that verifies that the topic field of
+// the row agrees with the name of the table. In the case the full_table_name
+// option is specified, it checks the topic includes the db and schema name.
+func NewTopicValidator(table string, fullTableName bool) Validator {
+	return &topicValidator{
+		table:         table,
+		fullTableName: fullTableName,
+	}
+}
+
+// NoteRow implements the Validator interface.
+func (v *topicValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
+	if v.fullTableName {
+		if topic != fmt.Sprintf(`d.public.%s`, v.table) {
+			v.failures = append(v.failures, fmt.Sprintf(
+				"topic %s does not match expected table d.public.%s", topic, v.table))
+		}
+	} else {
+		if topic != v.table {
+			v.failures = append(v.failures, fmt.Sprintf(
+				"topic %s does not match expected table %s", topic, v.table))
+		}
+	}
+	return nil
+}
+
+// NoteResolved implements the Validator interface.
+func (v *topicValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
+	return nil
+}
+
+// Failures implements the Validator interface.
+func (v *topicValidator) Failures() []string {
+	return v.failures
+}
+
 type validatorRow struct {
 	key, value string
 	updated    hlc.Timestamp
 }
 
-// fingerprintValidator verifies that recreating a table from its changefeed
+// FingerprintValidator verifies that recreating a table from its changefeed
 // will fingerprint the same at all "interesting" points in time.
-type fingerprintValidator struct {
-	sqlDB                  *gosql.DB
+type FingerprintValidator struct {
+	sqlDBFunc              func(func(*gosql.DB) error) error
 	origTable, fprintTable string
 	primaryKeyCols         []string
 	partitionResolved      map[string]hlc.Timestamp
 	resolved               hlc.Timestamp
 	// It's possible to get a resolved timestamp from before the table even
-	// exists, which is valid but complicates the way fingerprintValidator works.
+	// exists, which is valid but complicates the way FingerprintValidator works.
 	// Don't create a fingerprint earlier than the first seen row.
 	firstRowTimestamp hlc.Timestamp
 	// previousRowUpdateTs keeps track of the timestamp of the most recently processed row
@@ -347,6 +564,15 @@ type fingerprintValidator struct {
 	failures []string
 }
 
+// defaultSQLDBFunc is the default function passed the FingerprintValidator's
+// `sqlDBFunc`. It is sufficient in cases when the database is not expected to
+// fail while the validator is using it.
+func defaultSQLDBFunc(db *gosql.DB) func(func(*gosql.DB) error) error {
+	return func(f func(*gosql.DB) error) error {
+		return f(db)
+	}
+}
+
 // NewFingerprintValidator returns a new FingerprintValidator that uses `fprintTable` as
 // scratch space to recreate `origTable`. `fprintTable` must exist before calling this
 // constructor. `maxTestColumnCount` indicates the maximum number of columns that can be
@@ -354,19 +580,19 @@ type fingerprintValidator struct {
 // will modify `fprint`'s schema to add `maxTestColumnCount` columns to avoid having to
 // accommodate schema changes on the fly.
 func NewFingerprintValidator(
-	sqlDB *gosql.DB, origTable, fprintTable string, partitions []string, maxTestColumnCount int,
-) (Validator, error) {
+	db *gosql.DB, origTable, fprintTable string, partitions []string, maxTestColumnCount int,
+) (*FingerprintValidator, error) {
 	// Fetch the primary keys though information_schema schema inspections so we
 	// can use them to construct the SQL for DELETEs and also so we can verify
 	// that the key in a message matches what's expected for the value.
-	primaryKeyCols, err := fetchPrimaryKeyCols(sqlDB, fprintTable)
+	primaryKeyCols, err := fetchPrimaryKeyCols(db, fprintTable)
 	if err != nil {
 		return nil, err
 	}
 
 	// Record the non-test%d columns in `fprint`.
 	var fprintOrigColumns int
-	if err := sqlDB.QueryRow(`
+	if err := db.QueryRow(`
 		SELECT count(column_name)
 		FROM information_schema.columns
 		WHERE table_name=$1
@@ -384,13 +610,14 @@ func NewFingerprintValidator(
 			}
 			fmt.Fprintf(&addColumnStmt, `ADD COLUMN test%d STRING`, i)
 		}
-		if _, err := sqlDB.Exec(addColumnStmt.String()); err != nil {
+		_, err = db.Exec(addColumnStmt.String())
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	v := &fingerprintValidator{
-		sqlDB:             sqlDB,
+	v := &FingerprintValidator{
+		sqlDBFunc:         defaultSQLDBFunc(db),
 		origTable:         origTable,
 		fprintTable:       fprintTable,
 		primaryKeyCols:    primaryKeyCols,
@@ -404,56 +631,166 @@ func NewFingerprintValidator(
 	return v, nil
 }
 
+// DBFunc sets the database function used when the validator needs to
+// perform database operations (updating the scratch table, computing
+// fingerprints, etc)
+func (v *FingerprintValidator) DBFunc(
+	dbFunc func(func(*gosql.DB) error) error,
+) *FingerprintValidator {
+	v.sqlDBFunc = dbFunc
+	return v
+}
+
 // NoteRow implements the Validator interface.
-func (v *fingerprintValidator) NoteRow(
-	ignoredPartition string, key, value string, updated hlc.Timestamp,
+func (v *FingerprintValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
 ) error {
 	if v.firstRowTimestamp.IsEmpty() || updated.Less(v.firstRowTimestamp) {
 		v.firstRowTimestamp = updated
 	}
-	v.buffer = append(v.buffer, validatorRow{
-		key:     key,
-		value:   value,
-		updated: updated,
-	})
+
+	row := validatorRow{key: key, value: value, updated: updated}
+
+	// if this row's timestamp is earlier than the last resolved
+	// timestamp we processed, we can skip it as it is a duplicate
+	if row.updated.Less(v.resolved) {
+		return nil
+	}
+
+	v.buffer = append(v.buffer, row)
 	return nil
 }
 
+// fetchTableColTypes fetches the column types for the given table tableName.
+// Note that the table has to exist at the updated timestamp.
+func (v *FingerprintValidator) fetchTableColTypes(
+	tableName string, updated hlc.Timestamp,
+) (map[string]*types.T, error) {
+	parts := strings.Split(tableName, ".")
+	var dbName string
+	if len(parts) == 2 {
+		dbName = parts[0] + "."
+	}
+
+	colToType := make(map[string]*types.T)
+	if err := v.sqlDBFunc(func(sqlDB *gosql.DB) error {
+		var rows *gosql.Rows
+		queryStr := fmt.Sprintf(`SELECT a.attname AS column_name, t.oid AS type_oid, t.typname AS type_name
+		FROM %spg_catalog.pg_attribute a JOIN %spg_catalog.pg_type t ON a.atttypid = t.oid AS OF SYSTEM TIME '%s'
+		WHERE a.attrelid = $1::regclass AND a.attnum > 0`, dbName, dbName, updated.AsOfSystemTime())
+
+		rows, err := sqlDB.Query(queryStr, tableName)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		type result struct {
+			keyColumn string
+			oid       string
+			typeName  string
+		}
+
+		var results []result
+		for rows.Next() {
+			var keyColumn, oidStr, typeName string
+			if err := rows.Scan(&keyColumn, &oidStr, &typeName); err != nil {
+				return err
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			results = append(results, result{
+				keyColumn: keyColumn,
+				oid:       oidStr,
+				typeName:  typeName,
+			})
+			oidNum, err := strconv.Atoi(oidStr)
+			if err != nil {
+				return err
+			}
+			colToType[keyColumn] = types.OidToType[oid.Oid(oidNum)]
+		}
+		if len(results) == 0 {
+			return errors.Errorf("no columns found for table %s", tableName)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return colToType, nil
+}
+
 // applyRowUpdate applies the update represented by `row` to the scratch table.
-func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
+func (v *FingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 	defer func() {
-		_err = errors.Wrap(_err, "fingerprintValidator failed")
+		_err = errors.Wrap(_err, "FingerprintValidator failed")
 	}()
 
 	var args []interface{}
-	var primaryKeyDatums []interface{}
-	if err := gojson.Unmarshal([]byte(row.key), &primaryKeyDatums); err != nil {
+	keyJSON, err := json.ParseJSON(row.key)
+	if err != nil {
 		return err
 	}
-	if len(primaryKeyDatums) != len(v.primaryKeyCols) {
-		return errors.Errorf(`expected primary key columns %s got datums %s`,
-			v.primaryKeyCols, primaryKeyDatums)
+	keyJSONAsArray, ok := keyJSON.AsArray()
+	if !ok || len(keyJSONAsArray) != len(v.primaryKeyCols) {
+		return errors.Errorf(
+			`notArray: %t expected primary key columns %s got datums %s`,
+			ok, v.primaryKeyCols, keyJSONAsArray)
 	}
 
 	var stmtBuf bytes.Buffer
-	type wrapper struct {
-		After map[string]interface{} `json:"after"`
-	}
-	var value wrapper
-	if err := gojson.Unmarshal([]byte(row.value), &value); err != nil {
+	valueJSON, err := json.ParseJSON(row.value)
+	if err != nil {
 		return err
 	}
-	if value.After != nil {
+	afterJSON, err := valueJSON.FetchValKey("after")
+	if err != nil {
+		return err
+	}
+
+	if afterJSON != nil && afterJSON.Type() != json.NullJSONType {
 		// UPDATE or INSERT
 		fmt.Fprintf(&stmtBuf, `UPSERT INTO %s (`, v.fprintTable)
-		for col, colValue := range value.After {
+		iter, err := afterJSON.ObjectIter()
+		if err != nil {
+			return err
+		}
+		colNames := make([]string, 0)
+		for iter.Next() {
+			colNames = append(colNames, iter.Key())
+		}
+
+		typeofCol, err := v.fetchTableColTypes(v.origTable, row.updated)
+		for _, colValue := range colNames {
 			if len(args) != 0 {
 				stmtBuf.WriteString(`,`)
 			}
-			stmtBuf.WriteString(col)
-			args = append(args, colValue)
+			stmtBuf.WriteString(colValue)
+			if err != nil {
+				return err
+			}
+			colType, exists := typeofCol[colValue]
+			if !exists {
+				return errors.Errorf("column %s not found in table %s", colValue, v.origTable)
+			}
+			jsonValue, err := afterJSON.FetchValKey(colValue)
+			if err != nil {
+				return err
+			}
+			str, err := jsonValue.AsText()
+			if err != nil {
+				return err
+			}
+			if str != nil {
+				datum, _ := rowenc.ParseDatumStringAs(context.Background(), colType, *str,
+					eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings()), nil)
+				args = append(args, datum)
+			} else {
+				args = append(args, nil)
+			}
 		}
-		for i := len(value.After) - v.fprintOrigColumns; i < v.fprintTestColumns; i++ {
+
+		for i := len(colNames) - v.fprintOrigColumns; i < v.fprintTestColumns; i++ {
 			fmt.Fprintf(&stmtBuf, `, test%d`, i)
 			args = append(args, nil)
 		}
@@ -467,37 +804,37 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 		stmtBuf.WriteString(`)`)
 
 		// Also verify that the key matches the value.
-		primaryKeyDatums = make([]interface{}, len(v.primaryKeyCols))
 		for idx, primaryKeyCol := range v.primaryKeyCols {
-			primaryKeyDatums[idx] = value.After[primaryKeyCol]
-		}
-		primaryKeyJSON, err := gojson.Marshal(primaryKeyDatums)
-		if err != nil {
-			return err
-		}
-
-		if string(primaryKeyJSON) != row.key {
-			v.failures = append(v.failures,
-				fmt.Sprintf(`key %s did not match expected key %s for value %s`,
-					row.key, primaryKeyJSON, row.value))
+			valueJSON, err := afterJSON.FetchValKey(primaryKeyCol)
+			if err != nil {
+				return err
+			}
+			if rowKeyValue := keyJSONAsArray[idx]; valueJSON != rowKeyValue {
+				v.failures = append(v.failures,
+					fmt.Sprintf(`key %s did not match expected key %s for value %s`,
+						primaryKeyCol, rowKeyValue, valueJSON))
+			}
 		}
 	} else {
 		// DELETE
 		fmt.Fprintf(&stmtBuf, `DELETE FROM %s WHERE `, v.fprintTable)
-		for i, datum := range primaryKeyDatums {
+		for i, datum := range keyJSONAsArray {
 			if len(args) != 0 {
 				stmtBuf.WriteString(` AND `)
 			}
-			fmt.Fprintf(&stmtBuf, `%s = $%d`, v.primaryKeyCols[i], i+1)
-			args = append(args, datum)
+			fmt.Fprintf(&stmtBuf, `to_json(%s)::text = $%d`, v.primaryKeyCols[i], i+1)
+			args = append(args, datum.String())
 		}
 	}
-	_, err := v.sqlDB.Exec(stmtBuf.String(), args...)
-	return err
+
+	return v.sqlDBFunc(func(db *gosql.DB) error {
+		_, err := db.Exec(stmtBuf.String(), args...)
+		return err
+	})
 }
 
 // NoteResolved implements the Validator interface.
-func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
+func (v *FingerprintValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
 	if r, ok := v.partitionResolved[partition]; !ok {
 		return errors.Errorf(`unknown partition: %s`, partition)
 	} else if resolved.LessEq(r) {
@@ -534,6 +871,9 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 			break
 		}
 		row := v.buffer[0]
+		// NOTE: changes to the validator's state before `applyRowUpdate`
+		// are safe because if database calls can fail, they should be
+		// retried by passing a custom function to DBFunction
 		v.buffer = v.buffer[1:]
 
 		// If we've processed all row updates belonging to the previous row's timestamp,
@@ -567,17 +907,21 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 	return nil
 }
 
-func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
+func (v *FingerprintValidator) fingerprint(ts hlc.Timestamp) error {
 	var orig string
-	if err := v.sqlDB.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
+	if err := v.sqlDBFunc(func(db *gosql.DB) error {
+		return db.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
 		SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ` + v.origTable + `
-	] AS OF SYSTEM TIME '` + ts.AsOfSystemTime() + `'`).Scan(&orig); err != nil {
+	] AS OF SYSTEM TIME '` + ts.AsOfSystemTime() + `'`).Scan(&orig)
+	}); err != nil {
 		return err
 	}
 	var check string
-	if err := v.sqlDB.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
+	if err := v.sqlDBFunc(func(db *gosql.DB) error {
+		return db.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
 		SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ` + v.fprintTable + `
-	]`).Scan(&check); err != nil {
+	]`).Scan(&check)
+	}); err != nil {
 		return err
 	}
 	if orig != check {
@@ -588,7 +932,7 @@ func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
 }
 
 // Failures implements the Validator interface.
-func (v *fingerprintValidator) Failures() []string {
+func (v *FingerprintValidator) Failures() []string {
 	return v.failures
 }
 
@@ -597,9 +941,11 @@ func (v *fingerprintValidator) Failures() []string {
 type Validators []Validator
 
 // NoteRow implements the Validator interface.
-func (vs Validators) NoteRow(partition string, key, value string, updated hlc.Timestamp) error {
+func (vs Validators) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
 	for _, v := range vs {
-		if err := v.NoteRow(partition, key, value, updated); err != nil {
+		if err := v.NoteRow(partition, key, value, updated, topic); err != nil {
 			return err
 		}
 	}
@@ -635,16 +981,18 @@ type CountValidator struct {
 	rowsSinceResolved                    int
 }
 
-// MakeCountValidator returns a CountValidator wrapping the given Validator.
-func MakeCountValidator(v Validator) *CountValidator {
+// NewCountValidator returns a CountValidator wrapping the given Validator.
+func NewCountValidator(v Validator) *CountValidator {
 	return &CountValidator{v: v}
 }
 
 // NoteRow implements the Validator interface.
-func (v *CountValidator) NoteRow(partition string, key, value string, updated hlc.Timestamp) error {
+func (v *CountValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
 	v.NumRows++
 	v.rowsSinceResolved++
-	return v.v.NoteRow(partition, key, value, updated)
+	return v.v.NoteRow(partition, key, value, updated, topic)
 }
 
 // NoteResolved implements the Validator interface.
@@ -663,27 +1011,121 @@ func (v *CountValidator) Failures() []string {
 	return v.v.Failures()
 }
 
+// DuplicateCountingValidator wraps a Validator and counts duplicate rows.
+// All rows (including duplicates) are forwarded to the wrapped validator;
+// this validator only observes and counts. The inner validator is responsible
+// for its own duplicate handling.
+//
+// NoteRow and NoteResolved must be called from a single goroutine (they
+// access unsynchronized map state). NumTotal and NumDuplicates are safe
+// to read from other goroutines concurrently.
+type DuplicateCountingValidator struct {
+	v Validator
+	// resolved tracks the highest resolved timestamp seen per partition.
+	resolved map[string]hlc.Timestamp
+	// seen tracks the latest timestamp observed for each key per partition,
+	// for detecting duplicates that arrive before or between resolved
+	// timestamps. Changefeed ordering guarantees that once a key has been
+	// emitted at timestamp T, no previously unseen version of that key
+	// will arrive at a timestamp <= T. This means we only need to store
+	// one timestamp per key: any row at or below that timestamp is a
+	// duplicate.
+	//
+	// On each resolved timestamp, entries whose timestamp is at or below
+	// the resolved are pruned (the resolved check in NoteRow handles
+	// those going forward). This keeps the map bounded by the number of
+	// keys updated since the last resolved timestamp rather than growing
+	// with every row over the life of the test.
+	seen map[string]map[string]hlc.Timestamp
+
+	// NumTotal and NumDuplicates use atomic operations so they can be read
+	// safely from a monitoring goroutine while a consumer goroutine calls
+	// NoteRow.
+
+	// NumTotal is the total number of rows seen (duplicates + unique).
+	NumTotal atomic.Int64
+	// NumDuplicates is the number of rows that were identified as duplicates.
+	NumDuplicates atomic.Int64
+}
+
+// NewDuplicateCountingValidator returns a DuplicateCountingValidator wrapping
+// the given Validator.
+func NewDuplicateCountingValidator(v Validator) *DuplicateCountingValidator {
+	return &DuplicateCountingValidator{
+		v:        v,
+		resolved: make(map[string]hlc.Timestamp),
+		seen:     make(map[string]map[string]hlc.Timestamp),
+	}
+}
+
+// NoteRow implements the Validator interface.
+func (v *DuplicateCountingValidator) NoteRow(
+	partition, key, value string, updated hlc.Timestamp, topic string,
+) error {
+	v.NumTotal.Add(1)
+	if r, ok := v.resolved[partition]; ok && updated.LessEq(r) {
+		// Changefeed guarantees mean we must have seen this update before.
+		v.NumDuplicates.Add(1)
+	} else if lastSeen, ok := v.seen[partition][key]; ok && updated.LessEq(lastSeen) {
+		// We've seen a more recent update of this key. Changefeed guarantees
+		// mean this must be a duplicate.
+		v.NumDuplicates.Add(1)
+	} else {
+		// This row is not a duplicate.
+		if v.seen[partition] == nil {
+			v.seen[partition] = make(map[string]hlc.Timestamp)
+		}
+		v.seen[partition][key] = updated
+	}
+	return v.v.NoteRow(partition, key, value, updated, topic)
+}
+
+// NoteResolved implements the Validator interface.
+func (v *DuplicateCountingValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
+	if cur, ok := v.resolved[partition]; !ok || cur.Less(resolved) {
+		v.resolved[partition] = resolved
+		// Prune seen keys before this timestamp. This keeps the memory usage
+		// of `seen` in check.
+		for key, ts := range v.seen[partition] {
+			if ts.LessEq(resolved) {
+				delete(v.seen[partition], key)
+			}
+		}
+	}
+	return v.v.NoteResolved(partition, resolved)
+}
+
+// Failures implements the Validator interface.
+func (v *DuplicateCountingValidator) Failures() []string {
+	return v.v.Failures()
+}
+
 // ParseJSONValueTimestamps returns the updated or resolved timestamp set in the
 // provided `format=json` value. Exported for acceptance testing.
 func ParseJSONValueTimestamps(v []byte) (updated, resolved hlc.Timestamp, err error) {
 	var valueRaw struct {
 		Resolved string `json:"resolved"`
 		Updated  string `json:"updated"`
+		Source   struct {
+			TsHLC string `json:"ts_hlc"`
+		} `json:"source"`
 	}
 	if err := gojson.Unmarshal(v, &valueRaw); err != nil {
 		return hlc.Timestamp{}, hlc.Timestamp{}, errors.Wrapf(err, "parsing [%s] as json", v)
 	}
+
 	if valueRaw.Updated != `` {
-		var err error
-		updated, err = tree.ParseHLC(valueRaw.Updated)
-		if err != nil {
+		if updated, err = hlc.ParseHLC(valueRaw.Updated); err != nil {
 			return hlc.Timestamp{}, hlc.Timestamp{}, err
 		}
 	}
 	if valueRaw.Resolved != `` {
-		var err error
-		resolved, err = tree.ParseHLC(valueRaw.Resolved)
-		if err != nil {
+		if resolved, err = hlc.ParseHLC(valueRaw.Resolved); err != nil {
+			return hlc.Timestamp{}, hlc.Timestamp{}, err
+		}
+	}
+	if valueRaw.Source.TsHLC != `` {
+		if updated, err = hlc.ParseHLC(valueRaw.Source.TsHLC); err != nil {
 			return hlc.Timestamp{}, hlc.Timestamp{}, err
 		}
 	}

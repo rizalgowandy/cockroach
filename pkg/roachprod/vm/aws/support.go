@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package aws
 
@@ -14,13 +9,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"strings"
-	"text/template"
 
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -36,119 +30,123 @@ import (
 const awsStartupScriptTemplate = `#!/usr/bin/env bash
 # Script for setting up a AWS machine for roachprod use.
 
-set -x
-sudo apt-get update
-sudo apt-get install -qy --no-install-recommends mdadm
+{{ template "head_utils" . }}
+{{ template "apt_packages" . }}
 
-mount_opts="defaults"
-{{if .ExtraMountOpts}}mount_opts="${mount_opts},{{.ExtraMountOpts}}"{{end}}
+# Provider specific disk logic
+function detect_disks() {
+	# AWS-specific disk detection - returns list of available disks
+	# If both EC2 NVMe Instance Storage and EBS exist, prioritize EBS volumes to avoid
+	# performance differences when RAID'ing mixed disk types.
+	# Scenarios:
+	#   (local SSD = 0, Network Disk - 1)  - no RAID'ing and mount network disk
+	#   (local SSD = 1, Network Disk - 0)  - no RAID'ing and mount local SSD
+	#   (local SSD >= 1, Network Disk = 1) - no RAID'ing and mount network disk
+	#   (local SSD > 1, Network Disk = 0)  - local SSDs selected for RAID'ing
+	#   (local SSD >= 0, Network Disk > 1) - network disks selected for RAID'ing
+	local local_disks=()
+	local ebs_volumes=()
+	local disks=()
 
-use_multiple_disks='{{if .UseMultipleDisks}}true{{end}}'
+	# On different machine types, the drives are either called nvme... or xvdd.
+	for d in $(ls /dev/nvme?n1 /dev/xvdd); do
+		mounted="no"
+{{ if eq .Filesystem "zfs" }}
+		# Check if the disk is already part of a zpool or mounted; skip if so.
+		if (zpool list -v -P | grep -q ${d}) || (mount | grep -q ${d}); then
+			mounted="yes"
+		fi
+{{ else }}
+		# Skip already mounted disks.
+		if mount | grep -q ${d}; then
+			mounted="yes"
+		fi
+{{ end }}
+		if [ "$mounted" == "no" ]; then
+			if udevadm info --query=property --name=${d} | grep "ID_MODEL=Amazon Elastic Block Store">/dev/null; then
+				ebs_volumes+=("${d}")
+			else
+				local_disks+=("${d}")
+			fi
+			echo "Disk ${d} not mounted, need to mount..." >&2
+		else
+			echo "Disk ${d} already mounted, skipping..." >&2
+		fi
+	done
 
-disks=()
-mount_prefix="/mnt/data"
+	# use only EBS volumes if available and ignore EC2 NVMe Instance Storage
+	if [ "${#ebs_volumes[@]}" -gt "0" ]; then
+		echo "Using only EBS disks: ${ebs_volumes[@]}" >&2
+		disks=("${ebs_volumes[@]}")
+	else
+		echo "Using only local disks: ${local_disks[@]}" >&2
+		disks=("${local_disks[@]}")
+	fi
 
-# On different machine types, the drives are either called nvme... or xvdd.
-for d in $(ls /dev/nvme?n1 /dev/xvdd); do
-  if ! mount | grep ${d}; then
-    disks+=("${d}")
-    echo "Disk ${d} not mounted, need to mount..."
-  else
-    echo "Disk ${d} already mounted, skipping..."
-  fi
-done
+	# Return disks array by printing each element (only if non-empty)
+	if [ "${#disks[@]}" -gt 0 ]; then
+		printf '%s\n' "${disks[@]}"
+	fi
+}
 
+# Common disk setup logic that calls the above detect_disks function
+{{ template "setup_disks_utils" . }}
 
-if [ "${#disks[@]}" -eq "0" ]; then
-  mountpoint="${mount_prefix}1"
-  echo "No disks mounted, creating ${mountpoint}"
-  mkdir -p ${mountpoint}
-  chmod 777 ${mountpoint}
-elif [ "${#disks[@]}" -eq "1" ] || [ -n "$use_multiple_disks" ]; then
-  disknum=1
-  for disk in "${disks[@]}"
-  do
-    mountpoint="${mount_prefix}${disknum}"
-    disknum=$((disknum + 1 ))
-    echo "Mounting ${disk} at ${mountpoint}"
-    mkdir -p ${mountpoint}
-    mkfs.ext4 -F ${disk}
-    mount -o ${mount_opts} ${disk} ${mountpoint}
-    chmod 777 ${mountpoint}
-    echo "${disk} ${mountpoint} ext4 ${mount_opts} 1 1" | tee -a /etc/fstab
-  done
-else
-  mountpoint="${mount_prefix}1"
-  echo "${#disks[@]} disks mounted, creating ${mountpoint} using RAID 0"
-  mkdir -p ${mountpoint}
-  raiddisk="/dev/md0"
-  mdadm --create ${raiddisk} --level=0 --raid-devices=${#disks[@]} "${disks[@]}"
-  mkfs.ext4 -F ${raiddisk}
-  mount -o ${mount_opts} ${raiddisk} ${mountpoint}
-  chmod 777 ${mountpoint}
-  echo "${raiddisk} ${mountpoint} ext4 ${mount_opts} 1 1" | tee -a /etc/fstab
-fi
+{{ template "ulimits" . }}
+{{ template "tcpdump" . }}
+{{ template "keepalives" . }}
+{{ template "cron_utils" . }}
+{{ template "chrony_utils" . }}
+{{ template "timers_services_utils" . }}
+{{ template "core_dumps_utils" . }}
+{{ template "hostname_utils" . }}
+{{ template "fips_utils" . }}
+{{ template "ssh_utils" . }}
+{{ template "node_exporter" . }}
+{{ template "ebpf_exporter" . }}
 
-sudo apt-get install -qy chrony
-
-# Override the chrony config. In particular,
-# log aggressively when clock is adjusted (0.01s)
-# and exclusively use a single time server.
-sudo cat <<EOF > /etc/chrony/chrony.conf
-keyfile /etc/chrony/chrony.keys
-commandkey 1
-driftfile /var/lib/chrony/chrony.drift
-log tracking measurements statistics
-logdir /var/log/chrony
-maxupdateskew 100.0
-dumponexit
-dumpdir /var/lib/chrony
-logchange 0.01
-hwclockfile /etc/adjtime
-rtcsync
-server 169.254.169.123 prefer iburst
-makestep 0.1 3
-EOF
-
-sudo /etc/init.d/chrony restart
-sudo chronyc -a waitsync 30 0.01 | sudo tee -a /root/chrony.log
-
-# sshguard can prevent frequent ssh connections to the same host. Disable it.
-sudo service sshguard stop
-# increase the number of concurrent unauthenticated connections to the sshd
-# daemon. See https://en.wikibooks.org/wiki/OpenSSH/Cookbook/Load_Balancing.
-# By default, only 10 unauthenticated connections are permitted before sshd
-# starts randomly dropping connections.
-sudo sh -c 'echo "MaxStartups 64:30:128" >> /etc/ssh/sshd_config'
-# Crank up the logging for issues such as:
-# https://github.com/cockroachdb/cockroach/issues/36929
-sudo sed -i'' 's/LogLevel.*$/LogLevel DEBUG3/' /etc/ssh/sshd_config
-sudo service sshd restart
-# increase the default maximum number of open file descriptors for
-# root and non-root users. Load generators running a lot of concurrent
-# workers bump into this often.
-sudo sh -c 'echo "root - nofile 1048576\n* - nofile 1048576" > /etc/security/limits.d/10-roachprod-nofiles.conf'
-
-# Enable core dumps
-cat <<EOF > /etc/security/limits.d/core_unlimited.conf
-* soft core unlimited
-* hard core unlimited
-root soft core unlimited
-root hard core unlimited
-EOF
-
-mkdir -p /mnt/data1/cores
-chmod a+w /mnt/data1/cores
-CORE_PATTERN="/mnt/data1/cores/core.%e.%p.%h.%t"
-echo "$CORE_PATTERN" > /proc/sys/kernel/core_pattern
-sed -i'~' 's/enabled=1/enabled=0/' /etc/default/apport
-sed -i'~' '/.*kernel\\.core_pattern.*/c\\' /etc/sysctl.conf
-echo "kernel.core_pattern=$CORE_PATTERN" >> /etc/sysctl.conf
-
-sysctl --system  # reload sysctl settings
-
-sudo touch /mnt/data1/.roachprod-initialized
+sudo touch {{ .OSInitializedFile }}
 `
+
+// generateStartupScript generates the startup script content and returns it as bytes.
+//
+// extraMountOpts, if not empty, is appended to the default mount options. It is
+// a comma-separated list of options for the "mount -o" flag.
+func generateStartupScript(
+	name string,
+	extraMountOpts string,
+	fileSystem vm.Filesystem,
+	useMultiple bool,
+	enableFips bool,
+	remoteUser string,
+	bootDiskOnly bool,
+) ([]byte, error) {
+	// We define a local type in case we need to add more provider-specific params in
+	// the future.
+	type tmplParams struct {
+		vm.StartupArgs
+	}
+
+	args := tmplParams{
+		StartupArgs: vm.DefaultStartupArgs(
+			vm.WithVMName(name),
+			vm.WithSharedUser(remoteUser),
+			vm.WithFilesystem(fileSystem),
+			vm.WithExtraMountOpts(extraMountOpts),
+			vm.WithUseMultipleDisks(useMultiple),
+			vm.WithBootDiskOnly(bootDiskOnly),
+			vm.WithEnableFIPS(enableFips),
+			vm.WithChronyServers([]string{"169.254.169.123"}),
+		),
+	}
+
+	var buf bytes.Buffer
+	if err := vm.GenerateStartupScript(&buf, awsStartupScriptTemplate, args); err != nil {
+		return nil, errors.Wrapf(err, "unable to generate startup script")
+	}
+
+	return buf.Bytes(), nil
+}
 
 // writeStartupScript writes the startup script to a temp file.
 // Returns the path to the file.
@@ -156,52 +154,84 @@ sudo touch /mnt/data1/.roachprod-initialized
 //
 // extraMountOpts, if not empty, is appended to the default mount options. It is
 // a comma-separated list of options for the "mount -o" flag.
-func writeStartupScript(extraMountOpts string, useMultiple bool) (string, error) {
-	type tmplParams struct {
-		ExtraMountOpts   string
-		UseMultipleDisks bool
-	}
-
-	args := tmplParams{ExtraMountOpts: extraMountOpts, UseMultipleDisks: useMultiple}
-
-	tmpfile, err := ioutil.TempFile("", "aws-startup-script")
+func writeStartupScript(
+	name string,
+	extraMountOpts string,
+	fileSystem vm.Filesystem,
+	useMultiple bool,
+	enableFips bool,
+	remoteUser string,
+	bootDiskOnly bool,
+) (string, error) {
+	data, err := generateStartupScript(name, extraMountOpts, fileSystem, useMultiple, enableFips, remoteUser, bootDiskOnly)
 	if err != nil {
 		return "", err
 	}
-	defer tmpfile.Close()
 
-	t := template.Must(template.New("start").Parse(awsStartupScriptTemplate))
-	if err := t.Execute(tmpfile, args); err != nil {
+	tmpfile, err := os.CreateTemp("", "aws-startup-script")
+	if err != nil {
 		return "", err
 	}
+
+	if _, err := tmpfile.Write(data); err != nil {
+		_ = tmpfile.Close()
+		return "", err
+	}
+
+	if err := tmpfile.Close(); err != nil {
+		return "", err
+	}
+
 	return tmpfile.Name(), nil
 }
 
 // runCommand is used to invoke an AWS command.
-func (p *Provider) runCommand(args []string) ([]byte, error) {
+func (p *Provider) runCommand(l *logger.Logger, args []string) ([]byte, error) {
+	return p.runCommandWithContext(context.Background(), l, args)
+}
+
+// runCommand is used to invoke an AWS command.
+func (p *Provider) runCommandWithContext(
+	ctx context.Context, l *logger.Logger, args []string,
+) ([]byte, error) {
 
 	if p.Profile != "" {
 		args = append(args[:len(args):len(args)], "--profile", p.Profile)
 	}
+
+	credentialsEnv, err := p.getEnvironmentAWSCredentials()
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get AWS credentials")
+	}
+
 	var stderrBuf bytes.Buffer
-	cmd := exec.Command("aws", args...)
+	cmd := exec.CommandContext(ctx, "aws", args...)
 	cmd.Stderr = &stderrBuf
+	cmd.Env = append(os.Environ(), credentialsEnv...)
 	output, err := cmd.Output()
 	if err != nil {
 		if exitErr := (*exec.ExitError)(nil); errors.As(err, &exitErr) {
-			log.Infof(context.Background(), "%s", string(exitErr.Stderr))
+			l.Printf("%s", exitErr)
 		}
-		return nil, errors.Wrapf(err, "failed to run: aws %s: stderr: %v",
+		err = errors.Wrapf(err, "failed to run: aws %s: stderr: %v",
 			strings.Join(args, " "), stderrBuf.String())
+		return nil, maybeAWSCapacityError(err, stderrBuf.String())
 	}
 	return output, nil
 }
 
 // runJSONCommand invokes an aws command and parses the json output.
-func (p *Provider) runJSONCommand(args []string, parsed interface{}) error {
+func (p *Provider) runJSONCommand(l *logger.Logger, args []string, parsed interface{}) error {
+	return p.runJSONCommandWithContext(context.Background(), l, args, parsed)
+}
+
+// runJSONCommandWithContext invokes an aws command and parses the json output.
+func (p *Provider) runJSONCommandWithContext(
+	ctx context.Context, l *logger.Logger, args []string, parsed interface{},
+) error {
 	// Force json output in case the user has overridden the default behavior.
 	args = append(args[:len(args):len(args)], "--output", "json")
-	rawJSON, err := p.runCommand(args)
+	rawJSON, err := p.runCommandWithContext(ctx, l, args)
 	if err != nil {
 		return err
 	}
@@ -226,7 +256,11 @@ func regionMap(vms vm.List) (map[string]vm.List, error) {
 	return byRegion, nil
 }
 
-// zoneToRegion converts an availability zone like us-east-2a to the zone name us-east-2
+// zoneToRegion converts an availability zone like us-east-2a to the region
+// name us-east-2 by stripping the trailing availability zone letter.
 func zoneToRegion(zone string) (string, error) {
+	if len(zone) == 0 {
+		return "", errors.New("empty zone")
+	}
 	return zone[0 : len(zone)-1], nil
 }

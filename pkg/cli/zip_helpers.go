@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // zipper is the interface to the zip file stored on disk.
@@ -57,6 +53,7 @@ func (z *zipper) close() error {
 // responsible for locking the zipper beforehand.
 // Unsafe for concurrent use otherwise.
 func (z *zipper) createLocked(name string, mtime time.Time) (io.Writer, error) {
+	z.AssertHeld()
 	if mtime.IsZero() {
 		mtime = timeutil.Now()
 	}
@@ -88,12 +85,22 @@ func (z *zipper) createJSON(s *zipReporter, name string, m interface{}) (err err
 	if !strings.HasSuffix(name, ".json") {
 		return s.fail(errors.Errorf("%s does not have .json suffix", name))
 	}
-	s.progress("converting to JSON")
-	b, err := json.MarshalIndent(m, "", "  ")
+	s.progress("writing JSON output: %s", name)
+
+	z.Lock()
+	defer z.Unlock()
+	// Stream directly to file to avoid buffering large amounts of JSON in memory.
+	w, err := z.createLocked(name, time.Time{})
 	if err != nil {
 		return s.fail(err)
 	}
-	return z.createRaw(s, name, b)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(m); err != nil {
+		return s.fail(err)
+	}
+	s.done()
+	return nil
 }
 
 // createError reports an error payload.
@@ -248,35 +255,37 @@ func (fs *fileSelection) validate() error {
 // this filtering server-side so that the inclusion pattern can be
 // used to reduce the amount of data retrieved in the "get file list"
 // response.
+//
+// Only base-name patterns (those without '/') are sent to the server,
+// since the server does not know about the zip directory layout.
+// Path-based patterns are applied client-side only.
 func (fs *fileSelection) retrievalPatterns() []string {
 	if len(fs.includePatterns) == 0 {
 		// No include pattern defined: retrieve all files.
 		return []string{"*"}
 	}
-	return fs.includePatterns
+	var basePatterns []string
+	for _, p := range fs.includePatterns {
+		if !strings.Contains(p, "/") {
+			basePatterns = append(basePatterns, p)
+		}
+	}
+	if len(basePatterns) == 0 {
+		// All include patterns are path-based; we must retrieve all
+		// files and filter client-side.
+		return []string{"*"}
+	}
+	return basePatterns
 }
 
-// isIncluded determine whether the given file name is included in the selection.
-func (fs *fileSelection) isIncluded(filename string, ctime, mtime time.Time) bool {
-	// To be included, a file must be included in at least one of the retrieval patterns.
-	included := false
-	for _, p := range fs.retrievalPatterns() {
-		if matched, _ := filepath.Match(p, filename); matched {
-			included = true
-			break
-		}
-	}
-	if !included {
-		return false
-	}
-	// Then it must not match any of the exclusion patterns.
-	for _, p := range fs.excludePatterns {
-		if matched, _ := filepath.Match(p, filename); matched {
-			included = false
-			break
-		}
-	}
-	if !included {
+// isIncluded determines whether the given file is included in the
+// selection. The zipPath is the full path of the file within the zip
+// archive (e.g. "debug/nodes/1/details.json"), or just the base file
+// name when the full path is not available (e.g. "cpu.pprof").
+// Patterns containing '/' are matched against zipPath; patterns
+// without '/' are matched against filepath.Base(zipPath).
+func (fs *fileSelection) isIncluded(zipPath string, ctime, mtime time.Time) bool {
+	if !fs.shouldIncludeFile(zipPath) {
 		return false
 	}
 	// Then its mtime must not be before the selected "from" time.
@@ -292,6 +301,54 @@ func (fs *fileSelection) isIncluded(filename string, ctime, mtime time.Time) boo
 	return true
 }
 
+// matchPattern matches a single pattern against a zip path. If the
+// pattern contains '/', it is matched against the full zipPath.
+// Otherwise it is matched against filepath.Base(zipPath).
+func matchPattern(pattern, zipPath string) bool {
+	if strings.Contains(pattern, "/") {
+		matched, _ := filepath.Match(pattern, zipPath)
+		return matched
+	}
+	matched, _ := filepath.Match(pattern, filepath.Base(zipPath))
+	return matched
+}
+
+// shouldIncludeFile determines whether the given file is included in
+// the selection based on include & exclude patterns. The zipPath is
+// the full path of the file within the zip archive (e.g.
+// "debug/nodes/1/details.json"), or just the base file name when the
+// full path is not available (e.g. "cpu.pprof"). Patterns containing
+// '/' are matched against zipPath; patterns without '/' are matched
+// against filepath.Base(zipPath).
+func (fs *fileSelection) shouldIncludeFile(zipPath string) bool {
+	// To be included, a file must match at least one include pattern.
+	// Use includePatterns directly rather than retrievalPatterns(),
+	// which is intended only for server-side pre-filtering.
+	included := false
+	patterns := fs.includePatterns
+	if len(patterns) == 0 {
+		// No include patterns: include everything by default.
+		patterns = []string{"*"}
+	}
+	for _, p := range patterns {
+		if matchPattern(p, zipPath) {
+			included = true
+			break
+		}
+	}
+	if !included {
+		return false
+	}
+	// Then it must not match any of the exclusion patterns.
+	for _, p := range fs.excludePatterns {
+		if matchPattern(p, zipPath) {
+			included = false
+			break
+		}
+	}
+	return included
+}
+
 // to prevent interleaved output.
 var zipReportingMu syncutil.Mutex
 
@@ -299,7 +356,7 @@ var zipReportingMu syncutil.Mutex
 // progress messages for the zip command.
 type zipReporter struct {
 	// prefix is the string printed at the start of new lines.
-	prefix string
+	prefix redact.RedactableString
 
 	// flowing when set indicates the reporter should attempt to print
 	// progress about a single item of work on the same line of output.
@@ -314,12 +371,16 @@ type zipReporter struct {
 	// withPrefix(), start(), info() are only valid while inItem is false,
 	// whereas progress(), done() and fail() are only valid while inItem is true.
 	inItem bool
+
+	// The file name extension for SQL table contents
+	// retrieved via RunQueryAndFormatResults().
+	sqlOutputFilenameExtension string
 }
 
-func (zc *zipContext) newZipReporter(format string, args ...interface{}) *zipReporter {
+func (zc *zipContext) newZipReporter(prefix redact.RedactableString) *zipReporter {
 	return &zipReporter{
 		flowing: zc.concurrency == 1,
-		prefix:  "[" + fmt.Sprintf(format, args...) + "]",
+		prefix:  "[" + prefix + "]",
 		newline: true,
 		inItem:  false,
 	}
@@ -327,7 +388,7 @@ func (zc *zipContext) newZipReporter(format string, args ...interface{}) *zipRep
 
 // withPrefix creates a reported which adds the provided formatted
 // message as additional prefix at the start of new lines.
-func (z *zipReporter) withPrefix(format string, args ...interface{}) *zipReporter {
+func (z *zipReporter) withPrefix(prefix redact.RedactableString) *zipReporter {
 	zipReportingMu.Lock()
 	defer zipReportingMu.Unlock()
 
@@ -337,7 +398,7 @@ func (z *zipReporter) withPrefix(format string, args ...interface{}) *zipReporte
 
 	z.completeprevLocked()
 	return &zipReporter{
-		prefix:  z.prefix + " [" + fmt.Sprintf(format, args...) + "]",
+		prefix:  z.prefix + " [" + prefix + "]",
 		flowing: z.flowing,
 		newline: z.newline,
 	}
@@ -347,7 +408,7 @@ func (z *zipReporter) withPrefix(format string, args ...interface{}) *zipReporte
 // specific to that unit of work. The caller can call .progress()
 // zero or more times, and complete with .done() / .fail() /
 // .result().
-func (z *zipReporter) start(format string, args ...interface{}) *zipReporter {
+func (z *zipReporter) start(description redact.RedactableString) *zipReporter {
 	zipReportingMu.Lock()
 	defer zipReportingMu.Unlock()
 
@@ -356,13 +417,13 @@ func (z *zipReporter) start(format string, args ...interface{}) *zipReporter {
 	}
 
 	z.completeprevLocked()
-	msg := z.prefix + " " + fmt.Sprintf(format, args...)
+	msg := z.prefix + " " + description
 	nz := &zipReporter{
 		prefix:  msg,
 		flowing: z.flowing,
 		inItem:  true,
 	}
-	fmt.Print(msg + "...")
+	fmt.Print(msg.StripMarkers() + "...")
 	nz.flowLocked()
 	return nz
 }
@@ -370,7 +431,7 @@ func (z *zipReporter) start(format string, args ...interface{}) *zipReporter {
 // flowLocked is used internally by the reporter when progress on a
 // unit of work can be followed with additional output.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) flowLocked() {
 	if !z.flowing {
 		// Prevent multi-line output.
@@ -383,10 +444,11 @@ func (z *zipReporter) flowLocked() {
 // resumeLocked is used internally by the reporter when progress
 // on a unit of work is resuming.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) resumeLocked() {
+	zipReportingMu.AssertHeld()
 	if !z.flowing || z.newline {
-		fmt.Print(z.prefix + ":")
+		fmt.Print(z.prefix.StripMarkers() + ":")
 	}
 	if z.flowing {
 		z.newline = false
@@ -397,8 +459,9 @@ func (z *zipReporter) resumeLocked() {
 // message that needs to stand out on its own is about to be printed,
 // to complete any ongoing output and start a new line.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) completeprevLocked() {
+	zipReportingMu.AssertHeld()
 	if z.flowing && !z.newline {
 		fmt.Println()
 		z.newline = true
@@ -408,8 +471,9 @@ func (z *zipReporter) completeprevLocked() {
 // endlLocked is used internally by the reported when
 // completing a message that needs to stand out on its own.
 //
-// zipReporterMu is held.
+// zipReportingMu is held.
 func (z *zipReporter) endlLocked() {
+	zipReportingMu.AssertHeld()
 	fmt.Println()
 	if z.flowing {
 		z.newline = true
@@ -423,7 +487,7 @@ func (z *zipReporter) info(format string, args ...interface{}) {
 	defer zipReportingMu.Unlock()
 
 	z.completeprevLocked()
-	fmt.Print(z.prefix)
+	fmt.Print(z.prefix.StripMarkers())
 	fmt.Print(" ")
 	fmt.Printf(format, args...)
 	z.endlLocked()
@@ -454,7 +518,7 @@ func (z *zipReporter) shout(format string, args ...interface{}) {
 	defer zipReportingMu.Unlock()
 
 	z.completeprevLocked()
-	fmt.Print(z.prefix + ": ")
+	fmt.Print(z.prefix.StripMarkers() + ": ")
 	fmt.Printf(format, args...)
 	z.endlLocked()
 }
@@ -501,9 +565,10 @@ func (z *zipReporter) result(err error) error {
 // timestampValue is a wrapper around time.Time which supports the
 // pflag.Value interface and can be initialized from a command line flag.
 // It recognizes the following input formats:
-//    YYYY-MM-DD
-//    YYYY-MM-DD HH:MM
-//    YYYY-MM-DD HH:MM:SS
+//
+//	YYYY-MM-DD
+//	YYYY-MM-DD HH:MM
+//	YYYY-MM-DD HH:MM:SS
 type timestampValue time.Time
 
 // Type implements the pflag.Value interface.

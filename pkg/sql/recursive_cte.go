@@ -1,21 +1,18 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
 // recursiveCTENode implements the logic for a recursive CTE:
@@ -23,15 +20,23 @@ import (
 //     a "working" table.
 //  2. So long as the working table is not empty:
 //     * evaluate the recursive query, substituting the current contents of
-//       the working table for the recursive self-reference;
+//     the working table for the recursive self-reference;
 //     * emit all resulting rows, and save them as the next iteration's
-//       working table.
+//     working table.
+//
 // The recursive query tree is regenerated each time using a callback
 // (implemented by the execbuilder).
 type recursiveCTENode struct {
-	initial planNode
+	// The input plan node is for the initial query.
+	singleInputPlanNode
+
+	// forwarder allows propagating the ProducerMetadata towards the
+	// DistSQLReceiver.
+	forwarder metadataForwarder
 
 	genIterationFn exec.RecursiveCTEIterationFn
+	// iterationCount tracks the number of invocations of genIterationFn.
+	iterationCount int
 
 	label string
 
@@ -62,10 +67,10 @@ type recursiveCTERun struct {
 }
 
 func (n *recursiveCTENode) startExec(params runParams) error {
-	n.typs = planTypes(n.initial)
-	n.workingRows.Init(n.typs, params.extendedEvalCtx, "cte" /* opName */)
+	n.typs = planTypes(n.input)
+	n.workingRows.Init(params.ctx, n.typs, params.extendedEvalCtx, "cte" /* opName */)
 	if n.deduplicate {
-		n.allRows.InitWithDedup(n.typs, params.extendedEvalCtx, "cte-all" /* opName */)
+		n.allRows.InitWithDedup(params.ctx, n.typs, params.extendedEvalCtx, "cte-all" /* opName */)
 	}
 	return nil
 }
@@ -80,18 +85,18 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 		// at a time and returned them in the same fashion, but that would require
 		// special-case behavior).
 		for {
-			ok, err := n.initial.Next(params)
+			ok, err := n.input.Next(params)
 			if err != nil {
 				return false, err
 			}
 			if !ok {
 				break
 			}
-			if err := n.AddRow(params.ctx, n.initial.Values()); err != nil {
+			if err := n.AddRow(params.ctx, n.input.Values()); err != nil {
 				return false, err
 			}
 		}
-		n.iterator = newRowContainerIterator(params.ctx, n.workingRows, n.typs)
+		n.iterator = newRowContainerIterator(params.ctx, n.workingRows)
 		n.initialDone = true
 	}
 
@@ -123,27 +128,40 @@ func (n *recursiveCTENode) Next(params runParams) (bool, error) {
 	defer lastWorkingRows.Close(params.ctx)
 
 	n.workingRows = rowContainerHelper{}
-	n.workingRows.Init(n.typs, params.extendedEvalCtx, "cte" /* opName */)
+	n.workingRows.Init(params.ctx, n.typs, params.extendedEvalCtx, "cte" /* opName */)
 
 	// Set up a bufferNode that can be used as a reference for a scanBufferNode.
 	buf := &bufferNode{
 		// The plan here is only useful for planColumns, so it's ok to always use
 		// the initial plan.
-		plan:  n.initial,
-		typs:  n.typs,
-		rows:  lastWorkingRows,
-		label: n.label,
+		singleInputPlanNode: singleInputPlanNode{n.input},
+		typs:                n.typs,
+		rows:                lastWorkingRows,
+		label:               n.label,
 	}
-	newPlan, err := n.genIterationFn(newExecFactory(params.p), buf)
+
+	// Create a separate tracing span that will be used when planning and
+	// running this iteration. Note that we'll still use the "outer" params.ctx
+	// when accessing rows in the container.
+	n.iterationCount++
+	opName := "recursive-cte-iteration-" + strconv.Itoa(n.iterationCount)
+	planAndRunCtx, sp := tracing.ChildSpan(params.ctx, opName)
+	defer sp.Finish()
+
+	newPlan, err := n.genIterationFn(planAndRunCtx, newExecFactory(planAndRunCtx, params.p), buf)
 	if err != nil {
 		return false, err
 	}
-
-	if err := runPlanInsidePlan(params, newPlan.(*planComponents), rowResultWriter(n)); err != nil {
+	queryStats, err := runPlanInsidePlan(
+		planAndRunCtx, params, newPlan.(*planComponents), rowResultWriter(n),
+		nil /* deferredRoutineSender */, "" /* stmtForDistSQLDiagram */, nil, /* sqlStatsBuilder */
+	)
+	if err != nil {
 		return false, err
 	}
+	forwardInnerQueryStats(n.forwarder, queryStats)
 
-	n.iterator = newRowContainerIterator(params.ctx, n.workingRows, n.typs)
+	n.iterator = newRowContainerIterator(params.ctx, n.workingRows)
 	n.currentRow, err = n.iterator.Next()
 	if err != nil {
 		return false, err
@@ -156,7 +174,7 @@ func (n *recursiveCTENode) Values() tree.Datums {
 }
 
 func (n *recursiveCTENode) Close(ctx context.Context) {
-	n.initial.Close(ctx)
+	n.input.Close(ctx)
 	if n.deduplicate {
 		n.allRows.Close(ctx)
 	}
@@ -189,8 +207,8 @@ func (n *recursiveCTENode) AddRow(ctx context.Context, row tree.Datums) error {
 	return n.workingRows.AddRow(ctx, row)
 }
 
-// IncrementRowsAffected is part of the rowResultWriter interface.
-func (n *recursiveCTENode) IncrementRowsAffected(context.Context, int) {
+// SetRowsAffected is part of the rowResultWriter interface.
+func (n *recursiveCTENode) SetRowsAffected(context.Context, int) {
 }
 
 // SetError is part of the rowResultWriter interface.

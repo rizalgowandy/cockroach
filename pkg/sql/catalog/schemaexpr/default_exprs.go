@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -14,14 +9,30 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parserutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
+// colDefaultExpr returns the default expression string for a column. If the
+// column has an explicit default, that is returned. Otherwise, if the column's
+// type is a domain with a default expression, the domain's default is returned.
+// Returns "" if neither exists.
+func colDefaultExpr(col catalog.Column) string {
+	if col.HasDefault() {
+		return string(col.GetDefaultExpr())
+	}
+	colType := col.GetType()
+	if colType.TypeMeta.DomainData != nil {
+		return colType.TypeMeta.DomainData.DefaultExpr
+	}
+	return ""
+}
+
 // MakeDefaultExprs returns a slice of the default expressions for the slice
 // of input column descriptors, or nil if none of the input column descriptors
-// have default expressions.
+// have default expressions (including domain defaults).
 // The length of the result slice matches the length of the input column descriptors.
 // For every column that has no default expression, a NULL expression is reported
 // as default.
@@ -29,7 +40,7 @@ func MakeDefaultExprs(
 	ctx context.Context,
 	cols []catalog.Column,
 	txCtx *transform.ExprTransformContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 ) ([]tree.TypedExpr, error) {
 	// Check to see if any of the columns have DEFAULT expressions. If there
@@ -37,7 +48,7 @@ func MakeDefaultExprs(
 	// defaults map as the defaults are all NULL.
 	haveDefaults := false
 	for _, col := range cols {
-		if col.HasDefault() {
+		if colDefaultExpr(col) != "" {
 			haveDefaults = true
 			break
 		}
@@ -50,18 +61,18 @@ func MakeDefaultExprs(
 	defaultExprs := make([]tree.TypedExpr, 0, len(cols))
 	exprStrings := make([]string, 0, len(cols))
 	for _, col := range cols {
-		if col.HasDefault() {
-			exprStrings = append(exprStrings, col.GetDefaultExpr())
+		if s := colDefaultExpr(col); s != "" {
+			exprStrings = append(exprStrings, s)
 		}
 	}
-	exprs, err := parser.ParseExprs(exprStrings)
+	exprs, err := parserutils.ParseExprs(exprStrings)
 	if err != nil {
 		return nil, err
 	}
 
 	defExprIdx := 0
 	for _, col := range cols {
-		if !col.HasDefault() {
+		if colDefaultExpr(col) == "" {
 			defaultExprs = append(defaultExprs, tree.DNull)
 			continue
 		}
@@ -70,7 +81,15 @@ func MakeDefaultExprs(
 		if err != nil {
 			return nil, err
 		}
-		if typedExpr, err = txCtx.NormalizeExpr(evalCtx, typedExpr); err != nil {
+
+		// If the DEFAULT expression has a type that is not identical to the
+		// column's type, wrap the default expression in an assignment cast.
+		typedExpr, err = wrapWithAssignmentCast(ctx, typedExpr, col, semaCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		if typedExpr, err = txCtx.NormalizeExpr(ctx, evalCtx, typedExpr); err != nil {
 			return nil, err
 		}
 		defaultExprs = append(defaultExprs, typedExpr)
@@ -89,7 +108,7 @@ func ProcessColumnSet(
 		colIDSet.Add(cols[i].GetID())
 	}
 
-	// Add all public or columns in DELETE_AND_WRITE_ONLY state
+	// Add all public or columns in WRITE_ONLY state
 	// that satisfy the condition.
 	ret := make([]catalog.Column, 0, len(tableDesc.AllColumns()))
 	ret = append(ret, cols...)

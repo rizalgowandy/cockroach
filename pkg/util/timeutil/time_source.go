@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
@@ -17,6 +12,7 @@ import "time"
 type TimeSource interface {
 	Now() time.Time
 	Since(t time.Time) time.Duration
+	Until(t time.Time) time.Duration
 	NewTimer() TimerI
 	NewTicker(duration time.Duration) TickerI
 }
@@ -27,16 +23,12 @@ type TimerI interface {
 	// Reset will set the timer to notify on Ch() after duration.
 	Reset(duration time.Duration)
 
-	// Stop must only be called one time per timer.
+	// Stop prevents the Timer from firing.
 	Stop() bool
 
 	// Ch returns the channel which will be notified when the timer reaches its
 	// time.
 	Ch() <-chan time.Time
-
-	// MarkRead should be called when a value is read from the Ch() channel.
-	// If MarkRead is not called, the resetting the timer is less efficient.
-	MarkRead()
 }
 
 // TickerI is an interface wrapping Ticker.
@@ -69,9 +61,14 @@ func (DefaultTimeSource) Since(t time.Time) time.Duration {
 	return Since(t)
 }
 
+// Until implements TimeSource interface
+func (DefaultTimeSource) Until(t time.Time) time.Duration {
+	return Until(t)
+}
+
 // NewTimer returns a TimerI wrapping *Timer.
 func (DefaultTimeSource) NewTimer() TimerI {
-	return (*timer)(NewTimer())
+	return (*timer)(new(Timer))
 }
 
 // NewTicker creates a new ticker.
@@ -93,10 +90,6 @@ func (t *timer) Stop() bool {
 
 func (t *timer) Ch() <-chan time.Time {
 	return t.C
-}
-
-func (t *timer) MarkRead() {
-	t.Read = true
 }
 
 type ticker time.Ticker

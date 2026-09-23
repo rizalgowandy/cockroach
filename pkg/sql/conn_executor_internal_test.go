@@ -1,35 +1,36 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 package sql
 
 import (
 	"context"
-	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/license"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser/statements"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -39,19 +40,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 )
 
 // Test portal implicit destruction. Unless destroying a portal is explicitly
 // requested, portals live until the end of the transaction in which they're
 // created. If they're created outside of a transaction, they live until
-// the next transaction completes (so until the next statement is executed,
-// which statement is expected to be the execution of the portal that was just
-// created).
-// For the non-transactional case, our behavior is different than Postgres',
-// which states that, outside of transactions, portals live until the next Sync
-// protocol command.
+// the implicit transaction completes. As per the PostgreSQL docs, the implicit
+// transaction completes when the next Sync protocol command is handled.
 func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -104,7 +105,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	require.NoError(t, err)
 
 	cmdPos++
-	failedDescribePos := cmdPos
+	secondSuccessfulDescribePos := cmdPos
 	if err = buf.Push(ctx, DescribeStmt{
 		Name: "portal1",
 		Type: pgwirebase.PreparePortal,
@@ -113,7 +114,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 
 	cmdPos++
-	if err = buf.Push(ctx, Sync{}); err != nil {
+	if err = buf.Push(ctx, Sync{ExplicitFromClient: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -124,6 +125,29 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 	if err = results[successfulDescribePos].err; err != nil {
 		t.Fatalf("expected first Describe to succeed, got err: %s", err)
+	}
+	if err = results[secondSuccessfulDescribePos].err; err != nil {
+		t.Fatalf("expected second Describe to succeed, got err: %s", err)
+	}
+
+	// cmdPos gets reset after the Sync.
+	cmdPos = 0
+	failedDescribePos := cmdPos
+	if err = buf.Push(ctx, DescribeStmt{
+		Name: "portal1",
+		Type: pgwirebase.PreparePortal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cmdPos++
+	if err = buf.Push(ctx, Sync{ExplicitFromClient: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	results = <-syncResults
+	numResults = len(results)
+	if numResults != cmdPos+1 {
+		t.Fatalf("expected %d results, got: %d", cmdPos+1, len(results))
 	}
 	if !testutils.IsError(results[failedDescribePos].err, "unknown portal") {
 		t.Fatalf("expected error \"unknown portal\", got: %v", results[failedDescribePos].err)
@@ -181,7 +205,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	require.NoError(t, err)
 
 	cmdPos++
-	failedDescribePos = cmdPos
+	secondSuccessfulDescribePos = cmdPos
 	if err = buf.Push(ctx, DescribeStmt{
 		Name: "portal1",
 		Type: pgwirebase.PreparePortal,
@@ -190,7 +214,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 
 	cmdPos++
-	if err = buf.Push(ctx, Sync{}); err != nil {
+	if err = buf.Push(ctx, Sync{ExplicitFromClient: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,7 +228,7 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	if err = results[succDescIdx].err; err != nil {
 		t.Fatalf("expected first Describe to succeed, got err: %s", err)
 	}
-	failDescIdx := failedDescribePos - numResults
+	failDescIdx := secondSuccessfulDescribePos - numResults
 	if !testutils.IsError(results[failDescIdx].err, "unknown portal") {
 		t.Fatalf("expected error \"unknown portal\", got: %v", results[failDescIdx].err)
 	}
@@ -215,10 +239,10 @@ func TestPortalsDestroyedOnTxnFinish(t *testing.T) {
 	}
 }
 
-func mustParseOne(s string) parser.Statement {
+func mustParseOne(s string) statements.Statement[tree.Statement] {
 	stmts, err := parser.Parse(s)
 	if err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		log.Dev.Fatalf(context.Background(), "%v", err)
 	}
 	return stmts[0]
 }
@@ -240,80 +264,103 @@ func mustParseOne(s string) parser.Statement {
 // need to read from it.
 func startConnExecutor(
 	ctx context.Context,
-) (*StmtBuf, <-chan []resWithPos, <-chan error, *stop.Stopper, ieResultReader, error) {
+) (
+	*StmtBuf,
+	<-chan []*streamingCommandResult,
+	<-chan error,
+	*stop.Stopper,
+	ieResultReader,
+	error,
+) {
 	// A lot of boilerplate for creating a connExecutor.
 	stopper := stop.NewStopper()
-	clock := hlc.NewClock(hlc.UnixNano, 0 /* maxOffset */)
+	codec := keys.SystemSQLCodec
+	clock := hlc.NewClockForTesting(nil)
 	factory := kv.MakeMockTxnSenderFactory(
-		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
+		func(context.Context, *roachpb.Transaction, *kvpb.BatchRequest,
+		) (*kvpb.BatchResponse, *kvpb.Error) {
 			return nil, nil
 		})
-	db := kv.NewDB(testutils.MakeAmbientCtx(), factory, clock, stopper)
+	db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 	st := cluster.MakeTestingClusterSettings()
 	nodeID := base.TestingIDContainer
 	distSQLMetrics := execinfra.MakeDistSQLMetrics(time.Hour /* histogramWindow */)
 	gw := gossip.MakeOptionalGossip(nil)
-	tempEngine, tempFS, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	tempEngine, tempFS, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), nil /* statsCollector */)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
 	defer tempEngine.Close()
-	ambientCtx := testutils.MakeAmbientCtx()
-	cfg := &ExecutorConfig{
-		AmbientCtx:      ambientCtx,
-		Settings:        st,
-		Clock:           clock,
-		DB:              db,
-		SystemConfig:    config.EmptySystemConfigProvider{},
-		SessionRegistry: NewSessionRegistry(),
-		NodeInfo: NodeInfo{
-			NodeID:    nodeID,
-			ClusterID: func() uuid.UUID { return uuid.UUID{} },
+	ambientCtx := log.MakeTestingAmbientCtxWithNewTracer()
+	pool := mon.NewUnlimitedMonitor(ctx, mon.Options{
+		Name:     mon.MakeName("test"),
+		Settings: st,
+	})
+	// This pool should never be Stop()ed because, if the test is failing, memory
+	// is not properly released.
+	collectionFactory := descs.NewBareBonesCollectionFactory(st, codec)
+	registry := stmtdiagnostics.NewRegistry(nil, st)
+	distSQLSrv := distsql.NewServer(
+		ctx,
+		execinfra.ServerConfig{
+			AmbientContext:    ambientCtx,
+			Settings:          st,
+			Stopper:           stopper,
+			Metrics:           &distSQLMetrics,
+			NodeID:            nodeID,
+			TempFS:            tempFS,
+			ParentDiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
+			CollectionFactory: collectionFactory,
 		},
-		Codec: keys.SystemSQLCodec,
+		flowinfra.NewRemoteFlowRunner(ambientCtx, stopper, nil /* acc */),
+	)
+	cfg := &ExecutorConfig{
+		AmbientCtx: ambientCtx,
+		Settings:   st,
+		Clock:      clock,
+		DistSQLSrv: distSQLSrv,
+		DB:         db,
+		SystemConfig: config.NewConstantSystemConfigProvider(
+			config.NewSystemConfig(zonepb.DefaultZoneConfigRef()),
+		),
+		SessionRegistry:    NewSessionRegistry(),
+		ClosedSessionCache: NewClosedSessionCache(st, pool, time.Now),
+		NodeInfo: NodeInfo{
+			NodeID:           nodeID,
+			LogicalClusterID: func() uuid.UUID { return uuid.UUID{} },
+		},
+		Codec: codec,
 		DistSQLPlanner: NewDistSQLPlanner(
-			ctx, execinfra.Version, st, roachpb.NodeID(1),
+			ctx, st, 1, /* sqlInstanceID */
 			nil, /* rpcCtx */
-			distsql.NewServer(
-				ctx,
-				execinfra.ServerConfig{
-					AmbientContext:    ambientCtx,
-					Settings:          st,
-					Stopper:           stopper,
-					Metrics:           &distSQLMetrics,
-					NodeID:            nodeID,
-					TempFS:            tempFS,
-					ParentDiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
-				},
-				flowinfra.NewFlowScheduler(ambientCtx, stopper, st),
-			),
+			distSQLSrv,
 			nil, /* distSender */
 			nil, /* nodeDescs */
 			gw,
 			stopper,
-			func(roachpb.NodeID) bool { return true }, // everybody is available
-			nil, /* nodeDialer */
+			func(base.SQLInstanceID) bool { return true }, // everybody is available
+			nil, /* connHealthCheckerSystem */
+			nil, /* instanceConnHealthChecker */
+			nil, /* sqlInstanceDialer */
+			codec,
+			nil, /* sqlAddressResolver */
+			clock,
 		),
 		QueryCache:              querycache.New(0),
 		TestingKnobs:            ExecutorTestingKnobs{},
-		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, nil, gw, st),
+		StmtDiagnosticsRecorder: registry,
+		TxnDiagnosticsRecorder:  stmtdiagnostics.NewTxnRegistry(nil, st, registry, timeutil.DefaultTimeSource{}),
 		HistogramWindowInterval: base.DefaultHistogramWindowInterval(),
-		CollectionFactory:       descs.NewCollectionFactory(st, nil, nil, nil),
+		CollectionFactory:       collectionFactory,
+		LicenseEnforcer:         license.NewEnforcer(nil),
 	}
-	pool := mon.NewUnlimitedMonitor(
-		context.Background(), "test", mon.MemoryResource,
-		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
-	)
-	// This pool should never be Stop()ed because, if the test is failing, memory
-	// is not properly released.
 
 	s := NewServer(cfg, pool)
-	buf := NewStmtBuf()
-	syncResults := make(chan []resWithPos, 1)
+	buf := NewStmtBuf(0 /* toReserve */)
+	syncResults := make(chan []*streamingCommandResult, 1)
 	resultChannel := newAsyncIEResultChannel()
 	var cc ClientComm = &internalClientComm{
-		sync: func(res []resWithPos) {
+		sync: func(res []*streamingCommandResult) {
 			syncResults <- res
 		},
 		w: resultChannel,
@@ -321,7 +368,15 @@ func startConnExecutor(
 	sqlMetrics := MakeMemMetrics("test" /* endpoint */, time.Second /* histogramWindow */)
 
 	onDefaultIntSizeChange := func(int32) {}
-	conn, err := s.SetupConn(ctx, SessionArgs{}, buf, cc, sqlMetrics, onDefaultIntSizeChange)
+	conn, err := s.SetupConn(
+		ctx,
+		SessionArgs{},
+		buf,
+		cc,
+		sqlMetrics,
+		onDefaultIntSizeChange,
+		clusterunique.ID{},
+	)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -331,7 +386,12 @@ func startConnExecutor(
 	// routine, we're going to push commands into the StmtBuf and, from time to
 	// time, collect and check their results.
 	go func() {
-		finished <- s.ServeConn(ctx, conn, mon.BoundAccount{}, nil /* cancel */)
+		finished <- s.ServeConn(
+			ctx,
+			conn,
+			&mon.BoundAccount{},
+			nil, /* cancel */
+		)
 	}()
 	return buf, syncResults, finished, stopper, resultChannel, nil
 }
@@ -345,19 +405,27 @@ func TestSessionCloseWithPendingTempTableInTxn(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	srv := s.SQLServer().(*Server)
-	stmtBuf := NewStmtBuf()
-	flushed := make(chan []resWithPos)
+	stmtBuf := NewStmtBuf(0 /* toReserve */)
+	flushed := make(chan []*streamingCommandResult)
 	clientComm := &internalClientComm{
-		sync: func(res []resWithPos) {
+		sync: func(res []*streamingCommandResult) {
 			flushed <- res
 		},
 	}
 	onDefaultIntSizeChange := func(int32) {}
-	connHandler, err := srv.SetupConn(ctx, SessionArgs{User: security.RootUserName()}, stmtBuf, clientComm, MemoryMetrics{}, onDefaultIntSizeChange)
+	connHandler, err := srv.SetupConn(
+		ctx,
+		SessionArgs{User: username.RootUserName()},
+		stmtBuf,
+		clientComm,
+		MemoryMetrics{},
+		onDefaultIntSizeChange,
+		clusterunique.ID{},
+	)
 	require.NoError(t, err)
 
 	stmts, err := parser.Parse(`
@@ -371,11 +439,16 @@ CREATE TEMPORARY TABLE foo();
 	for _, stmt := range stmts {
 		require.NoError(t, stmtBuf.Push(ctx, ExecStmt{Statement: stmt}))
 	}
-	require.NoError(t, stmtBuf.Push(ctx, Sync{}))
+	require.NoError(t, stmtBuf.Push(ctx, Sync{ExplicitFromClient: false}))
 
 	done := make(chan error)
 	go func() {
-		done <- srv.ServeConn(ctx, connHandler, mon.BoundAccount{}, nil /* cancel */)
+		done <- srv.ServeConn(
+			ctx,
+			connHandler,
+			&mon.BoundAccount{},
+			nil, /* cancel */
+		)
 	}()
 	results := <-flushed
 	require.Len(t, results, 6) // We expect results for 5 statements + sync.
@@ -391,5 +464,58 @@ CREATE TEMPORARY TABLE foo();
 		t.Fatal("session close timed out; connExecutor deadlocked?")
 	case err = <-done:
 		require.NoError(t, err)
+	}
+}
+
+func TestAnonymizeStatementAndGistForReporting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	s := cluster.MakeTestingClusterSettings()
+	vt, err := NewVirtualSchemaHolder(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const stmt1s = `
+INSERT INTO sensitive(super, sensible) VALUES('that', 'nobody', 'must', 'see')
+`
+	stmt1, err := parser.ParseOne(stmt1s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make a dummy connExecutor.
+	var ex connExecutor
+	ex.curStmtAST = stmt1.AST
+	ex.curStmtPlanGist = "foobargist"
+	ex.planner.extendedEvalCtx.VirtualSchemas = vt
+
+	rUnsafe := errors.New("some error")
+	safeErr := ex.WithAnonymizedStatementAndGist(rUnsafe)
+
+	const expMessage = "some error"
+	actMessage := safeErr.Error()
+	if actMessage != expMessage {
+		t.Errorf("wanted: %s\ngot: %s", expMessage, actMessage)
+	}
+
+	const expSafeRedactedMsgPrefix = `some error
+(1) plan gist: foobargist
+Wraps: (2) while executing: INSERT INTO _(_, _) VALUES ('_', '_', __more1_10__)`
+
+	actSafeRedactedMessage := string(redact.Sprintf("%+v", safeErr))
+
+	if !strings.HasPrefix(actSafeRedactedMessage, expSafeRedactedMsgPrefix) {
+		diff, _ := difflib.GetUnifiedDiffString(difflib.UnifiedDiff{
+			A:        difflib.SplitLines(expSafeRedactedMsgPrefix),
+			B:        difflib.SplitLines(actSafeRedactedMessage[:len(expSafeRedactedMsgPrefix)]),
+			FromFile: "Expected Message Prefix",
+			FromDate: "",
+			ToFile:   "Actual Message Prefix",
+			ToDate:   "",
+			Context:  1,
+		})
+		t.Errorf("Diff:\n%s", diff)
 	}
 }

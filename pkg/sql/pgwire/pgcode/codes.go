@@ -1,14 +1,11 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgcode
+
+import "regexp"
 
 // Code is a wrapper around a string to ensure that pgcodes are used in
 // different pgerror functions by avoiding accidental string input.
@@ -127,6 +124,20 @@ var (
 	InvalidXMLContent                     = MakeCode("2200N")
 	InvalidXMLComment                     = MakeCode("2200S")
 	InvalidXMLProcessingInstruction       = MakeCode("2200T")
+	InvalidSQLJSONSubscript               = MakeCode("22033")
+	MoreThanOneSQLJSONItem                = MakeCode("22034")
+	NoSQLJSONItem                         = MakeCode("22035")
+	NonNumericSQLJSONItem                 = MakeCode("22036")
+	NonUniqueKeysInJSONObject             = MakeCode("22037")
+	SingletonSQLJSONItemRequired          = MakeCode("22038")
+	SQLJSONArrayNotFound                  = MakeCode("22039")
+	SQLJSONMemberNotFound                 = MakeCode("2203A")
+	SQLJSONNumberNotFound                 = MakeCode("2203B")
+	SQLJSONObjectNotFound                 = MakeCode("2203C")
+	TooManyJSONArrayElements              = MakeCode("2203D")
+	TooManyJSONObjectMembers              = MakeCode("2203E")
+	SQLJSONScalarRequired                 = MakeCode("2203F")
+	SQLJSONItemCannotBeCastToTargetType   = MakeCode("2203G")
 	// Section: Class 23 - Integrity Constraint Violation
 	IntegrityConstraintViolation = MakeCode("23000")
 	RestrictViolation            = MakeCode("23001")
@@ -380,10 +391,37 @@ var (
 	// internally on a connection between different Cockroach nodes.
 	InternalConnectionFailure = MakeCode("58C01")
 
+	// ProxyConnectionError is returned by the sqlproxy and it indicates a
+	// problem establishing the connection through the proxy.
+	ProxyConnectionError = MakeCode("08C00")
+
 	// Class XC - cockroach extension.
 	// CockroachDB distributed system related errors.
 
 	// UnsatisfiableBoundedStaleness signals that the bounded staleness query
 	// cannot be satisfied.
 	UnsatisfiableBoundedStaleness = MakeCode("XCUBS")
+
+	// QueryNotRunningInHomeRegion signals that a query is not running in its
+	// home region.
+	QueryNotRunningInHomeRegion = MakeCode("XCHR1")
+
+	// QueryHasNoHomeRegion signals that a query has no home region.
+	QueryHasNoHomeRegion = MakeCode("XCHR2")
+
+	// ExperimentalFeature signals that a feature we supported experimentally is being
+	// used without the session variable being enabled.
+	ExperimentalFeature = MakeCode("XCEXF")
 )
+
+var pgCodeRegexp = regexp.MustCompile(`[A-Z0-9]{5}`)
+
+// IsValidPGCode returns true if the given code is a valid error code. Note that
+// this does not check if the code is one of the pre-defined error codes like
+// "Syntax" or "InvalidName" - instead, it checks that the format of the code is
+// valid. This is because it is possible for users to throw and catch arbitrary
+// error codes in PLpgSQL routines.
+func IsValidPGCode(code string) bool {
+	// The code must consist of 5 digits and/or upper-case ASCII letters.
+	return pgCodeRegexp.MatchString(code)
+}

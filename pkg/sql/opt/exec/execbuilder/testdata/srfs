@@ -6,18 +6,21 @@ query T
 EXPLAIN SELECT * FROM generate_series(1, 3)
 ----
 distribution: local
-vectorized: true
 ·
 • project set
 │ estimated row count: 10
 │
 └── • emptyrow
 
-query T
+# Duplicate SRF names in FROM without aliases now correctly errors,
+# matching Postgres behavior (#150532).
+query error pgcode 42712 source name "generate_series" specified more than once
 EXPLAIN SELECT * FROM generate_series(1, 2), generate_series(1, 2)
+
+query T
+EXPLAIN SELECT * FROM generate_series(1, 2) AS a, generate_series(1, 2) AS b
 ----
 distribution: local
-vectorized: true
 ·
 • cross join
 │ estimated row count: 100
@@ -36,7 +39,6 @@ query T
 EXPLAIN SELECT * FROM ROWS FROM (cos(1))
 ----
 distribution: local
-vectorized: true
 ·
 • project set
 │ estimated row count: 1
@@ -47,7 +49,6 @@ query T
 EXPLAIN SELECT generate_series(1, 3)
 ----
 distribution: local
-vectorized: true
 ·
 • project set
 │ estimated row count: 10
@@ -61,7 +62,6 @@ query T
 EXPLAIN SELECT generate_series(1, 2), generate_series(1, 2)
 ----
 distribution: local
-vectorized: true
 ·
 • project set
 │ estimated row count: 10
@@ -122,7 +122,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, generate_series)
-│ ordering: +a,+generate_series
 │ estimated row count: 10,000 (missing stats)
 │ order: +a,+generate_series
 │
@@ -152,13 +151,11 @@ vectorized: true
 ·
 • sort
 │ columns: (x, y, z, "information_schema._pg_expandarray")
-│ ordering: +x
 │ estimated row count: 3,267 (missing stats)
 │ order: +x
 │
 └── • render
     │ columns: ("information_schema._pg_expandarray", x, y, z)
-    │ estimated row count: 3,267 (missing stats)
     │ render information_schema._pg_expandarray: ((x, n) AS x, n)
     │ render x: x
     │ render y: y
@@ -200,7 +197,6 @@ vectorized: true
 ·
 • project
 │ columns: (generate_series)
-│ estimated row count: 3,333 (missing stats)
 │
 └── • project set
     │ columns: (x, z, generate_series)
@@ -238,7 +234,6 @@ vectorized: true
 ·
 • project
 │ columns: (generate_subscripts, generate_series, unnest, y, z)
-│ estimated row count: 10,000 (missing stats)
 │
 └── • project set
     │ columns: (x, y, x, z, generate_subscripts, generate_series, unnest)
@@ -280,7 +275,6 @@ vectorized: true
 │
 ├── • project
 │   │ columns: (generate_series)
-│   │ estimated row count: 10,000 (missing stats)
 │   │
 │   └── • project set
 │       │ columns: (z, generate_series)
@@ -304,17 +298,24 @@ vectorized: true
         │
         └── • project
             │ columns: (unnest)
-            │ estimated row count: 2,000 (missing stats)
             │
             └── • apply join (inner)
                 │ columns: (x, y, unnest)
                 │ estimated row count: 2,000 (missing stats)
                 │
-                └── • scan
-                      columns: (x, y)
-                      estimated row count: 1,000 (missing stats)
-                      table: xy@xy_pkey
-                      spans: FULL SCAN
+                ├── • scan
+                │     columns: (x, y)
+                │     estimated row count: 1,000 (missing stats)
+                │     table: xy@xy_pkey
+                │     spans: FULL SCAN
+                │
+                └── • inner loop (unoptimized)
+                    │ columns: ()
+                    │
+                    └── • values
+                          columns: ()
+                           ├── (xy.x,)
+                           └── (y,)
 
 # Regression test for #24676.
 statement ok
@@ -336,7 +337,6 @@ vectorized: true
 ·
 • render
 │ columns: (group_name, jsonb_array_elements)
-│ estimated row count: 100,000 (missing stats)
 │ render group_name: data->>'name'
 │ render jsonb_array_elements: jsonb_array_elements
 │
@@ -355,14 +355,13 @@ vectorized: true
             │ columns: (id, data, "?column?")
             │
             └── • hash join (left outer)
-                │ columns: (column12, id, data, column13, "?column?")
+                │ columns: (column16, id, data, column17, "?column?")
                 │ estimated row count: 10,000 (missing stats)
-                │ equality: (column12) = (column13)
+                │ equality: (column16) = (column17)
                 │
                 ├── • render
-                │   │ columns: (column12, id, data)
-                │   │ estimated row count: 1,000 (missing stats)
-                │   │ render column12: data->>'name'
+                │   │ columns: (column16, id, data)
+                │   │ render column16: data->>'name'
                 │   │ render id: id
                 │   │ render data: data
                 │   │
@@ -373,9 +372,8 @@ vectorized: true
                 │         spans: FULL SCAN
                 │
                 └── • render
-                    │ columns: (column13, "?column?")
-                    │ estimated row count: 1,000 (missing stats)
-                    │ render column13: data->>'name'
+                    │ columns: (column17, "?column?")
+                    │ render column17: data->>'name'
                     │ render ?column?: data->'members'
                     │
                     └── • scan
@@ -426,7 +424,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (id, body, description, title, slug, tag_list, user_id, created_at, updated_at)
-│ ordering: +created_at
 │ estimated row count: 10 (missing stats)
 │ order: +any_not_null
 │ k: 10
@@ -476,7 +473,6 @@ vectorized: true
 ·
 • project
 │ columns: (generate_series)
-│ estimated row count: 10
 │
 └── • project set
     │ columns: (a, generate_series)
@@ -485,7 +481,6 @@ vectorized: true
     │
     └── • project
         │ columns: (a)
-        │ estimated row count: 1
         │
         └── • except all
             │ columns: (a, a)

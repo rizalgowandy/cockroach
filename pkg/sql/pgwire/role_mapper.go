@@ -1,19 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/identmap"
 	"github.com/cockroachdb/errors"
@@ -30,18 +25,53 @@ import (
 // maps groups of users onto database roles.
 type RoleMapper = func(
 	ctx context.Context,
-	systemIdentity security.SQLUsername,
-) ([]security.SQLUsername, error)
+	systemIdentity string,
+) ([]username.SQLUsername, error)
 
 // UseProvidedIdentity is a trivial implementation of RoleMapper which always
 // returns its input.
-func UseProvidedIdentity(
-	_ context.Context, id security.SQLUsername,
-) ([]security.SQLUsername, error) {
-	return []security.SQLUsername{id}, nil
+func UseProvidedIdentity(_ context.Context, id string) ([]username.SQLUsername, error) {
+	u, err := username.MakeSQLUsernameFromUserInput(id, username.PurposeValidation)
+	if err != nil {
+		return nil, err
+	}
+	return []username.SQLUsername{u}, nil
 }
 
 var _ RoleMapper = UseProvidedIdentity
+
+// EnhancedRoleMapper is like RoleMapper but also returns which specific
+// system identity was matched to each database user. This is useful for
+// certificate SAN authentication where multiple identities exist.
+type EnhancedRoleMapper = func(
+	ctx context.Context,
+	systemIdentities []string,
+) ([]identmap.IdentityMapping, error)
+
+// UseProvidedIdentities is the enhanced version that handles multiple identities.
+func UseProvidedIdentities(_ context.Context, ids []string) ([]identmap.IdentityMapping, error) {
+	mappings := make([]identmap.IdentityMapping, 0, len(ids))
+	for _, id := range ids {
+		u, err := username.MakeSQLUsernameFromUserInput(id, username.PurposeValidation)
+		if err != nil {
+			return nil, err
+		}
+		mappings = append(mappings, identmap.IdentityMapping{
+			SystemIdentity: id,
+			MappedUser:     u,
+		})
+	}
+	return mappings, nil
+}
+
+var _ EnhancedRoleMapper = UseProvidedIdentities
+
+// UseSpecifiedIdentity is a RoleMapper that always returns a fixed user.
+func UseSpecifiedIdentity(user username.SQLUsername) RoleMapper {
+	return func(_ context.Context, _ string) ([]username.SQLUsername, error) {
+		return []username.SQLUsername{user}, nil
+	}
+}
 
 // HbaMapper implements the "map" option that may be defined in a
 // host-based authentication rule. If the HBA entry does not define a
@@ -55,17 +85,40 @@ func HbaMapper(hbaEntry *hba.Entry, identMap *identmap.Conf) RoleMapper {
 	if mapName == "" {
 		return UseProvidedIdentity
 	}
-	return func(_ context.Context, id security.SQLUsername) ([]security.SQLUsername, error) {
-		users, err := identMap.Map(mapName, id.Normalized())
+	return func(_ context.Context, id string) ([]username.SQLUsername, error) {
+		users, _, err := identMap.Map(mapName, id)
 		if err != nil {
 			return nil, err
 		}
 		for _, user := range users {
 			if user.IsRootUser() || user.IsReserved() {
 				return nil, errors.Newf("system identity %q mapped to reserved database role %q",
-					id.Normalized(), user.Normalized())
+					id, user.Normalized())
 			}
 		}
 		return users, nil
+	}
+}
+
+// HbaEnhancedMapper is like HbaMapper but returns the enhanced mapping information
+// that includes which specific system identity mapped to each user. This is used
+// for certificate SAN authentication.
+func HbaEnhancedMapper(hbaEntry *hba.Entry, identMap *identmap.Conf) EnhancedRoleMapper {
+	mapName := hbaEntry.GetOption("map")
+	if mapName == "" {
+		return UseProvidedIdentities
+	}
+	return func(_ context.Context, ids []string) ([]identmap.IdentityMapping, error) {
+		mappings, _, err := identMap.MapMultiple(mapName, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, mapping := range mappings {
+			if mapping.MappedUser.IsRootUser() || mapping.MappedUser.IsReserved() {
+				return nil, errors.Newf("system identity %q mapped to reserved database role %q",
+					mapping.SystemIdentity, mapping.MappedUser.Normalized())
+			}
+		}
+		return mappings, nil
 	}
 }

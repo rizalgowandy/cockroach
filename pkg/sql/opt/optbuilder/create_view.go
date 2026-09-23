@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -15,28 +10,54 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 func (b *Builder) buildCreateView(cv *tree.CreateView, inScope *scope) (outScope *scope) {
 	b.DisableMemoReuse = true
-	sch, resName := b.resolveSchemaForCreate(&cv.Name)
-	schID := b.factory.Metadata().AddSchema(sch)
-	viewName := tree.MakeTableNameFromPrefix(resName, tree.Name(cv.Name.Object()))
+
+	isTemp := resolveTemporaryStatus(cv.Name.ObjectNamePrefix, cv.Persistence)
+	if isTemp {
+		// Postgres allows using `pg_temp` as an alias for the session specific temp
+		// schema. In PG, the following are equivalent:
+		// CREATE TEMP TABLE t <=> CREATE TABLE pg_temp.t <=> CREATE TEMP TABLE pg_temp.t
+		//
+		// The temporary schema is created the first time a session creates a
+		// temporary object, so it is possible to use `pg_temp` in a fully qualified
+		// name when the temporary schema does not exist. To allow the name to be
+		// resolved, we unset the explicitly named schema and set the Persistence to
+		// temporary.
+		cv.Name.ObjectNamePrefix.SchemaName = ""
+		cv.Name.ObjectNamePrefix.ExplicitSchema = false
+		cv.Persistence = tree.PersistenceTemporary
+	}
 
 	// We build the select statement to:
 	//  - check the statement semantically,
 	//  - get the fully resolved names into the AST, and
-	//  - collect the view dependencies in b.viewDeps.
+	//  - collect the view dependencies in b.schemaDeps.
 	// The result is not otherwise used.
 	b.insideViewDef = true
-	b.trackViewDeps = true
+	b.trackSchemaDeps = true
 	b.qualifyDataSourceNamesInAST = true
+	if b.sourceViews == nil {
+		b.sourceViews = make(map[string]struct{})
+	}
+
+	viewName := &cv.Name
+	sch, resName := b.resolveSchemaForCreateTable(viewName, isTemp)
+	viewName.ObjectNamePrefix = resName
+	schID := b.factory.Metadata().AddSchema(sch)
+
+	viewFQString := viewName.FQString()
+	b.sourceViews[viewFQString] = struct{}{}
 	defer func() {
 		b.insideViewDef = false
-		b.trackViewDeps = false
-		b.viewDeps = nil
-		b.viewTypeDeps = util.FastIntSet{}
+		b.trackSchemaDeps = false
+		b.schemaDeps = nil
+		b.schemaTypeDeps = intsets.Fast{}
 		b.qualifyDataSourceNamesInAST = false
+		delete(b.sourceViews, viewFQString)
 	}()
 
 	defScope := b.buildStmtAtRoot(cv.AsSource, nil /* desiredTypes */)
@@ -58,8 +79,8 @@ func (b *Builder) buildCreateView(cv *tree.CreateView, inScope *scope) (outScope
 
 	// If the type of any column that this view references is user
 	// defined, add a type dependency between this view and the UDT.
-	if b.trackViewDeps {
-		for _, d := range b.viewDeps {
+	if b.trackSchemaDeps {
+		for _, d := range b.schemaDeps {
 			if !d.ColumnOrdinals.Empty() {
 				d.ColumnOrdinals.ForEach(func(ord int) {
 					ids, err := d.DataSource.CollectTypes(ord)
@@ -67,26 +88,31 @@ func (b *Builder) buildCreateView(cv *tree.CreateView, inScope *scope) (outScope
 						panic(err)
 					}
 					for _, id := range ids {
-						b.viewTypeDeps.Add(int(id))
+						b.schemaTypeDeps.Add(int(id))
 					}
 				})
 			}
 		}
 	}
 
+	// We need the view query to include user-defined types as a 3-part name to
+	// properly detect cross-database type access.
+	fmtFlags := tree.FmtParsable | tree.FmtAlwaysQualifyUserDefinedTypeNames
+	if cv.Materialized {
+		// Don't include any AS OF SYSTEM TIME clauses here: our materialized view
+		// shouldn't get refreshed as of a particular time.
+		fmtFlags = fmtFlags | tree.FmtSkipAsOfSystemTimeClauses
+	}
 	outScope = b.allocScope()
 	outScope.expr = b.factory.ConstructCreateView(
 		&memo.CreateViewPrivate{
-			Schema:       schID,
-			ViewName:     &viewName,
-			IfNotExists:  cv.IfNotExists,
-			Replace:      cv.Replace,
-			Persistence:  cv.Persistence,
-			Materialized: cv.Materialized,
-			ViewQuery:    tree.AsStringWithFlags(cv.AsSource, tree.FmtParsable),
-			Columns:      p,
-			Deps:         b.viewDeps,
-			TypeDeps:     b.viewTypeDeps,
+			Syntax:    cv,
+			Schema:    schID,
+			ViewQuery: tree.AsStringWithFlags(cv.AsSource, fmtFlags),
+			Columns:   p,
+			Deps:      b.schemaDeps,
+			TypeDeps:  b.schemaTypeDeps,
+			FuncDeps:  b.schemaFunctionDeps,
 		},
 	)
 	return outScope

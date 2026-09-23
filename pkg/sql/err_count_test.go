@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -15,9 +10,9 @@ import (
 	gosql "database/sql"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -31,8 +26,7 @@ func TestErrorCounts(t *testing.T) {
 
 	telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	count1 := telemetry.GetRawFeatureCounts()["errorcodes."+pgcode.Syntax.String()]
@@ -65,32 +59,6 @@ func TestErrorCounts(t *testing.T) {
 	}
 }
 
-func TestUnimplementedCounts(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
-
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
-
-	if _, err := db.Exec(`
-CREATE TABLE t(x INT8); 
-SET enable_experimental_alter_column_type_general = true;
-BEGIN;
-`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec("ALTER TABLE t ALTER COLUMN x SET DATA TYPE STRING"); err == nil {
-		t.Fatal("expected error, got no error")
-	}
-
-	if telemetry.GetRawFeatureCounts()["unimplemented.#49351"] == 0 {
-		t.Fatal("expected unimplemented telemetry, got nothing")
-	}
-}
-
 func TestTransactionRetryErrorCounts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -101,8 +69,7 @@ func TestTransactionRetryErrorCounts(t *testing.T) {
 	// in pgwire (pgwire.convertToErrWithPGCode). Make sure we're
 	// reporting errors at a level that allows this code to be recorded.
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if _, err := db.Exec("CREATE TABLE accounts (id INT8 PRIMARY KEY, balance INT8)"); err != nil {

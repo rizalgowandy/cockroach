@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package coldata
 
@@ -20,15 +15,21 @@ import (
 
 // JSONs is a representation of columnar JSON data. It's simply a wrapper around
 // the flat Bytes structure. To pull a JSON out of the structure, we construct
-// a new "encodedJSON" object from scratch on demand.
+// a new JSONEncoded object from scratch on demand.
 type JSONs struct {
 	Bytes
+	// jsonScratch batches allocations of JSONEncoded objects (under the
+	// assumption that the vector doesn't have NULLs).
+	jsonScratch []json.JSONEncoded
+	// scratch is a scratch space for encoding a JSON object on demand.
+	scratch []byte
 }
 
 // NewJSONs returns a new JSONs presized to n elements.
 func NewJSONs(n int) *JSONs {
 	return &JSONs{
-		Bytes: *NewBytes(n),
+		Bytes:       *NewBytes(n),
+		jsonScratch: make([]json.JSONEncoded, n),
 	}
 }
 
@@ -41,26 +42,22 @@ func (js *JSONs) Get(i int) json.JSON {
 	if len(bytes) == 0 {
 		return json.NullJSONValue
 	}
-	ret, err := json.FromEncoding(bytes)
+	j := &js.jsonScratch[i]
+	err := json.FromEncodingInto(bytes, j)
 	if err != nil {
 		colexecerror.ExpectedError(err)
 	}
-	return ret
+	return j
 }
 
-// Set sets the ith JSON in JSONs. Overwriting a value that is not at the end
-// of the JSONs is not allowed since it complicates memory movement to make/take
-// away necessary space in the flat buffer.
+// Set sets the ith JSON in JSONs.
 func (js *JSONs) Set(i int, j json.JSON) {
-	b := &js.Bytes
-	appendTo := b.getAppendTo(i)
 	var err error
-	b.data, err = json.EncodeJSON(appendTo, j)
+	js.scratch, err = json.EncodeJSON(js.scratch[:0], j)
 	if err != nil {
 		colexecerror.ExpectedError(err)
 	}
-	b.offsets[i+1] = int32(len(b.data))
-	b.maxSetLength = i + 1
+	js.Bytes.Set(i, js.scratch)
 }
 
 // Window creates a "window" into the receiver. It behaves similarly to
@@ -70,7 +67,20 @@ func (js *JSONs) Set(i int, j json.JSON) {
 func (js *JSONs) Window(start, end int) *JSONs {
 	return &JSONs{
 		Bytes: *js.Bytes.Window(start, end),
+		// TODO(yuzefovich): in the general case, if we simply reused
+		// js.jsonScratch here, it could lead to problems down the line (because
+		// Get calls on js and on the window into js would be reusing the same
+		// JSONEncoded object). However, in practice the windowed batch should
+		// be consumed soon after it's created, without the overlap with Gets on
+		// the original batch. Think through this.
+		jsonScratch: make([]json.JSONEncoded, end-start),
 	}
+}
+
+// Copy copies a single value from src at position srcIdx into position destIdx
+// of the receiver.
+func (js *JSONs) Copy(src *JSONs, destIdx, srcIdx int) {
+	js.Bytes.Copy(&src.Bytes, destIdx, srcIdx)
 }
 
 // CopySlice copies srcStartIdx inclusive and srcEndIdx exclusive []byte values
@@ -83,25 +93,14 @@ func (js *JSONs) CopySlice(src *JSONs, destIdx, srcStartIdx, srcEndIdx int) {
 // values from src into the receiver starting at destIdx.
 func (js *JSONs) AppendSlice(src *JSONs, destIdx, srcStartIdx, srcEndIdx int) {
 	js.Bytes.AppendSlice(&src.Bytes, destIdx, srcStartIdx, srcEndIdx)
+	js.ensureJSONScratch()
 }
 
-// AppendVal appends the given JSON value to the end of the receiver.
-func (js *JSONs) AppendVal(j json.JSON) {
-	if j == nil {
-		// A nil JSON indicates a NULL value in the column. We've got to insert a
-		// "zero value" which in this case means an empty byte slice.
-		js.Bytes.AppendVal(nil)
-		return
-	}
-	b := &js.Bytes
-	appendTo := b.getAppendTo(b.Len())
-	var err error
-	b.data, err = json.EncodeJSON(appendTo, j)
-	if err != nil {
-		colexecerror.ExpectedError(err)
-	}
-	b.offsets = append(b.offsets, int32(len(b.data)))
-	b.maxSetLength = b.Len()
+// appendSliceWithSel appends all values specified in sel from the source into
+// the receiver starting at position destIdx.
+func (js *JSONs) appendSliceWithSel(src *JSONs, destIdx int, sel []int) {
+	js.Bytes.appendSliceWithSel(&src.Bytes, destIdx, sel)
+	js.ensureJSONScratch()
 }
 
 // String is used for debugging purposes.
@@ -113,4 +112,19 @@ func (js *JSONs) String() string {
 		)
 	}
 	return builder.String()
+}
+
+// Deserialize updates b according to the "arrow-like" format that was produced
+// by Serialize.
+func (js *JSONs) Deserialize(data []byte, offsets []int32) {
+	js.Bytes.Deserialize(data, offsets)
+	js.ensureJSONScratch()
+}
+
+func (js *JSONs) ensureJSONScratch() {
+	if cap(js.jsonScratch) < js.Bytes.Len() {
+		js.jsonScratch = make([]json.JSONEncoded, js.Bytes.Len())
+	} else {
+		js.jsonScratch = js.jsonScratch[:js.Bytes.Len()]
+	}
 }

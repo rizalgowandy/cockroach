@@ -1,18 +1,13 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { Highlight } from "./highlight";
 import classNames from "classnames/bind";
+import React from "react";
 
-import styles from "./sqlhighlight.module.styl";
+import { Highlight } from "./highlight";
+import styles from "./sqlhighlight.module.scss";
 
 export interface SqlBoxProps {
   value: string;
@@ -21,13 +16,11 @@ export interface SqlBoxProps {
 
 const cx = classNames.bind(styles);
 
-class SqlBox extends React.Component<SqlBoxProps> {
-  render() {
-    return (
-      <div className={cx("box-highlight")}>
-        <Highlight {...this.props} />
-      </div>
-    );
-  }
+function SqlBox({ value, secondaryValue }: SqlBoxProps): React.ReactElement {
+  return (
+    <div className={cx("box-highlight")}>
+      <Highlight value={value} secondaryValue={secondaryValue} />
+    </div>
+  );
 }
 export default SqlBox;

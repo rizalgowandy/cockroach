@@ -1,42 +1,35 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
-import Long from "long";
-import moment from "moment";
-import React from "react";
-import { connect } from "react-redux";
-import { createSelector } from "reselect";
-import * as protos from "src/js/protos";
 import {
-  MetricsQuery,
-  requestMetrics as requestMetricsAction,
-} from "src/redux/metrics";
-import { AdminUIState } from "src/redux/state";
-import { MilliToNano, MilliToSeconds } from "src/util/convert";
+  util,
+  TimeWindow,
+  TimeScale,
+  findClosestTimeScale,
+  defaultTimeScaleOptions,
+  useClusterSettings,
+} from "@cockroachlabs/cluster-ui";
+import { History } from "history";
+import isNil from "lodash/isNil";
+import isObject from "lodash/isObject";
+import map from "lodash/map";
+import Long from "long";
+import moment from "moment-timezone";
+import React, { useMemo } from "react";
+import { useSelector } from "react-redux";
+
+import { useMetrics } from "src/hooks/useMetrics";
+import { PayloadAction } from "src/interfaces/action";
+import * as protos from "src/js/protos";
+import { adjustTimeScale, selectMetricsTime } from "src/redux/timeScale";
 import { findChildrenOfType } from "src/util/find";
 import {
   Metric,
   MetricProps,
   MetricsDataComponentProps,
-  QueryTimeInfo,
 } from "src/views/shared/components/metricQuery";
-import { PayloadAction } from "src/interfaces/action";
-import {
-  TimeWindow,
-  TimeScale,
-  findClosestTimeScale,
-  defaultTimeScaleOptions,
-} from "@cockroachlabs/cluster-ui";
-import { History } from "history";
-import { refreshSettings } from "src/redux/apiReducers";
 
 /**
  * queryFromProps is a helper method which generates a TimeSeries Query data
@@ -48,10 +41,10 @@ function queryFromProps(
 ): protos.cockroach.ts.tspb.IQuery {
   let derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.NONE;
   let sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.SUM;
-  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
+  let downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
 
   // Compute derivative function.
-  if (!_.isNil(metricProps.derivative)) {
+  if (!isNil(metricProps.derivative)) {
     derivative = metricProps.derivative;
   } else if (metricProps.rate) {
     derivative = protos.cockroach.ts.tspb.TimeSeriesQueryDerivative.DERIVATIVE;
@@ -61,7 +54,7 @@ function queryFromProps(
         .NON_NEGATIVE_DERIVATIVE;
   }
   // Compute downsample function.
-  if (!_.isNil(metricProps.downsampler)) {
+  if (!isNil(metricProps.downsampler)) {
     downsampler = metricProps.downsampler;
   } else if (metricProps.downsampleMax) {
     downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
@@ -69,7 +62,7 @@ function queryFromProps(
     downsampler = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MIN;
   }
   // Compute aggregation function.
-  if (!_.isNil(metricProps.aggregator)) {
+  if (!isNil(metricProps.aggregator)) {
     sourceAggregator = metricProps.aggregator;
   } else if (metricProps.aggregateMax) {
     sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.MAX;
@@ -78,10 +71,12 @@ function queryFromProps(
   } else if (metricProps.aggregateAvg) {
     sourceAggregator = protos.cockroach.ts.tspb.TimeSeriesQueryAggregator.AVG;
   }
-
+  const tenantSource =
+    metricProps.tenantSource || graphProps.tenantSource || undefined;
   return {
     name: metricProps.name,
     sources: metricProps.sources || graphProps.sources || undefined,
+    tenant_id: tenantSource ? { id: Long.fromString(tenantSource) } : undefined,
     downsampler: downsampler,
     source_aggregator: sourceAggregator,
     derivative: derivative,
@@ -89,25 +84,14 @@ function queryFromProps(
 }
 
 /**
- * MetricsDataProviderConnectProps are the properties provided to a
- * MetricsDataProvider via the react-redux connect() system.
- */
-interface MetricsDataProviderConnectProps {
-  metrics: MetricsQuery;
-  timeInfo: QueryTimeInfo;
-  requestMetrics: typeof requestMetricsAction;
-  refreshNodeSettings: typeof refreshSettings;
-  setTimeRange?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
-  setTimeScale?: (ts: TimeScale) => PayloadAction<TimeScale>;
-  history?: History;
-}
-
-/**
- * MetricsDataProviderExplicitProps are the properties provided explicitly to a
+ * MetricsDataProviderProps are the properties provided explicitly to a
  * MetricsDataProvider object via React (i.e. setting an attribute in JSX).
  */
-interface MetricsDataProviderExplicitProps {
-  id: string;
+interface MetricsDataProviderProps {
+  // id is no longer used internally (the Redux metrics store key was removed
+  // when switching to SWR). Kept optional for backwards compatibility with
+  // existing call sites; can be removed in a follow-up cleanup.
+  id?: string;
   // If current is true, uses the current time instead of the global timewindow.
   current?: boolean;
   children?: React.ReactElement<{}>;
@@ -115,14 +99,25 @@ interface MetricsDataProviderExplicitProps {
     curTimeScale: TimeScale,
     timeWindow: TimeWindow,
   ) => TimeScale;
+  setMetricsFixedWindow?: (tw: TimeWindow) => PayloadAction<TimeWindow>;
+  setTimeScale?: (ts: TimeScale) => PayloadAction<TimeScale>;
+  history?: History;
 }
 
-/**
- * MetricsDataProviderProps is the complete set of properties which can be
- * provided to a MetricsDataProvider.
- */
-type MetricsDataProviderProps = MetricsDataProviderConnectProps &
-  MetricsDataProviderExplicitProps;
+const currentTimeInfo = () => {
+  let now = moment();
+  // Round to the nearest 10 seconds. There are 10000 ms in 10 s.
+  now = moment(Math.floor(now.valueOf() / 10000) * 10000);
+  return {
+    start: Long.fromNumber(
+      util.MilliToNano(now.clone().subtract(30, "s").valueOf()),
+    ),
+    end: Long.fromNumber(util.MilliToNano(now.valueOf())),
+    sampleDuration: Long.fromNumber(
+      util.MilliToNano(moment.duration(10, "s").asMilliseconds()),
+    ),
+  };
+};
 
 /**
  * MetricsDataProvider is a container which manages query data for a renderable
@@ -130,7 +125,7 @@ type MetricsDataProviderProps = MetricsDataProviderConnectProps &
  * component; the metric set becomes responsible for querying the server
  * required by that LineGraph.
  *
- * <MetricsDataProvider id="series-x-graph">
+ * <MetricsDataProvider>
  *  <LineGraph data="[]">
  *    <Axis label="Series X over time.">
  *      <Metric title="" name="series.x" sources="node.1" />
@@ -138,179 +133,114 @@ type MetricsDataProviderProps = MetricsDataProviderConnectProps &
  *  </LineGraph>
  * </MetricsDataProvider>;
  *
- * Each MetricsDataProvider must have an ID field, which identifies this
- * particular set of metrics to the metrics query reducer. Currently queries
- * metrics from the reducer will be provided to the metric set via the
- * react-redux connection.
- *
  * Additionally, each MetricsDataProvider has a single, externally set TimeSpan
  * property, that determines the window over which time series should be
  * queried. This property is also currently intended to be set via react-redux.
  */
-class MetricsDataProvider extends React.Component<
-  MetricsDataProviderProps,
-  {}
-> {
-  private queriesSelector = createSelector(
-    ({ children }: MetricsDataProviderProps) => children,
-    children => {
-      // MetricsDataProvider should contain only one direct child.
-      const child: React.ReactElement<MetricsDataComponentProps> = React.Children.only(
-        this.props.children,
-      );
-      // Perform a simple DFS to find all children which are Metric objects.
-      const selectors: React.ReactElement<MetricProps>[] = findChildrenOfType(
-        children,
-        Metric,
-      );
-      // Construct a query for each found selector child.
-      return _.map(selectors, s => queryFromProps(s.props, child.props));
-    },
-  );
+function MetricsDataProvider({
+  current: isCurrent,
+  children,
+  adjustTimeScaleOnChange,
+  setMetricsFixedWindow,
+  setTimeScale,
+  history,
+}: MetricsDataProviderProps): React.ReactElement {
+  const { settingValues } = useClusterSettings({
+    names: [
+      "timeseries.storage.resolution_10s.ttl",
+      "timeseries.storage.resolution_30m.ttl",
+    ],
+  });
+  const sTTLValue =
+    settingValues["timeseries.storage.resolution_10s.ttl"]?.value;
+  const sTTL = sTTLValue
+    ? util.durationFromISO8601String(sTTLValue)
+    : undefined;
+  const mTTLValue =
+    settingValues["timeseries.storage.resolution_30m.ttl"]?.value;
+  const mTTL = mTTLValue
+    ? util.durationFromISO8601String(mTTLValue)
+    : undefined;
 
-  private requestMessage = createSelector(
-    (props: MetricsDataProviderProps) => props.timeInfo,
-    this.queriesSelector,
-    (timeInfo, queries) => {
-      if (!timeInfo) {
-        return undefined;
-      }
-      return new protos.cockroach.ts.tspb.TimeSeriesQueryRequest({
-        start_nanos: timeInfo.start,
-        end_nanos: timeInfo.end,
-        sample_nanos: timeInfo.sampleDuration,
-        queries,
-      });
-    },
-  );
+  const metricsTime = useSelector(selectMetricsTime);
 
-  /**
-   * Refresh nodes status query when props are changed; this will immediately
-   * trigger a new request if the previous query is no longer valid.
-   */
-  refreshMetricsIfStale(props: MetricsDataProviderProps) {
-    const request = this.requestMessage(props);
-    if (!request) {
-      return;
+  const timeInfo = useMemo(() => {
+    if (isCurrent) {
+      return currentTimeInfo();
     }
-    const { metrics, requestMetrics, id } = props;
-    const nextRequest = metrics && metrics.nextRequest;
-    if (!nextRequest || !_.isEqual(nextRequest, request)) {
-      requestMetrics(id, request);
-    }
-  }
-
-  componentDidMount() {
-    // Refresh nodes status query when mounting.
-    this.refreshMetricsIfStale(this.props);
-    this.props.refreshNodeSettings();
-  }
-
-  componentDidUpdate() {
-    // Refresh nodes status query when props are received; this will immediately
-    // trigger a new request if previous results are invalidated.
-    this.refreshMetricsIfStale(this.props);
-  }
-
-  getData() {
-    if (this.props.metrics) {
-      const { data, request } = this.props.metrics;
-      // Do not attach data if queries are not equivalent.
-      if (
-        data &&
-        request &&
-        _.isEqual(request.queries, this.requestMessage(this.props).queries)
-      ) {
-        return data;
-      }
-    }
-    return undefined;
-  }
-
-  render() {
-    const { adjustTimeScaleOnChange } = this.props;
-    // MetricsDataProvider should contain only one direct child.
-    const child = React.Children.only(this.props.children);
-    const dataProps: MetricsDataComponentProps = {
-      data: this.getData(),
-      timeInfo: this.props.timeInfo,
-      setTimeRange: this.props.setTimeRange,
-      setTimeScale: this.props.setTimeScale,
-      history: this.props.history,
-      adjustTimeScaleOnChange,
-    };
-    return React.cloneElement(
-      child as React.ReactElement<MetricsDataComponentProps>,
-      dataProps,
-    );
-  }
-}
-
-// timeInfoSelector converts the current global time window into a set of Long
-// timestamps, which can be sent with requests to the server.
-const timeInfoSelector = createSelector(
-  (state: AdminUIState) => state.timewindow,
-  tw => {
-    if (!_.isObject(tw.currentWindow)) {
+    if (!isObject(metricsTime.currentWindow)) {
       return null;
     }
-
-    // It is possible for the currentWindow and scale to be out of sync due to
-    // the flow of some events such as drag-to-zoom. Thus, the source of truth for
-    // scale here should be based on the currentWindow.
-    const { currentWindow } = tw;
-    const start = currentWindow.start.valueOf();
-    const end = currentWindow.end.valueOf();
+    const { start: startMoment, end: endMoment } = metricsTime.currentWindow;
+    const start = startMoment.valueOf();
+    const end = endMoment.valueOf();
     const syncedScale = findClosestTimeScale(
       defaultTimeScaleOptions,
-      MilliToSeconds(end - start),
+      util.MilliToSeconds(end - start),
+    );
+    const adjusted = adjustTimeScale(
+      { ...syncedScale, fixedWindowEnd: false },
+      { start: startMoment, end: endMoment },
+      sTTL,
+      mTTL,
     );
 
     return {
-      start: Long.fromNumber(MilliToNano(start)),
-      end: Long.fromNumber(MilliToNano(end)),
+      start: Long.fromNumber(util.MilliToNano(start)),
+      end: Long.fromNumber(util.MilliToNano(end)),
       sampleDuration: Long.fromNumber(
-        MilliToNano(syncedScale.sampleSize.asMilliseconds()),
+        util.MilliToNano(adjusted.timeScale.sampleSize.asMilliseconds()),
       ),
     };
-  },
-);
+  }, [isCurrent, metricsTime, sTTL, mTTL]);
 
-const current = () => {
-  let now = moment();
-  // Round to the nearest 10 seconds. There are 10000 ms in 10 s.
-  now = moment(Math.floor(now.valueOf() / 10000) * 10000);
-  return {
-    start: Long.fromNumber(
-      MilliToNano(
-        now
-          .clone()
-          .subtract(30, "s")
-          .valueOf(),
+  // MetricsDataProvider should contain only one direct child.
+  const child = React.Children.only(children);
+
+  // Compute the time series queries from child Metric components.
+  const queries = useMemo(() => {
+    const selectors: React.ReactElement<MetricProps>[] = findChildrenOfType(
+      children,
+      Metric,
+    );
+    return map(selectors, s =>
+      queryFromProps(
+        s.props,
+        (child as React.ReactElement<MetricsDataComponentProps>).props,
       ),
-    ),
-    end: Long.fromNumber(MilliToNano(now.valueOf())),
-    sampleDuration: Long.fromNumber(
-      MilliToNano(moment.duration(10, "s").asMilliseconds()),
-    ),
+    );
+  }, [children, child]);
+
+  // Build the request message from timeInfo and queries.
+  const requestMsg = useMemo(() => {
+    if (!timeInfo || queries.length === 0) {
+      return undefined;
+    }
+    return new protos.cockroach.ts.tspb.TimeSeriesQueryRequest({
+      start_nanos: timeInfo.start,
+      end_nanos: timeInfo.end,
+      sample_nanos: timeInfo.sampleDuration,
+      queries,
+    });
+  }, [timeInfo, queries]);
+
+  // Fetch metrics data via SWR with request batching. Multiple
+  // MetricsDataProviders rendering in the same cycle have their
+  // requests coalesced into a single API call.
+  const { data } = useMetrics(requestMsg);
+
+  const dataProps: MetricsDataComponentProps = {
+    data,
+    timeInfo,
+    setMetricsFixedWindow,
+    setTimeScale,
+    history,
+    adjustTimeScaleOnChange,
   };
-};
+  return React.cloneElement(
+    child as React.ReactElement<MetricsDataComponentProps>,
+    dataProps,
+  );
+}
 
-// Connect the MetricsDataProvider class to redux state.
-const metricsDataProviderConnected = connect(
-  (state: AdminUIState, ownProps: MetricsDataProviderExplicitProps) => {
-    return {
-      metrics: state.metrics.queries[ownProps.id],
-      timeInfo: ownProps.current ? current() : timeInfoSelector(state),
-    };
-  },
-  {
-    requestMetrics: requestMetricsAction,
-    refreshNodeSettings: refreshSettings,
-  },
-)(MetricsDataProvider);
-
-export {
-  MetricsDataProvider as MetricsDataProviderUnconnected,
-  metricsDataProviderConnected as MetricsDataProvider,
-};
+export { MetricsDataProvider };

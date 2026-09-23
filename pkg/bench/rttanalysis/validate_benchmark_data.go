@@ -1,31 +1,27 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
 import (
-	"context"
+	"cmp"
 	"encoding/csv"
 	"flag"
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/system"
@@ -52,47 +48,48 @@ var expectationsHeader = []string{"exp", "benchmark"}
 
 var (
 	rewriteFlag = flag.Bool("rewrite", false,
-		"if non-empty, a regexp of benchmarks to rewrite")
+		"determines if benchmarks should be rewritten")
 	rewriteIterations = flag.Int("rewrite-iterations", 50,
 		"if re-writing, the number of times to execute each benchmark to "+
 			"determine the range of possible values")
+	allowOffByOne = flag.Bool("allow-off-by-one", true,
+		"if set, expectations that are not a range get a ±1 tolerance")
 )
 
 // RunBenchmarkExpectationTests runs tests to validate or rewrite the contents
 // of the benchmark expectations file.
 func runBenchmarkExpectationTests(t *testing.T, r *Registry) {
-	if util.IsMetamorphicBuild() {
+	if metamorphic.IsMetamorphicBuild() {
 		execTestSubprocess(t)
 		return
 	}
 
 	// Only create the scope after we've checked if we need to exec the subprocess.
-	defer log.Scope(t).Close(t)
+	scope := log.Scope(t)
+	defer scope.Close(t)
 
 	defer func() {
 		if t.Failed() {
-			t.Log("see the --rewrite flag to re-run the benchmarks and adjust the expectations")
+			t.Log("see the -rewrite flag to re-run the benchmarks and adjust the expectations")
+			t.Log("usage: ./dev test --rewrite pkg/bench/rttanalysis -f=TestBenchmarkExpectation/ --test-args '-rewrite-iterations=N'")
 		}
 	}()
 
 	var results resultSet
 	var wg sync.WaitGroup
-	concurrency := ((system.NumCPU()*4 - 1) / r.numNodes) + 1 // arbitrary
+	concurrency := min(4, ((system.NumCPU()-1)/r.numNodes)+1) //arbitrary
 	limiter := quotapool.NewIntPool("rttanalysis", uint64(concurrency))
 	isRewrite := *rewriteFlag
 	for b, cases := range r.r {
-		quota, err := limiter.Acquire(context.Background(), 1)
-		require.NoError(t, err)
 		wg.Add(1)
 		go func(b string, cases []RoundTripBenchTestCase) {
 			defer wg.Done()
-			defer quota.Release()
 			t.Run(b, func(t *testing.T) {
 				runs := 1
 				if isRewrite {
 					runs = *rewriteIterations
 				}
-				runRoundTripBenchmarkTest(t, &results, cases, r.cc, runs, limiter)
+				runRoundTripBenchmarkTest(t, scope, &results, cases, r.cc, runs, limiter)
 			})
 		}(b, cases)
 	}
@@ -156,10 +153,12 @@ func mergeExpectations(existing, new benchmarkExpectations) (merged benchmarkExp
 // always run with metamorphic testing enabled in CI.
 func execTestSubprocess(t *testing.T) {
 	var args []string
+	testRunPassed := false
 	flag.CommandLine.Visit(func(f *flag.Flag) {
 		vs := f.Value.String()
 		switch f.Name {
 		case "test.run":
+			testRunPassed = true
 			// Only run the current outermost test in the subprocess.
 			prefix := "^" + regexp.QuoteMeta(t.Name()) + "$"
 			if idx := strings.Index(vs, "/"); idx >= 0 {
@@ -179,13 +178,16 @@ func execTestSubprocess(t *testing.T) {
 		}
 		args = append(args, "--"+f.Name+"="+vs)
 	})
+	if !testRunPassed {
+		args = append(args, "--test.run=^"+regexp.QuoteMeta(t.Name())+"$")
+	}
 	args = append(args, "--test.bench=^$") // disable benchmarks
 	args = append(args, flag.CommandLine.Args()...)
 	cmd := exec.Command(os.Args[0], args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, util.DisableMetamorphicEnvVar+"=t")
+	cmd.Env = append(cmd.Env, metamorphic.DisableMetamorphicEnvVar+"=t")
 	t.Log(cmd.Args)
 	if err := cmd.Run(); err != nil {
 		t.FailNow()
@@ -221,8 +223,8 @@ func (s *resultSet) toSlice() (res []benchmarkResult) {
 }
 
 func resultsToExpectations(t *testing.T, results []benchmarkResult) benchmarkExpectations {
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].name < results[j].name
+	slices.SortFunc(results, func(a, b benchmarkResult) int {
+		return cmp.Compare(a.name, b.name)
 	})
 	var res benchmarkExpectations
 	var cur benchmarkExpectation
@@ -259,7 +261,7 @@ func resultsToExpectations(t *testing.T, results []benchmarkResult) benchmarkExp
 }
 
 func writeExpectationsFile(t *testing.T, expectations benchmarkExpectations) {
-	f, err := os.Create(testutils.TestDataPath(t, expectationsFilename))
+	f, err := os.Create(datapathutils.TestDataPath(t, expectationsFilename))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, f.Close()) }()
 	w := csv.NewWriter(f)
@@ -273,7 +275,7 @@ func writeExpectationsFile(t *testing.T, expectations benchmarkExpectations) {
 }
 
 func readExpectationsFile(t testing.TB) benchmarkExpectations {
-	f, err := os.Open(testutils.TestDataPath(t, expectationsFilename))
+	f, err := os.Open(datapathutils.TestDataPath(t, expectationsFilename))
 	require.NoError(t, err)
 	defer func() { _ = f.Close() }()
 
@@ -322,7 +324,18 @@ func (b benchmarkExpectations) find(name string) (benchmarkExpectation, bool) {
 }
 
 func (e benchmarkExpectation) matches(roundTrips int) bool {
-	return e.min <= roundTrips && roundTrips <= e.max
+	// Does the value fall in the range?
+	if e.min <= roundTrips && roundTrips <= e.max {
+		return true
+	}
+
+	// If the expectation isn't a range, it gets a leeway of one because we got
+	// tired of small indeterminism.
+	if (e.min == e.max) && *allowOffByOne && (roundTrips == e.min-1 || roundTrips == e.min+1) {
+		return true
+	}
+
+	return false
 }
 
 func (e benchmarkExpectation) String() string {

@@ -1,18 +1,13 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /*
 Package simulation provides tools meant to visualize or test aspects
 of a Cockroach cluster on a single host.
 
-Gossip
+# Gossip
 
 Gossip creates a gossip network of up to 250 nodes and outputs
 successive visualization of the gossip network graph via dot.
@@ -23,8 +18,8 @@ simulation.
 
 To run:
 
-    go install github.com/cockroachdb/cockroach/cmd/gossipsim
-    gossipsim -size=(small|medium|large|huge|ginormous)
+	go install github.com/cockroachdb/cockroach/cmd/gossipsim
+	gossipsim -size=(small|medium|large|huge|ginormous)
 
 Log output includes instructions for displaying the graph output as a
 series of images to visualize the evolution of the network.
@@ -33,23 +28,23 @@ Running the large through ginormous simulations will require the open
 files limit be increased either for the shell running the simulation,
 or system wide. For Linux:
 
-    # For the current shell:
-    ulimit -n 65536
+	# For the current shell:
+	ulimit -n 65536
 
-    # System-wide:
-    sysctl fs.file-max
-    fs.file-max = 50384
+	# System-wide:
+	sysctl fs.file-max
+	fs.file-max = 50384
 
 For MacOS:
 
-    # To view current limits (soft / hard):
-    launchctl limit maxfiles
+	# To view current limits (soft / hard):
+	launchctl limit maxfiles
 
-    # To edit, add/edit the following line in /etc/launchd.conf and
-    # restart for the new file limit to take effect.
-    #
-    # limit maxfiles 16384 32768
-    sudo vi /etc/launchd.conf
+	# To edit, add/edit the following line in /etc/launchd.conf and
+	# restart for the new file limit to take effect.
+	#
+	# limit maxfiles 16384 32768
+	sudo vi /etc/launchd.conf
 */
 package main
 
@@ -57,13 +52,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/gossip/simulation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -118,23 +111,23 @@ func (em edgeMap) addEdge(nodeID roachpb.NodeID, e edge) {
 //
 // The format of the output looks like this:
 //
-//   digraph G {
-//   node [shape=record];
-//        node1 [fontsize=12,label="{Node 1|MH=3}"]
-//        node1 -> node3 [color=green]
-//        node1 -> node4
-//        node1 -> node5 [color=red,style=dotted]
-//        node2 [fontsize=24,label="{Node 2|MH=2}"]
-//        node2 -> node5
-//        node3 [fontsize=18,label="{Node 3|MH=5}"]
-//        node3 -> node5
-//        node3 -> node4
-//        node4 [fontsize=24,label="{Node 4|MH=4}"]
-//        node4 -> node2
-//        node5 [fontsize=24,label="{Node 5|MH=1}"]
-//        node5 -> node2
-//        node5 -> node3
-//   }
+//	digraph G {
+//	node [shape=record];
+//	     node1 [fontsize=12,label="{Node 1|MH=3}"]
+//	     node1 -> node3 [color=green]
+//	     node1 -> node4
+//	     node1 -> node5 [color=red,style=dotted]
+//	     node2 [fontsize=24,label="{Node 2|MH=2}"]
+//	     node2 -> node5
+//	     node3 [fontsize=18,label="{Node 3|MH=5}"]
+//	     node3 -> node5
+//	     node3 -> node4
+//	     node4 [fontsize=24,label="{Node 4|MH=4}"]
+//	     node4 -> node2
+//	     node5 [fontsize=24,label="{Node 5|MH=1}"]
+//	     node5 -> node2
+//	     node5 -> node3
+//	}
 //
 // Returns the name of the output file and a boolean for whether or not
 // the network has quiesced (that is, no new edges, and all nodes are
@@ -144,7 +137,7 @@ func outputDotFile(
 ) (string, bool) {
 	f, err := os.Create(dotFN)
 	if err != nil {
-		log.Fatalf(context.TODO(), "unable to create temp file: %s", err)
+		log.Dev.Fatalf(context.TODO(), "unable to create temp file: %s", err)
 	}
 	defer f.Close()
 
@@ -182,7 +175,7 @@ func outputDotFile(
 		quiescent = false
 		nodeID, err := strconv.Atoi(strings.Split(key, ":")[0])
 		if err != nil {
-			log.Fatalf(context.TODO(), "%v", err)
+			log.Dev.Fatalf(context.TODO(), "%v", err)
 		}
 		outgoingMap.addEdge(roachpb.NodeID(nodeID), e)
 		delete(edgeSet, key)
@@ -206,21 +199,21 @@ func outputDotFile(
 			} else {
 				_, val, err := encoding.DecodeUint64Ascending(info)
 				if err != nil {
-					log.Fatalf(context.TODO(), "bad decode of node info cycle: %s", err)
+					log.Dev.Fatalf(context.TODO(), "bad decode of node info cycle: %s", err)
 				}
 				totalAge += int64(cycle) - int64(val)
 			}
 		}
-		log.Infof(context.TODO(), "node %d: missing infos for nodes %s", node.NodeID.Get(), missing)
+		log.Dev.Infof(context.TODO(), "node %d: missing infos for nodes %s", node.NodeID.Get(), missing)
 
 		var sentinelAge int64
 		// GetInfo returns an error if the info is missing.
 		if info, err := node.GetInfo(gossip.KeySentinel); err != nil {
-			log.Infof(context.TODO(), "error getting info for sentinel gossip key %q: %s", gossip.KeySentinel, err)
+			log.Dev.Infof(context.TODO(), "error getting info for sentinel gossip key %q: %s", gossip.KeySentinel, err)
 		} else {
 			_, val, err := encoding.DecodeUint64Ascending(info)
 			if err != nil {
-				log.Fatalf(context.TODO(), "bad decode of sentinel cycle: %s", err)
+				log.Dev.Fatalf(context.TODO(), "bad decode of sentinel cycle: %s", err)
 			}
 			sentinelAge = int64(cycle) - int64(val)
 		}
@@ -272,9 +265,9 @@ func main() {
 	}
 	flag.Parse()
 
-	dirName, err := ioutil.TempDir("", "gossip-simulation-")
+	dirName, err := os.MkdirTemp("", "gossip-simulation-")
 	if err != nil {
-		log.Fatalf(context.TODO(), "could not create temporary directory for gossip simulation output: %s", err)
+		log.Dev.Fatalf(context.TODO(), "could not create temporary directory for gossip simulation output: %s", err)
 	}
 
 	// Simulation callbacks to run the simulation for cycleCount
@@ -295,7 +288,7 @@ func main() {
 	case "ginormous":
 		nodeCount = 250
 	default:
-		log.Fatalf(context.TODO(), "unknown simulation size: %s", *size)
+		log.Dev.Fatalf(context.TODO(), "unknown simulation size: %s", *size)
 	}
 
 	edgeSet := make(map[string]edge)
@@ -303,7 +296,7 @@ func main() {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.TODO())
 
-	n := simulation.NewNetwork(stopper, nodeCount, true, zonepb.DefaultZoneConfigRef())
+	n := simulation.NewNetwork(stopper, nodeCount, true)
 	n.SimulateNetwork(
 		func(cycle int, network *simulation.Network) bool {
 			// Output dot graph.

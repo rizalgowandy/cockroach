@@ -5,15 +5,17 @@ load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 proto_library(
     name = "enginepb_proto",
     srcs = [
-        "engine.proto",
         "file_registry.proto",
+        "key_registry.proto",
         "mvcc.proto",
         "mvcc3.proto",
         "rocksdb.proto",
+        "stats.proto",
     ],
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvserver/concurrency/isolation:isolation_proto",
         "//pkg/util/hlc:hlc_proto",
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
     ],
@@ -26,6 +28,7 @@ go_proto_library(
     proto = ":enginepb_proto",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/util/hlc",
         "//pkg/util/uuid",  # keep
         "@com_github_gogo_protobuf//gogoproto",
@@ -36,15 +39,17 @@ go_library(
     name = "enginepb",
     srcs = [
         "decode.go",
-        "engine.go",
         "file_registry.go",
+        "key_registry.go",
         "mvcc.go",
         "mvcc3.go",
+        "mvcc3_valueheader.go",
     ],
     embed = [":enginepb_go_proto"],
     importpath = "github.com/cockroachdb/cockroach/pkg/storage/enginepb",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/kv/kvnemesis/kvnemesisutil",
         "//pkg/util/hlc",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
@@ -56,15 +61,21 @@ go_test(
     size = "small",
     srcs = [
         "decode_test.go",
+        "key_registry_test.go",
+        "mvcc3_test.go",
         "mvcc_test.go",
     ],
+    embed = [":enginepb"],
     deps = [
-        ":enginepb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvserver/concurrency/isolation",
+        "//pkg/roachpb",
         "//pkg/storage",
+        "//pkg/testutils/zerofields",
         "//pkg/util/hlc",
+        "//pkg/util/protoutil",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
 )

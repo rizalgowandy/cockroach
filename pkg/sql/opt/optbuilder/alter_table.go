@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -34,7 +30,7 @@ func (b *Builder) buildAlterTableSplit(split *tree.Split, inScope *scope) (outSc
 		panic(err)
 	}
 	table := index.Table()
-	if err := b.catalog.CheckPrivilege(b.ctx, table, privilege.INSERT); err != nil {
+	if err := b.catalog.CheckPrivilege(b.ctx, table, b.catalog.GetCurrentUser(), privilege.INSERT); err != nil {
 		panic(err)
 	}
 
@@ -98,7 +94,7 @@ func (b *Builder) buildAlterTableUnsplit(unsplit *tree.Unsplit, inScope *scope) 
 		panic(err)
 	}
 	table := index.Table()
-	if err := b.catalog.CheckPrivilege(b.ctx, table, privilege.INSERT); err != nil {
+	if err := b.catalog.CheckPrivilege(b.ctx, table, b.catalog.GetCurrentUser(), privilege.INSERT); err != nil {
 		panic(err)
 	}
 
@@ -148,7 +144,7 @@ func (b *Builder) buildAlterTableRelocate(
 		panic(err)
 	}
 	table := index.Table()
-	if err := b.catalog.CheckPrivilege(b.ctx, table, privilege.INSERT); err != nil {
+	if err := b.catalog.CheckPrivilege(b.ctx, table, b.catalog.GetCurrentUser(), privilege.INSERT); err != nil {
 		panic(err)
 	}
 
@@ -163,8 +159,8 @@ func (b *Builder) buildAlterTableRelocate(
 
 	// The first column is the target leaseholder or the relocation array,
 	// depending on variant.
-	cmdName := "EXPERIMENTAL_RELOCATE"
-	if relocate.RelocateLease {
+	cmdName := "RELOCATE"
+	if relocate.SubjectReplicas == tree.RelocateLease {
 		cmdName += " LEASE"
 		colNames = append([]string{"target leaseholder"}, colNames...)
 		colTypes = append([]*types.T{types.Int}, colTypes...)
@@ -181,8 +177,7 @@ func (b *Builder) buildAlterTableRelocate(
 	outScope.expr = b.factory.ConstructAlterTableRelocate(
 		inputScope.expr,
 		&memo.AlterTableRelocatePrivate{
-			RelocateLease:     relocate.RelocateLease,
-			RelocateNonVoters: relocate.RelocateNonVoters,
+			SubjectReplicas: relocate.SubjectReplicas,
 			AlterTableSplitPrivate: memo.AlterTableSplitPrivate{
 				Table:   b.factory.Metadata().AddTable(table, &tn),
 				Index:   index.Ordinal(),
@@ -203,13 +198,13 @@ func getIndexColumnNamesAndTypes(index cat.Index) (colNames []string, colTypes [
 		colNames[i] = string(c.ColName())
 		colTypes[i] = c.DatumType()
 	}
-	if index.IsInverted() && index.GeoConfig() != nil {
+	if index.Type() == idxtype.INVERTED && !index.GeoConfig().IsEmpty() {
 		// TODO(sumeer): special case Array too. JSON is harder since the split
 		// needs to be a Datum and the JSON inverted column is not.
 		//
-		// Geospatial inverted index. The first column is the inverted column and
-		// is an int.
-		colTypes[0] = types.Int
+		// Geospatial inverted index. The last explicit column is the inverted
+		// column and is an int.
+		colTypes[index.ExplicitColumnCount()-1] = types.Int
 	}
 	return colNames, colTypes
 }

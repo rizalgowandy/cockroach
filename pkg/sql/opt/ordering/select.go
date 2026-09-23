@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
@@ -22,7 +17,7 @@ func selectCanProvideOrdering(expr memo.RelExpr, required *props.OrderingChoice)
 }
 
 func selectBuildChildReqOrdering(
-	parent memo.RelExpr, required *props.OrderingChoice, childIdx int,
+	mem *memo.Memo, parent memo.RelExpr, required *props.OrderingChoice, childIdx int,
 ) props.OrderingChoice {
 	if childIdx != 0 {
 		return props.OrderingChoice{}
@@ -47,7 +42,7 @@ func selectBuildChildReqOrdering(
 	// down +1,+2,+3 as the required ordering to avoid an unnecessary sort.
 	//
 	// See #33023 for more details.
-	orders := DeriveInterestingOrderings(child)
+	orders := DeriveInterestingOrderings(mem, child)
 	for i := range orders {
 		if orders[i].Implies(required) {
 			// Get the common prefix of this ordering and the required ordering to

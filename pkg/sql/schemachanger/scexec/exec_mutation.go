@@ -1,185 +1,67 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scexec
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/scmutationexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 )
 
-func executeDescriptorMutationOps(ctx context.Context, deps Dependencies, ops []scop.Op) error {
-	mvs := newMutationVisitorState(deps.Catalog())
-	v := scmutationexec.NewMutationVisitor(deps.Catalog(), mvs, deps.EventLogger())
+// executeMutationOps will visit each operation, accumulating
+// side effects into a mutationVisitorState object, and then writing out
+// those side effects using the provided deps.
+func executeMutationOps(
+	ctx context.Context, deps Dependencies, phase scop.Phase, ops []scop.Op,
+) error {
+	// Execute immediate ops first.
+	uvs := immediateState{}
+	uv := scmutationexec.NewImmediateVisitor(&uvs, deps.Clock(), deps.Catalog())
 	for _, op := range ops {
-		if err := op.(scop.MutationOp).Visit(ctx, v); err != nil {
-			return err
+		if iop, ok := op.(scop.ImmediateMutationOp); ok {
+			if err := iop.Visit(ctx, uv); err != nil {
+				// If the error already has a PG code, then treat it as a user error.
+				if pgerror.HasCandidateCode(err) {
+					return scerrors.SchemaChangerUserError(err)
+				}
+				return errors.Wrapf(err, "%T: %v", op, op)
+			}
 		}
 	}
-	b := deps.Catalog().NewCatalogChangeBatcher()
-	err := mvs.checkedOutDescriptors.IterateByID(func(entry catalog.NameEntry) error {
-		return b.CreateOrUpdateDescriptor(ctx, entry.(catalog.MutableDescriptor))
-	})
-	if err != nil {
+	if err := uvs.exec(ctx, deps.Catalog()); err != nil {
 		return err
 	}
-	for id, drainedNames := range mvs.drainedNames {
-		for _, name := range drainedNames {
-			if err := b.DeleteName(ctx, name, id); err != nil {
-				return err
+	// Exit early when in statement phase to not persist any side effects.
+	if phase == scop.StatementPhase {
+		return nil
+	}
+	// Execute deferred ops last.
+	nvs := deferredState{}
+	nv := scmutationexec.NewDeferredVisitor(&nvs)
+	for _, op := range ops {
+		if dop, ok := op.(scop.DeferredMutationOp); ok {
+			if err := dop.Visit(ctx, nv); err != nil {
+				// If the error already has a PG code, then treat it as a user error.
+				if pgerror.HasCandidateCode(err) {
+					return scerrors.SchemaChangerUserError(err)
+				}
+				return errors.Wrapf(err, "%T: %v", op, op)
 			}
 		}
 	}
-	if len(mvs.descriptorGCJobs) > 0 {
-		job := jobspb.SchemaChangeGCDetails{
-			Tables: mvs.descriptorGCJobs,
-		}
-		jobName := func() string {
-			if len(mvs.descriptorGCJobs) == 1 {
-				return fmt.Sprintf("dropping descriptor %d", mvs.descriptorGCJobs[0].ID)
-			}
-			var sb strings.Builder
-			sb.WriteString("dropping descriptors")
-			for _, table := range mvs.descriptorGCJobs {
-				sb.WriteString(fmt.Sprintf(" %d", table.ID))
-			}
-			return sb.String()
-		}
-
-		record := createGCJobRecord(jobName(), security.NodeUserName(), job)
-		if _, err := deps.TransactionalJobCreator().CreateJob(ctx, record); err != nil {
-			return err
-		}
-	}
-	for tableID, indexes := range mvs.indexGCJobs {
-		job := jobspb.SchemaChangeGCDetails{
-			ParentID: tableID,
-			Indexes:  indexes,
-		}
-		jobName := func() string {
-			if len(indexes) == 1 {
-				return fmt.Sprintf("dropping table %d index %d", tableID, indexes[0].IndexID)
-			}
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("dropping table %d indexes", tableID))
-			for _, index := range indexes {
-				sb.WriteString(fmt.Sprintf(" %d", index.IndexID))
-			}
-			return sb.String()
-		}
-
-		record := createGCJobRecord(jobName(), security.NodeUserName(), job)
-		if _, err := deps.TransactionalJobCreator().CreateJob(ctx, record); err != nil {
-			return err
-		}
-	}
-	if err := deps.EventLogger().ProcessAndSubmitEvents(ctx); err != nil {
-		return err
-	}
-	return b.ValidateAndRun(ctx)
-}
-
-type mutationVisitorState struct {
-	c                     Catalog
-	checkedOutDescriptors nstree.Map
-	drainedNames          map[descpb.ID][]descpb.NameInfo
-	descriptorGCJobs      []jobspb.SchemaChangeGCDetails_DroppedID
-	indexGCJobs           map[descpb.ID][]jobspb.SchemaChangeGCDetails_DroppedIndex
-}
-
-func newMutationVisitorState(c Catalog) *mutationVisitorState {
-	return &mutationVisitorState{
-		c:            c,
-		drainedNames: make(map[descpb.ID][]descpb.NameInfo),
-		indexGCJobs:  make(map[descpb.ID][]jobspb.SchemaChangeGCDetails_DroppedIndex),
-	}
-}
-
-var _ scmutationexec.MutationVisitorStateUpdater = (*mutationVisitorState)(nil)
-
-func (mvs *mutationVisitorState) CheckOutDescriptor(
-	ctx context.Context, id descpb.ID,
-) (catalog.MutableDescriptor, error) {
-	entry := mvs.checkedOutDescriptors.GetByID(id)
-	if entry != nil {
-		return entry.(catalog.MutableDescriptor), nil
-	}
-	mut, err := mvs.c.MustReadMutableDescriptor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	mut.MaybeIncrementVersion()
-	mvs.checkedOutDescriptors.Upsert(mut)
-	return mut, nil
-}
-
-func (mvs *mutationVisitorState) AddDrainedName(id descpb.ID, nameInfo descpb.NameInfo) {
-	if _, ok := mvs.drainedNames[id]; !ok {
-		mvs.drainedNames[id] = []descpb.NameInfo{nameInfo}
-	} else {
-		mvs.drainedNames[id] = append(mvs.drainedNames[id], nameInfo)
-	}
-}
-
-func (mvs *mutationVisitorState) AddNewGCJobForDescriptor(descriptor catalog.Descriptor) {
-	mvs.descriptorGCJobs = append(mvs.descriptorGCJobs,
-		jobspb.SchemaChangeGCDetails_DroppedID{
-			ID:       descriptor.GetID(),
-			DropTime: timeutil.Now().UnixNano(),
-		})
-}
-
-func (mvs *mutationVisitorState) AddNewGCJobForIndex(
-	tbl catalog.TableDescriptor, index catalog.Index,
-) {
-	mvs.indexGCJobs[tbl.GetID()] = append(
-		mvs.indexGCJobs[tbl.GetID()],
-		jobspb.SchemaChangeGCDetails_DroppedIndex{
-			IndexID:  index.GetID(),
-			DropTime: timeutil.Now().UnixNano(),
-		})
-}
-
-// createGCJobRecord creates the job record for a GC job, setting some
-// properties which are common for all GC jobs.
-func createGCJobRecord(
-	originalDescription string, username security.SQLUsername, details jobspb.SchemaChangeGCDetails,
-) jobs.Record {
-	descriptorIDs := make([]descpb.ID, 0)
-	if len(details.Indexes) > 0 {
-		if len(descriptorIDs) == 0 {
-			descriptorIDs = []descpb.ID{details.ParentID}
-		}
-	} else {
-		for _, table := range details.Tables {
-			descriptorIDs = append(descriptorIDs, table.ID)
-		}
-	}
-	return jobs.Record{
-		Description:   fmt.Sprintf("GC for %s", originalDescription),
-		Username:      username,
-		DescriptorIDs: descriptorIDs,
-		Details:       details,
-		Progress:      jobspb.SchemaChangeGCProgress{},
-		RunningStatus: "waiting for GC TTL",
-		NonCancelable: true,
-	}
+	return nvs.exec(
+		ctx,
+		deps.Catalog(),
+		deps.TransactionalJobRegistry(),
+		deps.DescriptorMetadataUpdater(ctx),
+		deps.StatsRefresher(),
+		deps.IndexSpanSplitter(),
+	)
 }

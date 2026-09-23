@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props
 
@@ -15,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // FuncDepSet is a set of functional dependencies (FDs) that encode useful
@@ -26,12 +21,12 @@ import (
 // then those two rows will also have equal values for columns in B. For
 // example, where columns (a1, a2) are in set A, and column (b1) is in set B:
 //
-//   a1 a2 b1
-//   --------
-//   1  2  5
-//   1  2  5
-//   3  4  6
-//   3  4  6
+//	a1 a2 b1
+//	--------
+//	1  2  5
+//	1  2  5
+//	3  4  6
+//	3  4  6
 //
 // The left side of a functional dependency is called the "determinant", and
 // the right side is called the "dependant". Each side can contain zero or more
@@ -42,12 +37,12 @@ import (
 // When a dependant contains multiple columns, it is equivalent to splitting
 // the single FD into multiple FDs, each with a single column dependant:
 //
-//   (a)-->(b,c)
+//	(a)-->(b,c)
 //
 // is equivalent to these two FDs:
 //
-//   (a)-->(b)
-//   (a)-->(c)
+//	(a)-->(b)
+//	(a)-->(c)
 //
 // When a determinant contains zero columns, as in ()-->A, then A is fully
 // determined without reference to any other columns. An equivalent statement is
@@ -55,20 +50,20 @@ import (
 // And both of these statements are just another way of saying that columns in A
 // are constant:
 //
-//   a1 a2    b1 c1
-//   ----------------
-//   1  NULL  3  3
-//   1  NULL  3  NULL
-//   1  NULL  4  NULL
+//	a1 a2    b1 c1
+//	----------------
+//	1  NULL  3  3
+//	1  NULL  3  NULL
+//	1  NULL  4  NULL
 //
 // When a determinant contains multiple columns, then the functional dependency
 // holds for the *composite* value of those columns. For example:
 //
-//   a1 a2 b1
-//   --------
-//   1  2  5
-//   1  2  5
-//   1  3  4
+//	a1 a2 b1
+//	--------
+//	1  2  5
+//	1  2  5
+//	1  3  4
 //
 // These are valid values, even though a1 has the same values for all three
 // rows, because it is only the combination of (a1,a2) that determines (b1).
@@ -78,9 +73,9 @@ import (
 // columns that are functionally dependent on those columns, either directly or
 // indirectly. Consider this set of FD's:
 //
-//   (a)-->(b,c,d)
-//   (b,c,e)-->(f)
-//   (d)-->(e)
+//	(a)-->(b,c,d)
+//	(b,c,e)-->(f)
+//	(d)-->(e)
 //
 // The transitive closure of (a) is (a,b,c,d,e,f). To start, (a) determines
 // (b,c,d). From there, (d) transitively determines (e). And now that (b,c,e)
@@ -89,25 +84,25 @@ import (
 // duplicates, since all other columns will be equal. And if there are no
 // duplicate rows, then (a) is a key for the relation.
 //
-// Deriving FD Sets
+// # Deriving FD Sets
 //
 // Base table primary keys can be trivially mapped into an FD set, since the
 // primary key always uniquely determines the other columns:
 //
-//   CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT)
-//   (a)-->(b,c)
+//	CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT)
+//	(a)-->(b,c)
 //
 // Each SQL relational operator derives its own FD set from the FD sets of its
 // inputs. For example, the Select operator augments the FD set of its input,
 // based on its filter condition:
 //
-//   SELECT * FROM t WHERE a=1
+//	SELECT * FROM t WHERE a=1
 //
 // Equating a column to a constant value constructs a new FD with an empty
 // determinant, so that the augmented FD set becomes:
 //
-//   (a)-->(b,c)
-//   ()-->(a)
+//	(a)-->(b,c)
+//	()-->(a)
 //
 // Since the value of column "a" is always the same, and since "a" functionally
 // determines "b" and "c", the values of all columns are constants. Furthermore,
@@ -118,14 +113,14 @@ import (
 // including eliminating unnecessary DISTINCT operators, simplifying ORDER BY
 // columns, removing Max1Row operators, and mapping semi-joins to inner-joins.
 //
-// NULL Values
+// # NULL Values
 //
 // FDs become more complex when the possibility of NULL values is introduced.
 // SQL semantics often treat a NULL value as an "unknown" value that is not
 // equal to any other value, including another NULL value. For example, SQL
 // unique indexes exhibit this behavior:
 //
-//   CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT, UNIQUE (b))
+//	CREATE TABLE t (a INT PRIMARY KEY, b INT, c INT, UNIQUE (b))
 //
 // Here, "b" column values are unique...except for the case of multiple NULL
 // values, which are allowed because each NULL is treated as if it was a
@@ -139,53 +134,53 @@ import (
 // "are these two columns equal". The semantics are identical to what this SQL
 // expression returns:
 //
-//   ((c1 = c2) OR (c1 IS NULL AND c2 IS NULL)) IS True
+//	((c1 = c2) OR (c1 IS NULL AND c2 IS NULL)) IS True
 //
 // And here are some examples:
 //
-//   c1    c2    NULL=
-//   -----------------
-//   1     1     true
-//   NULL  NULL  true
-//   1     2     false
-//   1     NULL  false
-//   NULL  1     false
+//	c1    c2    NULL=
+//	-----------------
+//	1     1     true
+//	NULL  NULL  true
+//	1     2     false
+//	1     NULL  false
+//	NULL  1     false
 //
 // So now for the definition of A-->B that incorporates NULL values:
 //
-//   for any two rows r1 and r2 in the relation:
-//   A(r1) NULL= A(r2) ==> B(r1) NULL= B(r2)
+//	for any two rows r1 and r2 in the relation:
+//	A(r1) NULL= A(r2) ==> B(r1) NULL= B(r2)
 //
 // Intuitively, if two different rows have equal values for A using "NULLs are
 // equal" semantics, then those rows will also have equal values for B using
 // those same semantics. As an example, the following sets of rows would be
 // valid for the dependency (b)-->(c):
 //
-//   b     c
-//   ----------
-//   1     NULL
-//   1     NULL
-//   NULL  1
-//   NULL  1
-//   2     3
-//   2     3
+//	b     c
+//	----------
+//	1     NULL
+//	1     NULL
+//	NULL  1
+//	NULL  1
+//	2     3
+//	2     3
 //
-//   b     c
-//   ----------
-//   NULL  NULL
-//   NULL  NULL
+//	b     c
+//	----------
+//	NULL  NULL
+//	NULL  NULL
 //
 // but these sets of rows would be invalid:
 //
-//   b     c
-//   ----------
-//   NULL  1
-//   NULL  NULL
+//	b     c
+//	----------
+//	NULL  1
+//	NULL  NULL
 //
-//   b     c
-//   ----------
-//   NULL  1
-//   NULL  2
+//	b     c
+//	----------
+//	NULL  1
+//	NULL  2
 //
 // Unique constraints allow the latter cases, however, and therefore it is
 // desirable to somehow encode these weaker dependencies as FDs, because they
@@ -197,19 +192,19 @@ import (
 // false, then the FD is a "lax" dependency. Lax dependencies use "squiggly"
 // arrow notation to differentiate them from the strict variant:
 //
-//   A~~>B
+//	A~~>B
 //
 // In contrast to strict dependencies, lax dependencies treat NULLs on
 // determinant columns as distinct from one another, with equality semantics
 // identical to this SQL expression:
 //
-//   (c1 = c2) IS True
+//	(c1 = c2) IS True
 //
 // In other words, if either c1 or c2 is NULL, or both are NULL, then c1 is
 // considered not equal to c2. The definition for A~~>B follows from that:
 //
-//   for any two rows r1 and r2 in the relation:
-//   (A(r1) = A(r2)) IS True ==> B(r1) NULL= B(r2)
+//	for any two rows r1 and r2 in the relation:
+//	(A(r1) = A(r2)) IS True ==> B(r1) NULL= B(r2)
 //
 // In other words, if two different non-NULL rows have equal values for A, then
 // those rows will also have equal values for B using NULL= semantics. Note that
@@ -217,21 +212,21 @@ import (
 // the columns of A are not-NULL. The example row sets shown above that were
 // invalid for a strict dependency are valid for a lax dependency:
 //
-//   b     c
-//   ----------
-//   NULL  1
-//   NULL  NULL
+//	b     c
+//	----------
+//	NULL  1
+//	NULL  NULL
 //
-//   b     c
-//   ----------
-//   NULL  1
-//   NULL  2
+//	b     c
+//	----------
+//	NULL  1
+//	NULL  2
 //
 // To continue the CREATE TABLE example shown above, another FD can now be
 // derived from that statement, in addition to the primary key FD:
 //
-//   (a)-->(b,c)
-//   (b)~~>(a,c)
+//	(a)-->(b,c)
+//	(b)~~>(a,c)
 //
 // Lax dependencies are *not* transitive, and have limited usefulness as-is.
 // However, some operators (like Select) can "reject" NULL values, which means
@@ -240,13 +235,13 @@ import (
 // dependency (recall that the both have identical semantics when NULLs are not
 // present), as in this example:
 //
-//   SELECT * FROM t WHERE b>5
+//	SELECT * FROM t WHERE b>5
 //
 // The ">" operator rejects NULL values, which means that the Select operator
 // can convert the lax dependency to a strict dependency:
 //
-//   (a)-->(b,c)
-//   (b)-->(a,c)
+//	(a)-->(b,c)
+//	(b)-->(a,c)
 //
 // Now, either the "a" or "b" column determines the values of all other columns,
 // and both are keys for the relation.
@@ -254,8 +249,8 @@ import (
 // Another thing to note is that a lax dependency with an empty determinant is
 // the same as the corresponding strict dependency:
 //
-//   ()~~>(a,b)
-//   ()-->(a,b)
+//	()~~>(a,b)
+//	()-->(a,b)
 //
 // As described above, a strict dependency differs from a lax dependency only in
 // terms of what values are allowed in determinant columns. Since the
@@ -263,18 +258,18 @@ import (
 // For that reason, this library automatically maps lax constant dependencies to
 // strict constant dependencies.
 //
-// Keys
+// # Keys
 //
 // A key is a set of columns that have a unique composite value for every row in
 // the relation. There are two kinds of keys, strict and lax, that parallel the
 // two kinds of functional dependencies. Strict keys treat NULL values in key
 // columns as equal to one another:
 //
-//   b     c
-//   --------
-//   1     10
-//   2     20
-//   NULL  30
+//	b     c
+//	--------
+//	1     10
+//	2     20
+//	NULL  30
 //
 // Here, "b" is a key for the relation, even though it contains a NULL value,
 // because there is only one such value. Multiple NULL values would violate the
@@ -286,12 +281,12 @@ import (
 // By contrast, lax keys treat NULL values in key columns as distinct from one
 // another, and so considers column "b" as unique in the following example:
 //
-//   b     c
-//   --------
-//   1     10
-//   2     20
-//   NULL  30
-//   NULL  40
+//	b     c
+//	--------
+//	1     10
+//	2     20
+//	NULL  30
+//	NULL  40
 //
 // Note that both strict and lax keys treat non-NULL values identically; values
 // from two different rows must never compare equal to one another. In addition,
@@ -299,8 +294,8 @@ import (
 // with the key as determinant and all other columns in the relation as
 // dependants. Here is an example assuming a table with columns (a,b,c,d):
 //
-//   lax-key(a,b)    => (a,b)~~>(c,d)
-//   strict-key(a,b) => (a,b)-->(c,d)
+//	lax-key(a,b)    => (a,b)~~>(c,d)
+//	strict-key(a,b) => (a,b)-->(c,d)
 //
 // The "empty key" is a special key that has zero columns. It is used when the
 // relation is guaranteed to have at most one row. In this special case, every
@@ -344,23 +339,23 @@ import (
 // relatively short key is needed (e.g. during decorrelation), FuncDepSet has
 // one ready to go.
 //
-// Equivalent Columns
+// # Equivalent Columns
 //
 // FD sets encode "equivalent columns", which are pairs of columns that always
 // have equal values using the SQL equality operator with NULL= semantics. Two
 // columns a and b are equivalent if the following expression returns true:
 //
-//   ((a = b) OR (a IS NULL AND b IS NULL)) IS True
+//	((a = b) OR (a IS NULL AND b IS NULL)) IS True
 //
 // Equivalent columns are typically derived from a Select filter condition, and
 // are represented as two FDs with each column acting as both determinant and
 // dependant:
 //
-//   SELECT * FROM t WHERE b=c
-//   (a)-->(b,c)
-//   (b)~~>(a,c)
-//   (b)==(c)
-//   (c)==(b)
+//	SELECT * FROM t WHERE b=c
+//	(a)-->(b,c)
+//	(b)~~>(a,c)
+//	(b)==(c)
+//	(c)==(b)
 //
 // In the common case shown above, the WHERE clause rejects NULL values, so the
 // equivalency will always be strict, which means it retains all the same
@@ -368,58 +363,57 @@ import (
 // possible, the library currently maps them into regular lax dependencies to
 // simplify implementation.
 //
-// Theory to Practice
+// # Theory to Practice
 //
 // For a more rigorous examination of functional dependencies and their
 // interaction with various SQL operators, see the following Master's Thesis:
 //
-//   Norman Paulley, Glenn. (2000).
-//   Exploiting Functional Dependence in Query Optimization.
-//   https://cs.uwaterloo.ca/research/tr/2000/11/CS-2000-11.thesis.pdf
+//	Norman Paulley, Glenn. (2000).
+//	Exploiting Functional Dependence in Query Optimization.
+//	https://cs.uwaterloo.ca/research/tr/2000/11/CS-2000-11.thesis.pdf
 //
 // While this paper served as the inspiration for this library, a number of
 // details differ, including (but not limited to):
 //
-//   1. Most importantly, the definition of "lax" used in the paper differs from
-//      the definition used by this library. For a lax dependency A~~>B, the
-//      paper allows this set of rows:
+//  1. Most importantly, the definition of "lax" used in the paper differs from
+//     the definition used by this library. For a lax dependency A~~>B, the
+//     paper allows this set of rows:
 //
-//        a  b
-//        -------
-//        1  1
-//        1  NULL
+//     a  b
+//     -------
+//     1  1
+//     1  NULL
 //
-//      This library disallows that, since it requires that if the determinant
-//      of a lax dependency is not-null, then it is equivalent to a strict
-//      dependency. This alternate definition is briefly covered in section
-//      2.5.3.2 of the paper (see definition 2.19). The reason for this change
-//      is to allow a lax dependency to be upgraded to a strict dependency more
-//      readily, needing only the determinant columns to be not-null rather than
-//      both determinant and dependant columns.
+//     This library disallows that, since it requires that if the determinant
+//     of a lax dependency is not-null, then it is equivalent to a strict
+//     dependency. This alternate definition is briefly covered in section
+//     2.5.3.2 of the paper (see definition 2.19). The reason for this change
+//     is to allow a lax dependency to be upgraded to a strict dependency more
+//     readily, needing only the determinant columns to be not-null rather than
+//     both determinant and dependant columns.
 //
-//   2. The paper simplifies FD sets so that dependants never contain more than
-//      one column. This library allows multiple dependent columns, since they
-//      can be so efficiently stored and processed as ColSets.
+//  2. The paper simplifies FD sets so that dependants never contain more than
+//     one column. This library allows multiple dependent columns, since they
+//     can be so efficiently stored and processed as ColSets.
 //
-//   3. The paper deliberately avoids all simplifications when a SQL operator
-//      adds new FDs to an existing FD set, in order to avoid unneeded work and
-//      expensive reductions. This library performs quite a few simplifications
-//      in order to keep the FD set more manageable and understandable.
+//  3. The paper deliberately avoids all simplifications when a SQL operator
+//     adds new FDs to an existing FD set, in order to avoid unneeded work and
+//     expensive reductions. This library performs quite a few simplifications
+//     in order to keep the FD set more manageable and understandable.
 //
-//   4. The paper "colors" columns black when they are no longer part of a
-//      derived relation. Rather than marking removed columns, this library
-//      actually removes them from the FD set.
+//  4. The paper "colors" columns black when they are no longer part of a
+//     derived relation. Rather than marking removed columns, this library
+//     actually removes them from the FD set.
 //
-//   5. In order to ensure a unique key for every relation, the paper uses a
-//      special "tuple identifier" that acts like a virtual column and can be
-//      both a determinant and a dependant. If the transitive closure of any set
-//      of columns includes the tuple identifier column, then that set of
-//      columns is a super key for the relation. As described in the Keys
-//      section above, this library takes a simplified approach so that it
-//      doesn't need to allocate virtual columns in property derivation code.
-//
+//  5. In order to ensure a unique key for every relation, the paper uses a
+//     special "tuple identifier" that acts like a virtual column and can be
+//     both a determinant and a dependant. If the transitive closure of any set
+//     of columns includes the tuple identifier column, then that set of
+//     columns is a super key for the relation. As described in the Keys
+//     section above, this library takes a simplified approach so that it
+//     doesn't need to allocate virtual columns in property derivation code.
 type FuncDepSet struct {
-	// deps contains the functional dependencies that have a non-trivial
+	// deps contains the non-equiv functional dependencies that have a non-trivial
 	// determinant and dependant (i.e. not empty, with no overlapping columns):
 	//
 	//   (a)-->(b,c)
@@ -432,6 +426,9 @@ type FuncDepSet struct {
 	// This slice is owned by this FuncDepSet and shouldn't be shared unless
 	// all referencing sets are treated as immutable.
 	deps []funcDep
+
+	// equiv tracks the equivalencies separately from deps as an optimization.
+	equiv EquivGroups
 
 	// hasKey is:
 	//  - strictKey if the relation has no duplicate rows, which means at least
@@ -489,11 +486,6 @@ type funcDep struct {
 	// can map to different dependant values. See the NULL Values section in the
 	// FuncDeps comment for more details.
 	strict bool
-
-	// equiv is true if the value of the determinant equals the value of each of
-	// the dependant columns, and false if there's no known equality relationship.
-	// If equiv is true, the determinant may only consist of a single column.
-	equiv bool
 }
 
 // StrictKey returns a strict key for the relation, if there is one.
@@ -518,7 +510,7 @@ func (f *FuncDepSet) LaxKey() (_ opt.ColSet, ok bool) {
 
 // Empty is true if the set contains no FDs and no key.
 func (f *FuncDepSet) Empty() bool {
-	return len(f.deps) == 0 && f.hasKey == noKey
+	return len(f.deps) == 0 && f.equiv.Empty() && f.hasKey == noKey
 }
 
 // ColSet returns all columns referenced by the FD set.
@@ -528,6 +520,9 @@ func (f *FuncDepSet) ColSet() opt.ColSet {
 		fd := &f.deps[i]
 		cols.UnionWith(fd.from)
 		cols.UnionWith(fd.to)
+	}
+	for i := 0; i < f.equiv.GroupCount(); i++ {
+		cols.UnionWith(f.equiv.Group(i))
 	}
 	if f.hasKey != noKey {
 		// There are cases where key columns don't show up in FDs. For example:
@@ -547,26 +542,46 @@ func (f *FuncDepSet) CopyFrom(fdset *FuncDepSet) {
 	// Make certain to copy FDs to the slice owned by this set.
 	f.deps = f.deps[:0]
 	f.deps = append(f.deps, fdset.deps...)
+	f.equiv.CopyFrom(&fdset.equiv)
 	f.key = fdset.key
 	f.hasKey = fdset.hasKey
 }
 
 // RemapFrom copies the given FD into this FD, remapping column IDs according to
-// the from/to lists. Specifically, column from[i] is replaced with column
-// to[i] (see TranslateColSet).
-// Any columns not in the from list are removed from the FDs.
-func (f *FuncDepSet) RemapFrom(fdset *FuncDepSet, fromCols, toCols opt.ColList) {
+// the old/new lists. Specifically, column old[i] is replaced with column new[i]
+// (see TranslateColSet).
+//
+// Any columns not in the "old" list are removed from the FDs.
+func (f *FuncDepSet) RemapFrom(fdset *FuncDepSet, oldCols, newCols opt.ColList) {
 	f.CopyFrom(fdset)
 	colSet := f.ColSet()
-	fromSet := fromCols.ToSet()
+	fromSet := oldCols.ToSet()
 	if !colSet.SubsetOf(fromSet) {
 		f.ProjectCols(colSet.Intersection(fromSet))
 	}
-	for i := range f.deps {
-		f.deps[i].from = opt.TranslateColSetStrict(f.deps[i].from, fromCols, toCols)
-		f.deps[i].to = opt.TranslateColSetStrict(f.deps[i].to, fromCols, toCols)
+	n := 0
+	for i := 0; i < len(f.deps); i++ {
+		f.deps[i].from = opt.TranslateColSetStrict(f.deps[i].from, oldCols, newCols)
+		f.deps[i].to = opt.TranslateColSetStrict(f.deps[i].to, oldCols, newCols)
+		if n != i {
+			f.deps[n] = f.deps[i]
+		}
+		n++
 	}
-	f.key = opt.TranslateColSetStrict(f.key, fromCols, toCols)
+	f.deps = f.deps[:n]
+	f.equiv.TranslateColsStrict(oldCols, newCols)
+	f.key = opt.TranslateColSetStrict(f.key, oldCols, newCols)
+	var seenOldCols opt.ColSet
+	for i := range oldCols {
+		// If a "from" column maps to more than one "to" column, it is possible that
+		// there will be a new equivalency between the "to" columns that can be used
+		// to reduce the key.
+		if seenOldCols.Contains(oldCols[i]) {
+			f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
+			break
+		}
+		seenOldCols.Add(oldCols[i])
+	}
 }
 
 // ColsAreStrictKey returns true if the given columns contain a strict key for the
@@ -576,13 +591,12 @@ func (f *FuncDepSet) RemapFrom(fdset *FuncDepSet, fromCols, toCols opt.ColList) 
 // (a,b) is a strict key for the following relation, but (a) is not (because
 // there are multiple rows where a=1 and a=NULL):
 //
-//   a     b     c
-//   ----------------
-//   NULL  NULL  NULL
-//   NULL  1     1
-//   1     NULL  1
-//   1     1     1
-//
+//	a     b     c
+//	----------------
+//	NULL  NULL  NULL
+//	NULL  1     1
+//	1     NULL  1
+//	1     1     1
 func (f *FuncDepSet) ColsAreStrictKey(cols opt.ColSet) bool {
 	return f.colsAreKey(cols, strictKey)
 }
@@ -594,17 +608,16 @@ func (f *FuncDepSet) ColsAreStrictKey(cols opt.ColSet) bool {
 // following relation, but (a) is not (because there are multiple rows where
 // a=1):
 //
-//   a     b     c
-//   ----------------
-//   NULL  NULL  NULL
-//   NULL  NULL  1
-//   NULL  NULL  2
-//   NULL  1     1
-//   NULL  1     2
-//   1     NULL  1
-//   1     NULL  2
-//   1     1     1
-//
+//	a     b     c
+//	----------------
+//	NULL  NULL  NULL
+//	NULL  NULL  1
+//	NULL  NULL  2
+//	NULL  1     1
+//	NULL  1     2
+//	1     NULL  1
+//	1     NULL  2
+//	1     1     1
 func (f *FuncDepSet) ColsAreLaxKey(cols opt.ColSet) bool {
 	return f.colsAreKey(cols, laxKey)
 }
@@ -628,9 +641,31 @@ func (f *FuncDepSet) ConstantCols() opt.ColSet {
 // so, then the column is redundant. This algorithm has decent running time, but
 // will not necessarily find the candidate key with the fewest columns.
 func (f *FuncDepSet) ReduceCols(cols opt.ColSet) opt.ColSet {
+	if f.hasKey == strictKey && f.key.SubsetOf(cols) {
+		// Fast path: take advantage of the reduction that was already performed for
+		// an existing key.
+		cols = f.key
+	}
 	var removed opt.ColSet
 	cols = cols.Copy()
 	for i, ok := cols.Next(0); ok; i, ok = cols.Next(i + 1) {
+		// First check if the column is present in any "to" set of a dependency or
+		// is involved in an equivalency. If not, then it is not redundant and must
+		// remain in the set. This is a fast-path to avoid the more expensive
+		// functional-dependency-closure test below, when possible.
+		inToSet := false
+		for j := range f.deps {
+			if f.deps[j].to.Contains(i) {
+				inToSet = true
+				break
+			}
+		}
+		if !inToSet && !f.equiv.ContainsCol(i) {
+			continue
+		}
+
+		// Determine if the column is functionally determined by the other
+		// columns.
 		cols.Remove(i)
 		removed.Add(i)
 		if !f.inClosureOf(removed, cols, true /* strict */) {
@@ -653,23 +688,29 @@ func (f *FuncDepSet) InClosureOf(cols, in opt.ColSet) bool {
 // includes the input columns plus all columns that are functionally dependent
 // on those columns, either directly or indirectly. Consider this set of FD's:
 //
-//   (a)-->(b,c,d)
-//   (b,c,e)-->(f)
-//   (d)-->(e)
+//	(a)-->(b,c,d)
+//	(b,c,e)-->(f)
+//	(d)-->(e)
 //
 // The strict closure of (a) is (a,b,c,d,e,f), because (a) determines all other
 // columns. Therefore, if two rows have the same value for (a), then the rows
 // will be duplicates, since all other columns will be equal.
 func (f *FuncDepSet) ComputeClosure(cols opt.ColSet) opt.ColSet {
 	cols = cols.Copy()
-	for i := 0; i < len(f.deps); i++ {
-		fd := &f.deps[i]
+	for {
+		restart := false
+		cols = f.equiv.ComputeEquivClosureNoCopy(cols)
+		for i := 0; i < len(f.deps); i++ {
+			fd := &f.deps[i]
+			if fd.strict && fd.from.SubsetOf(cols) && !fd.to.SubsetOf(cols) {
+				cols.UnionWith(fd.to)
 
-		if fd.strict && fd.from.SubsetOf(cols) && !fd.to.SubsetOf(cols) {
-			cols.UnionWith(fd.to)
-
-			// Restart iteration to get transitive closure.
-			i = -1
+				// Restart iteration to get transitive closure.
+				restart = true
+			}
+		}
+		if !restart {
+			break
 		}
 	}
 	return cols
@@ -677,46 +718,32 @@ func (f *FuncDepSet) ComputeClosure(cols opt.ColSet) opt.ColSet {
 
 // AreColsEquiv returns true if the two given columns are equivalent.
 func (f *FuncDepSet) AreColsEquiv(col1, col2 opt.ColumnID) bool {
-	if col1 == col2 {
-		return true
-	}
-	for i := range f.deps {
-		fd := &f.deps[i]
-
-		if fd.equiv && fd.strict {
-			if (fd.from.Contains(col1) && fd.to.Contains(col2)) ||
-				(fd.from.Contains(col2) && fd.to.Contains(col1)) {
-				return true
-			}
-		}
-	}
-	return false
+	return f.equiv.AreColsEquiv(col1, col2)
 }
 
 // ComputeEquivClosure returns the equivalence closure of the given columns. The
 // closure includes the input columns plus all columns that are equivalent to
 // any of these columns, either directly or indirectly. For example:
 //
-//   (a)==(b)
-//   (b)==(c)
-//   (a)==(d)
-//   (e)==(f)
+//	(a)==(b)
+//	(b)==(c)
+//	(a)==(d)
+//	(e)==(f)
 //
 // The equivalence closure for (a,e) is (a,b,c,d,e,f) because all these columns
 // are transitively equal to either a or e. Therefore, all columns must have
 // equal non-NULL values, or else all must be NULL (see definition for NULL= in
 // the comment for FuncDepSet).
 func (f *FuncDepSet) ComputeEquivClosure(cols opt.ColSet) opt.ColSet {
-	// Don't need to get transitive closure, because equivalence closures are
-	// already maintained for every column.
-	cols = cols.Copy()
-	for i := range f.deps {
-		fd := &f.deps[i]
-		if fd.equiv && fd.from.SubsetOf(cols) && !fd.to.SubsetOf(cols) {
-			cols.UnionWith(fd.to)
-		}
-	}
-	return cols
+	return f.ComputeEquivClosureNoCopy(cols.Copy())
+}
+
+// ComputeEquivClosureNoCopy is similar to ComputeEquivClosure, but computes the
+// closure in-place (e.g. the argument ColSet will be mutated). It should only
+// be used when it is ok to mutate the argument. This avoids allocations when
+// columns overflow the small set of intsets.Fast.
+func (f *FuncDepSet) ComputeEquivClosureNoCopy(cols opt.ColSet) opt.ColSet {
+	return f.equiv.ComputeEquivClosureNoCopy(cols)
 }
 
 // AddStrictKey adds an FD for a new key. The given key columns are reduced to a
@@ -725,7 +752,7 @@ func (f *FuncDepSet) ComputeEquivClosure(cols opt.ColSet) opt.ColSet {
 // same set of values in the rest of the relation's columns. For key columns
 // (a,b) and relation columns (a,b,c,d), an FD like this is created:
 //
-//   (a,b)-->(c,d)
+//	(a,b)-->(c,d)
 //
 // If the resulting candidate key has fewer columns than the current key, then
 // the new key is adopted in its place.
@@ -737,7 +764,7 @@ func (f *FuncDepSet) AddStrictKey(keyCols, allCols opt.ColSet) {
 	// Ensure we have candidate key (i.e. has no columns that are functionally
 	// determined by other columns).
 	keyCols = f.ReduceCols(keyCols)
-	f.addDependency(keyCols, allCols, true /* strict */, false /* equiv */)
+	f.addDependency(keyCols, allCols, true /* strict */)
 
 	// Try to use the new FD to reduce any existing key first.
 	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
@@ -752,8 +779,7 @@ func (f *FuncDepSet) AddStrictKey(keyCols, allCols opt.ColSet) {
 // have the same values in other non-key columns. For key columns (a,b) and
 // relation columns (a,b,c,d), and FD like this is created:
 //
-//   (a,b)~~>(c,d)
-//
+//	(a,b)~~>(c,d)
 func (f *FuncDepSet) AddLaxKey(keyCols, allCols opt.ColSet) {
 	if !keyCols.SubsetOf(allCols) {
 		panic(errors.AssertionFailedf("allCols does not include keyCols"))
@@ -764,7 +790,7 @@ func (f *FuncDepSet) AddLaxKey(keyCols, allCols opt.ColSet) {
 
 	// Ensure we have candidate key (i.e. has no columns that are functionally
 	// determined by other columns).
-	f.addDependency(keyCols, allCols, false /* strict */, false /* equiv */)
+	f.addDependency(keyCols, allCols, false /* strict */)
 
 	// TODO(radu): without null column information, we cannot reduce lax keys (see
 	// tryToReduceKey). Consider passing that information (or storing it with the
@@ -784,53 +810,23 @@ func (f *FuncDepSet) AddLaxKey(keyCols, allCols opt.ColSet) {
 // optimization. For a relation with columns (a, b), the following FD is
 // created in the set:
 //
-//   ()-->(a,b)
+//	()-->(a,b)
 //
 // If f has equivalence dependencies of columns that are a subset of cols, those
 // dependencies are retained in f. This prevents losing additional information
 // about the columns, which a single FD with an empty key cannot describe. For
 // example:
 //
-//   f:      (a)-->(b,c), (a)==(b), (b)==(a), (a)==(c), (c)==(a)
-//   cols:   (a,c)
-//   result: ()-->(a,c), (a)==(c), (c)==(a)
-//
+//	f:      (a)-->(b,c), (a)==(b), (b)==(a), (a)==(c), (c)==(a)
+//	cols:   (a,c)
+//	result: ()-->(a,c), (a)==(c), (c)==(a)
 func (f *FuncDepSet) MakeMax1Row(cols opt.ColSet) {
 	// Remove all FDs except for equivalency FDs with columns that are a subset
 	// of cols.
-	copyIdx := 0
-	for i := range f.deps {
-		fd := &f.deps[i]
-
-		// Skip non-equivalence dependencies.
-		if !fd.equiv {
-			continue
-		}
-
-		// If fd is an equivalence dependency, from has a single column.
-		fromCol, ok := fd.from.Next(0)
-		if !ok {
-			panic(errors.AssertionFailedf("equivalence dependency from cannot be empty"))
-		}
-
-		// Add a new equivalence dependency with the same from column and the to
-		// columns that are present in cols.
-		if cols.Contains(fromCol) && fd.to.Intersects(cols) {
-			f.deps[copyIdx] = funcDep{
-				from:   fd.from,
-				to:     fd.to.Intersection(cols),
-				strict: true,
-				equiv:  true,
-			}
-			copyIdx++
-		}
-	}
-	f.deps = f.deps[:copyIdx]
-
+	f.deps = f.deps[:0]
+	f.equiv.ProjectCols(cols)
 	if !cols.Empty() {
 		f.deps = append(f.deps, funcDep{to: cols, strict: true})
-		// The constant FD must be the first in the set.
-		f.deps[0], f.deps[len(f.deps)-1] = f.deps[len(f.deps)-1], f.deps[0]
 	}
 	f.setKey(opt.ColSet{}, strictKey)
 }
@@ -863,9 +859,9 @@ func (f *FuncDepSet) MakeNotNull(notNullCols opt.ColSet) {
 	}
 
 	if firstLaxFD != nil {
-		f.addDependency(firstLaxFD.from, firstLaxFD.to, true /* strict */, false /* equiv */)
+		f.addDependency(firstLaxFD.from, firstLaxFD.to, true /* strict */)
 		for i := range otherLaxFDs {
-			f.addDependency(otherLaxFDs[i].from, otherLaxFDs[i].to, true /* strict */, false /* equiv */)
+			f.addDependency(otherLaxFDs[i].from, otherLaxFDs[i].to, true /* strict */)
 		}
 	}
 
@@ -877,11 +873,10 @@ func (f *FuncDepSet) MakeNotNull(notNullCols opt.ColSet) {
 // semantics, or else "a" is NULL and "b" is NULL. The following FDs are
 // created in the set:
 //
-//   (a)==(b)
-//   (b)==(a)
-//
+//	(a)==(b)
+//	(b)==(a)
 func (f *FuncDepSet) AddEquivalency(a, b opt.ColumnID) {
-	if a == b {
+	if f.AreColsEquiv(a, b) {
 		return
 	}
 
@@ -889,6 +884,13 @@ func (f *FuncDepSet) AddEquivalency(a, b opt.ColumnID) {
 	equiv.Add(a)
 	equiv.Add(b)
 	f.addEquivalency(equiv)
+	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
+}
+
+// AddStrictDependency adds a new strict dependency to the set.
+func (f *FuncDepSet) AddStrictDependency(from, to opt.ColSet) {
+	f.addDependency(from, to, true /* strict */)
+	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 }
 
 // AddConstants adds a strict FD to the set that declares each given column as
@@ -896,11 +898,18 @@ func (f *FuncDepSet) AddEquivalency(a, b opt.ColumnID) {
 // its value may be NULL, but then the column must be NULL for all rows. For
 // column "a", the FD looks like this:
 //
-//   ()-->(a)
+//	()-->(a)
 //
 // Since it is a constant, any set of determinant columns (including the empty
 // set) trivially determines the value of "a".
 func (f *FuncDepSet) AddConstants(cols opt.ColSet) {
+	f.addConstantsNoKeyReduction(cols)
+	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
+}
+
+// addConstantsNoKeyReduction adds constant FDs to the set. It does not attempt
+// to reduce the key. See AddConstants.
+func (f *FuncDepSet) addConstantsNoKeyReduction(cols opt.ColSet) {
 	if cols.Empty() {
 		return
 	}
@@ -920,28 +929,25 @@ func (f *FuncDepSet) AddConstants(cols opt.ColSet) {
 		f.deps[0].to = cols
 	}
 
-	// Remove any other FDs made redundant by adding the constants.
+	// Remove any other non-equiv FDs made redundant by adding the constants.
 	n := 1
 	for i := 1; i < len(f.deps); i++ {
 		fd := &f.deps[i]
 
-		// Always retain equivalency information, even for constants.
-		if !fd.equiv {
-			if fd.strict {
-				// Constant columns can be removed from the determinant of a strict
-				// FD. If all determinant columns are constant, then the entire FD
-				// can be removed, since this means that the dependant columns must
-				// also be constant (and were part of constant closure added to the
-				// constant FD above).
-				if !fd.removeFromCols(cols) {
-					continue
-				}
-			}
-
-			// Dependant constants are redundant, so remove them.
-			if !fd.removeToCols(cols) {
+		if fd.strict {
+			// Constant columns can be removed from the determinant of a strict
+			// FD. If all determinant columns are constant, then the entire FD
+			// can be removed, since this means that the dependant columns must
+			// also be constant (and were part of constant closure added to the
+			// constant FD above).
+			if !fd.removeFromCols(cols) {
 				continue
 			}
+		}
+
+		// Dependant constants are redundant, so remove them.
+		if !fd.removeToCols(cols) {
+			continue
 		}
 
 		if n != i {
@@ -950,20 +956,17 @@ func (f *FuncDepSet) AddConstants(cols opt.ColSet) {
 		n++
 	}
 	f.deps = f.deps[:n]
-
-	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 }
 
 // AddSynthesizedCol adds an FD to the set that is derived from a synthesized
 // column in a projection list. The synthesized column is often derived from
 // other columns, in which case AddSynthesizedCol creates a new FD like this:
 //
-//   (a,b)-->(c)
+//	(a,b)-->(c)
 //
 // Or it may be a constant column, like this:
 //
-//   ()-->(c)
-//
+//	()-->(c)
 func (f *FuncDepSet) AddSynthesizedCol(from opt.ColSet, col opt.ColumnID) {
 	if from.Contains(col) {
 		panic(errors.AssertionFailedf("synthesized column cannot depend upon itself"))
@@ -971,7 +974,7 @@ func (f *FuncDepSet) AddSynthesizedCol(from opt.ColSet, col opt.ColumnID) {
 
 	var colSet opt.ColSet
 	colSet.Add(col)
-	f.addDependency(from, colSet, true /* strict */, false /* equiv */)
+	f.addDependency(from, colSet, true /* strict */)
 
 	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 }
@@ -1009,7 +1012,7 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 	// won't be lost. Also, track list of un-projected columns that are part of
 	// non-equivalent determinants. It's possible these can be mapped to
 	// equivalent columns.
-	var constCols, detCols, equivCols opt.ColSet
+	var constCols, detCols opt.ColSet
 	for i := range f.deps {
 		fd := &f.deps[i]
 
@@ -1020,31 +1023,22 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 
 		// Add closures to dependants containing un-projected columns.
 		if !fd.to.SubsetOf(cols) {
-			// Equivalence dependencies already maintain closure, so skip them.
-			if !fd.equiv {
-				fd.to = f.ComputeClosure(fd.to)
-				// Maintain the invariant that from and to columns don't overlap.
-				fd.to.DifferenceWith(fd.from)
-			}
+			fd.to = f.ComputeClosure(fd.to)
+			// Maintain the invariant that from and to columns don't overlap.
+			fd.to.DifferenceWith(fd.from)
 		}
 
 		// Track list of un-projected columns that can possibly be mapped to
 		// equivalent columns.
-		if !fd.equiv && !fd.from.SubsetOf(cols) {
+		if !fd.from.SubsetOf(cols) {
 			detCols.UnionWith(fd.from)
-			detCols.DifferenceWith(cols)
-		}
-
-		// Track all columns that have equivalent alternates that are part of the
-		// projection.
-		if fd.equiv && fd.to.Intersects(cols) {
-			equivCols.UnionWith(fd.from)
 		}
 	}
 
 	// Construct equivalence map that supports substitution of an equivalent
 	// column in place of a removed column.
-	detCols.IntersectionWith(equivCols)
+	detCols.DifferenceWith(cols)
+	detCols.IntersectionWith(f.ComputeEquivClosure(cols))
 	equivMap := f.makeEquivMap(detCols, cols)
 
 	// If constants were found, then normalize constants to preserve FDs in a
@@ -1060,6 +1054,9 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 	if !constCols.Empty() {
 		f.AddConstants(constCols)
 	}
+
+	// Forget all equivalencies that involve un-projected columns.
+	f.equiv.ProjectCols(cols)
 
 	// During second pass, remove all dependencies with un-projected columns.
 	var newFDs []funcDep
@@ -1081,12 +1078,6 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 
 		// Try to substitute equivalent columns for removed determinant columns.
 		if !fd.from.SubsetOf(cols) {
-			if fd.equiv {
-				// Always discard equivalency with removed determinant, since other
-				// equivalencies will already include this column.
-				continue
-			}
-
 			// Start with "before" list of columns that need to be mapped, and try
 			// to find an "after" list containing equivalent columns.
 			var afterCols opt.ColSet
@@ -1103,7 +1094,7 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 				// Dependency can be remapped using equivalencies.
 				from := fd.from.Union(afterCols)
 				from.DifferenceWith(beforeCols)
-				newFDs = append(newFDs, funcDep{from: from, to: fd.to, strict: fd.strict, equiv: fd.equiv})
+				newFDs = append(newFDs, funcDep{from: from, to: fd.to, strict: fd.strict})
 			}
 			continue
 		}
@@ -1117,7 +1108,7 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 
 	for i := range newFDs {
 		fd := &newFDs[i]
-		f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
+		f.addDependency(fd.from, fd.to, fd.strict)
 	}
 
 	// Ensure that key still determines all other columns.
@@ -1131,21 +1122,25 @@ func (f *FuncDepSet) ProjectCols(cols opt.ColSet) {
 // "compatible", meaning that they operate on the same relations, with the same
 // keys, same columns, etc.
 func (f *FuncDepSet) AddFrom(fdset *FuncDepSet) {
+	for i := 0; i < fdset.equiv.GroupCount(); i++ {
+		// NOTE: the ColSet of an equiv group is immutable.
+		f.addEquivalency(fdset.equiv.Group(i))
+	}
 	for i := range fdset.deps {
 		fd := &fdset.deps[i]
-		f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
+		f.addDependency(fd.from, fd.to, fd.strict)
 	}
+	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 }
 
 // AddEquivFrom is similar to AddFrom, except that it only adds equivalence
 // dependencies from the given set to this set.
 func (f *FuncDepSet) AddEquivFrom(fdset *FuncDepSet) {
-	for i := range fdset.deps {
-		fd := &fdset.deps[i]
-		if fd.equiv {
-			f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
-		}
+	for i := 0; i < fdset.equiv.GroupCount(); i++ {
+		// NOTE: the ColSet of an equiv group is immutable.
+		f.addEquivalency(fdset.equiv.Group(i))
 	}
+	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 }
 
 // MakeProduct modifies the FD set to reflect the impact of a cartesian product
@@ -1155,24 +1150,32 @@ func (f *FuncDepSet) AddEquivFrom(fdset *FuncDepSet) {
 // concatenated, rather than simplified via calls to addDependency (except for
 // case of constant columns).
 func (f *FuncDepSet) MakeProduct(inner *FuncDepSet) {
+	f.equiv.AppendFromDisjoint(&inner.equiv)
+
+	// Save the old key and clear it so that addDependency doesn't attempt to
+	// reduce it. We'll handle the key below, and key reduction is expensive.
+	// Note that the ColSet used for the key is immutable, so it is safe to keep
+	// the reference to the old key.
+	oldKey, oldHasKey := f.key, f.hasKey
+	f.clearKey()
 	for i := range inner.deps {
 		fd := &inner.deps[i]
 		if fd.isConstant() {
-			f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
+			f.addDependency(fd.from, fd.to, fd.strict)
 		} else {
 			f.deps = append(f.deps, *fd)
 		}
 	}
 
-	if f.hasKey != noKey && inner.hasKey != noKey {
+	if oldHasKey != noKey && inner.hasKey != noKey {
 		// If both sides have a strict key, the union of keys is a strict key.
 		// If one side has a lax key and the other has a lax or strict key, the
 		// union is a lax key.
 		typ := laxKey
-		if f.hasKey == strictKey && inner.hasKey == strictKey {
+		if oldHasKey == strictKey && inner.hasKey == strictKey {
 			typ = strictKey
 		}
-		f.setKey(f.key.Union(inner.key), typ)
+		f.setKey(oldKey.Union(inner.key), typ)
 	} else {
 		f.clearKey()
 	}
@@ -1184,39 +1187,46 @@ func (f *FuncDepSet) MakeProduct(inner *FuncDepSet) {
 // longer hold and some other dependencies need to be augmented in order to be
 // valid for the apply join operator. Consider this example:
 //
-//   SELECT *
-//   FROM a
-//   INNER JOIN LATERAL (SELECT * FROM b WHERE b.y=a.y)
-//   ON True
+//		SELECT *
+//		FROM a
+//		INNER JOIN LATERAL (SELECT * FROM b WHERE b.y=a.y)
+//		ON True
 //
-// 1. The constant dependency created from the outer column reference b.y=a.y
-//    does not hold for the Apply operator, since b.y is no longer constant at
-//    this level. In general, constant dependencies cannot be retained, because
-//    they may have been generated from outer column equivalencies.
-// 2. If a strict dependency (b.x,b.y)-->(b.z) held, it would have been reduced
-//    to (b.x)-->(b.z) because (b.y) is constant in the inner query. However,
-//    (b.x)-->(b.z) does not hold for the Apply operator, since (b.y) is not
-//    constant in that case. However, the dependency *does* hold as long as its
-//    determinant is augmented by the left input's key columns (if key exists).
-// 3. Lax dependencies follow the same rules as #2.
-// 4. Equivalence dependencies in the inner query still hold for the Apply
-//    operator.
-// 5. If both the outer and inner inputs of the apply join have keys, then the
-//    concatenation of those keys is a key on the apply join result.
-//
+//	 1. The constant dependency created from the outer column reference b.y=a.y
+//	    does not hold for the Apply operator, since b.y is no longer constant at
+//	    this level. In general, constant dependencies cannot be retained, because
+//	    they may have been generated from outer column equivalencies.
+//	 2. If a strict dependency (b.x,b.y)-->(b.z) held, it would have been reduced
+//	    to (b.x)-->(b.z) because (b.y) is constant in the inner query. However,
+//	    (b.x)-->(b.z) does not hold for the Apply operator, since (b.y) is not
+//	    constant in that case. However, the dependency *does* hold as long as its
+//	    determinant is augmented by the left input's key columns (if key exists).
+//	 3. Lax dependencies follow the same rules as #2.
+//	 4. Equivalence dependencies in the inner query still hold for the Apply
+//	    operator.
+//	 5. If both the outer and inner inputs of the apply join have keys, then the
+//	    concatenation of those keys is a key on the apply join result.
 func (f *FuncDepSet) MakeApply(inner *FuncDepSet) {
+	for i := 0; i < inner.equiv.GroupCount(); i++ {
+		// NOTE: the ColSet of an equiv group is immutable.
+		f.addEquivalency(inner.equiv.Group(i))
+	}
+	// Save the old key and clear it so that addDependency doesn't attempt to
+	// reduce it. We'll handle the key below, and key reduction is expensive.
+	// Note that the ColSet used for the key is immutable, so it is safe to keep
+	// the reference to the old key.
+	oldKey, oldHasKey := f.key, f.hasKey
+	f.clearKey()
 	for i := range inner.deps {
 		fd := &inner.deps[i]
-		if fd.equiv {
-			f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
-		} else if !fd.isConstant() && f.hasKey == strictKey {
-			f.addDependency(f.key.Union(fd.from), fd.to, fd.strict, fd.equiv)
+		if !fd.isConstant() && oldHasKey == strictKey {
+			f.addDependency(oldKey.Union(fd.from), fd.to, fd.strict)
 		}
 		// TODO(radu): can we use a laxKey here?
 	}
 
-	if f.hasKey == strictKey && inner.hasKey == strictKey {
-		f.setKey(f.key.Union(inner.key), strictKey)
+	if oldHasKey == strictKey && inner.hasKey == strictKey {
+		f.setKey(oldKey.Union(inner.key), strictKey)
 		f.ensureKeyClosure(inner.ColSet())
 	} else {
 		// TODO(radu): can we use a laxKey here?
@@ -1513,7 +1523,7 @@ func (f *FuncDepSet) nullExtendRightRows(rightCols, notNullInputCols opt.ColSet)
 
 					// Rule #2, described above. Note that this rule does not apply to
 					// equivalence FDs, which remain valid.
-					if fd.strict && !fd.equiv && !fd.from.Intersects(notNullInputCols) {
+					if fd.strict && !fd.from.Intersects(notNullInputCols) {
 						newFDs = append(newFDs, funcDep{from: fd.from, to: fd.to})
 						continue
 					}
@@ -1533,9 +1543,28 @@ func (f *FuncDepSet) nullExtendRightRows(rightCols, notNullInputCols opt.ColSet)
 	}
 	f.deps = f.deps[:n]
 
+	// Equivalence is maintained between columns from the same side of the join,
+	// but not between columns on either side. An equiv group that only references
+	// one side is left as-is. A group that references both sides is split into
+	// two equiv groups (which may be empty). In addition, lax dependencies are
+	// added from each row-supplying column to all null-extended columns.
+	//
+	// Add the lax dependencies from row-supplying to null-extended cols.
+	for i := 0; i < f.equiv.GroupCount(); i++ {
+		group := f.equiv.Group(i)
+		if group.Intersects(rightCols) && !group.SubsetOf(rightCols) {
+			left, right := group.Intersection(rightCols), group.Difference(rightCols)
+			left.ForEach(func(col opt.ColumnID) {
+				newFDs = append(newFDs, funcDep{from: opt.MakeColSet(col), to: right})
+			})
+		}
+	}
+	// Split the equiv groups that reference both sides of the join.
+	f.equiv.PartitionBy(rightCols)
+
 	for i := range newFDs {
 		fd := &newFDs[i]
-		f.addDependency(fd.from, fd.to, fd.strict, fd.equiv)
+		f.addDependency(fd.from, fd.to, fd.strict)
 	}
 }
 
@@ -1544,13 +1573,9 @@ func (f *FuncDepSet) nullExtendRightRows(rightCols, notNullInputCols opt.ColSet)
 // from each equivalency group.
 func (f *FuncDepSet) EquivReps() opt.ColSet {
 	var reps opt.ColSet
-
-	// Equivalence closures are already maintained for every column.
-	for i := 0; i < len(f.deps); i++ {
-		fd := &f.deps[i]
-		if fd.equiv && !fd.to.Intersects(reps) {
-			reps.UnionWith(fd.from)
-		}
+	for i := 0; i < f.equiv.GroupCount(); i++ {
+		col, _ := f.equiv.Group(i).Next(0)
+		reps.Add(col)
 	}
 	return reps
 }
@@ -1558,7 +1583,7 @@ func (f *FuncDepSet) EquivReps() opt.ColSet {
 // ComputeEquivGroup returns the group of columns that are equivalent to the
 // given column. See ComputeEquivClosure for more details.
 func (f *FuncDepSet) ComputeEquivGroup(rep opt.ColumnID) opt.ColSet {
-	return f.ComputeEquivClosure(opt.MakeColSet(rep))
+	return f.ComputeEquivClosureNoCopy(opt.MakeColSet(rep))
 }
 
 // ensureKeyClosure checks whether the closure for this FD set's key (if there
@@ -1573,7 +1598,7 @@ func (f *FuncDepSet) ensureKeyClosure(cols opt.ColSet) {
 			// If we have a strict key, we add a strict dependency; otherwise we add a
 			// lax dependency.
 			strict := f.hasKey == strictKey
-			f.addDependency(f.key, cols, strict, false /* equiv */)
+			f.addDependency(f.key, cols, strict)
 		}
 	}
 }
@@ -1581,45 +1606,42 @@ func (f *FuncDepSet) ensureKeyClosure(cols opt.ColSet) {
 // Verify runs consistency checks against the FD set, in order to ensure that it
 // conforms to several invariants:
 //
-//   1. An FD determinant should not intersect its dependants.
-//   2. If a constant FD is present, it's the first FD in the set.
-//   3. A constant FD must be strict.
-//   4. Lax equivalencies should be reduced to lax dependencies.
-//   5. Equivalence determinant should be exactly one column.
-//   6. The dependants of an equivalence is always its closure.
-//   7. If FD set has a key, it should be a candidate key (already reduced).
-//   8. Closure of key should include all known columns in the FD set.
-//   9. If FD set has no key then key columns should be empty.
-//
+//  1. An FD determinant should not intersect its dependants.
+//  2. If a constant FD is present, it's the first FD in the set.
+//  3. A constant FD must be strict.
+//  4. Lax equivalencies should be reduced to lax dependencies.
+//  5. Equivalence determinant should be exactly one column.
+//  6. The dependants of an equivalence is always its closure.
+//  7. If FD set has a key, it should be a candidate key (already reduced).
+//  8. Closure of key should include all known columns in the FD set.
+//  9. If FD set has no key then key columns should be empty.
 func (f *FuncDepSet) Verify() {
 	for i := range f.deps {
 		fd := &f.deps[i]
 
 		if fd.from.Intersects(fd.to) {
-			panic(errors.AssertionFailedf("expected FD determinant and dependants to be disjoint: %s (%d)", log.Safe(f), log.Safe(i)))
+			panic(errors.AssertionFailedf("expected FD determinant and dependants to be disjoint: %s (%d)", redact.Safe(f), redact.Safe(i)))
 		}
 
 		if fd.isConstant() {
 			if i != 0 {
-				panic(errors.AssertionFailedf("expected constant FD to be first FD in set: %s (%d)", log.Safe(f), log.Safe(i)))
+				panic(errors.AssertionFailedf("expected constant FD to be first FD in set: %s (%d)", redact.Safe(f), redact.Safe(i)))
 			}
 			if !fd.strict {
-				panic(errors.AssertionFailedf("expected constant FD to be strict: %s", log.Safe(f)))
+				panic(errors.AssertionFailedf("expected constant FD to be strict: %s", redact.Safe(f)))
 			}
 		}
+	}
 
-		if fd.equiv {
-			if !fd.strict {
-				panic(errors.AssertionFailedf("expected equivalency to be strict: %s (%d)", f, i))
-			}
+	for i := 0; i < f.equiv.GroupCount(); i++ {
+		group := f.equiv.Group(i)
 
-			if fd.from.Len() != 1 {
-				panic(errors.AssertionFailedf("expected equivalence determinant to be single col: %s (%d)", log.Safe(f), log.Safe(i)))
-			}
+		if group.Len() <= 1 {
+			panic(errors.AssertionFailedf("expected equivalence group to be more than one col: %s", redact.Safe(group)))
+		}
 
-			if !f.ComputeEquivClosure(fd.from).Equals(fd.from.Union(fd.to)) {
-				panic(errors.AssertionFailedf("expected equivalence dependants to be its closure: %s (%d)", log.Safe(f), log.Safe(i)))
-			}
+		if !f.ComputeEquivClosure(group).Equals(group) {
+			panic(errors.AssertionFailedf("expected equivalence group to be its closure: %s", redact.Safe(group)))
 		}
 	}
 
@@ -1632,7 +1654,7 @@ func (f *FuncDepSet) Verify() {
 			allCols := f.ColSet()
 			allCols.UnionWith(f.key)
 			if !f.ComputeClosure(f.key).Equals(allCols) {
-				panic(errors.AssertionFailedf("expected closure of FD key to include all known cols: %s", log.Safe(f)))
+				panic(errors.AssertionFailedf("expected closure of FD key to include all known cols: %s", redact.Safe(f)))
 			}
 		}
 
@@ -1663,7 +1685,7 @@ func (f FuncDepSet) String() string {
 			b.WriteString("lax-")
 		}
 		fmt.Fprintf(&b, "key%s", f.key)
-		if len(f.deps) > 0 {
+		if len(f.deps) > 0 || !f.equiv.Empty() {
 			b.WriteString("; ")
 		}
 	}
@@ -1673,11 +1695,24 @@ func (f FuncDepSet) String() string {
 }
 
 func (f FuncDepSet) formatFDs(b *strings.Builder) {
+	needComma := false
 	for i := range f.deps {
-		if i != 0 {
+		if needComma {
 			b.WriteString(", ")
 		}
+		needComma = true
 		f.deps[i].format(b)
+	}
+	for i := 0; i < f.equiv.GroupCount(); i++ {
+		group := f.equiv.Group(i)
+		group.ForEach(func(col opt.ColumnID) {
+			if needComma {
+				b.WriteString(", ")
+			}
+			needComma = true
+			from := opt.MakeColSet(col)
+			fmt.Fprintf(b, "%s==%s", from, group.Difference(from))
+		})
 	}
 }
 
@@ -1730,7 +1765,10 @@ func (f *FuncDepSet) inClosureOf(cols, in opt.ColSet, strict bool) bool {
 		return true
 	}
 
-	in = in.Copy()
+	in = f.ComputeEquivClosure(in)
+	if cols.SubsetOf(in) {
+		return true
+	}
 
 	// Lax dependencies are not transitive (see figure 2.1 in the paper for
 	// properties that hold for lax dependencies), so only include them if they
@@ -1743,40 +1781,39 @@ func (f *FuncDepSet) inClosureOf(cols, in opt.ColSet, strict bool) bool {
 			if fd.from.SubsetOf(in) && !fd.to.SubsetOf(in) {
 				laxIn.UnionWith(fd.to)
 
-				// Equivalencies are always transitive.
-				if fd.equiv {
-					in.UnionWith(fd.to)
-
-					// Restart iteration to get transitive closure.
-					i = -1
-				}
-
 				// Short-circuit if the "laxIn" set now contains all the columns.
 				if cols.SubsetOf(laxIn) {
 					return true
 				}
 			}
 		}
-
 		// Use the set that includes columns reached via lax dependencies.
-		in = laxIn
+		in = f.ComputeEquivClosureNoCopy(laxIn)
 	}
 
 	// Now continue with full transitive closure of strict dependencies.
-	for i := 0; i < len(f.deps); i++ {
-		fd := &f.deps[i]
-
-		if fd.strict && fd.from.SubsetOf(in) && !fd.to.SubsetOf(in) {
-			in.UnionWith(fd.to)
-
-			// Short-circuit if the "in" set now contains all the columns.
-			if cols.SubsetOf(in) {
-				return true
-			}
-
-			// Restart iteration to get transitive closure.
-			i = -1
+	for {
+		restart := false
+		if cols.SubsetOf(in) {
+			return true
 		}
+		for i := 0; i < len(f.deps); i++ {
+			fd := &f.deps[i]
+			if fd.strict && fd.from.SubsetOf(in) && !fd.to.SubsetOf(in) {
+				in.UnionWith(fd.to)
+
+				// Short-circuit if the "in" set now contains all the columns.
+				if cols.SubsetOf(in) {
+					return true
+				}
+				// Restart iteration to get transitive closure.
+				restart = true
+			}
+		}
+		if !restart {
+			break
+		}
+		in = f.ComputeEquivClosureNoCopy(in)
 	}
 	return false
 }
@@ -1784,15 +1821,9 @@ func (f *FuncDepSet) inClosureOf(cols, in opt.ColSet, strict bool) bool {
 // addDependency adds a new dependency into the set. If another FD implies the
 // new FD, then it's not added. If it can be merged with an existing FD, that is
 // done. Otherwise, a brand new FD is added to the set.
-func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict, equiv bool) {
+func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict bool) {
 	// Fast-path for trivial no-op dependency.
 	if to.SubsetOf(from) {
-		return
-	}
-
-	// Delegate equivalence dependency.
-	if equiv {
-		f.addEquivalency(from.Union(to))
 		return
 	}
 
@@ -1804,9 +1835,14 @@ func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict, equiv bool) {
 	// Delegate constant dependency.
 	if from.Empty() {
 		if !strict {
-			panic(errors.AssertionFailedf("expected constant FD to be strict: %s", log.Safe(f)))
+			panic(errors.AssertionFailedf("expected constant FD to be strict: %s", redact.Safe(f)))
 		}
-		f.AddConstants(to)
+		f.addConstantsNoKeyReduction(to)
+		return
+	}
+
+	// Non-constant FDs are weaker than equivalence constraints.
+	if f.equiv.AreAllColsEquiv2(to, from) {
 		return
 	}
 
@@ -1816,7 +1852,7 @@ func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict, equiv bool) {
 		to = to.Difference(from)
 	}
 
-	newFD := funcDep{from: from, to: to, strict: strict, equiv: equiv}
+	newFD := funcDep{from: from, to: to, strict: strict}
 
 	// Merge the new dependency into the existing set.
 	n := 0
@@ -1835,7 +1871,6 @@ func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict, equiv bool) {
 			fd.from = from
 			fd.to = to
 			fd.strict = strict
-			fd.equiv = equiv
 
 			// Keep searching, in case there's another implied FD.
 			added = true
@@ -1843,7 +1878,7 @@ func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict, equiv bool) {
 			if fd.implies(&newFD) {
 				// The new FD does not add any additional information.
 				added = true
-			} else if fd.strict == strict && fd.equiv == equiv && fd.from.Equals(from) {
+			} else if fd.strict == strict && fd.from.Equals(from) {
 				// The new FD can at least add its determinant to an existing FD.
 				fd.to = fd.to.Union(to)
 				added = true
@@ -1864,15 +1899,14 @@ func (f *FuncDepSet) addDependency(from, to opt.ColSet, strict, equiv bool) {
 	}
 }
 
+// addEquivalency adds a new equivalency into the set.
+// NOTE: The caller must consider the given ColSet as immutable, since it may
+// be added directly to the EquivSet groups slice.
 func (f *FuncDepSet) addEquivalency(equiv opt.ColSet) {
-	var addConst bool
-	var found opt.ColSet
-
-	// Start by finding complete set of all columns that are equivalent to the
-	// given set.
-	equiv = f.ComputeEquivClosure(equiv)
+	equiv = f.equiv.AddNoCopy(equiv)
 
 	n := 0
+	var addConst bool
 	for i := 0; i < len(f.deps); i++ {
 		fd := &f.deps[i]
 
@@ -1883,18 +1917,10 @@ func (f *FuncDepSet) addEquivalency(equiv opt.ColSet) {
 			}
 		} else if fd.from.SubsetOf(equiv) {
 			// All determinant columns are equivalent to one another.
-			if fd.equiv {
-				// Ensure that each equivalent column directly maps to all other
-				// columns in the group.
-				fd.to = fd.to.Union(equiv)
-				fd.to.DifferenceWith(fd.from)
-				found.UnionWith(fd.from)
-			} else {
-				// Remove dependant columns that are equivalent, because equivalence
-				// is a stronger relationship than a strict or lax dependency.
-				if !fd.removeToCols(equiv) {
-					continue
-				}
+			// Remove dependant columns that are equivalent, because equivalence
+			// is a stronger relationship than a strict or lax dependency.
+			if !fd.removeToCols(equiv) {
+				continue
 			}
 		}
 
@@ -1907,25 +1933,8 @@ func (f *FuncDepSet) addEquivalency(equiv opt.ColSet) {
 
 	if addConst {
 		// Ensure that all equivalent columns are marked as constant.
-		f.AddConstants(equiv)
+		f.addConstantsNoKeyReduction(equiv)
 	}
-
-	if !equiv.SubsetOf(found) {
-		add := equiv.Difference(found)
-		deps := make([]funcDep, 0, len(f.deps)+add.Len())
-		deps = append(deps, f.deps...)
-
-		for id, ok := add.Next(0); ok; id, ok = add.Next(id + 1) {
-			fd := funcDep{strict: true, equiv: true}
-			fd.from.Add(id)
-			fd.to = equiv.Copy()
-			fd.to.Remove(id)
-			deps = append(deps, fd)
-		}
-		f.deps = deps
-	}
-
-	f.tryToReduceKey(opt.ColSet{} /* notNullCols */)
 }
 
 // setKey updates the key that the set is currently maintaining.
@@ -1975,9 +1984,7 @@ func (f *FuncDepSet) tryToReduceKey(notNullCols opt.ColSet) {
 func (f *FuncDepSet) makeEquivMap(from, to opt.ColSet) map[opt.ColumnID]opt.ColumnID {
 	var equivMap map[opt.ColumnID]opt.ColumnID
 	for i, ok := from.Next(0); ok; i, ok = from.Next(i + 1) {
-		var oneCol opt.ColSet
-		oneCol.Add(i)
-		closure := f.ComputeEquivClosure(oneCol)
+		closure := f.ComputeEquivClosureNoCopy(opt.MakeColSet(i))
 		closure.IntersectionWith(to)
 		if !closure.Empty() {
 			if equivMap == nil {
@@ -2000,10 +2007,10 @@ func (f *funcDep) isConstant() bool {
 // is true when:
 //   - the determinant is a subset of the given FD's determinant
 //   - the dependant is a superset of the given FD's dependant
-//   - the FD is at least as strict and equivalent as the given FD
+//   - the FD is at least as strict as the given FD
 func (f *funcDep) implies(fd *funcDep) bool {
 	if f.from.SubsetOf(fd.from) && fd.to.SubsetOf(f.to) {
-		if (f.strict || !fd.strict) && (f.equiv || !fd.equiv) {
+		if f.strict || !fd.strict {
 			return true
 		}
 	}
@@ -2018,7 +2025,6 @@ func (f *funcDep) removeFromCols(remove opt.ColSet) bool {
 		f.from = f.from.Difference(remove)
 	}
 	return !f.isConstant()
-
 }
 
 // removeToCols removes columns in the given set from this FD's dependant set.
@@ -2032,17 +2038,10 @@ func (f *funcDep) removeToCols(remove opt.ColSet) bool {
 }
 
 func (f *funcDep) format(b *strings.Builder) {
-	if f.equiv {
-		if !f.strict {
-			panic(errors.AssertionFailedf("lax equivalent columns are not supported"))
-		}
-		fmt.Fprintf(b, "%s==%s", f.from, f.to)
+	if f.strict {
+		fmt.Fprintf(b, "%s-->%s", f.from, f.to)
 	} else {
-		if f.strict {
-			fmt.Fprintf(b, "%s-->%s", f.from, f.to)
-		} else {
-			fmt.Fprintf(b, "%s~~>%s", f.from, f.to)
-		}
+		fmt.Fprintf(b, "%s~~>%s", f.from, f.to)
 	}
 }
 

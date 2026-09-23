@@ -1,18 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 )
 
 // offsetOp is an operator that implements offset, returning everything
@@ -36,12 +32,15 @@ func NewOffsetOp(input colexecop.Operator, offset uint64) colexecop.Operator {
 	}
 }
 
-func (c *offsetOp) Next() coldata.Batch {
+func (c *offsetOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	for {
-		bat := c.Input.Next()
+		bat, meta := c.Input.Next()
+		if meta != nil {
+			return nil, meta
+		}
 		length := bat.Length()
 		if length == 0 {
-			return bat
+			return bat, nil
 		}
 
 		c.seen += uint64(length)
@@ -66,7 +65,7 @@ func (c *offsetOp) Next() coldata.Batch {
 		}
 
 		if c.seen > c.offset {
-			return bat
+			return bat, nil
 		}
 	}
 }

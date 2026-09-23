@@ -1,22 +1,24 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package concurrency
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/poison"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanlatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 )
+
+// Node liveness heartbeats time out at 3s, so log slow latch acquisitions
+// sooner than 3s to help diagnose potential heartbeat failures.
+const slowLatchRequestThresholdSecondsOverride = 2
 
 // latchManagerImpl implements the latchManager interface.
 type latchManagerImpl struct {
@@ -24,15 +26,15 @@ type latchManagerImpl struct {
 }
 
 func (m *latchManagerImpl) Acquire(ctx context.Context, req Request) (latchGuard, *Error) {
-	lg, err := m.m.Acquire(ctx, req.LatchSpans)
+	lg, err := m.m.Acquire(ctx, req.LatchSpans, req.PoisonPolicy, req.Batch)
 	if err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 	return lg, nil
 }
 
 func (m *latchManagerImpl) AcquireOptimistic(req Request) latchGuard {
-	lg := m.m.AcquireOptimistic(req.LatchSpans)
+	lg := m.m.AcquireOptimistic(req.LatchSpans, req.PoisonPolicy, req.Batch)
 	return lg
 }
 
@@ -45,23 +47,37 @@ func (m *latchManagerImpl) WaitUntilAcquired(
 ) (latchGuard, *Error) {
 	lg, err := m.m.WaitUntilAcquired(ctx, lg.(*spanlatch.Guard))
 	if err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 	return lg, nil
 }
 
-func (m *latchManagerImpl) WaitFor(ctx context.Context, ss *spanset.SpanSet) *Error {
-	err := m.m.WaitFor(ctx, ss)
+func (m *latchManagerImpl) WaitFor(
+	ctx context.Context, ss *spanset.SpanSet, pp poison.Policy, ba *kvpb.BatchRequest,
+) *Error {
+	err := m.m.WaitFor(ctx, ss, pp, ba)
 	if err != nil {
-		return roachpb.NewError(err)
+		return kvpb.NewError(err)
 	}
 	return nil
 }
 
-func (m *latchManagerImpl) Release(lg latchGuard) {
-	m.m.Release(lg.(*spanlatch.Guard))
+func (m *latchManagerImpl) Poison(lg latchGuard) {
+	m.m.Poison(lg.(*spanlatch.Guard))
+}
+
+func (m *latchManagerImpl) Release(ctx context.Context, lg latchGuard) {
+	m.m.Release(ctx, lg.(*spanlatch.Guard))
 }
 
 func (m *latchManagerImpl) Metrics() LatchMetrics {
 	return m.m.Metrics()
+}
+
+func (m *latchManagerImpl) OnRangeDescUpdated(desc *roachpb.RangeDescriptor) {
+	if keys.NodeLivenessSpan.Overlaps(desc.KeySpan().AsRawSpanWithNoLocals()) {
+		m.m.SetSlowLatchRequestThresholdOverride(slowLatchRequestThresholdSecondsOverride)
+	} else {
+		m.m.SetSlowLatchRequestThresholdOverride(0)
+	}
 }

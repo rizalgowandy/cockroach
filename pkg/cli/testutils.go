@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
@@ -16,32 +11,36 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
 )
 
 // TestingReset resets global mutable state so that Run can be called multiple
-// times from the same test process. It is public for cliccl.
+// times from the same test process.
 func TestingReset() {
 	// Reset the client contexts for each test.
 	initCLIDefaults()
@@ -49,14 +48,18 @@ func TestingReset() {
 
 // TestCLI wraps a test server and is used by tests to make assertions about the output of CLI commands.
 type TestCLI struct {
-	*server.TestServer
+	// Insecure is a copy of the insecure mode parameter.
+	Insecure bool
+
+	Server      serverutils.TestServerInterface
+	tenant      serverutils.ApplicationLayerInterface
 	certsDir    string
 	cleanupFunc func() error
 	prevStderr  *os.File
 
 	// t is the testing.T instance used for this test.
 	// Example_xxx tests may have this set to nil.
-	t *testing.T
+	t testing.TB
 	// logScope binds the lifetime of the log files to this test, when t
 	// is not nil.
 	logScope *log.TestLogScope
@@ -64,22 +67,42 @@ type TestCLI struct {
 	omitArgs bool
 	// if true, prints the requested exit code during RunWithArgs.
 	reportExitCode bool
+	// if true, targets the system tenant.
+	useSystemTenant bool
 }
 
 // TestCLIParams contains parameters used by TestCLI.
 type TestCLIParams struct {
-	T        *testing.T
+	T        testing.TB
 	Insecure bool
 	// NoServer, if true, starts the test without a DB server.
 	NoServer bool
 
 	// The store specifications for the in-memory server.
 	StoreSpecs []base.StoreSpec
+
 	// The locality tiers for the in-memory server.
 	Locality roachpb.Locality
 
 	// NoNodelocal, if true, disables node-local external I/O storage.
 	NoNodelocal bool
+
+	// TenantArgs will be used to initialize the test tenant. This should
+	// be set when the test needs to run in multitenant mode.
+	TenantArgs *base.TestTenantArgs
+
+	// SharedProcessTenantArgs will be used to initialize a test tenant that is
+	// running in the same process as the test server. This should be set when the
+	// test needs to run in multitenant mode.
+	SharedProcessTenantArgs *base.TestSharedProcessTenantArgs
+
+	// UseSystemTenant is used to force the test to target the system tenant
+	// in a shared process multitenant test.
+	UseSystemTenant bool
+
+	// DisableAutoStats is used to disable the collection of automatic table statistics
+	// for the entire cluster.
+	DisableAutoStats bool
 }
 
 // testTempFilePrefix is a sentinel marker to be used as the prefix of a
@@ -93,9 +116,12 @@ const testTempFilePrefix = "test-temp-prefix-"
 // from the uniquely generated (temp directory) file path.
 const testUserfileUploadTempDirPrefix = "test-userfile-upload-temp-dir-"
 
-func (c *TestCLI) fail(err interface{}) {
+func (c *TestCLI) fail(err error) {
 	if c.t != nil {
-		defer c.logScope.Close(c.t)
+		if c.logScope != nil {
+			c.logScope.Close(c.t)
+			c.logScope = nil
+		}
 		c.t.Fatal(err)
 	} else {
 		panic(err)
@@ -108,9 +134,9 @@ func NewCLITest(params TestCLIParams) TestCLI {
 }
 
 func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerArgs)) TestCLI {
-	c := TestCLI{t: params.T}
+	c := TestCLI{t: params.T, Insecure: params.Insecure}
 
-	certsDir, err := ioutil.TempDir("", "cli-test")
+	certsDir, err := os.MkdirTemp("", "cli-test")
 	if err != nil {
 		c.fail(err)
 	}
@@ -122,21 +148,27 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 
 	c.cleanupFunc = func() error { return nil }
 
+	settings := makeClusterSettings()
+	if params.DisableAutoStats {
+		stats.AutomaticStatisticsClusterMode.Override(context.Background(), &settings.SV, false)
+	}
+
 	if !params.NoServer {
 		if !params.Insecure {
 			c.cleanupFunc = securitytest.CreateTestCerts(certsDir)
 		}
 
 		args := base.TestServerArgs{
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+
 			Insecure:      params.Insecure,
+			Settings:      settings,
 			SSLCertsDir:   c.certsDir,
 			StoreSpecs:    params.StoreSpecs,
 			Locality:      params.Locality,
 			ExternalIODir: filepath.Join(certsDir, "extern"),
 			Knobs: base.TestingKnobs{
-				SQLStatsKnobs: &sqlstats.TestingKnobs{
-					AOSTClause: "AS OF SYSTEM TIME '-1us'",
-				},
+				SQLStatsKnobs: sqlstats.CreateTestingKnobs(),
 			},
 		}
 		if argsFn != nil {
@@ -145,17 +177,54 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		if params.NoNodelocal {
 			args.ExternalIODir = ""
 		}
-		s, err := serverutils.StartServerRaw(args)
+		s, err := serverutils.StartServerOnlyE(params.T, args)
 		if err != nil {
 			c.fail(err)
 		}
-		c.TestServer = s.(*server.TestServer)
+		c.Server = s
 
-		log.Infof(context.Background(), "server started at %s", c.ServingRPCAddr())
-		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
+		log.Dev.Infof(context.Background(), "server started at %s", c.Server.AdvRPCAddr())
+		log.Dev.Infof(context.Background(), "SQL listener at %s", c.Server.AdvSQLAddr())
+
+		// When run under leader leases, requests will not heartbeat NodeLiveness on
+		// the lease acquisition codepath. This may then cause CLI commands
+		// (such as status or ls) which require a NodeLiveness record to fail. Explicitly
+		// heartbeat the NodeLiveness record to prevent tests from flaking.
+		err = retry.ForDuration(200*time.Second, c.Server.HeartbeatNodeLiveness)
+		if err != nil {
+			log.Dev.Fatalf(context.Background(), "Couldn't heartbeat node liveness: %s", err)
+		}
 	}
 
-	baseCfg.User = security.NodeUserName()
+	if params.TenantArgs != nil && params.SharedProcessTenantArgs != nil {
+		c.fail(errors.AssertionFailedf("cannot set both TenantArgs and SharedProcessTenantArgs"))
+	}
+
+	if params.TenantArgs != nil || params.SharedProcessTenantArgs != nil {
+		if c.Server == nil {
+			c.fail(errors.AssertionFailedf("multitenant mode for CLI requires a DB server, try setting `NoServer` argument to false"))
+		}
+	}
+
+	if params.TenantArgs != nil {
+		if params.Insecure {
+			params.TenantArgs.ForceInsecure = true
+		}
+		c.tenant, err = c.Server.TenantController().StartTenant(context.Background(), *params.TenantArgs)
+		if err != nil {
+			c.fail(err)
+		}
+	}
+
+	if params.SharedProcessTenantArgs != nil {
+		c.tenant, _, err = c.Server.TenantController().StartSharedProcessTenant(context.Background(), *params.SharedProcessTenantArgs)
+		if err != nil {
+			c.fail(err)
+		}
+		c.useSystemTenant = params.UseSystemTenant
+	}
+
+	baseCfg.User = username.NodeUserName()
 
 	// Ensure that CLI error messages and anything meant for the
 	// original stderr is redirected to stdout, where it can be
@@ -180,19 +249,19 @@ func setCLIDefaultsForTests() {
 
 // stopServer stops the test server.
 func (c *TestCLI) stopServer() {
-	if c.TestServer != nil {
-		log.Infof(context.Background(), "stopping server at %s / %s",
-			c.ServingRPCAddr(), c.ServingSQLAddr())
-		c.Stopper().Stop(context.Background())
+	if c.Server != nil {
+		log.Dev.Infof(context.Background(), "stopping server at %s / %s",
+			c.Server.AdvRPCAddr(), c.Server.AdvSQLAddr())
+		c.Server.Stopper().Stop(context.Background())
 	}
 }
 
-// RestartServer stops and restarts the test server. The ServingRPCAddr() may
+// RestartServer stops and restarts the test server. The AdvRPCAddr() may
 // have changed after this method returns.
 func (c *TestCLI) RestartServer(params TestCLIParams) {
 	c.stopServer()
-	log.Info(context.Background(), "restarting server")
-	s, err := serverutils.StartServerRaw(base.TestServerArgs{
+	log.Dev.Info(context.Background(), "restarting server")
+	s, err := serverutils.StartServerOnlyE(params.T, base.TestServerArgs{
 		Insecure:    params.Insecure,
 		SSLCertsDir: c.certsDir,
 		StoreSpecs:  params.StoreSpecs,
@@ -200,9 +269,17 @@ func (c *TestCLI) RestartServer(params TestCLIParams) {
 	if err != nil {
 		c.fail(err)
 	}
-	c.TestServer = s.(*server.TestServer)
-	log.Infof(context.Background(), "restarted server at %s / %s",
-		c.ServingRPCAddr(), c.ServingSQLAddr())
+	c.Insecure = params.Insecure
+	c.Server = s
+	log.Dev.Infof(context.Background(), "restarted server at %s / %s",
+		c.Server.AdvRPCAddr(), c.Server.AdvSQLAddr())
+	if params.TenantArgs != nil {
+		if c.Insecure {
+			params.TenantArgs.ForceInsecure = true
+		}
+		c.tenant, _ = serverutils.StartTenant(c.t, c.Server, *params.TenantArgs)
+		log.Dev.Infof(context.Background(), "restarted tenant SQL only server at %s", c.tenant.SQLAddr())
+	}
 }
 
 // Cleanup cleans up after the test, stopping the server if necessary.
@@ -217,7 +294,7 @@ func (c *TestCLI) Cleanup() {
 	// Restore stderr.
 	stderr = c.prevStderr
 
-	log.Info(context.Background(), "stopping server and cleaning up CLI test")
+	log.Dev.Info(context.Background(), "stopping server and cleaning up CLI test")
 
 	c.stopServer()
 
@@ -287,6 +364,20 @@ func captureOutput(f func()) (out string, err error) {
 		if x := recover(); x != nil {
 			err = errors.Errorf("panic: %v", x)
 		}
+		// Strip license-related NOTICE messages that the SQL driver may inject
+		// into output. These appear nondeterministically and can split retrieval
+		// lines across multiple lines, breaking the <dumping SQL tables> collapsing
+		// below. Strip them early so retrieval lines remain intact.
+		out = regexp.MustCompile(`NOTICE: No license is installed[^\n]*\n?`).
+			ReplaceAllString(out, "")
+		// Replace any series of 'retrieving SQL data for ...' messages with a
+		// single '<dumping SQL tables>' message so that these tests are agnostic to
+		// both specific names and total number of system and internal tables that
+		// are exported. The regex matches the rest of the line after the prefix
+		// unless the line contains an uppercase E to avoid trimming "ERROR" message
+		// lines, which are expected (and tested) for certain tables.
+		out = regexp.MustCompile(`(.*retrieving SQL data for ([^E\n])*\n)+`).
+			ReplaceAllString(out, "<dumping SQL tables>\n")
 	}()
 
 	// Run the command. The output will be returned in the defer block.
@@ -300,10 +391,24 @@ func isSQLCommand(args []string) (bool, error) {
 		return false, err
 	}
 	// We use --echo-sql as a marker of SQL-only commands.
-	if f := flagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
+	if f := cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
 		return true, nil
 	}
 	return false, nil
+}
+
+func (c TestCLI) getRPCAddr() string {
+	if c.tenant != nil && !c.useSystemTenant {
+		return c.tenant.AdvRPCAddr()
+	}
+	return c.Server.AdvRPCAddr()
+}
+
+func (c TestCLI) getSQLAddr() string {
+	if c.tenant != nil {
+		return c.tenant.AdvSQLAddr()
+	}
+	return c.Server.AdvSQLAddr()
 }
 
 // RunWithArgs add args according to TestCLI cfg.
@@ -312,25 +417,41 @@ func (c TestCLI) RunWithArgs(origArgs []string) {
 
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
-		if c.TestServer != nil {
-			addr := c.ServingRPCAddr()
-			if isSQL, err := isSQLCommand(origArgs); err != nil {
+		if c.Server != nil {
+			addr := c.getRPCAddr()
+			isSQL, err := isSQLCommand(origArgs)
+			if err != nil {
 				return err
-			} else if isSQL {
-				addr = c.ServingSQLAddr()
 			}
+			if isSQL {
+				addr = c.getSQLAddr()
+			}
+
 			h, p, err := net.SplitHostPort(addr)
 			if err != nil {
 				return err
 			}
-			args = append(args, fmt.Sprintf("--host=%s", net.JoinHostPort(h, p)))
-			if c.Cfg.Insecure {
+
+			if isSQL {
+				// Create a connection string URL with client_min_messages = 'warning'.
+				// This avoids showing SQL notices, which can be non-deterministic.
+				u := pgurl.New().WithNet(pgurl.NetTCP(h, p))
+				if err := u.SetOption("client_min_messages", "warning"); err != nil {
+					return err
+				}
+				args = append(args, fmt.Sprintf("--url=%s", u.String()))
+			} else {
+				args = append(args, fmt.Sprintf("--host=%s", net.JoinHostPort(h, p)))
+			}
+
+			if c.Insecure {
 				args = append(args, "--insecure=true")
 			} else {
 				args = append(args, "--insecure=false")
 				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 			}
 		}
+
 		args = append(args, origArgs[1:]...)
 
 		// `nodelocal upload` and `userfile upload -r` CLI tests create unique temp
@@ -375,8 +496,8 @@ func (c TestCLI) RunWithCAArgs(origArgs []string) {
 
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
-		if c.TestServer != nil {
-			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, security.EmbeddedCAKey)))
+		if c.Server != nil {
+			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, certnames.EmbeddedCAKey)))
 			args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 		}
 		args = append(args, origArgs[1:]...)
@@ -441,7 +562,7 @@ func GetCsvNumCols(csvStr string) (cols int, err error) {
 	reader := csv.NewReader(strings.NewReader(csvStr))
 	records, err := reader.Read()
 	if err != nil {
-		return 0, errors.Errorf("error reading csv input: \n %v\n errors:%s", csvStr, err)
+		return 0, errors.Wrapf(err, "error reading csv input:\n %v\n", csvStr)
 	}
 	return len(records), nil
 }
@@ -451,8 +572,8 @@ func GetCsvNumCols(csvStr string) (cols int, err error) {
 func MatchCSV(csvStr string, matchColRow [][]string) (err error) {
 	defer func() {
 		if err != nil {
-			err = errors.Errorf("csv input:\n%v\nexpected:\n%s\nerrors:%s",
-				csvStr, pretty.Sprint(matchColRow), err)
+			err = errors.Wrapf(err, "csv input:\n%v\nexpected:\n%s\n",
+				csvStr, pretty.Sprint(matchColRow))
 		}
 	}()
 
@@ -482,8 +603,8 @@ func MatchCSV(csvStr string, matchColRow [][]string) (err error) {
 			pat, str := matchColRow[i][j], records[i][j]
 			re := regexp.MustCompile(pat)
 			if !re.MatchString(str) {
-				err = errors.Errorf("%v\nrow #%d, col #%d: found %q which does not match %q",
-					err, i+1, j+1, str, pat)
+				err = errors.Wrapf(err, "row #%d, col #%d: found %q which does not match %q",
+					i+1, j+1, str, pat)
 			}
 		}
 	}

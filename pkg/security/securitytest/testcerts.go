@@ -1,38 +1,45 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package securitytest
 
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 )
+
+// EmbeddedTenantIDs lists the tenants we generate certs for.
+// See certgen.go for the generation logic.
+func EmbeddedTenantIDs() []uint64 { return []uint64{10, 11, 20, 3, 2} }
 
 // CreateTestCerts populates the test certificates in the given directory.
 func CreateTestCerts(certsDir string) (cleanup func() error) {
-	// Copy these assets to disk from embedded strings, so this test can
-	// run from a standalone binary.
-	// Disable embedded certs, or the security library will try to load
-	// our real files as embedded assets.
-	security.ResetAssetLoader()
+	// Copy runtime-generated certs to disk, so this test can run from a
+	// standalone binary. Disable the loader so the security library reads
+	// the on-disk files instead of the in-memory generated assets.
+	securityassets.ResetLoader()
 
 	assets := []string{
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert),
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCAKey),
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeCert),
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedNodeKey),
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootCert),
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedRootKey),
-		filepath.Join(security.EmbeddedCertsDir, security.EmbeddedTenantCACert),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedCACert),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedCAKey),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedNodeCert),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedNodeKey),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedRootCert),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedRootKey),
+		filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedTenantCACert),
+	}
+	for _, tenantID := range EmbeddedTenantIDs() {
+		st := strconv.Itoa(int(tenantID))
+		assets = append(assets,
+			filepath.Join(certnames.EmbeddedCertsDir, certnames.TenantCertFilename(st)),
+			filepath.Join(certnames.EmbeddedCertsDir, certnames.TenantKeyFilename(st)),
+		)
 	}
 
 	for _, a := range assets {
@@ -43,7 +50,7 @@ func CreateTestCerts(certsDir string) (cleanup func() error) {
 	}
 
 	return func() error {
-		security.SetAssetLoader(EmbeddedAssets)
+		securityassets.SetLoader(EmbeddedAssets)
 		return os.RemoveAll(certsDir)
 	}
 }

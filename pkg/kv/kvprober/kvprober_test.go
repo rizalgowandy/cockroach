@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvprober
 
@@ -16,10 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
 )
 
 func TestReadProbe(t *testing.T) {
@@ -76,6 +76,31 @@ func TestReadProbe(t *testing.T) {
 		require.Zero(t, p.Metrics().ReadProbeFailures.Count())
 	})
 
+	// Once a node is fully decommissioned, neither kvclient nor kvprober work from
+	// the node. This does not indicate a service health issue; it is expected behavior.
+	//
+	// This is not tested with an integration test, since the kvclient of a decommissioned
+	// node will occasionally return other errors. We choose not to filter those out for
+	// reasons given at errorIsExpectedDuringNormalOperation. As a result, an integration test
+	// would be flaky. We believe a unit test is sufficient, largely because the main risk
+	// in only having a unit test is false positive pages on SRE, due to changes in what errors
+	// are returned from the kvclient of a decommissioned node. Though false positive pages add
+	// ops load, they do not directly affect the customer experience.
+	t.Run("planning fails due to decommissioning but not counted as error", func(t *testing.T) {
+		m := &mock{
+			t:       t,
+			read:    true,
+			planErr: kvpb.NewDecommissionedStatusErrorf(codes.PermissionDenied, "foobar"),
+		}
+		p := initTestProber(ctx, m)
+		p.readProbeImpl(ctx, m, m, m)
+
+		require.Equal(t, int64(1), p.Metrics().ProbePlanAttempts.Count())
+		require.Zero(t, p.Metrics().ReadProbeAttempts.Count())
+		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
+		require.Zero(t, p.Metrics().ReadProbeFailures.Count())
+	})
+
 	t.Run("txn fails", func(t *testing.T) {
 		m := &mock{
 			t:      t,
@@ -104,6 +129,22 @@ func TestReadProbe(t *testing.T) {
 		require.Equal(t, int64(1), p.Metrics().ReadProbeAttempts.Count())
 		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
 		require.Equal(t, int64(1), p.Metrics().ReadProbeFailures.Count())
+	})
+
+	// See comment above matching case in TestReadProbe regarding planning.
+	t.Run("read fails due to decommissioning but not counted as error", func(t *testing.T) {
+		m := &mock{
+			t:       t,
+			read:    true,
+			readErr: kvpb.NewDecommissionedStatusErrorf(codes.PermissionDenied, "foobar"),
+		}
+		p := initTestProber(ctx, m)
+		p.readProbeImpl(ctx, m, m, m)
+
+		require.Equal(t, int64(1), p.Metrics().ProbePlanAttempts.Count())
+		require.Equal(t, int64(1), p.Metrics().ReadProbeAttempts.Count())
+		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
+		require.Zero(t, p.Metrics().ReadProbeFailures.Count())
 	})
 }
 
@@ -161,6 +202,22 @@ func TestWriteProbe(t *testing.T) {
 		require.Zero(t, p.Metrics().WriteProbeFailures.Count())
 	})
 
+	// See comment above matching case in TestReadProbe regarding planning.
+	t.Run("planning fails due to decommissioning but not counted as error", func(t *testing.T) {
+		m := &mock{
+			t:       t,
+			write:   true,
+			planErr: kvpb.NewDecommissionedStatusErrorf(codes.PermissionDenied, "foobar"),
+		}
+		p := initTestProber(ctx, m)
+		p.writeProbeImpl(ctx, m, m, m)
+
+		require.Equal(t, int64(1), p.Metrics().ProbePlanAttempts.Count())
+		require.Zero(t, p.Metrics().WriteProbeAttempts.Count())
+		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
+		require.Zero(t, p.Metrics().WriteProbeFailures.Count())
+	})
+
 	t.Run("open txn fails", func(t *testing.T) {
 		m := &mock{
 			t:      t,
@@ -190,6 +247,94 @@ func TestWriteProbe(t *testing.T) {
 		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
 		require.Equal(t, int64(1), p.Metrics().WriteProbeFailures.Count())
 	})
+
+	// See comment above matching case in TestReadProbe regarding planning.
+	t.Run("write fails due to decommissioning but not counted as error", func(t *testing.T) {
+		m := &mock{
+			t:        t,
+			write:    true,
+			writeErr: kvpb.NewDecommissionedStatusErrorf(codes.PermissionDenied, "foobar"),
+		}
+		p := initTestProber(ctx, m)
+		p.writeProbeImpl(ctx, m, m, m)
+
+		require.Equal(t, int64(1), p.Metrics().ProbePlanAttempts.Count())
+		require.Equal(t, int64(1), p.Metrics().WriteProbeAttempts.Count())
+		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
+		require.Zero(t, p.Metrics().WriteProbeFailures.Count())
+	})
+}
+
+func TestReturnLeaseholderInfo(t *testing.T) {
+
+	ctx := context.Background()
+
+	t.Run("leaseholder information is returned correctly", func(t *testing.T) {
+
+		// Mock recording with 2 spans. Line "[n1] node received request" contains the leaseholder information.
+		var mockRecording tracingpb.Recording = []tracingpb.RecordedSpan{
+			{
+				TraceID:      001,
+				SpanID:       002,
+				ParentSpanID: 003,
+				Operation:    "test probe 1",
+				TagGroups:    nil,
+				StartTime:    time.Now(),
+				Duration:     1,
+				Logs: []tracingpb.LogRecord{{Time: time.Now(), Message: "querying next range at /Table/9"},
+					{Time: time.Now(), Message: "key: /Table/9, desc: r13:‹/Table/{9-11}› [(n1,s1):1, next=2, gen=0]"},
+					{Time: time.Now(), Message: "r13: sending batch ‹1 Get› to (n1,s1):1"},
+					{Time: time.Now(), Message: "sending request to ‹localhost:26257›"}},
+			},
+			{
+				TraceID:      004,
+				SpanID:       005,
+				ParentSpanID: 006,
+				Operation:    "test probe 2",
+				TagGroups:    nil,
+				StartTime:    time.Now(),
+				Duration:     2,
+				Logs: []tracingpb.LogRecord{{Time: time.Now(), Message: "[n1] node received request: ‹1 Get›"},
+					{Time: time.Now(), Message: "[n1,s1,r13/1:‹/Table/{9-11}›] read-only path"},
+					{Time: time.Now(), Message: "[n1] node sending response"}},
+			},
+		}
+
+		m := &mock{t: t, read: true}
+		p := initTestProber(ctx, m)
+		// Expected leaseholder information is node 1.
+		require.Equal(t, "1", string(p.returnLeaseholderInfo(mockRecording)))
+	})
+
+	t.Run("traces do not contain leaseholder information", func(t *testing.T) {
+		// Mock recording without any leaseholder information.
+		var mockRecording tracingpb.Recording = []tracingpb.RecordedSpan{
+			{
+				TraceID:      001,
+				SpanID:       002,
+				ParentSpanID: 003,
+				Operation:    "test probe 1",
+				TagGroups:    nil,
+				StartTime:    time.Now(),
+				Duration:     1,
+				Logs: []tracingpb.LogRecord{{Time: time.Now(), Message: "querying next range at /Table/9"},
+					{Time: time.Now(), Message: "key: /Table/9, desc: r13:‹/Table/{9-11}› [(n1,s1):1, next=2, gen=0]"},
+					{Time: time.Now(), Message: "r13: sending batch ‹1 Get› to (n1,s1):1"},
+					{Time: time.Now(), Message: "sending request to ‹localhost:26257›"}},
+				RecordingMode:              0,
+				StructuredRecords:          nil,
+				GoroutineID:                0,
+				Finished:                   false,
+				StructuredRecordsSizeBytes: 0,
+				ChildrenMetadata:           nil,
+			},
+		}
+
+		m := &mock{t: t, read: true}
+		p := initTestProber(ctx, m)
+		// Since no leaseholder information is present, the function is expected to return an empty string.
+		require.Equal(t, "", string(p.returnLeaseholderInfo(mockRecording)))
+	})
 }
 
 func initTestProber(ctx context.Context, m *mock) *Prober {
@@ -200,6 +345,7 @@ func initTestProber(ctx context.Context, m *mock) *Prober {
 	})
 	readEnabled.Override(ctx, &p.settings.SV, m.read)
 	writeEnabled.Override(ctx, &p.settings.SV, m.write)
+	quarantineWriteEnabled.Override(ctx, &p.settings.SV, m.qWrite)
 	bypassAdmissionControl.Override(ctx, &p.settings.SV, m.bypass)
 	p.readPlanner = m
 	return p
@@ -210,24 +356,33 @@ type mock struct {
 
 	bypass bool
 
-	noPlan  bool
-	planErr error
+	noPlan     bool
+	emptyQPool bool
+	planErr    error
 
 	read     bool
 	write    bool
+	qWrite   bool
 	readErr  error
 	writeErr error
 	txnErr   error
 }
 
 func (m *mock) next(ctx context.Context) (Step, error) {
+	step := Step{}
 	if m.noPlan {
 		m.t.Error("plan call made but not expected")
 	}
-	return Step{}, m.planErr
+	if !m.emptyQPool {
+		step = Step{
+			RangeID: 1,
+			Key:     keys.LocalMax,
+		}
+	}
+	return step, m.planErr
 }
 
-func (m *mock) Read(key interface{}) func(context.Context, *kv.Txn) error {
+func (m *mock) Read(key roachpb.Key) func(context.Context, *kv.Txn) error {
 	return func(context.Context, *kv.Txn) error {
 		if !m.read {
 			m.t.Error("read call made but not expected")
@@ -236,7 +391,7 @@ func (m *mock) Read(key interface{}) func(context.Context, *kv.Txn) error {
 	}
 }
 
-func (m *mock) Write(key interface{}) func(context.Context, *kv.Txn) error {
+func (m *mock) Write(key roachpb.Key) func(context.Context, *kv.Txn) error {
 	return func(context.Context, *kv.Txn) error {
 		if !m.write {
 			m.t.Error("write call made but not expected")

@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -57,10 +52,14 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 	case *renderNode:
 		return n.columns
 	case *scanNode:
-		return n.resultColumns
+		return n.columns
 	case *unionNode:
 		return n.columns
 	case *valuesNode:
+		return n.columns
+	case *vectorMutationSearchNode:
+		return n.columns
+	case *vectorSearchNode:
 		return n.columns
 	case *virtualTableNode:
 		return n.columns
@@ -72,7 +71,11 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.columns
 	case *deleteNode:
 		return n.columns
+	case *deleteSwapNode:
+		return n.columns
 	case *updateNode:
+		return n.columns
+	case *updateSwapNode:
 		return n.columns
 	case *insertNode:
 		return n.columns
@@ -81,7 +84,7 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 	case *upsertNode:
 		return n.columns
 	case *indexJoinNode:
-		return n.resultColumns
+		return n.columns
 	case *projectSetNode:
 		return n.columns
 	case *applyJoinNode:
@@ -90,11 +93,19 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.columns
 	case *zigzagJoinNode:
 		return n.columns
+	case *showTenantNode:
+		return n.columns
 	case *vTableLookupJoinNode:
 		return n.columns
 	case *invertedFilterNode:
-		return n.resultColumns
+		return n.columns
 	case *invertedJoinNode:
+		return n.columns
+	case *showFingerprintsNode:
+		return n.columns
+	case *callNode:
+		return n.getResultColumns()
+	case *checkExternalConnectionNode:
 		return n.columns
 
 	// Nodes with a fixed schema.
@@ -112,8 +123,6 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.getColumns(mut, colinfo.AlterRangeRelocateColumns)
 	case *scatterNode:
 		return n.getColumns(mut, colinfo.AlterTableScatterColumns)
-	case *showFingerprintsNode:
-		return n.getColumns(mut, colinfo.ShowFingerprintsColumns)
 	case *splitNode:
 		return n.getColumns(mut, colinfo.AlterTableSplitColumns)
 	case *unsplitNode:
@@ -126,6 +135,8 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 		return n.getColumns(mut, colinfo.SequenceSelectColumns)
 	case *exportNode:
 		return n.getColumns(mut, colinfo.ExportColumns)
+	case *completionsNode:
+		return n.getColumns(mut, colinfo.ShowCompletionsColumns)
 
 	// The columns in the hookFnNode are returned by the hook function; we don't
 	// know if they can be modified in place or not.
@@ -135,36 +146,39 @@ func getPlanColumns(plan planNode, mut bool) colinfo.ResultColumns {
 	// Nodes that have the same schema as their source or their
 	// valueNode helper.
 	case *bufferNode:
-		return getPlanColumns(n.plan, mut)
+		return getPlanColumns(n.input, mut)
 	case *distinctNode:
-		return getPlanColumns(n.plan, mut)
+		return getPlanColumns(n.input, mut)
+	case *fetchNode:
+		return n.cursor.Types()
 	case *filterNode:
-		return getPlanColumns(n.source.plan, mut)
+		return getPlanColumns(n.input, mut)
 	case *max1RowNode:
-		return getPlanColumns(n.plan, mut)
+		return getPlanColumns(n.input, mut)
 	case *limitNode:
-		return getPlanColumns(n.plan, mut)
-	case *spoolNode:
-		return getPlanColumns(n.source, mut)
-	case *serializeNode:
-		return getPlanColumns(n.source, mut)
+		return getPlanColumns(n.input, mut)
 	case *saveTableNode:
-		return getPlanColumns(n.source, mut)
+		return getPlanColumns(n.input, mut)
 	case *scanBufferNode:
 		return getPlanColumns(n.buffer, mut)
 	case *sortNode:
-		return getPlanColumns(n.plan, mut)
+		return getPlanColumns(n.input, mut)
 	case *topKNode:
-		return getPlanColumns(n.plan, mut)
+		return getPlanColumns(n.input, mut)
 	case *recursiveCTENode:
-		return getPlanColumns(n.initial, mut)
+		return getPlanColumns(n.input, mut)
 
 	case *showVarNode:
 		return colinfo.ResultColumns{
 			{Name: n.name, Typ: types.String},
 		}
 	case *rowSourceToPlanNode:
-		return n.planCols
+		return n.columns
+	case *cdcValuesNode:
+		return n.columns
+
+	case *identifySystemNode:
+		return n.getColumns(mut, colinfo.IdentifySystemColumns)
 	}
 
 	// Every other node has no columns in their results.
@@ -199,4 +213,19 @@ func (c *optColumnsSlot) getColumns(mut bool, cols colinfo.ResultColumns) colinf
 	c.columns = make(colinfo.ResultColumns, len(cols))
 	copy(c.columns, cols)
 	return c.columns
+}
+
+// resultIsRowsAffected returns true if the given plan node returns a single
+// integer value indicating the number of rows affected.
+func resultIsRowsAffected(plan planNode) bool {
+	switch n := plan.(type) {
+	case mutationPlanNode:
+		return n.returnsRowsAffected()
+	case *moveNode, *controlJobsNode, *controlSchedulesNode,
+		*cancelQueriesNode, *cancelSessionsNode, *setZoneConfigNode:
+		// These nodes always return the row count.
+		return true
+	default:
+		return false
+	}
 }

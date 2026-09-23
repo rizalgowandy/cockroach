@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecbase
 
@@ -15,6 +10,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -47,18 +43,16 @@ func NewOrdinalityOp(
 	return c
 }
 
-func (c *ordinalityOp) Next() coldata.Batch {
-	bat := c.Input.Next()
+func (c *ordinalityOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	bat, meta := c.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	if bat.Length() == 0 {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
 
 	outputVec := bat.ColVec(c.outputIdx)
-	if outputVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		outputVec.Nulls().UnsetNulls()
-	}
 	col := outputVec.Int64()
 	sel := bat.Selection()
 
@@ -77,5 +71,5 @@ func (c *ordinalityOp) Next() coldata.Batch {
 		}
 	}
 
-	return bat
+	return bat, nil
 }

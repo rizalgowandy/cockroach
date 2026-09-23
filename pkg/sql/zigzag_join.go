@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -28,6 +23,7 @@ import (
 // For a more detailed description of zigzag joins, as well as when they can
 // be planned, see the comment in rowexec/zigzagjoiner.go.
 type zigzagJoinNode struct {
+	zeroInputPlanNode
 	// sides contains information about each individual "side" of a
 	// zigzag join. Must contain 2 or more zigzagJoinSides.
 	sides []zigzagJoinSide
@@ -47,12 +43,10 @@ type zigzagJoinNode struct {
 // join. Note that the length of all eqCols in one zigzagJoinNode should
 // be the same.
 type zigzagJoinSide struct {
-	// scan references a scan node containing index/table descriptor references
-	// for this side of the join.
-	scan *scanNode
+	fetch fetchPlanningInfo
 
 	// eqCols is an int slice containing the equated columns for this side
-	// of the zigzag join.
+	// of the zigzag join (as ordinals into scan.cols).
 	eqCols []int
 
 	// fixedVals contains fixed values for a prefix of this side's index columns.

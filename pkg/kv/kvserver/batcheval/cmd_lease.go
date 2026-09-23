@@ -1,27 +1,22 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
 func newFailedLeaseTrigger(isTransfer bool) result.Result {
@@ -55,80 +50,65 @@ func evalNewLease(
 	ms *enginepb.MVCCStats,
 	lease roachpb.Lease,
 	prevLease roachpb.Lease,
-	priorReadSum *rspb.ReadSummary,
-	isExtension bool,
 	isTransfer bool,
 ) (result.Result, error) {
 	// When returning an error from this method, must always return
 	// a newFailedLeaseTrigger() to satisfy stats.
 
-	// Ensure either an Epoch is set or Start < Expiration.
-	if (lease.Type() == roachpb.LeaseExpiration && lease.GetExpiration().LessEq(lease.Start.ToTimestamp())) ||
-		(lease.Type() == roachpb.LeaseEpoch && lease.Expiration != nil) {
-		// This amounts to a bug.
-		return newFailedLeaseTrigger(isTransfer),
-			&roachpb.LeaseRejectedError{
-				Existing:  prevLease,
-				Requested: lease,
-				Message: fmt.Sprintf("illegal lease: epoch=%d, interval=[%s, %s)",
-					lease.Epoch, lease.Start, lease.Expiration),
-			}
-	}
-
-	// Verify that requesting replica is part of the current replica set.
-	desc := rec.Desc()
-	if _, ok := desc.GetReplicaDescriptor(lease.Replica.StoreID); !ok {
-		return newFailedLeaseTrigger(isTransfer),
-			&roachpb.LeaseRejectedError{
-				Existing:  prevLease,
-				Requested: lease,
-				Message:   "replica not found",
-			}
-	}
-
-	// Requests should not set the sequence number themselves. Set the sequence
-	// number here based on whether the lease is equivalent to the one it's
-	// succeeding.
-	if lease.Sequence != 0 {
-		return newFailedLeaseTrigger(isTransfer),
-			&roachpb.LeaseRejectedError{
-				Existing:  prevLease,
-				Requested: lease,
-				Message:   "sequence number should not be set",
-			}
-	}
-	if prevLease.Equivalent(lease) {
-		// If the proposed lease is equivalent to the previous lease, it is
-		// given the same sequence number. This is subtle, but is important
-		// to ensure that leases which are meant to be considered the same
-		// lease for the purpose of matching leases during command execution
-		// (see Lease.Equivalent) will be considered so. For example, an
-		// extension to an expiration-based lease will result in a new lease
-		// with the same sequence number.
-		lease.Sequence = prevLease.Sequence
-	} else {
-		// We set the new lease sequence to one more than the previous lease
-		// sequence. This is safe and will never result in repeated lease
-		// sequences because the sequence check beneath Raft acts as an atomic
-		// compare-and-swap of sorts. If two lease requests are proposed in
-		// parallel, both with the same previous lease, only one will be
-		// accepted and the other will get a LeaseRejectedError and need to
-		// retry with a different sequence number. This is actually exactly what
-		// the sequence number is used to enforce!
-		lease.Sequence = prevLease.Sequence + 1
-	}
-
-	// Record information about the type of event that resulted in this new lease.
-	if rec.ClusterSettings().Version.IsActive(ctx, clusterversion.AcquisitionTypeInLeaseHistory) {
+	// Construct the prior read summary if the lease sequence is changing.
+	var priorReadSum *rspb.ReadSummary
+	var locksWritten int
+	if prevLease.Sequence != lease.Sequence {
+		// If the new lease is not equivalent to the old lease, construct a read
+		// summary to instruct the new leaseholder on how to update its timestamp
+		// cache to respect prior reads served on the range.
 		if isTransfer {
-			lease.AcquisitionType = roachpb.LeaseAcquisitionType_Transfer
+			// Collect a read summary from the outgoing leaseholder to ship to the
+			// incoming leaseholder. This is used to instruct the new leaseholder on
+			// how to update its timestamp cache to ensure that no future writes are
+			// allowed to invalidate prior reads.
+			localReadSum := rec.GetCurrentReadSummary(ctx)
+			priorReadSum = &localReadSum
+
+			durabilityUpgradeLimit := concurrency.GetMaxLockFlushSize(&rec.ClusterSettings().SV)
+			// If this is a lease transfer, we write out all unreplicated leases to
+			// storage, so that any waiters will discover them on the new leaseholder.
+			acquisitions, approxSize := rec.GetConcurrencyManager().OnRangeLeaseTransferEval()
+			if approxSize > durabilityUpgradeLimit {
+				log.KvExec.Warningf(ctx,
+					"refusing to upgrade lock durability of %d locks since approximate lock size of %d byte exceeds %d bytes",
+					len(acquisitions),
+					approxSize,
+					durabilityUpgradeLimit)
+			} else {
+				if len(acquisitions) > 0 {
+					log.KvExec.Infof(ctx, "upgrading durability of %d locks during lease transfer", len(acquisitions))
+				}
+				for _, acq := range acquisitions {
+					if err := storage.MVCCAcquireLock(ctx, readWriter,
+						&acq.Txn, acq.IgnoredSeqNums, acq.Strength, acq.Key, ms, 0, 0, true /* allowSequenceNumberRegression */); err != nil {
+						return newFailedLeaseTrigger(isTransfer), err
+					}
+				}
+				locksWritten = len(acquisitions)
+			}
 		} else {
-			lease.AcquisitionType = roachpb.LeaseAcquisitionType_Request
+			// If the new lease is not equivalent to the old lease (i.e. either the
+			// lease is changing hands or the leaseholder restarted), construct a
+			// read summary to instruct the new leaseholder on how to update its
+			// timestamp cache. Since we are not the leaseholder ourselves, we must
+			// pessimistically assume that prior leaseholders served reads all the
+			// way up to the start of the new lease.
+			//
+			// NB: this is equivalent to the leaseChangingHands condition in
+			// leasePostApplyLocked.
+			worstCaseSum := rspb.FromTimestamp(lease.Start.ToTimestamp())
+			priorReadSum = &worstCaseSum
 		}
 	}
 
 	// Store the lease to disk & in-memory.
-	if err := MakeStateLoader(rec).SetLease(ctx, readWriter, ms, lease); err != nil {
+	if err := MakeStateLoader(rec).SetLeaseBlind(ctx, readWriter, ms, lease, prevLease); err != nil {
 		return newFailedLeaseTrigger(isTransfer), err
 	}
 
@@ -136,23 +116,21 @@ func evalNewLease(
 	pd.Replicated.State = &kvserverpb.ReplicaState{
 		Lease: &lease,
 	}
-	pd.Replicated.PrevLeaseProposal = prevLease.ProposedTS
+	pd.Replicated.PrevLeaseProposal = &prevLease.ProposedTS
 
 	// If we're setting a new prior read summary, store it to disk & in-memory.
-	// We elide this step in mixed-version clusters as old nodes would ignore
-	// the PriorReadSummary field (they don't know about it). It's possible that
-	// in this particular case we could get away with it (as the in-mem field
-	// only ever updates in-mem state) but it's easy to get things wrong (in
-	// which case they could easily take a catastrophic turn) and the benefit is
-	// low.
 	if priorReadSum != nil {
-		if err := readsummary.Set(ctx, readWriter, rec.GetRangeID(), ms, priorReadSum); err != nil {
+		pd.Replicated.PriorReadSummary = priorReadSum
+		// Compress the persisted read summary, as it will likely never be needed.
+		compressedSum := priorReadSum.Clone()
+		compressedSum.Compress(0)
+		if err := readsummary.Set(ctx, readWriter, rec.GetRangeID(), ms, compressedSum); err != nil {
 			return newFailedLeaseTrigger(isTransfer), err
 		}
-		pd.Replicated.PriorReadSummary = priorReadSum
 	}
 
 	pd.Local.Metrics = new(result.Metrics)
+	pd.Local.Metrics.LeaseTransferLocksWritten = locksWritten
 	if isTransfer {
 		pd.Local.Metrics.LeaseTransferSuccess = 1
 	} else {

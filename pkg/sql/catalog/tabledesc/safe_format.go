@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tabledesc
 
@@ -46,6 +41,9 @@ func formatSafeTableProperties(w *redact.StringBuilder, desc catalog.TableDescri
 	}
 	if desc.IsVirtualTable() {
 		w.Printf(", Virtual: true")
+	}
+	if desc.IsSchemaLocked() {
+		w.Printf(", SchemaLocked: true")
 	}
 	formatSafeTableColumns(w, desc)
 	formatSafeTableColumnFamilies(w, desc)
@@ -341,7 +339,7 @@ func formatSafeCheck(
 	w.Printf("{Columns: ")
 	formatSafeColumnIDs(w, c.ColumnIDs)
 	w.Printf(", Validity: %s", c.Validity.String())
-	if c.Hidden {
+	if c.FromHashShardedColumn {
 		w.Printf(", Hidden: true")
 	}
 	if m != nil {

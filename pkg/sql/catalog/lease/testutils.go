@@ -1,18 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lease
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -29,8 +23,8 @@ type StorageTestingKnobs struct {
 	// Called after a lease is acquired, with any operation error.
 	LeaseAcquiredEvent func(desc catalog.Descriptor, err error)
 	// Called before waiting on a results from a DoChan call of acquireNodeLease
-	// in descriptorState.acquire() and descriptorState.acquireFreshestFromStore().
-	LeaseAcquireResultBlockEvent func(leaseBlockType AcquireBlockType, id descpb.ID)
+	// in Acquire and AcquireFreshestFromStore.
+	LeaseAcquireResultBlockEvent func(leaseBlockType AcquireType, id descpb.ID)
 	// RemoveOnceDereferenced forces leases to be removed
 	// as soon as they are dereferenced.
 	RemoveOnceDereferenced bool
@@ -52,17 +46,37 @@ type ManagerTestingKnobs struct {
 	// ignored.
 	TestingDescriptorUpdateEvent func(descriptor *descpb.Descriptor) error
 
+	// TestingBeforeAcquireLeaseDuringRefresh is a callback right before
+	// the lease manager attempts to acquire a lease for descriptor `id`.
+	TestingBeforeAcquireLeaseDuringRefresh func(id descpb.ID) error
+
+	// TestingOnNewVersion invoked when the range feed detects a new descriptor.
+	TestingOnNewVersion func(id descpb.ID)
+
+	// TestingOnLeaseGenerationBumpForNewVersion invoked when the lease generation,
+	// after a new descriptor or initial descriptor version are observed via
+	// the range feed.
+	TestingOnLeaseGenerationBumpForNewVersion func(id descpb.ID)
+
 	// To disable the deletion of orphaned leases at server startup.
 	DisableDeleteOrphanedLeases bool
 
-	// VersionPollIntervalForRangefeeds controls the polling interval for the
-	// check whether the requisite version for rangefeed-based notifications has
-	// been finalized.
-	//
-	// TODO(ajwerner): Remove this and replace it with a callback.
-	VersionPollIntervalForRangefeeds time.Duration
+	// RangeFeedReset channel is closed to indicate that the range feed
+	// has been reset.
+	RangeFeedResetChannel chan struct{}
 
 	LeaseStoreTestingKnobs StorageTestingKnobs
+
+	// DisallowBytesMonitorCaching determines if the bytes monitor
+	// is allow to allocate extra memory.
+	DisallowBytesMonitorCaching bool
+
+	// TestingLeaseUpsertEventForID, if set, is called on every lease upsert
+	// attempt for the specified descriptor. The msg argument describes what
+	// happened (e.g. "attempting", "skipping", "already leased"). This knob
+	// was added for debugging #162173, and it can be removed when it's no
+	// longer needed.
+	TestingLeaseUpsertEventForID func(id descpb.ID, version descpb.DescriptorVersion, msg string)
 }
 
 var _ base.ModuleTestingKnobs = &ManagerTestingKnobs{}
@@ -82,7 +96,7 @@ func (m *Manager) TestingAcquireAndAssertMinVersion(
 	if err := ensureVersion(ctx, id, minVersion, m); err != nil {
 		return nil, err
 	}
-	desc, _, err := t.findForTimestamp(ctx, timestamp)
+	desc, _, err := t.findForTimestamp(ctx, TimestampToReadTimestamp(timestamp))
 	if err != nil {
 		return nil, err
 	}
@@ -93,4 +107,16 @@ func (m *Manager) TestingAcquireAndAssertMinVersion(
 // used by this lease manager.
 func (m *Manager) TestingOutstandingLeasesGauge() *metric.Gauge {
 	return m.storage.outstandingLeases
+}
+
+// TestingSessionBasedLeasesExpiredGauge returns the session based leases
+// expired gauge that is used by this lease manager.
+func (m *Manager) TestingSessionBasedLeasesExpiredGauge() *metric.Gauge {
+	return m.storage.sessionBasedLeasesExpired
+}
+
+// TestingSessionBasedLeasesWaitingToExpireGauge returns the session based leases
+// waiting to expire gauge that is used by this lease manager.
+func (m *Manager) TestingSessionBasedLeasesWaitingToExpireGauge() *metric.Gauge {
+	return m.storage.sessionBasedLeasesWaitingToExpire
 }

@@ -985,7 +985,7 @@ project
  └── inner-join (cross)
       ├── columns: k:1!null i:2!null x:7!null x:11!null y:12!null
       ├── key: (7,11)
-      ├── fd: (1)-->(2), (1)==(7), (7)==(1), (11)-->(12)
+      ├── fd: (1)-->(2), (11)-->(12), (1)==(7), (7)==(1)
       ├── inner-join (hash)
       │    ├── columns: k:1!null i:2 x:7!null
       │    ├── multiplicity: left-rows(zero-or-one), right-rows(zero-or-one)
@@ -1008,7 +1008,7 @@ project
            └── i:2 < y:12 [outer=(2,12), constraints=(/2: (/NULL - ]; /12: (/NULL - ])]
 
 # ApplyJoin operator.
-norm expect=PruneJoinLeftCols
+norm expect=PruneJoinLeftCols disable=TryRemapJoinOuterColsRight
 SELECT k, i
 FROM a
 WHERE (SELECT k+1 AS r FROM xy WHERE y=k) = 1
@@ -1837,17 +1837,20 @@ SELECT ntile(i) OVER () FROM a
 project
  ├── columns: ntile:7(int)
  ├── stats: [rows=1000]
- ├── cost: 1084.56
+ ├── cost: 1088.56
+ ├── cost-flags: unbounded-cardinality
  ├── prune: (7)
  └── window partition=()
       ├── columns: t.public.a.i:2(int) ntile:7(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.54
+      ├── cost: 1078.54
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (7)
       ├── scan t.public.a
       │    ├── columns: t.public.a.i:2(int)
       │    ├── stats: [rows=1000]
-      │    ├── cost: 1074.52
+      │    ├── cost: 1078.52
+      │    ├── cost-flags: unbounded-cardinality
       │    └── prune: (2)
       └── windows
            └── ntile [as=ntile:7, type=int, outer=(2)]
@@ -1938,7 +1941,7 @@ sort
       ├── window partition=(3) ordering=+4 opt(3)
       │    ├── columns: k:1!null f:3 s:4 avg:7
       │    ├── key: (1)
-      │    ├── fd: (1)-->(3,4)
+      │    ├── fd: (1)-->(3,4,7)
       │    ├── scan a
       │    │    ├── columns: k:1!null f:3 s:4
       │    │    ├── key: (1)
@@ -1955,17 +1958,20 @@ SELECT x FROM (SELECT ntile(i) OVER () x, ntile(f::int) OVER () y FROM a)
 project
  ├── columns: x:7(int)
  ├── stats: [rows=1000]
- ├── cost: 1084.56
+ ├── cost: 1088.56
+ ├── cost-flags: unbounded-cardinality
  ├── prune: (7)
  └── window partition=()
       ├── columns: t.public.a.i:2(int) ntile:7(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.54
+      ├── cost: 1078.54
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (7)
       ├── scan t.public.a
       │    ├── columns: t.public.a.i:2(int)
       │    ├── stats: [rows=1000]
-      │    ├── cost: 1074.52
+      │    ├── cost: 1078.52
+      │    ├── cost-flags: unbounded-cardinality
       │    └── prune: (2)
       └── windows
            └── ntile [as=ntile:7, type=int, outer=(2)]
@@ -1987,6 +1993,7 @@ delete a
  ├── volatile, mutations
  └── scan a
       ├── columns: k:7!null
+      ├── flags: avoid-full-scan
       └── key: (7)
 
 # Prune when computed ordering column is present.
@@ -2023,6 +2030,7 @@ delete a
       │         │    ├── fd: (7)-->(8)
       │         │    ├── scan a
       │         │    │    ├── columns: k:7!null i:8
+      │         │    │    ├── flags: avoid-full-scan
       │         │    │    ├── key: (7)
       │         │    │    └── fd: (7)-->(8)
       │         │    └── filters
@@ -2046,6 +2054,7 @@ delete abcde
       ├── fd: (8)-->(9,10), (9,10)~~>(8)
       ├── scan abcde
       │    ├── columns: a:8!null b:9 c:10
+      │    ├── flags: avoid-full-scan
       │    ├── key: (8)
       │    └── fd: (8)-->(9,10), (9,10)~~>(8)
       └── filters
@@ -2062,6 +2071,7 @@ delete mutation
  ├── volatile, mutations
  └── scan mutation
       ├── columns: a:8!null b:9 d:11 e:12
+      ├── flags: avoid-full-scan
       ├── key: (8)
       └── fd: (8)-->(9,11,12)
 
@@ -2071,11 +2081,15 @@ DELETE FROM a RETURNING k, s
 delete a
  ├── columns: k:1!null s:4
  ├── fetch columns: k:7 s:10
+ ├── return-mapping:
+ │    ├── k:7 => k:1
+ │    └── s:10 => s:4
  ├── volatile, mutations
  ├── key: (1)
  ├── fd: (1)-->(4)
  └── scan a
       ├── columns: k:7!null s:10
+      ├── flags: avoid-full-scan
       ├── key: (7)
       └── fd: (7)-->(10)
 
@@ -2107,6 +2121,7 @@ update computed
       │    │    ├── computed column expressions
       │    │    │    └── d:11
       │    │    │         └── c:10 + 1
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (8)
       │    │    └── fd: (8)-->(9,10,12)
       │    └── filters
@@ -2147,6 +2162,7 @@ update computed
       │    │    │    ├── computed column expressions
       │    │    │    │    └── d:11
       │    │    │    │         └── c:10 + 1
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (8)
       │    │    │    └── fd: (8)-->(9-12), (10)-->(11)
       │    │    └── filters
@@ -2188,6 +2204,7 @@ update partial_indexes
       │    │    ├── partial index predicates
       │    │    │    └── partial_indexes_c_idx: filters
       │    │    │         └── b:8 > 1 [outer=(8), constraints=(/8: [/2 - ]; tight)]
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(10)
       │    └── filters
@@ -2227,6 +2244,7 @@ update partial_indexes
       │    │    ├── partial index predicates
       │    │    │    └── partial_indexes_c_idx: filters
       │    │    │         └── b:8 > 1 [outer=(8), constraints=(/8: [/2 - ]; tight)]
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(8-10)
       │    └── filters
@@ -2244,8 +2262,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO partial_indexes (a, d) VALUES (1, 2)
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 d:14
  ├── insert-mapping:
@@ -2286,6 +2304,7 @@ upsert partial_indexes
       │    │    │    ├── partial index predicates
       │    │    │    │    └── partial_indexes_c_idx: filters
       │    │    │    │         └── b:12 > 1 [outer=(12), constraints=(/12: [/2 - ]; tight)]
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (11)
       │    │    │    └── fd: (11)-->(12,14)
       │    │    └── filters
@@ -2301,8 +2320,8 @@ norm expect-not=PruneMutationFetchCols
 UPSERT INTO partial_indexes (a, b, d) VALUES (1, 2, 3)
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -2344,6 +2363,7 @@ upsert partial_indexes
       │    │    │    ├── partial index predicates
       │    │    │    │    └── partial_indexes_c_idx: filters
       │    │    │    │         └── b:12 > 1 [outer=(12), constraints=(/12: [/2 - ]; tight)]
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (11)
       │    │    │    └── fd: (11)-->(12-14)
       │    │    └── filters
@@ -2360,8 +2380,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO partial_indexes (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET d = 3
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 d:14
  ├── insert-mapping:
@@ -2402,6 +2422,7 @@ upsert partial_indexes
       │    │    │    ├── partial index predicates
       │    │    │    │    └── partial_indexes_c_idx: filters
       │    │    │    │         └── b:12 > 1 [outer=(12), constraints=(/12: [/2 - ]; tight)]
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (11)
       │    │    │    └── fd: (11)-->(12,14)
       │    │    └── filters
@@ -2418,8 +2439,8 @@ norm expect-not=PruneMutationFetchCols
 INSERT INTO partial_indexes (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3, d = 4
 ----
 upsert partial_indexes
- ├── columns: <none>
  ├── arbiter indexes: partial_indexes_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -2466,6 +2487,7 @@ upsert partial_indexes
       │    │    │    │    ├── partial index predicates
       │    │    │    │    │    └── partial_indexes_c_idx: filters
       │    │    │    │    │         └── b:12 > 1 [outer=(12), constraints=(/12: [/2 - ]; tight)]
+      │    │    │    │    ├── flags: avoid-full-scan
       │    │    │    │    ├── key: (11)
       │    │    │    │    └── fd: (11)-->(12-14)
       │    │    │    └── filters
@@ -2477,6 +2499,58 @@ upsert partial_indexes
       └── projections
            ├── upsert_b:20 > 1 [as=partial_index_put1:23, outer=(20)]
            └── b:12 > 1 [as=partial_index_del1:24, outer=(12)]
+
+# Regression test for #166122. When a temporary backfill index exists, columns
+# needed by the index and its predicate must be fetched even when the update does
+# not touch those columns. Here, the scan fetches a (index key) and b (predicate)
+# despite only updating c. Without the temp index, a and b would be pruned.
+exec-ddl
+CREATE TABLE prune_temp_idx (
+  k INT PRIMARY KEY,
+  a INT,
+  b STRING,
+  c INT,
+  FAMILY (k, a, b),
+  FAMILY (c),
+  INDEX "idx_temp:write-only+temp" (a) WHERE b IS NOT NULL
+)
+----
+
+norm
+UPDATE prune_temp_idx SET c = 1 WHERE k = 1
+----
+update prune_temp_idx
+ ├── columns: <none>
+ ├── fetch columns: k:7 a:8 c:10
+ ├── update-mapping:
+ │    └── c_new:13 => c:4
+ ├── partial index put columns: partial_index_put1:14
+ ├── partial index del columns: partial_index_put1:14
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: partial_index_put1:14!null c_new:13!null k:7!null a:8 c:10
+      ├── cardinality: [0 - 1]
+      ├── key: ()
+      ├── fd: ()-->(7,8,10,13,14)
+      ├── select
+      │    ├── columns: k:7!null a:8 b:9 c:10
+      │    ├── cardinality: [0 - 1]
+      │    ├── key: ()
+      │    ├── fd: ()-->(7-10)
+      │    ├── scan prune_temp_idx
+      │    │    ├── columns: k:7!null a:8 b:9 c:10
+      │    │    ├── partial index predicates
+      │    │    │    └── idx_temp: filters
+      │    │    │         └── b:9 IS NOT NULL [outer=(9), constraints=(/9: (/NULL - ]; tight)]
+      │    │    ├── flags: avoid-full-scan
+      │    │    ├── key: (7)
+      │    │    └── fd: (7)-->(8-10)
+      │    └── filters
+      │         └── k:7 = 1 [outer=(7), constraints=(/7: [/1 - /1]; tight), fd=()-->(7)]
+      └── projections
+           ├── b:9 IS NOT NULL [as=partial_index_put1:14, outer=(9)]
+           └── 1 [as=c_new:13]
 
 # Do not prune DELETE fetch columns.
 norm
@@ -2503,6 +2577,7 @@ delete partial_indexes
       │    │    ├── partial index predicates
       │    │    │    └── partial_indexes_c_idx: filters
       │    │    │         └── b:8 > 1 [outer=(8), constraints=(/8: [/2 - ]; tight)]
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(8,9)
       │    └── filters
@@ -2544,6 +2619,7 @@ update virt_partial_idx
       │    │    ├── partial index predicates
       │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │         └── b:9 > 0 [outer=(9), constraints=(/9: [/1 - ]; tight)]
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (8)
       │    │    └── fd: (8)-->(12)
       │    └── filters
@@ -2593,6 +2669,7 @@ update virt_partial_idx
       │    │    │    ├── partial index predicates
       │    │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │    │         └── b:9 > 0 [outer=(9), constraints=(/9: [/1 - ]; tight)]
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (8)
       │    │    │    └── fd: (8)-->(9,11,12)
       │    │    └── filters
@@ -2613,8 +2690,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO virt_partial_idx (a, d) VALUES (1, 2)
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 d:16
  ├── insert-mapping:
@@ -2667,6 +2744,7 @@ upsert virt_partial_idx
       │    │    │    │    ├── partial index predicates
       │    │    │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │    │    │         └── b:13 > 0 [outer=(13), constraints=(/13: [/1 - ]; tight)]
+      │    │    │    │    ├── flags: avoid-full-scan
       │    │    │    │    ├── key: (12)
       │    │    │    │    └── fd: (12)-->(13,16)
       │    │    │    └── filters
@@ -2684,8 +2762,8 @@ norm expect-not=PruneMutationFetchCols
 UPSERT INTO virt_partial_idx (a, b, d) VALUES (1, 2, 3)
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:13
  ├── fetch columns: a:13 b:14 v:15 c:16 d:17
  ├── insert-mapping:
@@ -2740,6 +2818,7 @@ upsert virt_partial_idx
       │    │    │    │    ├── partial index predicates
       │    │    │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │    │    │         └── b:14 > 0 [outer=(14), constraints=(/14: [/1 - ]; tight)]
+      │    │    │    │    ├── flags: avoid-full-scan
       │    │    │    │    ├── key: (13)
       │    │    │    │    └── fd: (13)-->(14,16,17)
       │    │    │    └── filters
@@ -2758,8 +2837,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO virt_partial_idx (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET d = 3
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 d:16
  ├── insert-mapping:
@@ -2812,6 +2891,7 @@ upsert virt_partial_idx
       │    │    │    │    ├── partial index predicates
       │    │    │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │    │    │         └── b:13 > 0 [outer=(13), constraints=(/13: [/1 - ]; tight)]
+      │    │    │    │    ├── flags: avoid-full-scan
       │    │    │    │    ├── key: (12)
       │    │    │    │    └── fd: (12)-->(13,16)
       │    │    │    └── filters
@@ -2830,8 +2910,8 @@ norm expect-not=PruneMutationFetchCols
 INSERT INTO virt_partial_idx (a, d) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3, d = 4
 ----
 upsert virt_partial_idx
- ├── columns: <none>
  ├── arbiter indexes: virt_partial_idx_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 b:13 v:14 c:15 d:16
  ├── insert-mapping:
@@ -2892,6 +2972,7 @@ upsert virt_partial_idx
       │    │    │    │    │    ├── partial index predicates
       │    │    │    │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │    │    │    │         └── b:13 > 0 [outer=(13), constraints=(/13: [/1 - ]; tight)]
+      │    │    │    │    │    ├── flags: avoid-full-scan
       │    │    │    │    │    ├── key: (12)
       │    │    │    │    │    └── fd: (12)-->(13,15,16)
       │    │    │    │    └── filters
@@ -2936,6 +3017,7 @@ delete virt_partial_idx
       │    │    ├── partial index predicates
       │    │    │    └── virt_partial_idx_c_idx: filters
       │    │    │         └── b:9 > 0 [outer=(9), constraints=(/9: [/1 - ]; tight)]
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (8)
       │    │    └── fd: (8)-->(9,11)
       │    └── filters
@@ -2979,6 +3061,7 @@ update partial_indexes
       │    │    │    ├── partial index predicates
       │    │    │    │    └── partial_indexes_c_idx: filters
       │    │    │    │         └── b:8 > 1 [outer=(8), constraints=(/8: [/2 - ]; tight)]
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (7)
       │    │    │    └── fd: (7)-->(8,9)
       │    │    └── filters
@@ -3006,6 +3089,7 @@ update family
       ├── fd: (8)-->(9,10)
       ├── scan family
       │    ├── columns: a:8!null b:9 c:10
+      │    ├── flags: avoid-full-scan
       │    ├── key: (8)
       │    └── fd: (8)-->(9,10)
       └── filters
@@ -3033,6 +3117,7 @@ update family
       │    ├── fd: (8)-->(9-12)
       │    ├── scan family
       │    │    ├── columns: a:8!null b:9 c:10 d:11 e:12
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (8)
       │    │    └── fd: (8)-->(9-12)
       │    └── filters
@@ -3052,6 +3137,9 @@ project
       ├── fetch columns: a:8 b:9 c:10 d:11
       ├── update-mapping:
       │    └── c_new:15 => c:3
+      ├── return-mapping:
+      │    ├── a:8 => a:1
+      │    └── b:9 => b:2
       ├── volatile, mutations
       ├── key: (1)
       ├── fd: (1)-->(2)
@@ -3062,6 +3150,7 @@ project
            ├── fd: (8)-->(9-11), (10)-->(15)
            ├── scan family
            │    ├── columns: a:8!null b:9 c:10 d:11
+           │    ├── flags: avoid-full-scan
            │    ├── key: (8)
            │    └── fd: (8)-->(9-11)
            └── projections
@@ -3091,6 +3180,7 @@ update multi_col_inv_idx
       │    ├── fd: ()-->(8-11)
       │    ├── scan multi_col_inv_idx
       │    │    ├── columns: a:8!null b:9 c:10 j:11
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (8)
       │    │    └── fd: (8)-->(9-11)
       │    └── filters
@@ -3103,8 +3193,8 @@ norm expect=PruneMutationInputCols
 INSERT INTO a (k, s) VALUES (1, 'foo') ON CONFLICT (k) DO UPDATE SET i=a.i+1
 ----
 upsert a
- ├── columns: <none>
  ├── arbiter indexes: a_pkey
+ ├── columns: <none>
  ├── canary column: k:11
  ├── fetch columns: k:11 i:12 f:13 s:14
  ├── insert-mapping:
@@ -3141,6 +3231,7 @@ upsert a
       │    │    ├── fd: ()-->(11-14)
       │    │    ├── scan a
       │    │    │    ├── columns: k:11!null i:12 f:13 s:14
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (11)
       │    │    │    └── fd: (11)-->(12-14)
       │    │    └── filters
@@ -3200,6 +3291,7 @@ upsert a
       │    │    ├── fd: ()-->(11-14)
       │    │    ├── scan a
       │    │    │    ├── columns: k:11!null i:12 f:13 s:14
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (11)
       │    │    │    └── fd: (11)-->(12-14)
       │    │    └── filters
@@ -3216,8 +3308,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 UPSERT INTO family (a, b) VALUES (1, 2)
 ----
 upsert family
- ├── columns: <none>
  ├── arbiter indexes: family_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12
  ├── insert-mapping:
@@ -3249,6 +3341,7 @@ upsert family
       │    ├── fd: ()-->(11,12)
       │    ├── scan family
       │    │    ├── columns: a:11!null b:12
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (11)
       │    │    └── fd: (11)-->(12)
       │    └── filters
@@ -3308,6 +3401,7 @@ project
            │    │    ├── fd: ()-->(13,15-17)
            │    │    ├── scan family
            │    │    │    ├── columns: a:13!null c:15 d:16 e:17
+           │    │    │    ├── flags: avoid-full-scan
            │    │    │    ├── key: (13)
            │    │    │    └── fd: (13)-->(15-17)
            │    │    └── filters
@@ -3324,8 +3418,8 @@ norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
 INSERT INTO family VALUES (1, 2, 3, 4) ON CONFLICT (a) DO UPDATE SET d=10
 ----
 upsert family
- ├── columns: <none>
  ├── arbiter indexes: family_pkey
+ ├── columns: <none>
  ├── canary column: a:13
  ├── fetch columns: a:13 c:15 d:16
  ├── insert-mapping:
@@ -3362,6 +3456,7 @@ upsert family
       │    │    ├── fd: ()-->(13,15,16)
       │    │    ├── scan family
       │    │    │    ├── columns: a:13!null c:15 d:16
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (13)
       │    │    │    └── fd: (13)-->(15,16)
       │    │    └── filters
@@ -3375,8 +3470,8 @@ norm expect=(PruneMutationInputCols)
 INSERT INTO mutation VALUES (1, 2, 3) ON CONFLICT (a) DO UPDATE SET b=10
 ----
 upsert mutation
- ├── columns: <none>
  ├── arbiter indexes: mutation_pkey
+ ├── columns: <none>
  ├── canary column: a:12
  ├── fetch columns: a:12 b:13 c:14 d:15 e:16
  ├── insert-mapping:
@@ -3413,6 +3508,7 @@ upsert mutation
       │    │    ├── fd: ()-->(12-16)
       │    │    ├── scan mutation
       │    │    │    ├── columns: a:12!null b:13 c:14 d:15 e:16
+      │    │    │    ├── flags: avoid-full-scan
       │    │    │    ├── key: (12)
       │    │    │    └── fd: (12)-->(13-16)
       │    │    └── filters
@@ -3452,6 +3548,7 @@ update checks
       │    ├── columns: a:7!null b:8 c:9 d:10
       │    ├── check constraint expressions
       │    │    └── a:7 > 0 [outer=(7), constraints=(/7: [/1 - ]; tight)]
+      │    ├── flags: avoid-full-scan
       │    ├── key: (7)
       │    └── fd: (7)-->(8-10)
       └── projections
@@ -3477,6 +3574,7 @@ update checks
       │    ├── columns: a:7!null b:8 c:9 d:10
       │    ├── check constraint expressions
       │    │    └── a:7 > 0 [outer=(7), constraints=(/7: [/1 - ]; tight)]
+      │    ├── flags: avoid-full-scan
       │    ├── key: (7)
       │    └── fd: (7)-->(8-10)
       └── projections
@@ -3532,8 +3630,8 @@ norm
 UPSERT INTO checks (a, c, d) VALUES (1, 3, 4)
 ----
 upsert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -3578,6 +3676,7 @@ upsert checks
       │    │    │    │    ├── columns: a:11!null b:12 c:13 d:14
       │    │    │    │    ├── check constraint expressions
       │    │    │    │    │    └── a:11 > 0 [outer=(11), constraints=(/11: [/1 - ]; tight)]
+      │    │    │    │    ├── flags: avoid-full-scan
       │    │    │    │    ├── key: (11)
       │    │    │    │    └── fd: (11)-->(12-14)
       │    │    │    └── filters
@@ -3616,6 +3715,7 @@ update uniq
  │    │    ├── fd: ()-->(9,11-13)
  │    │    ├── scan uniq
  │    │    │    ├── columns: uniq.k:9!null uniq.w:11 uniq.x:12 uniq.y:13
+ │    │    │    ├── flags: avoid-full-scan
  │    │    │    ├── key: (9)
  │    │    │    └── fd: (9)-->(11-13), (11)~~>(9,12,13), (12,13)~~>(9,11)
  │    │    └── filters
@@ -3645,6 +3745,7 @@ update uniq
       │              │    └── fd: ()-->(27,29)
       │              ├── scan uniq
       │              │    ├── columns: uniq.k:19!null uniq.w:21
+      │              │    ├── flags: avoid-full-scan
       │              │    ├── key: (19)
       │              │    └── fd: (19)-->(21)
       │              └── filters
@@ -3672,6 +3773,7 @@ update uniq
                      │    └── fd: ()-->(41,44,45)
                      ├── scan uniq
                      │    ├── columns: uniq.k:33!null uniq.x:36 uniq.y:37
+                     │    ├── flags: avoid-full-scan
                      │    ├── key: (33)
                      │    └── fd: (33)-->(36,37)
                      └── filters
@@ -3703,6 +3805,7 @@ update uniq_partial
  │    │    ├── fd: ()-->(7-9)
  │    │    ├── scan uniq_partial
  │    │    │    ├── columns: uniq_partial.k:7!null uniq_partial.v:8 uniq_partial.w:9
+ │    │    │    ├── flags: avoid-full-scan
  │    │    │    ├── key: (7)
  │    │    │    └── fd: (7)-->(8,9)
  │    │    └── filters
@@ -3743,6 +3846,7 @@ update uniq_partial
                      │    ├── fd: (14)-->(15,16)
                      │    ├── scan uniq_partial
                      │    │    ├── columns: uniq_partial.k:14!null uniq_partial.v:15 uniq_partial.w:16
+                     │    │    ├── flags: avoid-full-scan
                      │    │    ├── key: (14)
                      │    │    └── fd: (14)-->(15,16)
                      │    └── filters
@@ -3756,8 +3860,8 @@ norm expect=PruneMutationInputCols
 INSERT INTO uniq_fk_parent VALUES (2, 1) ON CONFLICT (k) DO UPDATE SET c = 1
 ----
 upsert uniq_fk_parent
- ├── columns: <none>
  ├── arbiter indexes: uniq_fk_parent_pkey
+ ├── columns: <none>
  ├── canary column: uniq_fk_parent.k:11
  ├── fetch columns: uniq_fk_parent.k:11 uniq_fk_parent.b:13 uniq_fk_parent.c:14
  ├── insert-mapping:
@@ -3797,6 +3901,7 @@ upsert uniq_fk_parent
  │    │    │    ├── fd: ()-->(11-14)
  │    │    │    ├── scan uniq_fk_parent
  │    │    │    │    ├── columns: uniq_fk_parent.k:11!null uniq_fk_parent.a:12 uniq_fk_parent.b:13 uniq_fk_parent.c:14
+ │    │    │    │    ├── flags: avoid-full-scan
  │    │    │    │    ├── key: (11)
  │    │    │    │    └── fd: (11)-->(12-14), (12)~~>(11,13,14), (13,14)~~>(11,12)
  │    │    │    └── filters
@@ -3829,6 +3934,7 @@ upsert uniq_fk_parent
       │              │    └── fd: ()-->(31,32)
       │              ├── scan uniq_fk_parent
       │              │    ├── columns: uniq_fk_parent.k:24!null uniq_fk_parent.a:25
+      │              │    ├── flags: avoid-full-scan
       │              │    ├── key: (24)
       │              │    └── fd: (24)-->(25)
       │              └── filters
@@ -3856,6 +3962,7 @@ upsert uniq_fk_parent
                      │    └── fd: ()-->(43,45,46)
                      ├── scan uniq_fk_parent
                      │    ├── columns: uniq_fk_parent.k:36!null uniq_fk_parent.b:38 uniq_fk_parent.c:39
+                     │    ├── flags: avoid-full-scan
                      │    ├── key: (36)
                      │    └── fd: (36)-->(38,39)
                      └── filters
@@ -3868,8 +3975,8 @@ norm expect=PruneMutationInputCols
 INSERT INTO uniq_fk_parent VALUES (1) ON CONFLICT (k) DO UPDATE SET d = 1
 ----
 upsert uniq_fk_parent
- ├── columns: <none>
  ├── arbiter indexes: uniq_fk_parent_pkey
+ ├── columns: <none>
  ├── canary column: uniq_fk_parent.k:10
  ├── fetch columns: uniq_fk_parent.k:10 uniq_fk_parent.d:14
  ├── insert-mapping:
@@ -3907,6 +4014,7 @@ upsert uniq_fk_parent
  │    │    │    ├── fd: ()-->(10-14)
  │    │    │    ├── scan uniq_fk_parent
  │    │    │    │    ├── columns: uniq_fk_parent.k:10!null uniq_fk_parent.a:11 uniq_fk_parent.b:12 uniq_fk_parent.c:13 uniq_fk_parent.d:14
+ │    │    │    │    ├── flags: avoid-full-scan
  │    │    │    │    ├── key: (10)
  │    │    │    │    └── fd: (10)-->(11-14), (11)~~>(10,12-14), (12,13)~~>(10,11,14)
  │    │    │    └── filters
@@ -3940,6 +4048,7 @@ upsert uniq_fk_parent
       │              │    └── fd: ()-->(30,31)
       │              ├── scan uniq_fk_parent
       │              │    ├── columns: uniq_fk_parent.k:23!null uniq_fk_parent.a:24
+      │              │    ├── flags: avoid-full-scan
       │              │    ├── key: (23)
       │              │    └── fd: (23)-->(24)
       │              └── filters
@@ -3967,6 +4076,7 @@ upsert uniq_fk_parent
                      │    └── fd: ()-->(42,44,45)
                      ├── scan uniq_fk_parent
                      │    ├── columns: uniq_fk_parent.k:35!null uniq_fk_parent.b:37 uniq_fk_parent.c:38
+                     │    ├── flags: avoid-full-scan
                      │    ├── key: (35)
                      │    └── fd: (35)-->(37,38)
                      └── filters
@@ -3991,6 +4101,7 @@ delete uniq_fk_parent
  │    ├── fd: ()-->(8-11)
  │    ├── scan uniq_fk_parent
  │    │    ├── columns: k:8!null uniq_fk_parent.a:9 uniq_fk_parent.b:10 uniq_fk_parent.c:11
+ │    │    ├── flags: avoid-full-scan
  │    │    ├── key: (8)
  │    │    └── fd: (8)-->(9-11), (9)~~>(8,10,11), (10,11)~~>(8,9)
  │    └── filters
@@ -4012,6 +4123,7 @@ delete uniq_fk_parent
       │         │    └── fd: ()-->(15,16)
       │         ├── scan uniq_fk_child
       │         │    ├── columns: uniq_fk_child.b:18 uniq_fk_child.c:19
+      │         │    ├── flags: avoid-full-scan
       │         │    ├── lax-key: (18,19)
       │         │    └── fd: (19)~~>(18)
       │         └── filters
@@ -4031,7 +4143,8 @@ delete uniq_fk_parent
                 │    ├── key: ()
                 │    └── fd: ()-->(24)
                 ├── scan uniq_fk_child
-                │    └── columns: uniq_fk_child.a:25
+                │    ├── columns: uniq_fk_child.a:25
+                │    └── flags: avoid-full-scan
                 └── filters
                      └── a:24 = uniq_fk_child.a:25 [outer=(24,25), constraints=(/24: (/NULL - ]; /25: (/NULL - ]), fd=(24)==(25), (25)==(24)]
 
@@ -4052,6 +4165,7 @@ delete virt
       │    ├── computed column expressions
       │    │    └── v:8
       │    │         └── a:6 + b:7
+      │    ├── flags: avoid-full-scan
       │    └── key: (6)
       └── filters
            └── a:6 > 1 [outer=(6), constraints=(/6: [/2 - ]; tight)]
@@ -4066,6 +4180,9 @@ project
  └── delete virt
       ├── columns: a:1!null v:3
       ├── fetch columns: a:6 v:8
+      ├── return-mapping:
+      │    ├── a:6 => a:1
+      │    └── v:8 => v:3
       ├── volatile, mutations
       ├── key: (1)
       ├── fd: (1)-->(3)
@@ -4083,6 +4200,7 @@ project
            │    │    ├── computed column expressions
            │    │    │    └── v:8
            │    │    │         └── a:6 + b:7
+           │    │    ├── flags: avoid-full-scan
            │    │    ├── key: (6)
            │    │    └── fd: (6)-->(7)
            │    └── filters
@@ -4113,6 +4231,7 @@ delete virt_idx
       │    │    ├── computed column expressions
       │    │    │    └── v:10
       │    │    │         └── a:7 + b:8
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(8)
       │    └── filters
@@ -4147,6 +4266,7 @@ update virt_idx
       │    │    ├── computed column expressions
       │    │    │    └── v:10
       │    │    │         └── a:7 + b:8
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(8,9)
       │    └── projections
@@ -4182,6 +4302,7 @@ update virt_idx
       │    │    ├── computed column expressions
       │    │    │    └── v:10
       │    │    │         └── a:7 + b:8
+      │    │    ├── flags: avoid-full-scan
       │    │    ├── key: (7)
       │    │    └── fd: (7)-->(8)
       │    └── projections
@@ -4211,6 +4332,7 @@ update virt_idx
       │    ├── computed column expressions
       │    │    └── v:10
       │    │         └── a:7 + b:8
+      │    ├── flags: avoid-full-scan
       │    ├── key: (7)
       │    └── fd: (7)-->(9)
       └── projections
@@ -4238,6 +4360,7 @@ update virt_idx2
       │    ├── computed column expressions
       │    │    └── v:10
       │    │         └── b:8 + 1
+      │    ├── flags: avoid-full-scan
       │    ├── key: (7)
       │    └── fd: (7)-->(8,9)
       └── projections
@@ -4266,11 +4389,160 @@ update virt_idx3
       │    ├── computed column expressions
       │    │    └── v:10
       │    │         └── b:8 + 1
+      │    ├── flags: avoid-full-scan
       │    ├── key: (7)
       │    └── fd: (7)-->(8,9)
       └── projections
            ├── c:9 + 1 [as=c_new:13, outer=(9), immutable]
            └── b:8 + 1 [as=v:10, outer=(8), immutable]
+
+# ------------------------------------------------------------------------------
+# PruneInsertReturnCols
+# ------------------------------------------------------------------------------
+
+# Returning a single insert column can prune the others.
+norm expect=PruneInsertReturnCols
+INSERT INTO computed (a, b, c) VALUES (1, 2, 3) RETURNING a
+----
+insert computed
+ ├── columns: a:1!null
+ ├── insert-mapping:
+ │    ├── column1:8 => a:1
+ │    ├── column2:9 => b:2
+ │    ├── column3:10 => c:3
+ │    ├── d_comp:11 => d:4
+ │    └── x_comp:12 => x:5
+ ├── return-mapping:
+ │    └── column1:8 => a:1
+ ├── cardinality: [1 - 1]
+ ├── volatile, mutations
+ ├── key: ()
+ ├── fd: ()-->(1)
+ └── values
+      ├── columns: column1:8!null column2:9!null column3:10!null d_comp:11!null x_comp:12!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(8-12)
+      └── (1, 2, 3, 4, 13)
+
+# RETURNING * does not prune columns
+norm expect-not=PruneInsertReturnCols
+INSERT INTO computed (a, b, c) SELECT a, b, c FROM computed RETURNING *
+----
+insert computed
+ ├── columns: a:1!null b:2 c:3 d:4
+ ├── insert-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    ├── c:10 => c:3
+ │    ├── d_comp:15 => d:4
+ │    └── x_comp:16 => x:5
+ ├── return-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    ├── c:10 => c:3
+ │    └── d_comp:15 => d:4
+ ├── volatile, mutations
+ ├── key: (1)
+ ├── fd: (1)-->(2-4), (3)-->(4)
+ └── project
+      ├── columns: d_comp:15 x_comp:16 a:8!null b:9 c:10
+      ├── immutable
+      ├── key: (8)
+      ├── fd: (8)-->(9,10), (10)-->(15,16)
+      ├── scan computed
+      │    ├── columns: a:8!null b:9 c:10
+      │    ├── computed column expressions
+      │    │    └── d:11
+      │    │         └── c:10 + 1
+      │    ├── key: (8)
+      │    └── fd: (8)-->(9,10)
+      └── projections
+           ├── c:10 + 1 [as=d_comp:15, outer=(10), immutable]
+           └── c:10 + 10 [as=x_comp:16, outer=(10), immutable]
+
+# Returning a subset of insert columns can prune the others.
+norm expect=PruneInsertReturnCols
+INSERT INTO computed (a, b, c) SELECT a, b, c FROM computed RETURNING a, b, c
+----
+insert computed
+ ├── columns: a:1!null b:2 c:3
+ ├── insert-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    ├── c:10 => c:3
+ │    ├── d_comp:15 => d:4
+ │    └── x_comp:16 => x:5
+ ├── return-mapping:
+ │    ├── a:8 => a:1
+ │    ├── b:9 => b:2
+ │    └── c:10 => c:3
+ ├── volatile, mutations
+ ├── key: (1)
+ ├── fd: (1)-->(2,3)
+ └── project
+      ├── columns: d_comp:15 x_comp:16 a:8!null b:9 c:10
+      ├── immutable
+      ├── key: (8)
+      ├── fd: (8)-->(9,10), (10)-->(15,16)
+      ├── scan computed
+      │    ├── columns: a:8!null b:9 c:10
+      │    ├── computed column expressions
+      │    │    └── d:11
+      │    │         └── c:10 + 1
+      │    ├── key: (8)
+      │    └── fd: (8)-->(9,10)
+      └── projections
+           ├── c:10 + 1 [as=d_comp:15, outer=(10), immutable]
+           └── c:10 + 10 [as=x_comp:16, outer=(10), immutable]
+
+# We apply the PruneInsertReturnCols rule multiple times, to get
+# the minimal set of columns. Columns c and b are pruned away.
+norm expect=PruneInsertReturnCols
+SELECT a FROM [SELECT a, b FROM [INSERT INTO computed (a, b, c) VALUES (1, 2, 3) RETURNING a, b, c]]
+----
+with &1
+ ├── columns: a:16!null
+ ├── cardinality: [1 - 1]
+ ├── volatile, mutations
+ ├── key: ()
+ ├── fd: ()-->(16)
+ ├── insert computed
+ │    ├── columns: computed.a:1!null computed.b:2!null computed.c:3!null
+ │    ├── insert-mapping:
+ │    │    ├── column1:8 => computed.a:1
+ │    │    ├── column2:9 => computed.b:2
+ │    │    ├── column3:10 => computed.c:3
+ │    │    ├── d_comp:11 => d:4
+ │    │    └── x_comp:12 => x:5
+ │    ├── return-mapping:
+ │    │    ├── column1:8 => computed.a:1
+ │    │    ├── column2:9 => computed.b:2
+ │    │    └── column3:10 => computed.c:3
+ │    ├── cardinality: [1 - 1]
+ │    ├── volatile, mutations
+ │    ├── key: ()
+ │    ├── fd: ()-->(1-3)
+ │    └── values
+ │         ├── columns: column1:8!null column2:9!null column3:10!null d_comp:11!null x_comp:12!null
+ │         ├── cardinality: [1 - 1]
+ │         ├── key: ()
+ │         ├── fd: ()-->(8-12)
+ │         └── (1, 2, 3, 4, 13)
+ └── project
+      ├── columns: a:16!null
+      ├── cardinality: [1 - 1]
+      ├── key: ()
+      ├── fd: ()-->(16)
+      ├── with-scan &1
+      │    ├── columns: a:13!null
+      │    ├── mapping:
+      │    │    └──  computed.a:1 => a:13
+      │    ├── cardinality: [1 - 1]
+      │    ├── key: ()
+      │    └── fd: ()-->(13)
+      └── projections
+           └── a:13 [as=a:16, outer=(13)]
 
 # ------------------------------------------------------------------------------
 # PruneMutationReturnCols
@@ -4306,6 +4578,15 @@ project
       ├── fetch columns: a:11 b:12 c:13 d:14 e:15 f:16 g:17 rowid:18
       ├── update-mapping:
       │    └── a_new:21 => a:1
+      ├── return-mapping:
+      │    ├── a_new:21 => a:1
+      │    ├── b:12 => b:2
+      │    ├── c:13 => c:3
+      │    ├── d:14 => d:4
+      │    ├── e:15 => e:5
+      │    ├── f:16 => f:6
+      │    ├── g:17 => g:7
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1-7)
@@ -4316,6 +4597,7 @@ project
            ├── fd: (18)-->(11-17), (11)~~>(12-18), (11)-->(21)
            ├── scan returning_test
            │    ├── columns: a:11 b:12 c:13 d:14 e:15 f:16 g:17 rowid:18!null
+           │    ├── flags: avoid-full-scan
            │    ├── key: (18)
            │    └── fd: (18)-->(11-17), (11)~~>(12-18)
            └── projections
@@ -4336,6 +4618,10 @@ project
       ├── fetch columns: a:11 d:14 e:15 f:16 g:17 rowid:18
       ├── update-mapping:
       │    └── d_new:21 => d:4
+      ├── return-mapping:
+      │    ├── a:11 => a:1
+      │    ├── d_new:21 => d:4
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1,4), (1)~~>(4,8)
@@ -4346,6 +4632,7 @@ project
            ├── fd: (18)-->(11,14-17), (11)~~>(14-18), (11,14)-->(21)
            ├── scan returning_test
            │    ├── columns: a:11 d:14 e:15 f:16 g:17 rowid:18!null
+           │    ├── flags: avoid-full-scan
            │    ├── key: (18)
            │    └── fd: (18)-->(11,14-17), (11)~~>(14-18)
            └── projections
@@ -4363,6 +4650,9 @@ project
       ├── fetch columns: a:11 rowid:18
       ├── update-mapping:
       │    └── a_new:21 => a:1
+      ├── return-mapping:
+      │    ├── a_new:21 => a:1
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1)
@@ -4373,6 +4663,7 @@ project
            ├── fd: (18)-->(11,21), (11)~~>(18,21)
            ├── scan returning_test
            │    ├── columns: a:11 d:14 rowid:18!null
+           │    ├── flags: avoid-full-scan
            │    ├── key: (18)
            │    └── fd: (18)-->(11,14), (11)~~>(14,18)
            └── projections
@@ -4393,6 +4684,11 @@ project
       ├── update-mapping:
       │    ├── a_new:21 => a:1
       │    └── a:11 => b:2
+      ├── return-mapping:
+      │    ├── a_new:21 => a:1
+      │    ├── a:11 => b:2
+      │    ├── c:13 => c:3
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1-3), (2)~~>(1,3,8)
@@ -4403,6 +4699,7 @@ project
            ├── fd: (18)-->(11-13), (11)~~>(12,13,18), (11,12)-->(21)
            ├── scan returning_test
            │    ├── columns: a:11 b:12 c:13 rowid:18!null
+           │    ├── flags: avoid-full-scan
            │    ├── key: (18)
            │    └── fd: (18)-->(11-13), (11)~~>(12,13,18)
            └── projections
@@ -4426,6 +4723,11 @@ with &1
  │         ├── fetch columns: returning_test.a:11 returning_test.b:12 returning_test.c:13 rowid:18
  │         ├── update-mapping:
  │         │    └── a_new:21 => returning_test.a:1
+ │         ├── return-mapping:
+ │         │    ├── a_new:21 => returning_test.a:1
+ │         │    ├── returning_test.b:12 => returning_test.b:2
+ │         │    ├── returning_test.c:13 => returning_test.c:3
+ │         │    └── rowid:18 => rowid:8
  │         ├── volatile, mutations
  │         ├── key: (8)
  │         ├── fd: (8)-->(1-3)
@@ -4436,6 +4738,7 @@ with &1
  │              ├── fd: (18)-->(11-13), (11)~~>(12,13,18), (11)-->(21)
  │              ├── scan returning_test
  │              │    ├── columns: returning_test.a:11 returning_test.b:12 returning_test.c:13 rowid:18!null
+ │              │    ├── flags: avoid-full-scan
  │              │    ├── key: (18)
  │              │    └── fd: (18)-->(11-13), (11)~~>(12,13,18)
  │              └── projections
@@ -4467,6 +4770,11 @@ with &1
  │         ├── fetch columns: returning_test.a:11 returning_test.b:12 returning_test.c:13 rowid:18
  │         ├── update-mapping:
  │         │    └── a_new:21 => returning_test.a:1
+ │         ├── return-mapping:
+ │         │    ├── a_new:21 => returning_test.a:1
+ │         │    ├── returning_test.b:12 => returning_test.b:2
+ │         │    ├── returning_test.c:13 => returning_test.c:3
+ │         │    └── rowid:18 => rowid:8
  │         ├── volatile, mutations
  │         ├── key: (8)
  │         ├── fd: (8)-->(1-3)
@@ -4477,6 +4785,7 @@ with &1
  │              ├── fd: (18)-->(11-13), (11)~~>(12,13,18), (11)-->(21)
  │              ├── scan returning_test
  │              │    ├── columns: returning_test.a:11 returning_test.b:12 returning_test.c:13 rowid:18!null
+ │              │    ├── flags: avoid-full-scan
  │              │    ├── key: (18)
  │              │    └── fd: (18)-->(11-13), (11)~~>(12,13,18)
  │              └── projections
@@ -4514,6 +4823,11 @@ with &2
  │         ├── fetch columns: returning_test.a:23 returning_test.b:24 returning_test.c:25 rowid:30
  │         ├── update-mapping:
  │         │    └── a_new:33 => returning_test.a:13
+ │         ├── return-mapping:
+ │         │    ├── a_new:33 => returning_test.a:13
+ │         │    ├── returning_test.b:24 => returning_test.b:14
+ │         │    ├── returning_test.c:25 => returning_test.c:15
+ │         │    └── rowid:30 => rowid:20
  │         ├── volatile, mutations
  │         ├── key: (20)
  │         ├── fd: (20)-->(13-15)
@@ -4524,26 +4838,21 @@ with &2
  │              ├── fd: (30)-->(23-25), (23)~~>(24,25,30), (23)-->(33)
  │              ├── scan returning_test
  │              │    ├── columns: returning_test.a:23 returning_test.b:24 returning_test.c:25 rowid:30!null
+ │              │    ├── flags: avoid-full-scan
  │              │    ├── key: (30)
  │              │    └── fd: (30)-->(23-25), (23)~~>(24,25,30)
  │              └── projections
  │                   └── returning_test.a:23 + 1 [as=a_new:33, outer=(23), immutable]
- └── inner-join (cross)
-      ├── columns: a:11 b:12 a:37!null b:38
+ └── project
+      ├── columns: a:37!null b:38 a:11 b:12
       ├── fd: (11)~~>(12)
-      ├── project
-      │    ├── columns: a:11 b:12
-      │    ├── lax-key: (11,12)
-      │    ├── fd: (11)~~>(12)
+      ├── inner-join (cross)
+      │    ├── columns: returning_test.a:1 returning_test.b:2 a:34!null b:35
+      │    ├── fd: (1)~~>(2)
       │    ├── scan returning_test
       │    │    ├── columns: returning_test.a:1 returning_test.b:2
       │    │    ├── lax-key: (1,2)
       │    │    └── fd: (1)~~>(2)
-      │    └── projections
-      │         ├── returning_test.a:1 [as=a:11, outer=(1)]
-      │         └── returning_test.b:2 [as=b:12, outer=(2)]
-      ├── project
-      │    ├── columns: a:37!null b:38
       │    ├── select
       │    │    ├── columns: a:34!null b:35
       │    │    ├── with-scan &2
@@ -4553,10 +4862,12 @@ with &2
       │    │    │         └──  returning_test.b:14 => b:35
       │    │    └── filters
       │    │         └── a:34 > 1 [outer=(34), constraints=(/34: [/2 - ]; tight)]
-      │    └── projections
-      │         ├── a:34 [as=a:37, outer=(34)]
-      │         └── b:35 [as=b:38, outer=(35)]
-      └── filters (true)
+      │    └── filters (true)
+      └── projections
+           ├── a:34 [as=a:37, outer=(34)]
+           ├── b:35 [as=b:38, outer=(35)]
+           ├── returning_test.a:1 [as=a:11, outer=(1)]
+           └── returning_test.b:2 [as=b:12, outer=(2)]
 
 # Check if the rule works as desired for other mutations.
 norm
@@ -4620,6 +4931,7 @@ project
            │    │    ├── fd: ()-->(16-18,23)
            │    │    ├── scan returning_test
            │    │    │    ├── columns: a:16 b:17 c:18 rowid:23!null
+           │    │    │    ├── flags: avoid-full-scan
            │    │    │    ├── key: (23)
            │    │    │    └── fd: (23)-->(16-18), (16)~~>(17,18,23)
            │    │    └── filters
@@ -4642,6 +4954,11 @@ project
  └── delete returning_test
       ├── columns: a:1!null b:2 d:4 rowid:8!null
       ├── fetch columns: a:11 b:12 d:14 rowid:18
+      ├── return-mapping:
+      │    ├── a:11 => a:1
+      │    ├── b:12 => b:2
+      │    ├── d:14 => d:4
+      │    └── rowid:18 => rowid:8
       ├── volatile, mutations
       ├── key: (8)
       ├── fd: (8)-->(1,2,4), (1)-->(2,4,8)
@@ -4652,6 +4969,7 @@ project
            ├── fd: (18)-->(11,12,14), (11)-->(12,14,18)
            ├── scan returning_test
            │    ├── columns: a:11 b:12 d:14 rowid:18!null
+           │    ├── flags: avoid-full-scan
            │    ├── key: (18)
            │    └── fd: (18)-->(11,12,14), (11)~~>(12,14,18)
            └── filters
@@ -4707,32 +5025,16 @@ project
            │    ├── volatile
            │    ├── key: ()
            │    ├── fd: ()-->(11-19,23)
-           │    ├── ensure-upsert-distinct-on
+           │    ├── values
            │    │    ├── columns: column1:11!null column2:12!null column3:13!null d_default:14 rowid_default:15
-           │    │    ├── grouping columns: rowid_default:15
-           │    │    ├── error: "UPSERT or INSERT...ON CONFLICT command cannot affect row a second time"
            │    │    ├── cardinality: [1 - 1]
            │    │    ├── volatile
            │    │    ├── key: ()
            │    │    ├── fd: ()-->(11-15)
-           │    │    ├── values
-           │    │    │    ├── columns: column1:11!null column2:12!null column3:13!null d_default:14 rowid_default:15
-           │    │    │    ├── cardinality: [1 - 1]
-           │    │    │    ├── volatile
-           │    │    │    ├── key: ()
-           │    │    │    ├── fd: ()-->(11-15)
-           │    │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid())
-           │    │    └── aggregations
-           │    │         ├── first-agg [as=column1:11, outer=(11)]
-           │    │         │    └── column1:11
-           │    │         ├── first-agg [as=column2:12, outer=(12)]
-           │    │         │    └── column2:12
-           │    │         ├── first-agg [as=column3:13, outer=(13)]
-           │    │         │    └── column3:13
-           │    │         └── first-agg [as=d_default:14, outer=(14)]
-           │    │              └── d_default:14
+           │    │    └── (1, 2, 'c', CAST(NULL AS INT8), unique_rowid())
            │    ├── scan returning_test
            │    │    ├── columns: a:16 b:17 c:18 d:19 rowid:23!null
+           │    │    ├── flags: avoid-full-scan
            │    │    ├── key: (23)
            │    │    └── fd: (23)-->(16-19), (16)~~>(17-19,23)
            │    └── filters
@@ -4756,9 +5058,12 @@ RETURNING
 update abcde
  ├── columns: a:1!null b:16 c:17
  ├── fetch columns: abcde.a:8 abcde.b:9 abcde.c:10 abcde.d:11 abcde.e:12
+ ├── passthrough columns: "family".b:16 "family".c:17
  ├── update-mapping:
  │    ├── "family".b:16 => abcde.b:2
  │    └── "family".c:17 => abcde.c:3
+ ├── return-mapping:
+ │    └── abcde.a:8 => abcde.a:1
  ├── volatile, mutations
  ├── key: (1)
  ├── fd: (1)-->(16,17)
@@ -4769,6 +5074,7 @@ update abcde
       ├── fd: (8)-->(9-12), (9,10)~~>(8,11,12), (15)-->(16,17), (8)==(15), (15)==(8)
       ├── scan abcde
       │    ├── columns: abcde.a:8!null abcde.b:9 abcde.c:10 abcde.d:11 abcde.e:12
+      │    ├── flags: avoid-full-scan
       │    ├── key: (8)
       │    └── fd: (8)-->(9-12), (9,10)~~>(8,11,12)
       ├── scan family
@@ -4813,13 +5119,20 @@ semi-join (hash)
  │    ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3
  │    ├── key: (1)
  │    └── fd: (1)-->(2,3), (2,3)~~>(1)
- ├── scan family
- │    ├── columns: "family".a:8!null "family".b:9 "family".c:10
+ ├── project
+ │    ├── columns: column16:16 "family".a:8!null
+ │    ├── immutable
  │    ├── key: (8)
- │    └── fd: (8)-->(9,10)
+ │    ├── fd: (8)-->(16)
+ │    ├── scan family
+ │    │    ├── columns: "family".a:8!null "family".b:9 "family".c:10
+ │    │    ├── key: (8)
+ │    │    └── fd: (8)-->(9,10)
+ │    └── projections
+ │         └── "family".b:9 + "family".c:10 [as=column16:16, outer=(9,10), immutable]
  └── filters
       ├── abcde.a:1 = "family".a:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
-      └── abcde.b:2 > ("family".b:9 + "family".c:10) [outer=(2,9,10), immutable, constraints=(/2: (/NULL - ])]
+      └── abcde.b:2 > column16:16 [outer=(2,16), constraints=(/2: (/NULL - ]; /16: (/NULL - ])]
 
 norm expect=PruneSemiAntiJoinRightCols
 SELECT a, b, c FROM abcde WHERE NOT EXISTS (SELECT * FROM family WHERE abcde.a=family.a)
@@ -4839,7 +5152,7 @@ anti-join (hash)
       └── abcde.a:1 = "family".a:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
 
 # Test using multi-level nesting so we don't decorrelate the semi-join.
-norm expect=PruneSemiAntiJoinRightCols
+norm expect=PruneSemiAntiJoinRightCols disable=(TryRemapJoinOuterColsRight,TryRemapSelectOuterCols)
 SELECT
     a, b, c
 FROM
@@ -4878,7 +5191,7 @@ semi-join-apply
       └── abcde.a:1 = "family".a:8 [outer=(1,8), constraints=(/1: (/NULL - ]; /8: (/NULL - ]), fd=(1)==(8), (8)==(1)]
 
 # Test using multi-level nesting so we don't decorrelate the anti-join.
-norm expect=PruneSemiAntiJoinRightCols
+norm expect=PruneSemiAntiJoinRightCols disable=(TryRemapJoinOuterColsRight,TryRemapSelectOuterCols)
 SELECT
     a, b, c
 FROM
@@ -4938,12 +5251,14 @@ WITH foo AS (SELECT * FROM a)
 with &1 (foo)
  ├── columns: i:8(int)
  ├── stats: [rows=1000]
- ├── cost: 1104.86
+ ├── cost: 1108.86
+ ├── cost-flags: unbounded-cardinality
  ├── prune: (8)
  ├── scan t.public.a
  │    ├── columns: t.public.a.k:1(int!null) t.public.a.i:2(int) t.public.a.f:3(float) t.public.a.s:4(string)
  │    ├── stats: [rows=1000]
- │    ├── cost: 1104.82
+ │    ├── cost: 1108.82
+ │    ├── cost-flags: unbounded-cardinality
  │    ├── key: (1)
  │    ├── fd: (1)-->(2-4)
  │    ├── prune: (1-4)
@@ -4954,6 +5269,7 @@ with &1 (foo)
       │    └──  t.public.a.i:2(int) => i:8(int)
       ├── stats: [rows=1000]
       ├── cost: 0.02
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (8)
       └── cte-uses
            └── &1: count=1 used-columns=(2)
@@ -5157,3 +5473,200 @@ project
  │    └── filters (true)
  └── projections
       └── NULL [as="?column?":18]
+
+# Regression test for #86308.
+exec-ddl
+CREATE TABLE table86308 (
+  col3_0 INET NOT NULL,
+  col3_1 INT4 NOT NULL,
+  col3_2 TIMETZ NOT NULL,
+  col3_3 FLOAT4 NOT NULL,
+  col3_4 BIT(17) NOT NULL,
+  col3_5 GEOGRAPHY NOT NULL,
+  col3_6 BIT(22) NOT NULL,
+  col3_7 STRING NOT NULL,
+  col3_8 UUID NOT NULL,
+  col3_9 FLOAT8 NOT NULL AS (col3_3 + 0.7530620098114014:::FLOAT8) STORED,
+  col3_10 STRING NOT NULL AS (lower(CAST(col3_0 AS STRING))) STORED,
+  col3_11 FLOAT8 NOT NULL AS (col3_3 + 0.8790965676307678:::FLOAT8) VIRTUAL,
+  col3_12 STRING NOT NULL AS (lower(CAST(col3_0 AS STRING))) VIRTUAL,
+  col3_13 STRING NOT NULL AS (lower(CAST(col3_6 AS STRING))) STORED,
+  col3_14 FLOAT8 NOT NULL AS (col3_3 + (-0.27059364318847656):::FLOAT8) STORED,
+  col3_15 STRING NOT NULL AS (lower(CAST(col3_5 AS STRING))) STORED,
+  rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+  CONSTRAINT table3_pkey PRIMARY KEY (rowid ASC),
+  UNIQUE INDEX table3_col3_4_col3_11_col3_1_col3_0_col3_3_key (col3_4 DESC, col3_11 ASC, col3_1 DESC, col3_0 ASC, col3_3 DESC) STORING (col3_5, col3_8, col3_9, col3_10, col3_13) WHERE ((((col3_9 = 5e-324:::FLOAT8) OR (col3_1 = (-32768):::INT8)) OR (col3_15 = '':::STRING)) AND (col3_3 > 3.4028234663852886e+38:::FLOAT8)) AND (col3_12 != '""':::STRING)
+);
+----
+
+# Before the fix, PruneGroupByCols would fire to push a Project below the
+# GroupBy. Then, since PruneWindowInputCols was disabled,
+# EliminateGroupByProject would remove the Project and the cycle would repeat.
+norm disable=PruneWindowInputCols format=hide-all
+SELECT concat_agg(tab_1739.col3_7::STRING ORDER BY tab_1739.col3_7 DESC)::STRING AS col_4664
+FROM table86308@[0] AS tab_1739 GROUP BY tab_1739.col3_7 HAVING bool_and(false::BOOL)::BOOL
+----
+project
+ └── select
+      ├── group-by (hash)
+      │    ├── project
+      │    │    ├── scan table86308
+      │    │    │    ├── computed column expressions
+      │    │    │    │    ├── col3_9
+      │    │    │    │    │    └── col3_3 + 0.7530620098114014
+      │    │    │    │    ├── col3_10
+      │    │    │    │    │    └── lower(col3_0::STRING)
+      │    │    │    │    ├── col3_11
+      │    │    │    │    │    └── col3_3 + 0.8790965676307678
+      │    │    │    │    ├── col3_12
+      │    │    │    │    │    └── lower(col3_0::STRING)
+      │    │    │    │    ├── col3_13
+      │    │    │    │    │    └── lower(col3_6::STRING)
+      │    │    │    │    ├── col3_14
+      │    │    │    │    │    └── col3_3 + -0.27059364318847656
+      │    │    │    │    └── col3_15
+      │    │    │    │         └── lower(col3_5::STRING)
+      │    │    │    └── partial index predicates
+      │    │    │         └── table3_col3_4_col3_11_col3_1_col3_0_col3_3_key: filters
+      │    │    │              ├── ((col3_9 = 5e-324) OR (col3_1 = -32768)) OR (col3_15 = '')
+      │    │    │              ├── col3_3 > 3.4028234663852886e+38
+      │    │    │              └── lower(col3_0::STRING) != '""'
+      │    │    └── projections
+      │    │         └── false
+      │    └── aggregations
+      │         ├── concat-agg
+      │         │    └── col3_7
+      │         └── bool-and
+      │              └── column21
+      └── filters
+           └── bool_and
+
+exec-ddl
+CREATE TABLE p100478 (
+  region STRING NOT NULL,
+  id INT,
+  PRIMARY KEY (region, id),
+  UNIQUE INDEX p_id_idx (id)
+)
+----
+
+exec-ddl
+CREATE TABLE c100478 (
+  region STRING NOT NULL,
+  id INT PRIMARY KEY,
+  p_id INT NOT NULL,
+  FOREIGN KEY (region, p_id) REFERENCES p100478 (region, id)
+)
+----
+
+# A join which doesn't prune columns which could potentially appear in derived
+# ON clause conditions should not result in infinite rule recursion.
+norm expect=(EliminateGroupByProject,PruneJoinLeftCols,PruneJoinRightCols) disable=(EliminateJoinUnderProjectLeft,EliminateJoinUnderProjectRight,EliminateJoinUnderGroupByLeft,EliminateJoinUnderGroupByRight)
+SELECT p.id FROM p100478 p JOIN c100478 ON p_id = p.id GROUP BY p.id
+----
+distinct-on
+ ├── columns: id:2!null
+ ├── grouping columns: p.id:2!null
+ ├── key: (2)
+ └── inner-join (hash)
+      ├── columns: p.region:1!null p.id:2!null c100478.region:5!null p_id:7!null
+      ├── multiplicity: left-rows(zero-or-more), right-rows(exactly-one)
+      ├── fd: (2)-->(1), (2)==(7), (7)==(2)
+      ├── scan p100478 [as=p]
+      │    ├── columns: p.region:1!null p.id:2!null
+      │    ├── key: (2)
+      │    └── fd: (2)-->(1)
+      ├── scan c100478
+      │    └── columns: c100478.region:5!null p_id:7!null
+      └── filters
+           └── p_id:7 = p.id:2 [outer=(2,7), constraints=(/2: (/NULL - ]; /7: (/NULL - ]), fd=(2)==(7), (7)==(2)]
+
+# Regression test for #159793. PruneUnionAllCols must intersect the needed
+# columns with the UnionAll's output columns before calling NeededColMapLeft/
+# Right, since the projections may reference outer columns.
+exec-ddl
+CREATE TABLE t159793 (k INT PRIMARY KEY)
+----
+
+norm format=hide-all
+SELECT (
+  WITH cte (col) AS (
+    SELECT * FROM (VALUES (false))
+    UNION
+    SELECT * FROM (VALUES ((NOT true) AND false), (false))
+    UNION ALL
+    SELECT * FROM (VALUES (NULL::BOOL IN (SELECT true FROM t159793 AS t1)))
+  )
+  SELECT t.k::TEXT FROM cte WHERE col
+) FROM t159793 AS t
+----
+project
+ ├── ensure-distinct-on
+ │    ├── left-join-apply
+ │    │    ├── scan t159793 [as=t]
+ │    │    ├── project
+ │    │    │    ├── union-all
+ │    │    │    │    ├── project
+ │    │    │    │    │    └── limit
+ │    │    │    │    │         ├── select
+ │    │    │    │    │         │    ├── values
+ │    │    │    │    │         │    │    ├── (false,)
+ │    │    │    │    │         │    │    └── (false,)
+ │    │    │    │    │         │    └── filters
+ │    │    │    │    │         │         └── column1
+ │    │    │    │    │         └── 1
+ │    │    │    │    └── project
+ │    │    │    │         └── select
+ │    │    │    │              ├── values
+ │    │    │    │              │    └── tuple
+ │    │    │    │              │         └── any: eq
+ │    │    │    │              │              ├── project
+ │    │    │    │              │              │    ├── scan t159793 [as=t1]
+ │    │    │    │              │              │    └── projections
+ │    │    │    │              │              │         └── true
+ │    │    │    │              │              └── CAST(NULL AS BOOL)
+ │    │    │    │              └── filters
+ │    │    │    │                   └── column1
+ │    │    │    └── projections
+ │    │    │         └── t.k::STRING
+ │    │    └── filters (true)
+ │    └── aggregations
+ │         └── const-agg
+ │              └── k
+ └── projections
+      └── k
+
+# Regression test for #159793 with PL/pgSQL. The projection references a
+# PL/pgSQL variable which is an outer scope column.
+norm
+DO $$
+DECLARE
+  decl OIDVECTOR;
+BEGIN
+  WHILE true LOOP
+  CONTINUE WHEN false;
+  WITH cte (col) AS
+    (
+      SELECT * FROM (VALUES (false))
+    UNION
+      SELECT * FROM (VALUES ((NOT true) AND false), (false))
+    UNION ALL
+      SELECT * FROM (VALUES (NULL::BOOL IN (SELECT true FROM t159793 AS t1)))
+    )
+    SELECT decl FROM cte WHERE col INTO decl;
+  END LOOP;
+END;
+$$
+----
+call
+ ├── cardinality: [0 - 0]
+ ├── volatile
+ └── procedure: inline_code_block
+      ├── strict
+      └── body
+           └── values
+                ├── columns: stmt_loop_2:30
+                ├── cardinality: [1 - 1]
+                ├── key: ()
+                ├── fd: ()-->(30)
+                └── (stmt_loop_2(CAST(NULL AS OIDVECTOR)),)

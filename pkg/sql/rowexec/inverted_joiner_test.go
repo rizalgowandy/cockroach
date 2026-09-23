@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -16,16 +11,17 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -35,7 +31,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -195,18 +193,21 @@ func (jsonUnionExpr) PreFilter(_ inverted.EncVal, _ []interface{}, _ []bool) (bo
 
 func TestInvertedJoiner(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	aFn := func(row int) tree.Datum {
 		return tree.NewDInt(tree.DInt(row))
 	}
 	bFn := func(row int) tree.Datum {
-		arr := tree.NewDArray(types.Int)
-		arr.Array = tree.Datums{tree.NewDInt(tree.DInt(row / 10)), tree.NewDInt(tree.DInt(row % 10))}
-		return arr
+		return tree.NewDArrayFromDatums(
+			types.Int, tree.Datums{tree.NewDInt(tree.DInt(row / 10)), tree.NewDInt(tree.DInt(row % 10))},
+		)
 	}
 	cFn := func(row int) tree.Datum {
 		j, err := json.ParseJSON(fmt.Sprintf(`{"c1": %d, "c2": %d}`, row/10, row%10))
@@ -240,7 +241,7 @@ func TestInvertedJoiner(t *testing.T) {
 	const dciIndex = 4
 	const daciIndex = 5
 
-	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "t")
 
 	type testCase struct {
 		description           string
@@ -268,6 +269,9 @@ func TestInvertedJoiner(t *testing.T) {
 		c.post.Projection = true
 		return c
 	}
+	// Note: in all these testcases, the "right hand" columns are the columns of
+	// the inverted index that is used, in the order defined in the index
+	// (followed by the PK).
 	testCases := []testCase{
 		{
 			description: "array intersection",
@@ -283,7 +287,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             arrayIntersectionExpr{t: t},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.TwoIntCols,
-			outputColumns:            []uint32{0, 1},
+			outputColumns:            []uint32{0, 2},
 			expected:                 "[[5 5] [5 50] [20 2] [20 20] [42 24] [42 42]]",
 			expectedWithContinuation: "[[5 5 false] [5 50 true] [20 2 false] [20 20 true] [42 24 false] [42 42 true]]",
 		},
@@ -303,7 +307,7 @@ func TestInvertedJoiner(t *testing.T) {
 			},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.TwoIntCols,
-			outputColumns:            []uint32{0, 1},
+			outputColumns:            []uint32{0, 2},
 			expected:                 "[[20 2] [20 20] [42 24] [42 42]]",
 			expectedWithContinuation: "[[20 2 false] [20 20 true] [42 24 false] [42 42 true]]",
 		},
@@ -315,7 +319,7 @@ func TestInvertedJoiner(t *testing.T) {
 			// LeftOuterJoin, LeftSemiJoin and LeftAntiJoin cases below.
 			description: "array intersection and onExpr",
 			indexIdx:    biIndex,
-			onExpr:      "@2 > 20",
+			onExpr:      "@3 > 20",
 			input: [][]tree.Datum{
 				{tree.NewDInt(tree.DInt(5))}, {tree.NewDInt(tree.DInt(20))}, {tree.NewDInt(tree.DInt(42))},
 			},
@@ -323,7 +327,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             arrayIntersectionExpr{t: t},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.TwoIntCols,
-			outputColumns:            []uint32{0, 1},
+			outputColumns:            []uint32{0, 2},
 			expected:                 "[[5 50] [42 24] [42 42]]",
 			expectedWithContinuation: "[[5 50 false] [42 24 false] [42 42 true]]",
 		},
@@ -333,7 +337,7 @@ func TestInvertedJoiner(t *testing.T) {
 			// NULL for the right side.
 			description: "array intersection and onExpr and LeftOuterJoin",
 			indexIdx:    biIndex,
-			onExpr:      "@2 > 20",
+			onExpr:      "@3 > 20",
 			input: [][]tree.Datum{
 				{tree.NewDInt(tree.DInt(5))}, {tree.NewDInt(tree.DInt(20))}, {tree.NewDInt(tree.DInt(42))},
 			},
@@ -341,7 +345,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:  arrayIntersectionExpr{t: t},
 			joinType:      descpb.LeftOuterJoin,
 			outputTypes:   types.TwoIntCols,
-			outputColumns: []uint32{0, 1},
+			outputColumns: []uint32{0, 2},
 			// Similar to previous, but the left side input failing the onExpr is emitted.
 			expected:                 "[[5 50] [20 NULL] [42 24] [42 42]]",
 			expectedWithContinuation: "[[5 50 false] [20 NULL false] [42 24 false] [42 42 true]]",
@@ -351,7 +355,7 @@ func TestInvertedJoiner(t *testing.T) {
 			// the output.
 			description: "array intersection and onExpr and LeftSemiJoin",
 			indexIdx:    biIndex,
-			onExpr:      "@2 > 20",
+			onExpr:      "@3 > 20",
 			input: [][]tree.Datum{
 				{tree.NewDInt(tree.DInt(5))}, {tree.NewDInt(tree.DInt(20))}, {tree.NewDInt(tree.DInt(42))},
 			},
@@ -367,7 +371,7 @@ func TestInvertedJoiner(t *testing.T) {
 			// input, which does not match, is output.
 			description: "array intersection and onExpr and LeftAntiJoin",
 			indexIdx:    biIndex,
-			onExpr:      "@2 > 20",
+			onExpr:      "@3 > 20",
 			input: [][]tree.Datum{
 				{tree.NewDInt(tree.DInt(5))}, {tree.NewDInt(tree.DInt(20))}, {tree.NewDInt(tree.DInt(42))},
 			},
@@ -394,7 +398,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             jsonIntersectionExpr{},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.TwoIntCols,
-			outputColumns:            []uint32{0, 1},
+			outputColumns:            []uint32{0, 2},
 			expected:                 "[[5 5] [42 42] [20 20]]",
 			expectedWithContinuation: "[[5 5 false] [42 42 false] [20 20 false]]",
 		},
@@ -415,7 +419,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:  jsonUnionExpr{},
 			joinType:      descpb.InnerJoin,
 			outputTypes:   types.TwoIntCols,
-			outputColumns: []uint32{0, 1},
+			outputColumns: []uint32{0, 2},
 			// The ordering looks odd because of how the JSON values were ordered in the
 			// inverted index. The spans we are reading for the first batch of two inputs
 			// 5, 42 are (c1, 0), (c1, 4), (c2, 2), (c2, 5). (c1, 0) causes
@@ -498,7 +502,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             arrayIntersectionExpr{t: t},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.ThreeIntCols,
-			outputColumns:            []uint32{0, 1, 2},
+			outputColumns:            []uint32{0, 1, 4},
 			expected:                 "[[5 50 5] [42 420 42]]",
 			expectedWithContinuation: "[[5 50 5 false] [42 420 42 false]]",
 		},
@@ -520,7 +524,7 @@ func TestInvertedJoiner(t *testing.T) {
 			},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.ThreeIntCols,
-			outputColumns:            []uint32{0, 1, 2},
+			outputColumns:            []uint32{0, 1, 4},
 			expected:                 "[[20 200 20] [42 420 42]]",
 			expectedWithContinuation: "[[20 200 20 false] [42 420 42 false]]",
 		},
@@ -531,7 +535,7 @@ func TestInvertedJoiner(t *testing.T) {
 			// input 20 has its joined rows completely eliminated.
 			description: "array intersection and onExpr two-column index",
 			indexIdx:    dbiIndex,
-			onExpr:      "@3 > 20",
+			onExpr:      "@5 > 20",
 			input: [][]tree.Datum{
 				{tree.NewDInt(tree.DInt(5)), tree.NewDInt(tree.DInt(50))},
 				{tree.NewDInt(tree.DInt(20)), tree.NewDInt(tree.DInt(200))},
@@ -543,7 +547,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             arrayIntersectionExpr{t: t},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.ThreeIntCols,
-			outputColumns:            []uint32{0, 1, 2},
+			outputColumns:            []uint32{0, 1, 4},
 			expected:                 "[[42 420 42]]",
 			expectedWithContinuation: "[[42 420 42 false]]",
 		},
@@ -566,7 +570,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             jsonIntersectionExpr{},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.ThreeIntCols,
-			outputColumns:            []uint32{0, 1, 2},
+			outputColumns:            []uint32{0, 1, 4},
 			expected:                 "[[5 50 5] [20 200 20]]",
 			expectedWithContinuation: "[[5 50 5 false] [20 200 20 false]]",
 		},
@@ -588,7 +592,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             jsonUnionExpr{},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.ThreeIntCols,
-			outputColumns:            []uint32{0, 1, 2},
+			outputColumns:            []uint32{0, 1, 4},
 			expected:                 "[[5 50 5] [42 420 42] [20 200 20]]",
 			expectedWithContinuation: "[[5 50 5 false] [42 420 42 false] [20 200 20 false]]",
 		},
@@ -610,7 +614,7 @@ func TestInvertedJoiner(t *testing.T) {
 			datumsToExpr:             jsonIntersectionExpr{},
 			joinType:                 descpb.InnerJoin,
 			outputTypes:              types.ThreeIntCols,
-			outputColumns:            []uint32{0, 1, 2},
+			outputColumns:            []uint32{0, 1, 3},
 			expected:                 "[[5 50 5] [42 420 42] [20 200 20]]",
 			expectedWithContinuation: "[[5 50 5 false] [42 420 42 false] [20 200 20 false]]",
 		},
@@ -619,23 +623,24 @@ func TestInvertedJoiner(t *testing.T) {
 		testCases[i] = initCommonFields(c)
 	}
 
-	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	st := s.ClusterSettings()
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContextWithCodec(s.Codec(), st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
 		},
-		Txn:         kv.NewTxn(ctx, s.DB(), s.NodeID()),
+		Txn:         kv.NewTxn(ctx, s.DB(), srv.NodeID()),
 		DiskMonitor: diskMonitor,
 	}
 	for _, c := range testCases {
@@ -648,31 +653,46 @@ func TestInvertedJoiner(t *testing.T) {
 				for rowIdx, row := range c.input {
 					encRow := make(rowenc.EncDatumRow, len(row))
 					for i, d := range row {
-						encRow[i] = rowenc.DatumToEncDatum(c.inputTypes[i], d)
+						encRow[i] = rowenc.DatumToEncDatumUnsafe(c.inputTypes[i], d)
 					}
 					encRows[rowIdx] = encRow
 				}
 				in := distsqlutils.NewRowBuffer(c.inputTypes, encRows, distsqlutils.RowBufferArgs{})
 				out := &distsqlutils.RowBuffer{}
 
+				index := td.ActiveIndexes()[c.indexIdx]
+				var fetchColIDs []descpb.ColumnID
+				for _, c := range td.IndexFullColumns(index) {
+					fetchColIDs = append(fetchColIDs, c.GetID())
+				}
+				invCol, err := catalog.MustFindColumnByID(td, index.InvertedColumnID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var fetchSpec fetchpb.IndexFetchSpec
+				if err := rowenc.InitIndexFetchSpec(
+					&fetchSpec,
+					s.Codec(),
+					td, index, fetchColIDs,
+				); err != nil {
+					t.Fatal(err)
+				}
+
 				post := c.post
 				if outputGroupContinuation {
 					// Append the continuation column which is the last column.
-					// The total number of columns is the number of left columns
-					// + 4 columns from the right (a, b, c, d) + 1 continuation
-					// column, so the index of the continuation column is the
-					// number of left columns + 4.
-					continuationColumnIdx := uint32(len(c.inputTypes) + 4)
+					continuationColumnIdx := uint32(len(c.inputTypes) + len(fetchColIDs))
 					post.OutputColumns = append(c.outputColumns, continuationColumnIdx)
 				} else {
 					post.OutputColumns = c.outputColumns
 				}
+
 				ij, err := newInvertedJoiner(
+					ctx,
 					&flowCtx,
 					0, /* processorID */
 					&execinfrapb.InvertedJoinerSpec{
-						Table:    *td.TableDesc(),
-						IndexIdx: c.indexIdx,
+						FetchSpec: fetchSpec,
 						// The invertedJoiner does not look at InvertedExpr since that information
 						// is encapsulated in the DatumsToInvertedExpr parameter.
 						InvertedExpr:                      execinfrapb.Expression{},
@@ -680,16 +700,16 @@ func TestInvertedJoiner(t *testing.T) {
 						Type:                              c.joinType,
 						OutputGroupContinuationForLeftRow: outputGroupContinuation,
 						PrefixEqualityColumns:             c.prefixEqualityColumns,
+						InvertedColumnOriginalType:        invCol.GetType(),
 					},
 					c.datumsToExpr,
 					in,
 					&post,
-					out,
 				)
 				require.NoError(t, err)
 				// Small batch size to exercise multiple batches.
 				ij.(*invertedJoiner).SetBatchSize(2)
-				ij.Run(ctx)
+				ij.Run(ctx, out)
 				require.True(t, in.Done)
 				require.True(t, out.ProducerClosed())
 
@@ -719,65 +739,79 @@ func TestInvertedJoiner(t *testing.T) {
 
 func TestInvertedJoinerDrain(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	aFn := func(row int) tree.Datum {
 		return tree.NewDInt(tree.DInt(row))
 	}
 	bFn := func(row int) tree.Datum {
-		arr := tree.NewDArray(types.Int)
-		arr.Array = tree.Datums{tree.NewDInt(tree.DInt(row / 10)), tree.NewDInt(tree.DInt(row % 10))}
-		return arr
+		return tree.NewDArrayFromDatums(
+			types.Int, tree.Datums{tree.NewDInt(tree.DInt(row / 10)), tree.NewDInt(tree.DInt(row % 10))},
+		)
 	}
 	sqlutils.CreateTable(t, sqlDB, "t",
-		"a INT, b INT ARRAY, INVERTED INDEX bi (b)",
+		"a INT PRIMARY KEY, b INT ARRAY, INVERTED INDEX bi (b)",
 		invertedJoinerNumRows,
 		sqlutils.ToRowFn(aFn, bFn))
 	const biIndex = 1
-	td := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	td := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "t")
 
 	tracer := s.TracerI().(*tracing.Tracer)
-	ctx, sp := tracing.StartVerboseTrace(context.Background(), tracer, "test flow ctx")
+	ctx, sp := tracer.StartSpanCtx(context.Background(), "test flow ctx", tracing.WithRecording(tracingpb.RecordingVerbose))
 	defer sp.Finish()
-	st := cluster.MakeTestingClusterSettings()
-	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
+	st := s.ClusterSettings()
+	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), nil /* statsCollector */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tempEngine.Close()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContextWithCodec(s.Codec(), st)
 	defer evalCtx.Stop(context.Background())
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
-	rootTxn := kv.NewTxn(ctx, s.DB(), s.NodeID())
-	leafInputState := rootTxn.GetLeafTxnInputState(ctx)
-	leafTxn := kv.NewLeafTxn(ctx, s.DB(), s.NodeID(), &leafInputState)
+	rootTxn := kv.NewTxn(ctx, s.DB(), srv.NodeID())
+	leafInputState, err := rootTxn.GetLeafTxnInputState(ctx, nil /* readsTree */)
+	require.NoError(t, err)
+	leafTxn := kv.NewLeafTxn(ctx, s.DB(), srv.NodeID(), leafInputState, nil /* header */)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
 		},
 		Txn:         leafTxn,
+		Gateway:     false,
 		DiskMonitor: diskMonitor,
 	}
 
-	testReaderProcessorDrain(ctx, t, func(out execinfra.RowReceiver) (execinfra.Processor, error) {
+	testReaderProcessorDrain(ctx, t, func() (execinfra.Processor, error) {
+		var fetchSpec fetchpb.IndexFetchSpec
+		if err := rowenc.InitIndexFetchSpec(
+			&fetchSpec,
+			s.Codec(),
+			td, td.ActiveIndexes()[biIndex],
+			[]descpb.ColumnID{1, 2},
+		); err != nil {
+			t.Fatal(err)
+		}
 		return newInvertedJoiner(
+			ctx,
 			&flowCtx,
 			0, /* processorID */
 			&execinfrapb.InvertedJoinerSpec{
-				Table:        *td.TableDesc(),
-				IndexIdx:     biIndex,
-				InvertedExpr: execinfrapb.Expression{},
-				Type:         descpb.InnerJoin,
+				FetchSpec:                  fetchSpec,
+				InvertedExpr:               execinfrapb.Expression{},
+				Type:                       descpb.InnerJoin,
+				InvertedColumnOriginalType: types.Json,
 			},
 			arrayIntersectionExpr{t: t},
 			distsqlutils.NewRowBuffer(types.TwoIntCols, nil /* rows */, distsqlutils.RowBufferArgs{}),
 			&execinfrapb.PostProcessSpec{},
-			out,
 		)
 	})
 }

@@ -14,13 +14,12 @@ go_library(
         "//pkg/workload/histogram",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_spf13_pflag//:pflag",
-        "@org_golang_x_exp//rand",
     ],
 )
 
 go_test(
     name = "bank_test",
-    size = "small",
+    size = "medium",
     srcs = [
         "bank_test.go",
         "main_test.go",
@@ -28,14 +27,17 @@ go_test(
     embed = [":bank"],
     deps = [
         "//pkg/base",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
+        "//pkg/util/log",
         "//pkg/util/randutil",
+        "//pkg/workload",
         "//pkg/workload/workloadsql",
+        "@com_github_stretchr_testify//require",
     ],
 )

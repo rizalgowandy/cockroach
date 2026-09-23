@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -23,18 +18,18 @@ type ReqOrdering = colinfo.ColumnOrdering
 func planReqOrdering(plan planNode) ReqOrdering {
 	switch n := plan.(type) {
 	case *limitNode:
-		return planReqOrdering(n.plan)
+		return planReqOrdering(n.input)
 	case *max1RowNode:
-		return planReqOrdering(n.plan)
-	case *spoolNode:
-		return planReqOrdering(n.source)
+		return planReqOrdering(n.input)
 	case *saveTableNode:
-		return planReqOrdering(n.source)
-	case *serializeNode:
-		return planReqOrdering(n.source)
+		return planReqOrdering(n.input)
 	case *deleteNode:
 		if n.run.rowsNeeded {
-			return planReqOrdering(n.source)
+			return planReqOrdering(n.input)
+		}
+	case *deleteSwapNode:
+		if n.run.rowsNeeded {
+			return planReqOrdering(n.input)
 		}
 
 	case *filterNode:
@@ -52,13 +47,17 @@ func planReqOrdering(plan planNode) ReqOrdering {
 	case *windowNode:
 		// TODO: window partitions can be ordered if the source is ordered
 		// appropriately.
+	case *vectorSearchNode:
+	case *vectorMutationSearchNode:
+		// TODO(drewk,mw5h): vector partition search could pass through the input
+		// ordering.
 	case *joinNode:
 		return n.reqOrdering
 	case *unionNode:
 		return n.reqOrdering
 	case *insertNode, *insertFastPathNode:
 		// TODO(knz): RETURNING is ordered by the PK.
-	case *updateNode, *upsertNode:
+	case *updateNode, *updateSwapNode, *upsertNode:
 		// After an update, the original order may have been destroyed.
 		// For example, if the PK is updated by a SET expression.
 		// So we can't assume any ordering.

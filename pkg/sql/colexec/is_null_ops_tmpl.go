@@ -1,16 +1,10 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for is_null_ops.eg.go. It's formatted
@@ -26,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -77,11 +72,14 @@ type is_KINDNullProjOp struct {
 
 var _ colexecop.Operator = &is_KINDNullProjOp{}
 
-func (o *is_KINDNullProjOp) Next() coldata.Batch {
-	batch := o.Input.Next()
+func (o *is_KINDNullProjOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batch, meta := o.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	n := batch.Length()
 	if n == 0 {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
 	vec := batch.ColVec(o.colIdx)
 	nulls := vec.Nulls()
@@ -90,11 +88,6 @@ func (o *is_KINDNullProjOp) Next() coldata.Batch {
 	// {{end}}
 	projVec := batch.ColVec(o.outputIdx)
 	projCol := projVec.Bool()
-	if projVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		projVec.Nulls().UnsetNulls()
-	}
 	if nulls.MaybeHasNulls() {
 		if sel := batch.Selection(); sel != nil {
 			sel = sel[:n]
@@ -120,7 +113,7 @@ func (o *is_KINDNullProjOp) Next() coldata.Batch {
 			}
 		}
 	}
-	return batch
+	return batch, nil
 }
 
 // {{end}}
@@ -189,12 +182,15 @@ type is_KINDNullSelOp struct {
 
 var _ colexecop.Operator = &is_KINDNullSelOp{}
 
-func (o *is_KINDNullSelOp) Next() coldata.Batch {
+func (o *is_KINDNullSelOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	for {
-		batch := o.Input.Next()
+		batch, meta := o.Input.Next()
+		if meta != nil {
+			return nil, meta
+		}
 		n := batch.Length()
 		if n == 0 {
-			return batch
+			return batch, nil
 		}
 		var idx int
 		vec := batch.ColVec(o.colIdx)
@@ -220,7 +216,7 @@ func (o *is_KINDNullSelOp) Next() coldata.Batch {
 			}
 			if idx > 0 {
 				batch.SetLength(idx)
-				return batch
+				return batch, nil
 			}
 			// {{if not .IsTuple}}
 		} else {
@@ -228,7 +224,7 @@ func (o *is_KINDNullSelOp) Next() coldata.Batch {
 			if o.negate {
 				// o.negate is true, so we select all tuples, i.e. we don't need to
 				// modify the batch and can just return it.
-				return batch
+				return batch, nil
 			}
 			// o.negate is false, so we omit all tuples from this batch and move onto
 			// the next one.
@@ -249,8 +245,10 @@ func _MAYBE_SELECT(
 	// {{define "maybeSelect" -}}
 
 	// {{if .IsTuple}}
-	selectTuple := nulls.NullAt(i) != o.negate
-	if !selectTuple {
+	var selectTuple bool
+	if nulls.NullAt(i) {
+		selectTuple = !o.negate
+	} else {
 		selectTuple = isTupleNull(datums.Get(i).(tree.Datum), o.negate)
 	}
 	if selectTuple {

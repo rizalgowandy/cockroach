@@ -1,25 +1,20 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colrpc
 
 import (
 	"context"
 	"io"
-	"math"
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow/go/arrow/array"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/colserde"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -42,6 +37,13 @@ type flowStreamServer interface {
 	Recv() (*execinfrapb.ProducerMessage, error)
 }
 
+// streamAndProducerHeader is sent over Inbox.streamCh to pass both the
+// stream and the producer identity from RunWithStream to Init.
+type streamAndProducerHeader struct {
+	stream flowStreamServer
+	header *execinfrapb.ProducerHeader
+}
+
 // Inbox is used to expose data from remote flows through a colexecop.Operator
 // interface. FlowStream RPC handlers should call RunWithStream (which blocks
 // until operation terminates, gracefully or unexpectedly) to pass the stream
@@ -58,17 +60,19 @@ type Inbox struct {
 
 	typs []*types.T
 
-	allocator  *colmem.Allocator
-	converter  *colserde.ArrowBatchConverter
-	serializer *colserde.RecordBatchSerializer
+	allocator    *colmem.Allocator
+	deserializer colexecutils.Deserializer
 
 	// streamID is used to overwrite a caller's streamID
 	// in the ctx argument of Next and DrainMeta.
 	streamID execinfrapb.StreamID
 
+	// producer is the ID of the producer, used for debugging.
+	producer base.SQLInstanceID
+
 	// streamCh is the channel over which the stream is passed from the stream
 	// handler to the reader goroutine.
-	streamCh chan flowStreamServer
+	streamCh chan streamAndProducerHeader
 	// contextCh is the channel over which the reader goroutine passes the
 	// context to the stream handler so that it can listen for context
 	// cancellation.
@@ -77,6 +81,9 @@ type Inbox struct {
 	// timeoutCh is the channel over which an error will be sent if the reader
 	// goroutine should exit while waiting for a stream.
 	timeoutCh chan error
+
+	// flowCtxDone is the Done() channel of the flow context of the Inbox host.
+	flowCtxDone <-chan struct{}
 
 	// errCh is the channel that RunWithStream will block on, waiting until the
 	// Inbox does not need a stream any more. An error will only be sent on this
@@ -91,9 +98,9 @@ type Inbox struct {
 	// done prevents double closing. It should not be used by the RunWithStream
 	// goroutine.
 	done bool
-	// bufferedMeta buffers any metadata found in Next when reading from the
-	// stream and is returned by DrainMeta.
-	bufferedMeta []execinfrapb.ProducerMetadata
+	// remoteMeta, if set, contains the remaining pieces of remote metadata that
+	// have already been recv'ed but not yet propagated out.
+	remoteMeta []execinfrapb.ProducerMetadata
 
 	// stream is the RPC stream. It is set when RunWithStream is called but
 	// only the Next/DrainMeta goroutine may access it.
@@ -118,11 +125,6 @@ type Inbox struct {
 	// batches. Note that the stop watch is safe for concurrent use, so it
 	// doesn't have to have an explicit synchronization like fields above.
 	deserializationStopWatch *timeutil.StopWatch
-
-	scratch struct {
-		data []*array.Data
-		b    coldata.Batch
-	}
 }
 
 var _ colexecop.Operator = &Inbox{}
@@ -131,27 +133,33 @@ var _ colexecop.Operator = &Inbox{}
 func NewInbox(
 	allocator *colmem.Allocator, typs []*types.T, streamID execinfrapb.StreamID,
 ) (*Inbox, error) {
-	c, err := colserde.NewArrowBatchConverter(typs)
-	if err != nil {
-		return nil, err
-	}
-	s, err := colserde.NewRecordBatchSerializer(typs)
-	if err != nil {
-		return nil, err
-	}
 	i := &Inbox{
 		typs:                     typs,
 		allocator:                allocator,
-		converter:                c,
-		serializer:               s,
 		streamID:                 streamID,
-		streamCh:                 make(chan flowStreamServer, 1),
+		streamCh:                 make(chan streamAndProducerHeader, 1),
 		contextCh:                make(chan context.Context, 1),
 		timeoutCh:                make(chan error, 1),
 		errCh:                    make(chan error, 1),
 		deserializationStopWatch: timeutil.NewStopWatch(),
 	}
-	i.scratch.data = make([]*array.Data, len(typs))
+	err := i.deserializer.Init(allocator, typs, false /* alwaysReallocate */)
+	return i, err
+}
+
+// NewInboxWithFlowCtxDone creates a new Inbox when the done channel of the flow
+// context is available.
+func NewInboxWithFlowCtxDone(
+	allocator *colmem.Allocator,
+	typs []*types.T,
+	streamID execinfrapb.StreamID,
+	flowCtxDone <-chan struct{},
+) (*Inbox, error) {
+	i, err := NewInbox(allocator, typs, streamID)
+	if err != nil {
+		return nil, err
+	}
+	i.flowCtxDone = flowCtxDone
 	return i, nil
 }
 
@@ -161,10 +169,11 @@ func NewInboxWithAdmissionControl(
 	allocator *colmem.Allocator,
 	typs []*types.T,
 	streamID execinfrapb.StreamID,
+	flowCtxDone <-chan struct{},
 	admissionQ *admission.WorkQueue,
 	admissionInfo admission.WorkInfo,
 ) (*Inbox, error) {
-	i, err := NewInbox(allocator, typs, streamID)
+	i, err := NewInboxWithFlowCtxDone(allocator, typs, streamID, flowCtxDone)
 	if err != nil {
 		return nil, err
 	}
@@ -185,21 +194,34 @@ func (i *Inbox) close() {
 	}
 }
 
+// checkFlowCtxCancellation returns an error if the flow context has already
+// been canceled.
+func (i *Inbox) checkFlowCtxCancellation() error {
+	select {
+	case <-i.flowCtxDone:
+		return cancelchecker.QueryCanceledError
+	default:
+		return nil
+	}
+}
+
 // RunWithStream sets the Inbox's stream and waits until either streamCtx is
-// canceled, a caller of Next cancels the context passed into Init, or any error
-// is encountered on the stream by the Next goroutine.
-//
-// flowCtxDone is listened on only during the setup of the handler, before the
-// readerCtx is received. This is needed in case Inbox.Init is never called.
+// canceled, the Inbox's host cancels the flow context, a caller of Next cancels
+// the context passed into Init, or any error is encountered on the stream by
+// the Next goroutine.
 func (i *Inbox) RunWithStream(
-	streamCtx context.Context, stream flowStreamServer, flowCtxDone <-chan struct{},
+	streamCtx context.Context, stream flowStreamServer, firstMsgHeader *execinfrapb.ProducerHeader,
 ) error {
 	streamCtx = logtags.AddTag(streamCtx, "streamID", i.streamID)
-	log.VEvent(streamCtx, 2, "Inbox handling stream")
+	var producer base.SQLInstanceID
+	if firstMsgHeader != nil {
+		producer = firstMsgHeader.Producer
+	}
+	log.VEventf(streamCtx, 2, "Inbox handling stream from %d", producer)
 	defer log.VEvent(streamCtx, 2, "Inbox exited stream handler")
 	// Pass the stream to the reader goroutine (non-blocking) and get the
 	// context to listen for cancellation.
-	i.streamCh <- stream
+	i.streamCh <- streamAndProducerHeader{stream: stream, header: firstMsgHeader}
 	var readerCtx context.Context
 	select {
 	case err := <-i.errCh:
@@ -208,8 +230,12 @@ func (i *Inbox) RunWithStream(
 	case readerCtx = <-i.contextCh:
 		log.VEvent(streamCtx, 2, "Inbox reader arrived")
 	case <-streamCtx.Done():
-		return errors.Wrap(streamCtx.Err(), "streamCtx error while waiting for reader (remote client canceled)")
-	case <-flowCtxDone:
+		return errors.Wrapf(
+			streamCtx.Err(),
+			"streamCtx error while waiting for reader (remote client %d canceled stream %d)",
+			producer, i.streamID,
+		)
+	case <-i.flowCtxDone:
 		// The flow context of the inbox host has been canceled. This can occur
 		// e.g. when the query is canceled, or when another stream encountered
 		// an unrecoverable error forcing it to shutdown the flow.
@@ -219,21 +245,28 @@ func (i *Inbox) RunWithStream(
 	// Now wait for one of the events described in the method comment. If a
 	// cancellation is encountered, nothing special must be done to cancel the
 	// reader goroutine as returning from the handler will close the stream.
-	//
-	// Note that we don't listen for cancellation on flowCtxDone because
-	// readerCtx must be the child of the flow context.
 	select {
 	case err := <-i.errCh:
 		// nil will be read from errCh when the channel is closed.
 		return err
+	case <-i.flowCtxDone:
+		// The flow context of the inbox host has been canceled. This can occur
+		// e.g. when the query is canceled, or when another stream encountered
+		// an unrecoverable error forcing it to shutdown the flow.
+		return cancelchecker.QueryCanceledError
 	case <-readerCtx.Done():
-		// The reader canceled the stream meaning that it no longer needs any
-		// more data from the outbox. This is a graceful termination, so we
-		// return nil.
-		return nil
+		// readerCtx is canceled, but we don't know whether it was because the
+		// flow context was canceled or for other reason. In the former case we
+		// have an ungraceful shutdown whereas in the latter case we have a
+		// graceful one.
+		return i.checkFlowCtxCancellation()
 	case <-streamCtx.Done():
 		// The client canceled the stream.
-		return errors.Wrap(streamCtx.Err(), "streamCtx error in Inbox stream handler (remote client canceled)")
+		return errors.Wrapf(
+			streamCtx.Err(),
+			"streamCtx error in Inbox stream handler (remote client %d canceled stream %d)",
+			producer, i.streamID,
+		)
 	}
 }
 
@@ -256,17 +289,27 @@ func (i *Inbox) Init(ctx context.Context) {
 		// Wait for the stream to be initialized. We're essentially waiting for
 		// the remote connection.
 		select {
-		case i.stream = <-i.streamCh:
+		case streamAndHeader := <-i.streamCh:
+			i.stream = streamAndHeader.stream
+			if streamAndHeader.header != nil {
+				i.producer = streamAndHeader.header.Producer
+			}
 		case err := <-i.timeoutCh:
 			i.errCh <- errors.Wrap(err, "remote stream arrived too late")
 			return err
+		case <-i.flowCtxDone:
+			i.errCh <- cancelchecker.QueryCanceledError
+			return cancelchecker.QueryCanceledError
 		case <-i.Ctx.Done():
-			// Our reader canceled the context meaning that it no longer needs
-			// any more data from the outbox. This is a graceful termination, so
-			// we don't send any error on errCh and only return an error. This
-			// will close the inbox (making the stream handler exit gracefully)
-			// and will stop the current goroutine from proceeding further.
-			return i.Ctx.Err()
+			// errToThrow is propagated to the reader of the Inbox.
+			errToThrow := i.Ctx.Err()
+			if err := i.checkFlowCtxCancellation(); err != nil {
+				// This is an ungraceful termination because the flow context
+				// has been canceled.
+				i.errCh <- err
+				errToThrow = err
+			}
+			return errToThrow
 		}
 
 		if i.ctxInterceptorFn != nil {
@@ -287,18 +330,28 @@ func (i *Inbox) Init(ctx context.Context) {
 // Next returns the next batch. It will block until there is data available.
 // The Inbox will exit when either the context passed in Init() is canceled or
 // when DrainMeta goroutine tells it to do so.
-func (i *Inbox) Next() coldata.Batch {
+func (i *Inbox) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if i.done {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
+	}
+	if len(i.remoteMeta) > 0 {
+		meta := i.remoteMeta[0]
+		i.remoteMeta[0] = execinfrapb.ProducerMetadata{}
+		i.remoteMeta = i.remoteMeta[1:]
+		return nil, &meta
 	}
 
+	var ungracefulStreamTermination bool
 	defer func() {
 		// Catch any panics that occur and close the Inbox in order to not leak
 		// the goroutine listening for context cancellation. The Inbox must
 		// still be closed during normal termination.
 		if panicObj := recover(); panicObj != nil {
-			// Only close the Inbox here in case of an ungraceful termination.
-			i.close()
+			if ungracefulStreamTermination {
+				// Only close the Inbox here in case of an ungraceful
+				// termination.
+				i.close()
+			}
 			err := logcrash.PanicAsError(0, panicObj)
 			log.VEventf(i.Ctx, 1, "Inbox encountered an error in Next: %v", err)
 			// Note that here we use InternalError to propagate the error
@@ -312,40 +365,69 @@ func (i *Inbox) Next() coldata.Batch {
 	defer i.deserializationStopWatch.Stop()
 	for {
 		i.deserializationStopWatch.Stop()
+		cleanup := ash.SetWorkState(
+			i.admissionInfo.TenantID,
+			ash.WorkloadInfo{
+				WorkloadID:    i.admissionInfo.WorkloadID,
+				AppNameID:     i.admissionInfo.AppNameID,
+				GatewayNodeID: i.admissionInfo.GatewayNodeID,
+				WorkloadType:  i.admissionInfo.WorkloadType,
+			},
+			ash.WorkNetwork, "InboxRecv")
 		m, err := i.stream.Recv()
+		cleanup()
 		i.deserializationStopWatch.Start()
 		atomic.AddInt64(&i.statsAtomics.numMessages, 1)
 		if err != nil {
 			if err == io.EOF {
 				// Done.
 				i.close()
-				return coldata.ZeroBatch
+				return coldata.ZeroBatch, nil
 			}
 			// Note that here err can be stream's context cancellation.
 			// Regardless of the cause we want to propagate such an error as
 			// expected one in all cases so that the caller could decide on how
 			// to handle it.
-			err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "inbox communication error")
+			log.VEventf(
+				i.Ctx, 2, "Inbox communication error in stream %d from %d: %v", i.streamID, i.producer, err,
+			)
+			err = pgerror.Wrapf(
+				err, pgcode.InternalConnectionFailure, "inbox communication error in stream %d from %d",
+				i.streamID, i.producer,
+			)
 			i.errCh <- err
+			ungracefulStreamTermination = true
 			colexecerror.ExpectedError(err)
 		}
 		if len(m.Data.Metadata) != 0 {
+			log.VEvent(i.Ctx, 2, "Inbox received metadata")
+			// If an error was encountered, it needs to be propagated
+			// immediately via the panic mechanism.
+			var receivedErr error
 			for _, rpm := range m.Data.Metadata {
 				meta, ok := execinfrapb.RemoteProducerMetaToLocalMeta(i.Ctx, rpm)
 				if !ok {
 					continue
 				}
-				if meta.Err != nil {
-					// If an error was encountered, it needs to be propagated
-					// immediately. All other metadata will simply be buffered
-					// and returned in DrainMeta.
-					colexecerror.ExpectedError(meta.Err)
+				if meta.Err != nil && receivedErr == nil {
+					receivedErr = meta.Err
+				} else {
+					i.remoteMeta = append(i.remoteMeta, meta)
 				}
-				i.bufferedMeta = append(i.bufferedMeta, meta)
+			}
+			if receivedErr != nil {
+				colexecerror.ExpectedError(receivedErr)
+			}
+			if len(i.remoteMeta) > 0 {
+				meta := i.remoteMeta[0]
+				i.remoteMeta[0] = execinfrapb.ProducerMetadata{}
+				i.remoteMeta = i.remoteMeta[1:]
+				return nil, &meta
 			}
 			// Continue until we get the next batch or EOF.
 			continue
 		}
+		log.VEvent(i.Ctx, 2, "Inbox received batch")
 		if len(m.Data.RawBytes) == 0 {
 			// Protect against Deserialization panics by skipping empty messages.
 			continue
@@ -354,7 +436,7 @@ func (i *Inbox) Next() coldata.Batch {
 		atomic.AddInt64(&i.statsAtomics.bytesRead, numSerializedBytes)
 		// Update the allocator since we're holding onto the serialized bytes
 		// for now.
-		i.allocator.AdjustMemoryUsage(numSerializedBytes)
+		i.allocator.AdjustMemoryUsageAfterAllocation(numSerializedBytes)
 		// Do admission control after memory accounting for the serialized bytes
 		// and before deserialization.
 		if i.admissionQ != nil {
@@ -364,27 +446,15 @@ func (i *Inbox) Next() coldata.Batch {
 				colexecerror.ExpectedError(err)
 			}
 		}
-		i.scratch.data = i.scratch.data[:0]
-		batchLength, err := i.serializer.Deserialize(&i.scratch.data, m.Data.RawBytes)
+		batch := i.deserializer.Deserialize(m.Data.RawBytes)
 		// Eagerly throw away the RawBytes memory.
 		m.Data.RawBytes = nil
-		if err != nil {
-			colexecerror.InternalError(err)
-		}
-		// We rely on the outboxes to produce reasonably sized batches.
-		const maxBatchMemSize = math.MaxInt64
-		i.scratch.b, _ = i.allocator.ResetMaybeReallocate(i.typs, i.scratch.b, batchLength, maxBatchMemSize)
-		i.allocator.PerformOperation(i.scratch.b.ColVecs(), func() {
-			if err := i.converter.ArrowToBatch(i.scratch.data, batchLength, i.scratch.b); err != nil {
-				colexecerror.InternalError(err)
-			}
-		})
 		// At this point, we have lost all references to the serialized bytes
 		// (because ArrowToBatch nils out elements in i.scratch.data once
 		// processed), so we update the allocator accordingly.
 		i.allocator.AdjustMemoryUsage(-numSerializedBytes)
-		atomic.AddInt64(&i.statsAtomics.rowsRead, int64(i.scratch.b.Length()))
-		return i.scratch.b
+		atomic.AddInt64(&i.statsAtomics.rowsRead, int64(batch.Length()))
+		return batch, nil
 	}
 }
 
@@ -412,9 +482,7 @@ func (i *Inbox) GetNumMessages() int64 {
 func (i *Inbox) sendDrainSignal(ctx context.Context) error {
 	log.VEvent(ctx, 2, "Inbox sending drain signal to Outbox")
 	if err := i.stream.Send(&execinfrapb.ConsumerSignal{DrainRequest: &execinfrapb.DrainRequest{}}); err != nil {
-		if log.V(1) {
-			log.Warningf(ctx, "Inbox unable to send drain signal to Outbox: %+v", err)
-		}
+		log.Dev.VWarningf(ctx, 1, "Inbox unable to send drain signal to Outbox from %d: %+v", i.producer, err)
 		return err
 	}
 	return nil
@@ -423,8 +491,14 @@ func (i *Inbox) sendDrainSignal(ctx context.Context) error {
 // DrainMeta is part of the colexecop.MetadataSource interface. DrainMeta may
 // not be called concurrently with Next.
 func (i *Inbox) DrainMeta() []execinfrapb.ProducerMetadata {
-	allMeta := i.bufferedMeta
-	i.bufferedMeta = i.bufferedMeta[:0]
+	allMeta := i.remoteMeta
+	i.remoteMeta = nil
+	// We also no longer need the deserializer.
+	i.deserializer.Close(i.Ctx)
+	// The allocator tracks the memory usage for a few things (e.g. the scratch
+	// batch in the deserializer), and when this function returns, we no longer
+	// reference any of those, so we can release all of the allocations.
+	defer i.allocator.ReleaseAll()
 
 	if i.done {
 		// Next exhausted the stream of metadata.
@@ -442,11 +516,17 @@ func (i *Inbox) DrainMeta() []execinfrapb.ProducerMetadata {
 			if err == io.EOF {
 				break
 			}
-			if log.V(1) {
-				log.Warningf(i.Ctx, "Inbox Recv connection error while draining metadata: %+v", err)
-			}
+			log.VEventf(
+				i.Ctx, 1, "Inbox communication error in stream %d from %d while draining metadata: %v",
+				i.streamID, i.producer, err,
+			)
 			return allMeta
 		}
+		if len(msg.Data.Metadata) == 0 {
+			log.VEvent(i.Ctx, 2, "Inbox received batch while draining metadata, ignoring")
+			continue
+		}
+		log.VEvent(i.Ctx, 2, "Inbox received metadata while draining metadata")
 		for _, remoteMeta := range msg.Data.Metadata {
 			meta, ok := execinfrapb.RemoteProducerMetaToLocalMeta(i.Ctx, remoteMeta)
 			if !ok {

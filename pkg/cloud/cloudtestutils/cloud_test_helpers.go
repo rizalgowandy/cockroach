@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloudtestutils
 
@@ -15,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -29,11 +23,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
@@ -106,9 +101,8 @@ func storeFromURI(
 	t *testing.T,
 	uri string,
 	clientFactory blobs.BlobClientFactory,
-	user security.SQLUsername,
-	ie sqlutil.InternalExecutor,
-	kvDB *kv.DB,
+	user username.SQLUsername,
+	db isql.DB,
 	testSettings *cluster.Settings,
 ) cloud.ExternalStorage {
 	conf, err := cloud.ExternalStorageConfFromURI(uri, user)
@@ -117,34 +111,56 @@ func storeFromURI(
 	}
 	// Setup a sink for the given args.
 	s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings,
-		clientFactory, ie, kvDB)
+		clientFactory, db, nil, cloud.NilMetrics)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
 }
 
-// CheckExportStore runs an array of tests against a storeURI.
-func CheckExportStore(
-	t *testing.T,
-	storeURI string,
-	skipSingleFile bool,
-	user security.SQLUsername,
-	ie sqlutil.InternalExecutor,
-	kvDB *kv.DB,
-	testSettings *cluster.Settings,
-) {
+type StoreInfo struct {
+	URI  string
+	User username.SQLUsername
+
+	// Fields below are optional.
+
+	TestSettings  *cluster.Settings
+	DB            isql.DB
+	ExternalIODir string
+}
+
+func (info StoreInfo) testSettings() *cluster.Settings {
+	if info.TestSettings != nil {
+		return info.TestSettings
+	}
+	return cluster.MakeTestingClusterSettings()
+}
+
+// CheckExportStore runs an array of tests against a store.
+func CheckExportStore(t *testing.T, info StoreInfo) {
+	checkExportStore(t, info, false /* skipSingleFile */)
+}
+
+// CheckExportStoreSkipSingleFile runs an array of tests against a store,
+// skipping single file tests.
+func CheckExportStoreSkipSingleFile(t *testing.T, info StoreInfo) {
+	checkExportStore(t, info, true /* skipSingleFile */)
+}
+
+// CheckExportStore runs an array of tests against a store.
+func checkExportStore(t *testing.T, info StoreInfo, skipSingleFile bool) {
 	ioConf := base.ExternalIODirConfig{}
 	ctx := context.Background()
+	testSettings := info.testSettings()
 
-	conf, err := cloud.ExternalStorageConfFromURI(storeURI, user)
+	conf, err := cloud.ExternalStorageConfFromURI(info.URI, info.User)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Setup a sink for the given args.
-	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
-	s, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory, ie, kvDB)
+	clientFactory := blobs.TestBlobServiceClient(info.ExternalIODir)
+	s, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory, info.DB, nil, cloud.NilMetrics)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,13 +189,13 @@ func CheckExportStore(
 				t.Errorf("size mismatch, got %d, expected %d", sz, len(payload))
 			}
 
-			r, err := s.ReadFile(ctx, name)
+			r, _, err := s.ReadFile(ctx, name, cloud.ReadOptions{NoFileSize: true})
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer r.Close()
+			defer r.Close(ctx) //nolint:deferloop
 
-			res, err := ioutil.ReadAll(r)
+			res, err := ioctx.ReadAll(ctx, r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -204,12 +220,12 @@ func CheckExportStore(
 		}
 
 		// Attempt to read (or fetch) it back.
-		res, err := s.ReadFile(ctx, testingFilename)
+		res, _, err := s.ReadFile(ctx, testingFilename, cloud.ReadOptions{NoFileSize: true})
 		if err != nil {
 			t.Fatalf("Could not get reader for %s: %+v", testingFilename, err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -221,19 +237,23 @@ func CheckExportStore(
 		t.Run("rand-readats", func(t *testing.T) {
 			for i := 0; i < 10; i++ {
 				t.Run("", func(t *testing.T) {
-					byteReader := bytes.NewReader(testingContent)
-					offset, length := rng.Int63n(size), rng.Intn(32*1024)
+					offset := rng.Int63n(size)
+					length := 1 + rng.Int63n(32*1024)
 					t.Logf("read %d of file at %d", length, offset)
-					reader, size, err := s.ReadFileAt(ctx, testingFilename, offset)
+					reader, size, err := s.ReadFile(ctx, testingFilename, cloud.ReadOptions{
+						Offset:     offset,
+						LengthHint: length,
+					})
 					require.NoError(t, err)
-					defer reader.Close()
+					defer reader.Close(ctx)
 					require.Equal(t, int64(len(testingContent)), size)
-					expected, got := make([]byte, length), make([]byte, length)
-					_, err = byteReader.Seek(offset, io.SeekStart)
-					require.NoError(t, err)
 
-					expectedN, expectedErr := io.ReadFull(byteReader, expected)
-					gotN, gotErr := io.ReadFull(reader, got)
+					expectedByteReader := io.LimitReader(bytes.NewReader(testingContent[offset:]), length)
+
+					expected := make([]byte, length)
+					expectedN, expectedErr := io.ReadFull(expectedByteReader, expected)
+					got := make([]byte, length)
+					gotN, gotErr := io.ReadFull(ioctx.ReaderCtxAdapter(ctx, reader), got)
 					require.Equal(t, expectedErr != nil, gotErr != nil, "%+v vs %+v", expectedErr, gotErr)
 					require.Equal(t, expectedN, gotN)
 					require.Equal(t, expected, got)
@@ -251,16 +271,16 @@ func CheckExportStore(
 		if err := cloud.WriteFile(ctx, s, testingFilename, bytes.NewReader([]byte("aaa"))); err != nil {
 			t.Fatal(err)
 		}
-		singleFile := storeFromURI(ctx, t, appendPath(t, storeURI, testingFilename), clientFactory,
-			user, ie, kvDB, testSettings)
+		singleFile := storeFromURI(ctx, t, appendPath(t, info.URI, testingFilename), clientFactory,
+			info.User, info.DB, testSettings)
 		defer singleFile.Close()
 
-		res, err := singleFile.ReadFile(ctx, "")
+		res, _, err := singleFile.ReadFile(ctx, "", cloud.ReadOptions{NoFileSize: true})
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -272,20 +292,20 @@ func CheckExportStore(
 	})
 	t.Run("write-single-file-by-uri", func(t *testing.T) {
 		const testingFilename = "B"
-		singleFile := storeFromURI(ctx, t, appendPath(t, storeURI, testingFilename), clientFactory,
-			user, ie, kvDB, testSettings)
+		singleFile := storeFromURI(ctx, t, appendPath(t, info.URI, testingFilename), clientFactory,
+			info.User, info.DB, testSettings)
 		defer singleFile.Close()
 
 		if err := cloud.WriteFile(ctx, singleFile, "", bytes.NewReader([]byte("bbb"))); err != nil {
 			t.Fatal(err)
 		}
 
-		res, err := s.ReadFile(ctx, testingFilename)
+		res, _, err := s.ReadFile(ctx, testingFilename, cloud.ReadOptions{NoFileSize: true})
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -304,16 +324,16 @@ func CheckExportStore(
 		if err := cloud.WriteFile(ctx, s, testingFilename, bytes.NewReader([]byte("aaa"))); err != nil {
 			t.Fatal(err)
 		}
-		singleFile := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, kvDB, testSettings)
+		singleFile := storeFromURI(ctx, t, info.URI, clientFactory, info.User, info.DB, testSettings)
 		defer singleFile.Close()
 
 		// Read a valid file.
-		res, err := singleFile.ReadFile(ctx, testingFilename)
+		res, _, err := s.ReadFile(ctx, testingFilename, cloud.ReadOptions{NoFileSize: true})
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -323,48 +343,37 @@ func CheckExportStore(
 		}
 
 		// Attempt to read a file which does not exist.
-		_, err = singleFile.ReadFile(ctx, "file_does_not_exist")
+		_, _, err = s.ReadFile(ctx, "file does not exist", cloud.ReadOptions{NoFileSize: true})
 		require.Error(t, err)
 		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist), "Expected a file does not exist error but returned %s")
 
-		_, _, err = singleFile.ReadFileAt(ctx, "file_does_not_exist", 0)
+		_, _, err = singleFile.ReadFile(ctx, "file_does_not_exist", cloud.ReadOptions{Offset: 24})
 		require.Error(t, err)
 		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist), "Expected a file does not exist error but returned %s")
 
-		_, _, err = singleFile.ReadFileAt(ctx, "file_does_not_exist", 24)
-		require.Error(t, err)
-		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist), "Expected a file does not exist error but returned %s")
-
+		require.NoError(t, s.Delete(ctx, testingFilename))
+		// Deleting a file that does not exist is okay. This behavior is somewhat
+		// forced by the behavior of S3. In non-versioned S3 buckets, S3 does not
+		// return an error or metadata indicating the object did not exist before
+		// the delete. So if we want consistent behavior across all cloud.Storage
+		// interfaces, and we don't want to read before we delete an S3 object, we
+		// need to treat this as a non-error.
 		require.NoError(t, s.Delete(ctx, testingFilename))
 	})
 }
 
 // CheckListFiles tests the ListFiles() interface method for the ExternalStorage
 // specified by storeURI.
-func CheckListFiles(
-	t *testing.T,
-	storeURI string,
-	user security.SQLUsername,
-	ie sqlutil.InternalExecutor,
-	kvDB *kv.DB,
-	testSettings *cluster.Settings,
-) {
-	CheckListFilesCanonical(t, storeURI, "", user, ie, kvDB, testSettings)
+func CheckListFiles(t *testing.T, info StoreInfo) {
+	CheckListFilesCanonical(t, info, "" /* canonical */)
 }
 
 // CheckListFilesCanonical is like CheckListFiles but takes a canonical prefix
 // that it should expect to see on returned listings, instead of storeURI (e.g.
 // if storeURI automatically expands).
-func CheckListFilesCanonical(
-	t *testing.T,
-	storeURI string,
-	canonical string,
-	user security.SQLUsername,
-	ie sqlutil.InternalExecutor,
-	kvDB *kv.DB,
-	testSettings *cluster.Settings,
-) {
+func CheckListFilesCanonical(t *testing.T, info StoreInfo, canonical string) {
 	ctx := context.Background()
+	testSettings := info.testSettings()
 	dataLetterFiles := []string{"file/letters/dataA.csv", "file/letters/dataB.csv", "file/letters/dataC.csv"}
 	dataNumberFiles := []string{"file/numbers/data1.csv", "file/numbers/data2.csv", "file/numbers/data3.csv"}
 	letterFiles := []string{"file/abc/A.csv", "file/abc/B.csv", "file/abc/C.csv"}
@@ -372,9 +381,9 @@ func CheckListFilesCanonical(
 	fileNames = append(fileNames, letterFiles...)
 	sort.Strings(fileNames)
 
-	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
+	clientFactory := blobs.TestBlobServiceClient(info.ExternalIODir)
 	for _, fileName := range fileNames {
-		file := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, kvDB, testSettings)
+		file := storeFromURI(ctx, t, info.URI, clientFactory, info.User, info.DB, testSettings)
 		if err := cloud.WriteFile(ctx, file, fileName, bytes.NewReader([]byte("bbb"))); err != nil {
 			t.Fatal(err)
 		}
@@ -390,81 +399,133 @@ func CheckListFilesCanonical(
 	}
 
 	t.Run("List", func(t *testing.T) {
+		// NB: When using AfterKey in tests, pick keys such that they do not exist
+		// in the expected output to avoid tests flaking due to different cloud
+		// provider behaviors around AfterKey's inclusiveness.
 		for _, tc := range []struct {
-			name      string
-			uri       string
-			prefix    string
-			delimiter string
-			expected  []string
+			name     string
+			uri      string
+			prefix   string
+			opts     cloud.ListOptions
+			expected []string
 		}{
 			{
 				"root",
-				storeURI,
+				info.URI,
 				"",
-				"",
+				cloud.ListOptions{},
 				foreach(fileNames, func(s string) string { return "/" + s }),
 			},
 			{
 				"file-slash-numbers-slash",
-				storeURI,
+				info.URI,
 				"file/numbers/",
-				"",
+				cloud.ListOptions{},
 				[]string{"data1.csv", "data2.csv", "data3.csv"},
 			},
 			{
 				"root-slash",
-				storeURI,
+				info.URI,
 				"/",
-				"",
+				cloud.ListOptions{},
 				foreach(fileNames, func(s string) string { return s }),
 			},
 			{
 				"file",
-				storeURI,
+				info.URI,
 				"file",
-				"",
+				cloud.ListOptions{},
 				foreach(fileNames, func(s string) string { return strings.TrimPrefix(s, "file") }),
 			},
 			{
 				"file-slash",
-				storeURI,
+				info.URI,
 				"file/",
-				"",
+				cloud.ListOptions{},
 				foreach(fileNames, func(s string) string { return strings.TrimPrefix(s, "file/") }),
 			},
 			{
 				"slash-f",
-				storeURI,
+				info.URI,
 				"/f",
-				"",
+				cloud.ListOptions{},
 				foreach(fileNames, func(s string) string { return strings.TrimPrefix(s, "f") }),
 			},
 			{
 				"nothing",
-				storeURI,
+				info.URI,
 				"nothing",
-				"",
+				cloud.ListOptions{},
 				nil,
 			},
 			{
 				"delim-slash-file-slash",
-				storeURI,
+				info.URI,
 				"file/",
-				"/",
+				cloud.ListOptions{Delimiter: "/"},
 				[]string{"abc/", "letters/", "numbers/"},
 			},
 			{
 				"delim-data",
-				storeURI,
+				info.URI,
 				"",
-				"data",
+				cloud.ListOptions{Delimiter: "data"},
 				[]string{"/file/abc/A.csv", "/file/abc/B.csv", "/file/abc/C.csv", "/file/letters/data", "/file/numbers/data"},
+			},
+			{
+				"afterkey-no-prefix",
+				info.URI,
+				"",
+				cloud.ListOptions{AfterKey: "file/letters/dataB"},
+				[]string{"/file/letters/dataB.csv", "/file/letters/dataC.csv", "/file/numbers/data1.csv", "/file/numbers/data2.csv", "/file/numbers/data3.csv"},
+			},
+			{
+				"afterkey-with-prefix",
+				info.URI,
+				"file/letters/",
+				cloud.ListOptions{AfterKey: "file/letters/dataB"},
+				[]string{"dataB.csv", "dataC.csv"},
+			},
+			{
+				"afterkey-before-prefix",
+				info.URI,
+				"file/numbers/",
+				cloud.ListOptions{AfterKey: "file/abc/D"},
+				[]string{"data1.csv", "data2.csv", "data3.csv"},
+			},
+			{
+				"afterkey-after-prefix",
+				info.URI,
+				"file/abc/",
+				cloud.ListOptions{AfterKey: "file/z"},
+				nil,
+			},
+			{
+				"afterkey-excluded-from-results",
+				info.URI,
+				"file/abc/",
+				cloud.ListOptions{AfterKey: "file/abc/B.csv"},
+				[]string{"C.csv"},
+			},
+			{
+				"afterkey-with-delim",
+				info.URI,
+				"file/",
+				cloud.ListOptions{Delimiter: "/", AfterKey: "file/bar"},
+				[]string{"letters/", "numbers/"},
+			},
+			{
+				"afterkey-applied-after-delim-grouping",
+				info.URI,
+				"file/",
+				cloud.ListOptions{Delimiter: "/", AfterKey: "file/abc/B"},
+				[]string{"letters/", "numbers/"},
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				s := storeFromURI(ctx, t, tc.uri, clientFactory, user, ie, kvDB, testSettings)
+				s := storeFromURI(ctx, t, tc.uri, clientFactory, info.User, info.DB, testSettings)
 				var actual []string
-				require.NoError(t, s.List(ctx, tc.prefix, tc.delimiter, func(f string) error {
+				require.NoError(t, s.List(ctx, tc.prefix, tc.opts, func(f string) error {
 					actual = append(actual, f)
 					return nil
 				}))
@@ -475,7 +536,7 @@ func CheckListFilesCanonical(
 	})
 
 	for _, fileName := range fileNames {
-		file := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, kvDB, testSettings)
+		file := storeFromURI(ctx, t, info.URI, clientFactory, info.User, info.DB, testSettings)
 		if err := file.Delete(ctx, fileName); err != nil {
 			t.Fatal(err)
 		}
@@ -487,15 +548,18 @@ func uploadData(
 	t *testing.T,
 	testSettings *cluster.Settings,
 	rnd *rand.Rand,
-	dest roachpb.ExternalStorage,
+	dest cloudpb.ExternalStorage,
 	basename string,
 ) ([]byte, func()) {
 	data := randutil.RandBytes(rnd, 16<<20)
 	ctx := context.Background()
 
-	s, err := cloud.MakeExternalStorage(
-		ctx, dest, base.ExternalIODirConfig{}, testSettings,
-		nil, nil, nil)
+	s, err := cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{}, testSettings,
+		nil, /* blobClientFactory */
+		nil, /* db */
+		nil, /* limiters */
+		cloud.NilMetrics,
+	)
 	require.NoError(t, err)
 	require.NoError(t, cloud.WriteFile(ctx, s, basename, bytes.NewReader(data)))
 	return data, func() {
@@ -507,11 +571,11 @@ func uploadData(
 // CheckAntagonisticRead checks an external storage is able to perform reads if
 // the HTTP client's dialer artificially degrades its connections.
 func CheckAntagonisticRead(
-	t *testing.T, conf roachpb.ExternalStorage, testSettings *cluster.Settings,
+	t *testing.T, conf cloudpb.ExternalStorage, testSettings *cluster.Settings,
 ) {
 	rnd, _ := randutil.NewTestRand()
 
-	const basename = "test-antagonistic-read"
+	basename := fmt.Sprintf("test-antagonistic-read-%d", NewTestID())
 	data, cleanup := uploadData(t, testSettings, rnd, conf, basename)
 	defer cleanup()
 
@@ -534,16 +598,107 @@ func CheckAntagonisticRead(
 	}()
 
 	ctx := context.Background()
-	s, err := cloud.MakeExternalStorage(
-		ctx, conf, base.ExternalIODirConfig{}, testSettings,
-		nil, nil, nil)
+	s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings,
+		nil, /* blobClientFactory */
+		nil, /* db */
+		nil, /* limiters */
+		cloud.NilMetrics,
+	)
 	require.NoError(t, err)
 	defer s.Close()
 
-	stream, err := s.ReadFile(ctx, basename)
+	stream, _, err := s.ReadFile(ctx, basename, cloud.ReadOptions{NoFileSize: true})
 	require.NoError(t, err)
-	defer stream.Close()
-	read, err := ioutil.ReadAll(stream)
+	defer stream.Close(ctx)
+	read, err := ioctx.ReadAll(ctx, stream)
 	require.NoError(t, err)
 	require.Equal(t, data, read)
+}
+
+// CheckNoPermission checks that we do not have permission to list the external
+// storage at storeURI.
+func CheckNoPermission(t *testing.T, info StoreInfo) {
+	ioConf := base.ExternalIODirConfig{}
+	ctx := context.Background()
+
+	conf, err := cloud.ExternalStorageConfFromURI(info.URI, info.User)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testSettings := info.testSettings()
+	clientFactory := blobs.TestBlobServiceClient(info.ExternalIODir)
+	s, err := cloud.MakeExternalStorage(
+		ctx, conf, ioConf, testSettings, clientFactory, info.DB, nil, cloud.NilMetrics,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	err = s.List(ctx, "", cloud.ListOptions{}, nil)
+	if err == nil {
+		t.Fatalf("expected error when listing %s with no permissions", info.URI)
+	}
+
+	require.Regexp(t, "(failed|unable) to list", err)
+}
+
+// IsImplicitAuthConfigured returns true if the `GOOGLE_APPLICATION_CREDENTIALS`
+// environment variable is set. This env variable points to the `keys.json` file
+// that is used for implicit authentication.
+func IsImplicitAuthConfigured() bool {
+	credentials := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	return credentials != ""
+}
+
+func NewTestID() uint64 {
+	rng, _ := randutil.NewTestRand()
+	return rng.Uint64()
+}
+
+func RequireSuccessfulKMS(ctx context.Context, t *testing.T, uri string) {
+	data := []byte("test123")
+	k, err := cloud.KMSFromURI(ctx, uri, &cloud.TestKMSEnv{
+		Settings:         cluster.MakeTestingClusterSettings(),
+		ExternalIOConfig: &base.ExternalIODirConfig{},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, k.Close())
+	}()
+
+	encData, err := k.Encrypt(ctx, data)
+	require.NoError(t, err)
+
+	decData, err := k.Decrypt(ctx, encData)
+	require.NoError(t, err)
+
+	require.Equal(t, data, decData)
+}
+
+func RequireKMSInaccessibleErrorContaining(
+	ctx context.Context, t *testing.T, uri string, errRE string,
+) {
+	data := []byte("test123")
+	k, err := cloud.KMSFromURI(ctx, uri, &cloud.TestKMSEnv{
+		Settings:         cluster.MakeTestingClusterSettings(),
+		ExternalIOConfig: &base.ExternalIODirConfig{},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, k.Close())
+	}()
+
+	_, err = k.Encrypt(ctx, data)
+	require.True(t, cloud.IsKMSInaccessible(err), "error not kms inaccessible")
+	if !testutils.IsError(err, errRE) {
+		t.Fatalf("expected error '%s', got: %s", errRE, err)
+	}
+
+	_, err = k.Decrypt(ctx, data)
+	require.True(t, cloud.IsKMSInaccessible(err), "error not kms inaccessible")
+	if !testutils.IsError(err, errRE) {
+		t.Fatalf("expected error '%s', got: %s", errRE, err)
+	}
 }

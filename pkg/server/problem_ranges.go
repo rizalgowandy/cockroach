@@ -1,47 +1,45 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
 	"context"
-	"sort"
 
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-func (s *statusServer) ProblemRanges(
+func (s *systemStatusServer) ProblemRanges(
 	ctx context.Context, req *serverpb.ProblemRangesRequest,
 ) (*serverpb.ProblemRangesResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
+	if err := s.privilegeChecker.RequireViewClusterMetadataPermission(ctx); err != nil {
+		return nil, err
+	}
+
 	response := &serverpb.ProblemRangesResponse{
-		NodeID:           s.gossip.NodeID.Get(),
+		NodeID:           roachpb.NodeID(s.serverIterator.getID()),
 		ProblemsByNodeID: make(map[roachpb.NodeID]serverpb.ProblemRangesResponse_NodeProblems),
 	}
 
-	isLiveMap := s.nodeLiveness.GetIsLiveMap()
+	var isLiveMap map[roachpb.NodeID]livenesspb.NodeVitality
 	// If there is a specific nodeID requested, limited the responses to
 	// just that node.
 	if len(req.NodeID) > 0 {
 		requestedNodeID, _, err := s.parseNodeID(req.NodeID)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, err.Error())
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
-		isLiveMap = liveness.IsLiveMap{
-			requestedNodeID: liveness.IsLiveMapEntry{IsLive: true},
-		}
+		isLiveMap = map[roachpb.NodeID]livenesspb.NodeVitality{requestedNodeID: s.nodeLiveness.GetNodeVitalityFromCache(requestedNodeID)}
+	} else {
+		isLiveMap = s.nodeLiveness.ScanNodeVitalityFromCache()
 	}
 
 	type nodeResponse struct {
@@ -60,7 +58,9 @@ func (s *statusServer) ProblemRanges(
 				status, err := s.dialNode(ctx, nodeID)
 				var rangesResponse *serverpb.RangesResponse
 				if err == nil {
-					req := &serverpb.RangesRequest{}
+					req := &serverpb.RangesRequest{
+						ProblemsOnly: true,
+					}
 					rangesResponse, err = status.Ranges(ctx, req)
 				}
 				response := nodeResponse{
@@ -76,7 +76,7 @@ func (s *statusServer) ProblemRanges(
 					// Context completed, response no longer needed.
 				}
 			}); err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
+			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
 
@@ -129,18 +129,24 @@ func (s *statusServer) ProblemRanges(
 					problems.RaftLogTooLargeRangeIDs =
 						append(problems.RaftLogTooLargeRangeIDs, info.State.Desc.RangeID)
 				}
+				if info.Problems.CircuitBreakerError {
+					problems.CircuitBreakerErrorRangeIDs =
+						append(problems.CircuitBreakerErrorRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.PausedFollowers {
+					problems.PausedReplicaIDs =
+						append(problems.PausedReplicaIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.RangeTooLarge {
+					problems.TooLargeRangeIds =
+						append(problems.TooLargeRangeIds, info.State.Desc.RangeID)
+				}
 			}
-			sort.Sort(roachpb.RangeIDSlice(problems.UnavailableRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.RaftLeaderNotLeaseHolderRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.NoRaftLeaderRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.NoLeaseRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.UnderreplicatedRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.OverreplicatedRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.QuiescentEqualsTickingRangeIDs))
-			sort.Sort(roachpb.RangeIDSlice(problems.RaftLogTooLargeRangeIDs))
+			// Note: Range IDs are already sorted because the Ranges RPC uses
+			// kvserver.WithReplicasInOrder() when visiting replicas.
 			response.ProblemsByNodeID[resp.nodeID] = problems
 		case <-ctx.Done():
-			return nil, status.Errorf(codes.DeadlineExceeded, ctx.Err().Error())
+			return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
 		}
 	}
 

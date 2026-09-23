@@ -1,55 +1,41 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { connect } from "react-redux";
+import { sumNodeStats, useNodesSummary, util } from "@cockroachlabs/cluster-ui";
+import { format } from "d3-format";
+import React, { useMemo } from "react";
 import { Link } from "react-router-dom";
-import * as d3 from "d3";
 
-import { NodesSummary } from "src/redux/nodes";
-import { Bytes } from "src/util/format";
-import { NanoToMilli } from "src/util/convert";
-
+import { Anchor, Tooltip } from "src/components";
+import { howAreCapacityMetricsCalculated } from "src/util/docs";
 import { EventBox } from "src/views/cluster/containers/events";
 import { Metric } from "src/views/shared/components/metricQuery";
 import {
   SummaryBar,
   SummaryLabel,
+  SummaryMetricsAggregator,
   SummaryMetricStat,
   SummaryStat,
   SummaryStatBreakdown,
   SummaryStatMessage,
-  SummaryMetricsAggregator,
 } from "src/views/shared/components/summaryBar";
-import { Tooltip, Anchor } from "src/components";
-import { howAreCapacityMetricsCalculated } from "src/util/docs";
-import { AdminUIState } from "src/redux/state";
 
 /**
  * ClusterNodeTotals displays a high-level breakdown of the nodes on the cluster
  * and their current liveness status.
  */
-
-export interface ClusterNodeTotalsProps {
-  nodesSummary: NodesSummary;
-  nodesSummaryEmpty: boolean;
-}
-
-export const ClusterNodeTotalsComponent: React.FC<ClusterNodeTotalsProps> = ({
-  nodesSummary,
-  nodesSummaryEmpty,
-}) => {
-  if (nodesSummaryEmpty) {
+export const ClusterNodeTotals: React.FC = () => {
+  const { nodeStatuses, livenessStatusByNodeID } = useNodesSummary();
+  const nodeSums = useMemo(
+    () => sumNodeStats(nodeStatuses, livenessStatusByNodeID),
+    [nodeStatuses, livenessStatusByNodeID],
+  );
+  if (!nodeStatuses || nodeStatuses.length === 0) {
     return null;
   }
-  const { nodeCounts } = nodesSummary.nodeSums;
+  const { nodeCounts } = nodeSums;
   let children: React.ReactNode;
   if (nodeCounts.dead > 0 || nodeCounts.suspect > 0) {
     children = (
@@ -86,23 +72,10 @@ export const ClusterNodeTotalsComponent: React.FC<ClusterNodeTotalsProps> = ({
   );
 };
 
-export function selectNodesSummaryEmpty(state: AdminUIState) {
-  return !state.cachedData.nodes.data;
-}
-
-const mapStateToProps = (state: AdminUIState) => ({
-  nodesSummaryEmpty: selectNodesSummaryEmpty(state),
-});
-
-const ClusterNodeTotals = connect(
-  mapStateToProps,
-  {},
-)(ClusterNodeTotalsComponent);
-
-const formatOnePlace = d3.format(".1f");
-const formatPercentage = d3.format(".2%");
+const formatOnePlace = format(".1f");
+const formatPercentage = format(".2%");
 function formatNanosAsMillis(n: number) {
-  return formatOnePlace(NanoToMilli(n)) + " ms";
+  return formatOnePlace(util.NanoToMilli(n)) + " ms";
 }
 
 /**
@@ -110,19 +83,25 @@ function formatNanosAsMillis(n: number) {
  */
 export interface ClusterSummaryProps {
   nodeSources: string[];
-  nodesSummary: NodesSummary;
+  tenantSource?: string;
 }
 
-export default function(props: ClusterSummaryProps) {
+export default function (props: ClusterSummaryProps) {
+  const { Bytes } = util;
+  const { nodeStatuses, livenessStatusByNodeID } = useNodesSummary();
+  const nodeSums = useMemo(
+    () => sumNodeStats(nodeStatuses, livenessStatusByNodeID),
+    [nodeStatuses, livenessStatusByNodeID],
+  );
   // Capacity math used in the summary status section.
-  const { capacityUsed, capacityUsable } = props.nodesSummary.nodeSums;
+  const { capacityUsed, capacityUsable } = nodeSums;
   const capacityPercent =
     capacityUsable !== 0 ? capacityUsed / capacityUsable : null;
   return (
     <div>
       <SummaryBar>
         <SummaryLabel>Summary</SummaryLabel>
-        <ClusterNodeTotals nodesSummary={props.nodesSummary} />
+        <ClusterNodeTotals />
         <SummaryStat
           title={
             <Tooltip
@@ -153,7 +132,8 @@ export default function(props: ClusterSummaryProps) {
         </SummaryStat>
         <SummaryStat
           title="Unavailable ranges"
-          value={props.nodesSummary.nodeSums.unavailableRanges}
+          value={nodeSums.unavailableRanges}
+          numberAlert={nodeSums.unavailableRanges > 0}
         />
         <SummaryMetricStat
           id="qps"
@@ -164,26 +144,9 @@ export default function(props: ClusterSummaryProps) {
         >
           <Metric
             sources={props.nodeSources}
-            name="cr.node.sql.select.count"
+            name="cr.node.sql.crud_query.count"
             title="Queries/Sec"
-            nonNegativeRate
-          />
-          <Metric
-            sources={props.nodeSources}
-            name="cr.node.sql.insert.count"
-            title="Queries/Sec"
-            nonNegativeRate
-          />
-          <Metric
-            sources={props.nodeSources}
-            name="cr.node.sql.update.count"
-            title="Queries/Sec"
-            nonNegativeRate
-          />
-          <Metric
-            sources={props.nodeSources}
-            name="cr.node.sql.delete.count"
-            title="Queries/Sec"
+            tenantSource={props.tenantSource}
             nonNegativeRate
           />
         </SummaryMetricStat>
@@ -195,6 +158,7 @@ export default function(props: ClusterSummaryProps) {
           <Metric
             sources={props.nodeSources}
             name="cr.node.sql.service.latency-p99"
+            tenantSource={props.tenantSource}
             aggregateMax
             downsampleMax
           />

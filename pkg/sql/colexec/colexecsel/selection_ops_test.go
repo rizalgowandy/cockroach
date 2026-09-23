@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecsel
 
@@ -21,17 +16,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/stretchr/testify/require"
-)
-
-const (
-	selectivity     = .5
-	nullProbability = .1
 )
 
 func TestSelLTInt64Int64ConstOp(t *testing.T) {
@@ -75,7 +66,7 @@ func TestSelLTInt64Int64(t *testing.T) {
 func TestGetSelectionConstOperator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	cmpOp := tree.MakeComparisonOperator(tree.LT)
+	cmpOp := treecmp.MakeComparisonOperator(treecmp.LT)
 	var input colexecop.Operator
 	colIdx := 3
 	inputTypes := make([]*types.T, colIdx+1)
@@ -103,7 +94,7 @@ func TestGetSelectionConstOperator(t *testing.T) {
 func TestGetSelectionConstMixedTypeOperator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	cmpOp := tree.MakeComparisonOperator(tree.LT)
+	cmpOp := treecmp.MakeComparisonOperator(treecmp.LT)
 	var input colexecop.Operator
 	colIdx := 3
 	inputTypes := make([]*types.T, colIdx+1)
@@ -132,7 +123,7 @@ func TestGetSelectionOperator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ct := types.Int2
-	cmpOp := tree.MakeComparisonOperator(tree.GE)
+	cmpOp := treecmp.MakeComparisonOperator(treecmp.GE)
 	var input colexecop.Operator
 	col1Idx := 5
 	col2Idx := 7
@@ -168,7 +159,7 @@ func runSelOpBenchmarks(
 			batch := testAllocator.NewMemBatchWithMaxCapacity(inputTypes)
 			nullProb := 0.0
 			if hasNulls {
-				nullProb = nullProbability
+				nullProb = 0.1
 			}
 			for _, colVec := range batch.ColVecs() {
 				coldatatestutils.RandomVec(coldatatestutils.RandomVecArgs{
@@ -195,7 +186,7 @@ func runSelOpBenchmarks(
 			b.Run(fmt.Sprintf("useSel=%t,hasNulls=%t", useSel, hasNulls), func(b *testing.B) {
 				b.SetBytes(int64(len(inputTypes) * 8 * coldata.BatchSize()))
 				for i := 0; i < b.N; i++ {
-					op.Next()
+					colexecop.NextNoMeta(op)
 				}
 			})
 		}
@@ -209,7 +200,7 @@ func BenchmarkSelLTInt64Int64ConstOp(b *testing.B) {
 		func(source *colexecop.RepeatableBatchSource) (colexecop.Operator, error) {
 			constArg := tree.DInt(0)
 			return GetSelectionConstOperator(
-				tree.MakeComparisonOperator(tree.LT), source, inputTypes, 0, /* colIdx */
+				treecmp.MakeComparisonOperator(treecmp.LT), source, inputTypes, 0, /* colIdx */
 				&constArg, nil /* evalCtx */, nil, /* cmpExpr */
 			)
 		},
@@ -223,7 +214,7 @@ func BenchmarkSelLTInt64Int64Op(b *testing.B) {
 		b,
 		func(source *colexecop.RepeatableBatchSource) (colexecop.Operator, error) {
 			return GetSelectionOperator(
-				tree.MakeComparisonOperator(tree.LT), source, inputTypes, 0 /* col1Idx */, 1, /* col2Idx */
+				treecmp.MakeComparisonOperator(treecmp.LT), source, inputTypes, 0 /* col1Idx */, 1, /* col2Idx */
 				nil /* evalCtx */, nil, /* cmpExpr */
 			)
 		},
@@ -237,7 +228,7 @@ func BenchmarkSelLTBytesBytesOp(b *testing.B) {
 		b,
 		func(source *colexecop.RepeatableBatchSource) (colexecop.Operator, error) {
 			return GetSelectionOperator(
-				tree.MakeComparisonOperator(tree.LT), source, inputTypes, 0 /* col1Idx */, 1, /* col2Idx */
+				treecmp.MakeComparisonOperator(treecmp.LT), source, inputTypes, 0 /* col1Idx */, 1, /* col2Idx */
 				nil /* evalCtx */, nil, /* cmpExpr */
 			)
 		},

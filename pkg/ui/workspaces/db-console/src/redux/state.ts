@@ -1,14 +1,16 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+import {
+  connectRouter,
+  routerMiddleware,
+  RouterState,
+} from "connected-react-router";
+import { History } from "history";
+import identity from "lodash/identity";
 import {
   createStore,
   combineReducers,
@@ -16,61 +18,84 @@ import {
   compose,
   Store,
   Action,
+  Dispatch,
 } from "redux";
-import createSagaMiddleware from "redux-saga";
-import thunk, { ThunkDispatch } from "redux-thunk";
-import {
-  connectRouter,
-  routerMiddleware,
-  RouterState,
-} from "connected-react-router";
-import { createHashHistory, History } from "history";
+import { createSelector } from "reselect";
 
-import { apiReducersReducer, APIReducersState } from "./apiReducers";
+import { DataFromServer } from "src/util/dataFromServer";
+
+import { healthReducer, HealthState } from "./health";
 import { hoverReducer, HoverState } from "./hover";
 import { localSettingsReducer, LocalSettingsState } from "./localsettings";
-import { metricsReducer, MetricsState } from "./metrics";
-import { queryManagerReducer, QueryManagerState } from "./queryManager/reducer";
-import { timeWindowReducer, TimeWindowState } from "./timewindow";
-import { uiDataReducer, UIDataState } from "./uiData";
 import { loginReducer, LoginAPIState } from "./login";
-import rootSaga from "./sagas";
+import { timeScaleReducer, TimeScaleState } from "./timeScale";
+import { uiDataReducer, UIDataState } from "./uiData";
+
+import FeatureFlags = cockroach.server.serverpb.FeatureFlags;
 
 export interface AdminUIState {
-  cachedData: APIReducersState;
+  health: HealthState;
   hover: HoverState;
   localSettings: LocalSettingsState;
-  metrics: MetricsState;
-  queryManager: QueryManagerState;
   router: RouterState;
-  timewindow: TimeWindowState;
+  timeScale: TimeScaleState;
   uiData: UIDataState;
   login: LoginAPIState;
+  flags: FeatureFlags;
 }
 
-const history = createHashHistory();
+const emptyDataFromServer: DataFromServer = {
+  Insecure: true,
+  FeatureFlags: new FeatureFlags(),
+  LoggedInUser: "",
+  NodeID: "",
+  OIDCAutoLogin: false,
+  OIDCButtonText: "",
+  OIDCLoginEnabled: false,
+  OIDCGenerateJWTAuthTokenEnabled: false,
+  Tag: "",
+  Version: "",
+  LicenseType: "OSS",
+  SecondsUntilLicenseExpiry: 0,
+  IsManaged: false,
+};
 
-const routerReducer = connectRouter(history);
+export const featureFlagSelector = createSelector(
+  (state: AdminUIState) => state.flags,
+  flags => flags,
+);
+
+export function flagsReducer(state = emptyDataFromServer.FeatureFlags) {
+  return state;
+}
 
 // createAdminUIStore is a function that returns a new store for the admin UI.
 // It's in a function so it can be recreated as necessary for testing.
-export function createAdminUIStore(historyInst: History<any>) {
-  const sagaMiddleware = createSagaMiddleware();
+export function createAdminUIStore(
+  historyInst: History<any>,
+  dataFromServer: DataFromServer = emptyDataFromServer,
+) {
+  const routerReducer = connectRouter(historyInst);
 
   const s: Store<AdminUIState> = createStore(
     combineReducers<AdminUIState>({
-      cachedData: apiReducersReducer,
+      health: healthReducer,
       hover: hoverReducer,
       localSettings: localSettingsReducer,
-      metrics: metricsReducer,
-      queryManager: queryManagerReducer,
       router: routerReducer,
-      timewindow: timeWindowReducer,
+      timeScale: timeScaleReducer,
       uiData: uiDataReducer,
       login: loginReducer,
+      flags: flagsReducer,
     }),
+    {
+      login: {
+        loggedInUser: dataFromServer.LoggedInUser,
+      },
+      flags: dataFromServer.FeatureFlags,
+    },
     compose(
-      applyMiddleware(thunk, sagaMiddleware, routerMiddleware(historyInst)),
+      applyMiddleware(routerMiddleware(historyInst)),
       // Support for redux dev tools
       // https://chrome.google.com/webstore/detail/redux-devtools/lmhkpmbekcpmknklioeibfkpmmfibljd
       (window as any).__REDUX_DEVTOOLS_EXTENSION__
@@ -86,16 +111,11 @@ export function createAdminUIStore(historyInst: History<any>) {
               },
             },
           })
-        : _.identity,
+        : identity,
     ),
   );
 
-  sagaMiddleware.run(rootSaga);
   return s;
 }
 
-const store = createAdminUIStore(history);
-
-export type AppDispatch = ThunkDispatch<AdminUIState, unknown, Action>;
-
-export { history, store };
+export type AppDispatch = Dispatch<Action>;

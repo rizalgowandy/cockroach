@@ -1,43 +1,44 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { useMemo } from "react";
-import moment from "moment";
-import { Divider } from "antd";
 import classNames from "classnames/bind";
-import {
-  TimeRangeTitle,
-  TimeScale,
-  TimeWindow,
-  ArrowDirection,
-  TimeScaleCollection,
-} from "./timeScaleTypes";
-import TimeFrameControls from "./timeFrameControls";
-import RangeSelect, { RangeOption } from "./rangeSelect";
-import { defaultTimeScaleOptions, findClosestTimeScale } from "./utils";
+import moment from "moment-timezone";
+import React, { useContext, useMemo } from "react";
 
+import { TimezoneContext } from "../contexts";
+import { FormatWithTimezone, getLogger } from "../util";
+
+import RangeSelect, {
+  RangeOption,
+  Selected as RangeSelectSelected,
+} from "./rangeSelect";
+import { TimeFrameControls } from "./timeFrameControls";
 import styles from "./timeScale.module.scss";
+import {
+  ArrowDirection,
+  TimeScale,
+  TimeScaleOptions,
+  TimeWindow,
+} from "./timeScaleTypes";
+import { defaultTimeScaleOptions, findClosestTimeScale } from "./utils";
 
 const cx = classNames.bind(styles);
 
 export const dateFormat = "MMM DD,";
-export const timeFormat = "h:mmA";
+export const timeFormat = "H:mm";
 
 export interface TimeScaleDropdownProps {
   currentScale: TimeScale;
-  options?: TimeScaleCollection;
+  options?: TimeScaleOptions;
   setTimeScale: (tw: TimeScale) => void;
   adjustTimeScaleOnChange?: (
     curTimeScale: TimeScale,
     timeWindow: TimeWindow,
   ) => TimeScale;
+  hasCustomOption?: boolean;
+  className?: string;
 }
 
 export const getTimeLabel = (
@@ -68,10 +69,17 @@ export const getTimeLabel = (
   }
 };
 
-export const getTimeRangeTitle = (
+export const formatRangeSelectSelected = (
   currentWindow: TimeWindow,
   currentScale: TimeScale,
-): TimeRangeTitle => {
+  timezone: string,
+): RangeSelectSelected => {
+  const selected = {
+    timeLabel: getTimeLabel(currentWindow),
+    timeWindow: currentWindow,
+    key: currentScale.key,
+  };
+
   if (currentScale.key === "Custom") {
     const start = currentWindow.start.utc();
     const end = currentWindow.end.utc();
@@ -80,18 +88,14 @@ export const getTimeRangeTitle = (
 
     const omitDayFormat = endDayIsToday && startEndOnSameDay;
     return {
+      ...selected,
       dateStart: omitDayFormat ? "" : start.format(dateFormat),
       dateEnd: omitDayFormat || startEndOnSameDay ? "" : end.format(dateFormat),
-      timeStart: moment.utc(start).format(timeFormat),
-      timeEnd: moment.utc(end).format(timeFormat),
-      title: "Custom",
-      timeLabel: getTimeLabel(currentWindow),
+      timeStart: FormatWithTimezone(start, timeFormat, timezone),
+      timeEnd: FormatWithTimezone(end, timeFormat, timezone),
     };
   } else {
-    return {
-      title: currentScale.key,
-      timeLabel: getTimeLabel(currentWindow),
-    };
+    return selected;
   }
 };
 
@@ -124,22 +128,27 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   options = defaultTimeScaleOptions,
   setTimeScale,
   adjustTimeScaleOnChange,
+  hasCustomOption = true,
+  className,
 }): React.ReactElement => {
-  const end = currentScale.windowEnd
-    ? moment.utc(currentScale.windowEnd)
+  const end = currentScale.fixedWindowEnd
+    ? moment.utc(currentScale.fixedWindowEnd)
     : moment().utc();
   const currentWindow: TimeWindow = {
     start: moment.utc(end).subtract(currentScale.windowSize),
     end,
   };
+  const timezone = useContext(TimezoneContext);
 
-  const onOptionSelect = (rangeOption: RangeOption) => {
-    const newSettings = options[rangeOption.label];
-    newSettings.windowEnd = null;
-    let timeScale: TimeScale = { ...newSettings, key: rangeOption.label };
+  const onPresetOptionSelect = (rangeOption: RangeOption) => {
+    let timeScale: TimeScale = {
+      ...options[rangeOption.label],
+      key: rangeOption.label,
+      fixedWindowEnd: false,
+    };
     if (adjustTimeScaleOnChange) {
       const timeWindow: TimeWindow = {
-        start: moment.utc().subtract(newSettings.windowSize),
+        start: moment.utc().subtract(timeScale.windowSize),
         end: moment.utc(),
       };
       timeScale = adjustTimeScaleOnChange(timeScale, timeWindow);
@@ -153,55 +162,61 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
     );
 
     const seconds = windowSize.asSeconds();
-    let selected = {};
     let key = currentScale.key;
-    let windowEnd = moment.utc(currentWindow.end);
+    let endTime = moment.utc(currentWindow.end);
+    // Dynamic moving window should be off unless the window extends to the current time.
+    let isMoving = false;
 
     switch (direction) {
       case ArrowDirection.RIGHT:
-        if (windowEnd) {
-          windowEnd = windowEnd.add(seconds, "seconds");
-        }
+        endTime = endTime.add(seconds, "seconds");
+        key = "Custom";
         break;
       case ArrowDirection.LEFT:
-        windowEnd = windowEnd.subtract(seconds, "seconds");
+        endTime = endTime.subtract(seconds, "seconds");
+        key = "Custom";
         break;
       case ArrowDirection.CENTER:
-        // CENTER is used to set the time window to the current time.
-        windowEnd = moment.utc();
+        // Clicking `NOW` always makes the metric view become live.
+        isMoving = true;
+
+        key = Object.keys(defaultTimeScaleOptions).reduce(
+          (closest, current) => {
+            const currentDiff = Math.abs(
+              defaultTimeScaleOptions[current].windowSize.asSeconds() -
+                windowSize.asSeconds(),
+            );
+            const closestDiff = Math.abs(
+              defaultTimeScaleOptions[closest].windowSize.asSeconds() -
+                windowSize.asSeconds(),
+            );
+            return currentDiff < closestDiff ? current : closest;
+          },
+        );
         break;
       default:
-        console.error("Unknown direction: ", direction);
-    }
-    // If the timescale extends into the future then fallback to a default
-    // timescale. Otherwise set the key to "Custom" so it appears correctly.
-    if (
-      !windowEnd ||
-      windowEnd > moment.utc().subtract(currentScale.windowValid)
-    ) {
-      const foundTimeScale = Object.entries(options).find(
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        ([_, value]) => value.windowSize.asSeconds() === windowSize.asSeconds(),
-      );
-      if (foundTimeScale) {
-        selected = { key: foundTimeScale[0], ...foundTimeScale[1] };
-      } else {
-        key = "Custom";
-      }
-    } else {
-      key = "Custom";
+        getLogger().error("Unknown direction: ", direction);
     }
 
-    let timeScale: TimeScale = {
-      ...currentScale,
-      windowEnd,
-      windowSize,
-      key,
-      ...selected,
-    };
-    if (adjustTimeScaleOnChange) {
-      timeScale = adjustTimeScaleOnChange(timeScale, currentWindow);
+    let timeScale: TimeScale;
+    if (isMoving) {
+      timeScale = {
+        ...defaultTimeScaleOptions[key],
+        key: key,
+        fixedWindowEnd: false,
+      };
+    } else {
+      timeScale = {
+        ...currentScale,
+        fixedWindowEnd: endTime,
+        windowSize,
+        key,
+      };
+      if (adjustTimeScaleOnChange) {
+        timeScale = adjustTimeScaleOnChange(timeScale, currentWindow);
+      }
     }
+
     setTimeScale(timeScale);
   };
 
@@ -211,20 +226,22 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
       label: key,
       timeLabel: getTimeLabel(null, value.windowSize),
     }));
-    optionsList.push({
-      value: "Custom",
-      label: "Custom",
-      timeLabel: "--",
-    });
+    if (hasCustomOption) {
+      optionsList.push({
+        value: "Custom",
+        label: "Custom",
+        timeLabel: "--",
+      });
+    }
     return optionsList;
-  }, [options]);
+  }, [options, hasCustomOption]);
 
   const setDateRange = ([start, end]: [moment.Moment, moment.Moment]) => {
     const seconds = moment.duration(moment.utc(end).diff(start)).asSeconds();
     let timeScale: TimeScale = {
       ...findClosestTimeScale(options, seconds),
       windowSize: moment.duration(end.diff(start)),
-      windowEnd: end,
+      fixedWindowEnd: end,
       key: "Custom",
     };
     if (adjustTimeScaleOnChange) {
@@ -234,12 +251,15 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
   };
 
   return (
-    <div className={cx("timescale")}>
-      <Divider type="vertical" />
+    <div className={`${cx("timescale")} ${className}`}>
       <RangeSelect
-        selected={getTimeRangeTitle(currentWindow, currentScale)}
-        onChange={onOptionSelect}
-        changeDate={setDateRange}
+        selected={formatRangeSelectSelected(
+          currentWindow,
+          currentScale,
+          timezone,
+        )}
+        onPresetOptionSelect={onPresetOptionSelect}
+        onCustomSelect={setDateRange}
         options={timeScaleOptions}
       />
       <TimeFrameControls
@@ -248,4 +268,24 @@ export const TimeScaleDropdown: React.FC<TimeScaleDropdownProps> = ({
       />
     </div>
   );
+};
+
+// getValidOption check if the option selected is valid. If is valid returns
+// the selected option, otherwise  returns the first valid option.
+export const getValidOption = (
+  currentScale: TimeScale,
+  options: TimeScaleOptions,
+): TimeScale => {
+  if (currentScale.key === "Custom") {
+    return currentScale;
+  }
+  if (!(currentScale.key in options)) {
+    const firstValidKey = Object.keys(options)[0];
+    return {
+      ...options[firstValidKey],
+      key: firstValidKey,
+      fixedWindowEnd: false,
+    };
+  }
+  return currentScale;
 };

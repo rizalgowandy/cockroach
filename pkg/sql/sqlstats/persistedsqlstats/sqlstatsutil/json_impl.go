@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlstatsutil
 
@@ -14,8 +9,8 @@ import (
 	"encoding/hex"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/errors"
@@ -50,9 +45,12 @@ var (
 	_ jsonMarshaler = (*jsonInt)(nil)
 	_ jsonMarshaler = (*stmtFingerprintID)(nil)
 	_ jsonMarshaler = (*int64Array)(nil)
+	_ jsonMarshaler = (*int32Array)(nil)
+	_ jsonMarshaler = &latencyInfo{}
+	_ jsonMarshaler = &experimentStatsInfo{}
 )
 
-type txnStats roachpb.TransactionStatistics
+type txnStats appstatspb.TransactionStatistics
 
 func (t *txnStats) jsonFields() jsonFields {
 	return jsonFields{
@@ -69,12 +67,13 @@ func (t *txnStats) encodeJSON() (json.JSON, error) {
 	return t.jsonFields().encodeJSON()
 }
 
-type stmtStats roachpb.StatementStatistics
+type stmtStats appstatspb.StatementStatistics
 
 func (s *stmtStats) jsonFields() jsonFields {
 	return jsonFields{
 		{"statistics", (*innerStmtStats)(s)},
 		{"execution_statistics", (*execStats)(&s.ExecStats)},
+		{"index_recommendations", (*stringArray)(&s.IndexRecommendations)},
 	}
 }
 
@@ -86,19 +85,55 @@ func (s *stmtStats) encodeJSON() (json.JSON, error) {
 	return s.jsonFields().encodeJSON()
 }
 
-type stmtStatsMetadata roachpb.CollectedStatementStatistics
+type stmtStatsMetadata appstatspb.CollectedStatementStatistics
 
 func (s *stmtStatsMetadata) jsonFields() jsonFields {
 	return jsonFields{
-		{"stmtTyp", (*jsonString)(&s.Stats.SQLType)},
+		{"stmtType", (*jsonString)(&s.Stats.SQLType)},
 		{"query", (*jsonString)(&s.Key.Query)},
 		{"querySummary", (*jsonString)(&s.Key.QuerySummary)},
 		{"db", (*jsonString)(&s.Key.Database)},
 		{"distsql", (*jsonBool)(&s.Key.DistSQL)},
-		{"failed", (*jsonBool)(&s.Key.Failed)},
-		{"implicitTxn", (*jsonBool)(&s.Key.ImplicitTxn)},
 		{"vec", (*jsonBool)(&s.Key.Vec)},
 		{"fullScan", (*jsonBool)(&s.Key.FullScan)},
+	}
+}
+
+func (s *stmtStatsMetadata) jsonFlagsOnlyFields() jsonFields {
+	return jsonFields{
+		{"db", (*jsonString)(&s.Key.Database)},
+		{"distsql", (*jsonBool)(&s.Key.DistSQL)},
+		{"vec", (*jsonBool)(&s.Key.Vec)},
+		{"fullScan", (*jsonBool)(&s.Key.FullScan)},
+	}
+}
+
+type aggregatedMetadata appstatspb.AggregatedStatementMetadata
+
+func (s *aggregatedMetadata) jsonFields() jsonFields {
+	return jsonFields{
+		{"db", (*stringArray)(&s.Databases)},
+		{"appNames", (*stringArray)(&s.AppNames)},
+		{"distSQLCount", (*jsonInt)(&s.DistSQLCount)},
+		{"fullScanCount", (*jsonInt)(&s.FullScanCount)},
+		{"query", (*jsonString)(&s.Query)},
+		{"formattedQuery", (*jsonString)(&s.FormattedQuery)},
+		{"querySummary", (*jsonString)(&s.QuerySummary)},
+		{"stmtType", (*jsonString)(&s.StmtType)},
+		{"vecCount", (*jsonInt)(&s.VecCount)},
+		{"totalCount", (*jsonInt)(&s.TotalCount)},
+		{"fingerprintID", (*jsonString)(&s.FingerprintID)},
+	}
+}
+
+func (s *aggregatedMetadata) jsonAggregatedFields() jsonFields {
+	return jsonFields{
+		{"db", (*stringArray)(&s.Databases)},
+		{"appNames", (*stringArray)(&s.AppNames)},
+		{"distSQLCount", (*jsonInt)(&s.DistSQLCount)},
+		{"fullScanCount", (*jsonInt)(&s.FullScanCount)},
+		{"vecCount", (*jsonInt)(&s.VecCount)},
+		{"totalCount", (*jsonInt)(&s.TotalCount)},
 	}
 }
 
@@ -135,7 +170,66 @@ func (a *int64Array) encodeJSON() (json.JSON, error) {
 	return builder.Build(), nil
 }
 
-type stmtFingerprintIDArray []roachpb.StmtFingerprintID
+type int32Array []int32
+
+func (a *int32Array) decodeJSON(js json.JSON) error {
+	arrLen := js.Len()
+	for i := 0; i < arrLen; i++ {
+		var value jsonInt
+		valJSON, err := js.FetchValIdx(i)
+		if err != nil {
+			return err
+		}
+		if err := value.decodeJSON(valJSON); err != nil {
+			return err
+		}
+		*a = append(*a, int32(value))
+	}
+	return nil
+}
+
+func (a *int32Array) encodeJSON() (json.JSON, error) {
+	builder := json.NewArrayBuilder(len(*a))
+	for _, value := range *a {
+		builder.Add(json.FromInt64(int64(value)))
+	}
+	return builder.Build(), nil
+}
+
+type stringArray []string
+
+func (a *stringArray) decodeJSON(js json.JSON) error {
+	arrLen := js.Len()
+	for i := 0; i < arrLen; i++ {
+		var value jsonString
+		valJSON, err := js.FetchValIdx(i)
+		if err != nil {
+			return err
+		}
+		if err := value.decodeJSON(valJSON); err != nil {
+			return err
+		}
+		*a = append(*a, string(value))
+	}
+
+	return nil
+}
+
+func (a *stringArray) encodeJSON() (json.JSON, error) {
+	builder := json.NewArrayBuilder(len(*a))
+
+	for _, value := range *a {
+		jsVal, err := (*jsonString)(&value).encodeJSON()
+		if err != nil {
+			return nil, err
+		}
+		builder.Add(jsVal)
+	}
+
+	return builder.Build(), nil
+}
+
+type stmtFingerprintIDArray []appstatspb.StmtFingerprintID
 
 func (s *stmtFingerprintIDArray) decodeJSON(js json.JSON) error {
 	arrLen := js.Len()
@@ -148,7 +242,7 @@ func (s *stmtFingerprintIDArray) decodeJSON(js json.JSON) error {
 		if err := fingerprintID.decodeJSON(fingerprintIDJSON); err != nil {
 			return err
 		}
-		*s = append(*s, roachpb.StmtFingerprintID(fingerprintID))
+		*s = append(*s, appstatspb.StmtFingerprintID(fingerprintID))
 	}
 
 	return nil
@@ -168,7 +262,7 @@ func (s *stmtFingerprintIDArray) encodeJSON() (json.JSON, error) {
 	return builder.Build(), nil
 }
 
-type stmtFingerprintID roachpb.StmtFingerprintID
+type stmtFingerprintID appstatspb.StmtFingerprintID
 
 func (s *stmtFingerprintID) decodeJSON(js json.JSON) error {
 	var str jsonString
@@ -192,10 +286,10 @@ func (s *stmtFingerprintID) decodeJSON(js json.JSON) error {
 
 func (s *stmtFingerprintID) encodeJSON() (json.JSON, error) {
 	return json.FromString(
-		encodeStmtFingerprintIDToString((roachpb.StmtFingerprintID)(*s))), nil
+		EncodeStmtFingerprintIDToString((appstatspb.StmtFingerprintID)(*s))), nil
 }
 
-type innerTxnStats roachpb.TransactionStatistics
+type innerTxnStats appstatspb.TransactionStatistics
 
 func (t *innerTxnStats) jsonFields() jsonFields {
 	return jsonFields{
@@ -205,9 +299,11 @@ func (t *innerTxnStats) jsonFields() jsonFields {
 		{"svcLat", (*numericStats)(&t.ServiceLat)},
 		{"retryLat", (*numericStats)(&t.RetryLat)},
 		{"commitLat", (*numericStats)(&t.CommitLat)},
+		{"idleLat", (*numericStats)(&t.IdleLat)},
 		{"bytesRead", (*numericStats)(&t.BytesRead)},
 		{"rowsRead", (*numericStats)(&t.RowsRead)},
 		{"rowsWritten", (*numericStats)(&t.RowsWritten)},
+		{"kvCPUTimeNanos", (*numericStats)(&t.KVCPUTimeNanos)},
 	}
 }
 
@@ -219,7 +315,7 @@ func (t *innerTxnStats) encodeJSON() (json.JSON, error) {
 	return t.jsonFields().encodeJSON()
 }
 
-type innerStmtStats roachpb.StatementStatistics
+type innerStmtStats appstatspb.StatementStatistics
 
 func (s *innerStmtStats) jsonFields() jsonFields {
 	return jsonFields{
@@ -228,6 +324,7 @@ func (s *innerStmtStats) jsonFields() jsonFields {
 		{"maxRetries", (*jsonInt)(&s.MaxRetries)},
 		{"lastExecAt", (*jsonTime)(&s.LastExecTimestamp)},
 		{"numRows", (*numericStats)(&s.NumRows)},
+		{"idleLat", (*numericStats)(&s.IdleLat)},
 		{"parseLat", (*numericStats)(&s.ParseLat)},
 		{"planLat", (*numericStats)(&s.PlanLat)},
 		{"runLat", (*numericStats)(&s.RunLat)},
@@ -236,19 +333,70 @@ func (s *innerStmtStats) jsonFields() jsonFields {
 		{"bytesRead", (*numericStats)(&s.BytesRead)},
 		{"rowsRead", (*numericStats)(&s.RowsRead)},
 		{"rowsWritten", (*numericStats)(&s.RowsWritten)},
+		{"kvCPUTimeNanos", (*numericStats)(&s.KVCPUTimeNanos)},
 		{"nodes", (*int64Array)(&s.Nodes)},
+		{"kvNodeIds", (*int32Array)(&s.KVNodeIDs)},
+		{"regions", (*stringArray)(&s.Regions)},
+		{"usedFollowerRead", (*jsonBool)(&s.UsedFollowerRead)},
+		{"planGists", (*stringArray)(&s.PlanGists)},
+		{"indexes", (*stringArray)(&s.Indexes)},
+		{"latencyInfo", (*latencyInfo)(&s.LatencyInfo)},
+		{"lastErrorCode", (*jsonString)(&s.LastErrorCode)},
+		{"failureCount", (*jsonInt)(&s.FailureCount)},
+		{"genericCount", (*jsonInt)(&s.GenericCount)},
+		{"stmtHintsCount", (*jsonInt)(&s.StmtHintsCount)},
+		{"sqlType", (*jsonString)(&s.SQLType)},
+	}
+}
+
+// canaryJsonFields returns the JSON fields for canary stats tracking.
+// These are separated from jsonFields() so they can be conditionally
+// encoded only when canary/stable data is present, avoiding storage
+// overhead per row in system.statement_statistics for the common case
+// where the canary experiment is not active.
+func (s *innerStmtStats) canaryJsonFields() jsonFields {
+	return jsonFields{
+		{"canaryStats", (*experimentStatsInfo)(&s.CanaryStats)},
+	}
+}
+
+// stableJsonFields returns the JSON fields for stable stats tracking.
+// Like canaryJsonFields, these are conditionally encoded.
+func (s *innerStmtStats) stableJsonFields() jsonFields {
+	return jsonFields{
+		{"stableStats", (*experimentStatsInfo)(&s.StableStats)},
 	}
 }
 
 func (s *innerStmtStats) decodeJSON(js json.JSON) error {
-	return s.jsonFields().decodeJSON(js)
+	if err := s.jsonFields().decodeJSON(js); err != nil {
+		return err
+	}
+	// Canary and stable fields are optional in the JSON — they are only
+	// present when the canary experiment was active. Decode them if present;
+	// missing fields are left at their zero values by decodeJSON.
+	if err := s.canaryJsonFields().decodeJSON(js); err != nil {
+		return err
+	}
+	return s.stableJsonFields().decodeJSON(js)
 }
 
 func (s *innerStmtStats) encodeJSON() (json.JSON, error) {
-	return s.jsonFields().encodeJSON()
+	fields := s.jsonFields()
+	// Only include canary/stable fields when the respective stats were
+	// actually collected. This avoids adding zero-valued JSON to every
+	// row in system.statement_statistics when the canary experiment is
+	// not in use.
+	if s.CanaryStats.Count > 0 {
+		fields = append(fields, s.canaryJsonFields()...)
+	}
+	if s.StableStats.Count > 0 {
+		fields = append(fields, s.stableJsonFields()...)
+	}
+	return fields.encodeJSON()
 }
 
-type execStats roachpb.ExecStats
+type execStats appstatspb.ExecStats
 
 func (e *execStats) jsonFields() jsonFields {
 	return jsonFields{
@@ -258,6 +406,9 @@ func (e *execStats) jsonFields() jsonFields {
 		{"contentionTime", (*numericStats)(&e.ContentionTime)},
 		{"networkMsgs", (*numericStats)(&e.NetworkMessages)},
 		{"maxDiskUsage", (*numericStats)(&e.MaxDiskUsage)},
+		{"cpuSQLNanos", (*numericStats)(&e.CPUSQLNanos)},
+		{"mvccIteratorStats", (*iteratorStats)(&e.MVCCIteratorStats)},
+		{"admissionWaitTime", (*numericStats)(&e.AdmissionWaitTime)},
 	}
 }
 
@@ -269,7 +420,35 @@ func (e *execStats) encodeJSON() (json.JSON, error) {
 	return e.jsonFields().encodeJSON()
 }
 
-type numericStats roachpb.NumericStat
+type iteratorStats appstatspb.MVCCIteratorStats
+
+func (e *iteratorStats) jsonFields() jsonFields {
+	return jsonFields{
+		{"stepCount", (*numericStats)(&e.StepCount)},
+		{"stepCountInternal", (*numericStats)(&e.StepCountInternal)},
+		{"seekCount", (*numericStats)(&e.SeekCount)},
+		{"seekCountInternal", (*numericStats)(&e.SeekCountInternal)},
+		{"blockBytes", (*numericStats)(&e.BlockBytes)},
+		{"blockBytesInCache", (*numericStats)(&e.BlockBytesInCache)},
+		{"keyBytes", (*numericStats)(&e.KeyBytes)},
+		{"valueBytes", (*numericStats)(&e.ValueBytes)},
+		{"pointCount", (*numericStats)(&e.PointCount)},
+		{"pointsCoveredByRangeTombstones", (*numericStats)(&e.PointsCoveredByRangeTombstones)},
+		{"rangeKeyCount", (*numericStats)(&e.RangeKeyCount)},
+		{"rangeKeyContainedPoints", (*numericStats)(&e.RangeKeyContainedPoints)},
+		{"rangeKeySkippedPoints", (*numericStats)(&e.RangeKeySkippedPoints)},
+	}
+}
+
+func (e *iteratorStats) decodeJSON(js json.JSON) error {
+	return e.jsonFields().decodeJSON(js)
+}
+
+func (e *iteratorStats) encodeJSON() (json.JSON, error) {
+	return e.jsonFields().encodeJSON()
+}
+
+type numericStats appstatspb.NumericStat
 
 func (n *numericStats) jsonFields() jsonFields {
 	return jsonFields{
@@ -284,6 +463,41 @@ func (n *numericStats) decodeJSON(js json.JSON) error {
 
 func (n *numericStats) encodeJSON() (json.JSON, error) {
 	return n.jsonFields().encodeJSON()
+}
+
+type latencyInfo appstatspb.LatencyInfo
+
+func (l *latencyInfo) jsonFields() jsonFields {
+	return jsonFields{
+		{"min", (*jsonFloat)(&l.Min)},
+		{"max", (*jsonFloat)(&l.Max)},
+	}
+}
+
+func (l *latencyInfo) decodeJSON(js json.JSON) error {
+	return l.jsonFields().decodeJSON(js)
+}
+
+func (l *latencyInfo) encodeJSON() (json.JSON, error) {
+	return l.jsonFields().encodeJSON()
+}
+
+type experimentStatsInfo appstatspb.ExperimentStatsInfo
+
+func (e *experimentStatsInfo) jsonFields() jsonFields {
+	return jsonFields{
+		{"count", (*jsonInt)(&e.Count)},
+		{"runLat", (*numericStats)(&e.RunLat)},
+		{"planLat", (*numericStats)(&e.PlanLat)},
+	}
+}
+
+func (e *experimentStatsInfo) decodeJSON(js json.JSON) error {
+	return e.jsonFields().decodeJSON(js)
+}
+
+func (e *experimentStatsInfo) encodeJSON() (json.JSON, error) {
+	return e.jsonFields().encodeJSON()
 }
 
 type jsonFields []jsonField
@@ -357,11 +571,21 @@ func (t *jsonTime) encodeJSON() (json.JSON, error) {
 type jsonString string
 
 func (s *jsonString) decodeJSON(js json.JSON) error {
+	// Tolerate provided nil JSON value as valid case and interpret
+	// it as null result.
+	if js == nil {
+		*s = "<null>"
+		return nil
+	}
 	text, err := js.AsText()
 	if err != nil {
 		return err
 	}
-	*s = (jsonString)(*text)
+	if text != nil {
+		*s = (jsonString)(*text)
+	} else {
+		*s = "<null>"
+	}
 	return nil
 }
 

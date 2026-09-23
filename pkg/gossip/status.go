@@ -1,29 +1,37 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/redact"
 )
 
+// minCallbackDurationToRecord is the minimum duration for which we record
+// callback pending and callback processing durations. This skews the histogram,
+// but avoids recording very short durations which are not interesting and
+// which. will be dominated by the overhead of recording the duration itself.
+const minCallbackDurationToRecord = 10 * time.Millisecond
+
 // Metrics contains gossip metrics used per node and server.
 type Metrics struct {
-	ConnectionsRefused *metric.Counter
-	BytesReceived      *metric.Counter
-	BytesSent          *metric.Counter
-	InfosReceived      *metric.Counter
-	InfosSent          *metric.Counter
+	ConnectionsRefused          *metric.Counter
+	BytesReceived               *metric.Counter
+	BytesSent                   *metric.Counter
+	InfosReceived               *metric.Counter
+	InfosSent                   *metric.Counter
+	MessagesSent                *metric.Counter
+	MessagesReceived            *metric.Counter
+	CallbacksProcessed          *metric.Counter
+	CallbacksPending            *metric.Gauge
+	CallbacksProcessingDuration metric.IHistogram
+	CallbacksPendingDuration    metric.IHistogram
 }
 
 func makeMetrics() Metrics {
@@ -33,6 +41,22 @@ func makeMetrics() Metrics {
 		BytesSent:          metric.NewCounter(MetaBytesSent),
 		InfosReceived:      metric.NewCounter(MetaInfosReceived),
 		InfosSent:          metric.NewCounter(MetaInfosSent),
+		MessagesReceived:   metric.NewCounter(MetaMessagesReceived),
+		MessagesSent:       metric.NewCounter(MetaMessagesSent),
+		CallbacksProcessed: metric.NewCounter(MetaCallbacksProcessed),
+		CallbacksPending:   metric.NewGauge(MetaCallbacksPending),
+		CallbacksProcessingDuration: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     MetaCallbacksProcessingDuration,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets,
+		}),
+		CallbacksPendingDuration: metric.NewHistogram(metric.HistogramOptions{
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     MetaCallbacksPendingDuration,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets,
+		}),
 	}
 }
 
@@ -43,11 +67,13 @@ func (m Metrics) String() string {
 // Snapshot returns a snapshot of the metrics.
 func (m Metrics) Snapshot() MetricSnap {
 	return MetricSnap{
-		ConnsRefused:  m.ConnectionsRefused.Count(),
-		BytesReceived: m.BytesReceived.Count(),
-		BytesSent:     m.BytesSent.Count(),
-		InfosReceived: m.InfosReceived.Count(),
-		InfosSent:     m.InfosSent.Count(),
+		ConnsRefused:     m.ConnectionsRefused.Count(),
+		BytesReceived:    m.BytesReceived.Count(),
+		BytesSent:        m.BytesSent.Count(),
+		InfosReceived:    m.InfosReceived.Count(),
+		InfosSent:        m.InfosSent.Count(),
+		MessagesReceived: m.MessagesReceived.Count(),
+		MessagesSent:     m.MessagesSent.Count(),
 	}
 }
 
@@ -57,7 +83,8 @@ func (m MetricSnap) String() string {
 
 // SafeFormat implements the redact.SafeFormatter interface.
 func (m MetricSnap) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("infos %d/%d sent/received, bytes %dB/%dB sent/received",
+	w.Printf("messages %d/%d sent/received, infos %d/%d sent/received, bytes %dB/%dB sent/received",
+		m.MessagesSent, m.MessagesReceived,
 		m.InfosSent, m.InfosReceived,
 		m.BytesSent, m.BytesReceived)
 	if m.ConnsRefused > 0 {

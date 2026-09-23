@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package zonepb
 
@@ -20,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -60,6 +56,20 @@ func TestZoneConfigValidate(t *testing.T) {
 				RangeMaxBytes: proto.Int64(0),
 			},
 			"RangeMaxBytes 0 less than minimum allowed",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   proto.Int32(1),
+				RangeMaxBytes: proto.Int64(9 << 30 /* 9 GiB */),
+			},
+			"RangeMaxBytes 9663676416 greater than maximum allowed 8589934592",
+		},
+		{
+			ZoneConfig{
+				NumReplicas:   proto.Int32(1),
+				RangeMaxBytes: proto.Int64(60 << 20),
+			},
+			"RangeMaxBytes 62914560 less than minimum allowed",
 		},
 		{
 			ZoneConfig{
@@ -1027,7 +1037,7 @@ func TestZoneSpecifiers(t *testing.T) {
 	}
 	resolveID := func(id uint32) (parentID, parentSchemaID uint32, name string, err error) {
 		if id == keys.PublicSchemaID {
-			return 0, 0, string(tree.PublicSchemaName), nil
+			return 0, 0, string(catconstants.PublicSchemaName), nil
 		}
 		for entry, entryID := range namespace {
 			if id == entryID {
@@ -1117,7 +1127,7 @@ func tableSpecifier(
 ) tree.ZoneSpecifier {
 	return tree.ZoneSpecifier{
 		TableOrIndex: tree.TableIndexName{
-			Table: tree.MakeTableNameWithSchema(db, tree.PublicSchemaName, tbl),
+			Table: tree.MakeTableNameWithSchema(db, catconstants.PublicSchemaName, tbl),
 			Index: idx,
 		},
 		Partition: partition,
@@ -1426,7 +1436,13 @@ func TestZoneConfigToSpanConfigConversion(t *testing.T) {
 	}
 }
 
-func TestDefaultZoneAndSpanConfigs(t *testing.T) {
-	converted := DefaultZoneConfigRef().AsSpanConfig()
-	require.True(t, converted.Equal(roachpb.TestingDefaultSpanConfig()))
+func TestHardCodedSpanConfigs(t *testing.T) {
+	{
+		converted := DefaultZoneConfigRef().AsSpanConfig()
+		require.True(t, converted.Equal(roachpb.TestingDefaultSpanConfig()))
+	}
+	{
+		converted := DefaultSystemZoneConfigRef().AsSpanConfig()
+		require.True(t, converted.Equal(roachpb.TestingSystemSpanConfig()))
+	}
 }

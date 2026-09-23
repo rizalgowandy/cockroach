@@ -1,22 +1,23 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package skip
 
 import (
 	"flag"
 	"fmt"
+	"os"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic/metamorphicutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
@@ -30,20 +31,32 @@ type SkippableTest interface {
 // WithIssue skips this test, logging the given issue ID as the reason.
 func WithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
-	t.Skip(append([]interface{}{
-		fmt.Sprintf("https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID)},
-		args...))
+	maybeSkip(t, fmt.Sprintf("https://github.com/cockroachdb/cockroach/issues/%d", githubIssueID),
+		args...)
+}
+
+// Unimplemented skips this test case, loggint the given issue ID. It
+// is included in addition to WithIssue to allow the caller to signal
+// that this test is not being skipped because of a bug, but rather
+// because of an unimplemented feature.
+func Unimplemented(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	maybeSkip(t, withIssue("unimplemented", githubIssueID), args...)
 }
 
 // IgnoreLint skips this test, explicitly marking it as not a test that
 // should be tracked as a "skipped test" by external tools. You should use this
 // if, for example, your test should only be run in Race mode.
+//
+// Does not respect COCKROACH_FORCE_RUN_SKIPPED_TESTS.
 func IgnoreLint(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	t.Skip(args...)
 }
 
 // IgnoreLintf is like IgnoreLint, and it also takes a format string.
+//
+// Does not respect COCKROACH_FORCE_RUN_SKIPPED_TESTS.
 func IgnoreLintf(t SkippableTest, format string, args ...interface{}) {
 	t.Helper()
 	t.Skipf(format, args...)
@@ -53,7 +66,7 @@ func IgnoreLintf(t SkippableTest, format string, args ...interface{}) {
 func UnderDeadlock(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if syncutil.DeadlockEnabled {
-		t.Skip(append([]interface{}{"disabled under deadlock detector"}, args...))
+		maybeSkip(t, "disabled under deadlock detector", args...)
 	}
 }
 
@@ -62,10 +75,7 @@ func UnderDeadlock(t SkippableTest, args ...interface{}) {
 func UnderDeadlockWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if syncutil.DeadlockEnabled {
-		t.Skip(append([]interface{}{fmt.Sprintf(
-			"disabled under deadlock detector. issue: https://github.com/cockroachdb/cockroach/issue/%d",
-			githubIssueID,
-		)}, args...))
+		maybeSkip(t, withIssue("disabled under deadlock detector", githubIssueID), args...)
 	}
 }
 
@@ -73,7 +83,15 @@ func UnderDeadlockWithIssue(t SkippableTest, githubIssueID int, args ...interfac
 func UnderRace(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if util.RaceEnabled {
-		t.Skip(append([]interface{}{"disabled under race"}, args...))
+		maybeSkip(t, "disabled under race", args...)
+	}
+}
+
+// UnlessUnderRace skips this test if the race detector is not enabled.
+func UnlessUnderRace(t SkippableTest, args ...interface{}) {
+	t.Helper()
+	if !util.RaceEnabled {
+		maybeSkip(t, "disabled unless under race", args...)
 	}
 }
 
@@ -82,9 +100,7 @@ func UnderRace(t SkippableTest, args ...interface{}) {
 func UnderRaceWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if util.RaceEnabled {
-		t.Skip(append([]interface{}{fmt.Sprintf(
-			"disabled under race. issue: https://github.com/cockroachdb/cockroach/issue/%d", githubIssueID,
-		)}, args...))
+		maybeSkip(t, withIssue("disabled under race", githubIssueID), args...)
 	}
 }
 
@@ -93,9 +109,7 @@ func UnderRaceWithIssue(t SkippableTest, githubIssueID int, args ...interface{})
 func UnderBazelWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
 	if bazel.BuiltWithBazel() {
-		t.Skip(append([]interface{}{fmt.Sprintf(
-			"disabled under bazel. issue: https://github.com/cockroachdb/cockroach/issue/%d", githubIssueID,
-		)}, args...))
+		maybeSkip(t, withIssue("disabled under bazel", githubIssueID), args...)
 	}
 }
 
@@ -106,24 +120,24 @@ var _ = UnderBazelWithIssue
 func UnderShort(t SkippableTest, args ...interface{}) {
 	t.Helper()
 	if testing.Short() {
-		t.Skip(append([]interface{}{"disabled under -short"}, args...))
+		maybeSkip(t, "disabled under -short", args...)
 	}
 }
 
 // UnderStress skips this test when running under stress.
 func UnderStress(t SkippableTest, args ...interface{}) {
 	t.Helper()
-	if NightlyStress() {
-		t.Skip(append([]interface{}{"disabled under stress"}, args...))
+	if Stress() {
+		maybeSkip(t, "disabled under stress", args...)
 	}
 }
 
-// UnderStressRace skips this test during stressrace runs, which are tests
-// run under stress with the -race flag.
-func UnderStressRace(t SkippableTest, args ...interface{}) {
+// UnderStressWithIssue skips this test when running under stress, logging the
+// given issue ID as the reason.
+func UnderStressWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
 	t.Helper()
-	if NightlyStress() && util.RaceEnabled {
-		t.Skip(append([]interface{}{"disabled under stressrace"}, args...))
+	if Stress() {
+		maybeSkip(t, withIssue("disabled under stress", githubIssueID), args...)
 	}
 }
 
@@ -131,9 +145,53 @@ func UnderStressRace(t SkippableTest, args ...interface{}) {
 // run with the metamorphic build tag.
 func UnderMetamorphic(t SkippableTest, args ...interface{}) {
 	t.Helper()
-	if util.IsMetamorphicBuild() {
-		t.Skip(append([]interface{}{"disabled under metamorphic"}, args...))
+	if metamorphicutil.IsMetamorphicBuild {
+		maybeSkip(t, "disabled under metamorphic", args...)
 	}
+}
+
+// UnderMetamorphicWithIssue skips this test during metamorphic runs, which are
+// tests run with the metamorphic build tag, logging the given issue ID as the
+// reason.
+func UnderMetamorphicWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	if metamorphicutil.IsMetamorphicBuild {
+		maybeSkip(t, withIssue("disabled under metamorphic", githubIssueID), args...)
+	}
+}
+
+// UnderNonTestBuild skips this test if the build does not have the crdb_test
+// tag.
+func UnderNonTestBuild(t SkippableTest) {
+	if !buildutil.CrdbTestBuild {
+		maybeSkip(t, "crdb_test tag required for this test")
+	}
+}
+
+// UnderDuress skips the test if we are running under any of the
+// conditions we have observed as producing slow builds.
+func UnderDuress(t SkippableTest, args ...interface{}) {
+	t.Helper()
+	if Duress() {
+		skipReason := fmt.Sprintf("duress (current config %s)", testConfig())
+		maybeSkip(t, skipReason, args...)
+	}
+}
+
+// UnderDuressWithIssue skips the test if we are running under any of the
+// conditions we have observed as producing slow builds.
+func UnderDuressWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	if Duress() {
+		skipReason := fmt.Sprintf("duress (current config %s)", testConfig())
+		maybeSkip(t, withIssue(skipReason, githubIssueID), args...)
+	}
+}
+
+// Duress captures the conditions that currently lead us to believe that tests
+// may be slower than normal.
+func Duress() bool {
+	return util.RaceEnabled || Stress() || syncutil.DeadlockEnabled
 }
 
 // UnderBench returns true iff a test is currently running under `go
@@ -145,4 +203,73 @@ func UnderBench() bool {
 	// test executable with `-test.bench 1`.
 	f := flag.Lookup("test.bench")
 	return f != nil && f.Value.String() != ""
+}
+
+// UnderRemoteExecution skips the given test under remote test execution.
+func UnderRemoteExecutionWithIssue(t SkippableTest, githubIssueID int, args ...interface{}) {
+	t.Helper()
+	isRemote := os.Getenv("REMOTE_EXEC")
+	if len(isRemote) > 0 {
+		maybeSkip(t, withIssue("disabled under race", githubIssueID), args...)
+	}
+
+}
+
+func OnArch(t SkippableTest, arch string, args ...interface{}) {
+	t.Helper()
+	if runtime.GOARCH == arch {
+		skipReason := fmt.Sprintf("on-arch %s (current config %s)", arch, testConfig())
+		maybeSkip(t, skipReason, args...)
+	}
+}
+
+func testConfig() string {
+	configs := []string{}
+	if Stress() {
+		configs = append(configs, "stress")
+	}
+	if util.RaceEnabled {
+		configs = append(configs, "race")
+	}
+	if syncutil.DeadlockEnabled {
+		configs = append(configs, "deadlock")
+	}
+	return strings.Join(configs, ",")
+}
+
+func withIssue(reason string, githubIssueID int) string {
+	return fmt.Sprintf(
+		"%s. issue: https://github.com/cockroachdb/cockroach/issues/%d",
+		reason,
+		githubIssueID,
+	)
+}
+
+var forceRunSkippedTests = envutil.EnvOrDefaultBool("COCKROACH_FORCE_RUN_SKIPPED_TESTS", false)
+
+func maybeSkip(t SkippableTest, reason string, args ...interface{}) {
+	if forceRunSkippedTests {
+		return
+	}
+
+	t.Skip(append([]interface{}{reason}, args...)...)
+}
+
+// ServerlessOnly marks a test as testing Serverless-specific functionality.
+// Currently a no-op; uncomment the skip in release branches that no longer
+// support Serverless in production.
+func ServerlessOnly(t SkippableTest) {
+	// IgnoreLint(t, "version is not used by serverless in production")
+}
+
+var miscNightly = envutil.EnvOrDefaultBool("COCKROACH_MISC_NIGHTLY", false)
+
+// IfNotMiscNightly skips this test unless the COCKROACH_MISC_NIGHTLY
+// env var is set to 'true'.
+//
+// Does not respect COCKROACH_FORCE_RUN_SKIPPED_TESTS.
+func IfNotMiscNightly(t SkippableTest) {
+	if !miscNightly {
+		t.Skip("only runs in Misc Nightly CI")
+	}
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geomfn
 
@@ -254,6 +249,63 @@ func TestMinimumClearanceLine(t *testing.T) {
 			require.NoError(t, err)
 			require.EqualValues(t, tc.expected, wkt)
 			require.EqualValues(t, srid, result.SRID())
+		})
+	}
+}
+
+func TestPerimeter3D(t *testing.T) {
+	testCases := []struct {
+		wkt      string
+		expected float64
+	}{
+		{"POLYGON Z((0 0 0, 10 0 0, 10 10 5, 0 10 5, 0 0 0))", 42.3606797749979},
+		{"POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))", 40},
+		{"LINESTRING Z(0 0 0, 10 0 0)", 0},
+		{"POINT Z(0 0 0)", 0},
+		{"MULTIPOLYGON Z(((0 0 0, 1 0 0, 1 1 0, 0 1 0, 0 0 0)),((2 2 0, 3 2 0, 3 3 1, 2 3 1, 2 2 0)))", 8.82842712474619},
+	}
+
+	// Get reference value for multipolygon from PostGIS.
+	// Calculate manually: first polygon is flat (perimeter=4), second has Z offsets.
+	// For now, just test against PostGIS output.
+
+	for _, tc := range testCases {
+		t.Run(tc.wkt, func(t *testing.T) {
+			g := geo.MustParseGeometry(tc.wkt)
+			ret, err := Perimeter3D(g)
+			require.NoError(t, err)
+			require.InDelta(t, tc.expected, ret, 1e-10)
+		})
+	}
+}
+
+func TestLength3D(t *testing.T) {
+	testCases := []struct {
+		wkt      string
+		expected float64
+	}{
+		{"POINT(1.0 1.0)", 0},
+		{"POINT(1.0 1.0 1.0)", 0},
+		{"POLYGON((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 0.0))", 0},
+		{"POLYGON((0.0 0.0 0.0, 1.0 0.0 0.0, 1.0 1.0 0.0, 1.0 1.0 1.0, 0.0 0.0 0.0))", 0},
+		{"LINESTRING(1.0 1.0, 2.0 2.0, 3.0 3.0)", 2.8284271247461903},
+		{"MULTILINESTRING((1.0 1.0, 2.0 2.0, 3.0 3.0), (6.0 6.0, 7.0 6.0))", 3.8284271247461903},
+		{"GEOMETRYCOLLECTION (POINT (40 10),LINESTRING (10 10, 20 20, 10 40),POLYGON ((40 40, 20 45, 45 30, 40 40)))", 36.50281539872885},
+		{"GEOMETRYCOLLECTION (GEOMETRYCOLLECTION(POINT (40 10),LINESTRING (10 10, 20 20, 10 40),POLYGON ((40 40, 20 45, 45 30, 40 40))))", 36.50281539872885},
+		{"LINESTRING(743238 2967416 1,743238 2967450 1,743265 2967450 3, 743265.625 2967416 3,743238 2967416 3)", 122.70471674145682},
+		{"LINESTRING(0 0 0, 1 1 1, 0 0 0)", 3.4641016151377544},
+		{"MULTILINESTRING((0 0 0, 1 1 1, 0 0 0), (743238 2967416 1,743238 2967450 1,743265 2967450 3, 743265.625 2967416 3,743238 2967416 3))", 126.16881835659457},
+		{"GEOMETRYCOLLECTION (POINT (0 0 0), LINESTRING(0 0 0, 1 1 1, 0 0 0), POLYGON((0.0 0.0 0.0, 1.0 0.0 0.0, 1.0 1.0 0.0, 1.0 1.0 1.0, 0.0 0.0 0.0)))", 3.4641016151377544},
+		{"GEOMETRYCOLLECTION (GEOMETRYCOLLECTION(POINT (0 0 0), LINESTRING(0 0 0, 1 1 1, 0 0 0), POLYGON((0.0 0.0 0.0, 1.0 0.0 0.0, 1.0 1.0 0.0, 1.0 1.0 1.0, 0.0 0.0 0.0))))", 3.4641016151377544},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.wkt, func(t *testing.T) {
+			g, err := geo.ParseGeometry(tc.wkt)
+			require.NoError(t, err)
+			ret, err := Length3D(g)
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, ret)
 		})
 	}
 }

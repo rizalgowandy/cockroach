@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -14,6 +9,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -42,19 +38,22 @@ func NewCountOp(allocator *colmem.Allocator, input colexecop.Operator) colexecop
 	return c
 }
 
-func (c *countOp) Next() coldata.Batch {
+func (c *countOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if c.done {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
 	c.internalBatch.ResetInternalBatch()
 	for {
-		bat := c.Input.Next()
+		bat, meta := c.Input.Next()
+		if meta != nil {
+			return nil, meta
+		}
 		length := bat.Length()
 		if length == 0 {
 			c.done = true
 			c.internalBatch.ColVec(0).Int64()[0] = c.count
 			c.internalBatch.SetLength(1)
-			return c.internalBatch
+			return c.internalBatch, nil
 		}
 		c.count += int64(length)
 	}

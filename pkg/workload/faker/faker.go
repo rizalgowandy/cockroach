@@ -1,16 +1,11 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package faker
 
-import "golang.org/x/exp/rand"
+import "math/rand/v2"
 
 // This is a rough go port of https://github.com/joke2k/faker.
 
@@ -67,5 +62,5 @@ func (e *weightedEntries) Rand(rng *rand.Rand) interface{} {
 }
 
 func randInt(rng *rand.Rand, minInclusive, maxInclusive int) int {
-	return rng.Intn(maxInclusive-minInclusive+1) + minInclusive
+	return rng.IntN(maxInclusive-minInclusive+1) + minInclusive
 }

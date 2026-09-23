@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
@@ -16,6 +11,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -28,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/stretchr/testify/require"
 )
 
 var emptyAddr = util.MakeUnresolvedAddr("test", "<test-addr>")
@@ -37,7 +33,7 @@ func newTestInfoStore() (*infoStore, *stop.Stopper) {
 	stopper := stop.NewStopper()
 	nc := &base.NodeIDContainer{}
 	nc.Set(context.Background(), 1)
-	is := newInfoStore(log.AmbientContext{Tracer: tracing.NewTracer()}, nc, emptyAddr, stopper)
+	is := newInfoStore(log.MakeTestingAmbientCtxWithNewTracer(), nc, emptyAddr, stopper, makeMetrics())
 	return is, stopper
 }
 
@@ -93,6 +89,65 @@ func TestInfoStoreGetInfo(t *testing.T) {
 	}
 	if is.getInfo("b") != nil {
 		t.Error("erroneously produced non-existent info for key b")
+	}
+}
+
+// TestGetHighWaterStampsWithDiff checks that getHighWaterStampsWithDiff()
+// returns the diff between the passed high water stamps and the current
+// InfoStore high water stamps.
+func TestGetHighWaterStampsWithDiff(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	is, stopper := newTestInfoStore()
+	defer stopper.Stop(context.Background())
+
+	// Create two nodes, and attach some info to them.
+	i1 := is.newInfo(nil, time.Second)
+	i1.NodeID = 1
+	err := is.addInfo("a", i1)
+	require.NoError(t, err)
+
+	i2 := is.newInfo(nil, time.Second)
+	i2.NodeID = 2
+	err = is.addInfo("b", i2)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		prevHighWaterStamps map[roachpb.NodeID]int64
+		highWaterStamps     map[roachpb.NodeID]int64
+		expDiffStamps       map[roachpb.NodeID]int64
+	}{
+		{
+			prevHighWaterStamps: map[roachpb.NodeID]int64{},
+			highWaterStamps:     map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 10},
+			expDiffStamps:       map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 10},
+		},
+		{
+			prevHighWaterStamps: map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 20},
+			highWaterStamps:     map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 20},
+			expDiffStamps:       map[roachpb.NodeID]int64{},
+		},
+		{
+			prevHighWaterStamps: map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 20},
+			highWaterStamps:     map[roachpb.NodeID]int64{i1.NodeID: 20, i2.NodeID: 20},
+			expDiffStamps:       map[roachpb.NodeID]int64{i1.NodeID: 20},
+		},
+		{
+			prevHighWaterStamps: map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 20},
+			highWaterStamps:     map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 30},
+			expDiffStamps:       map[roachpb.NodeID]int64{i2.NodeID: 30},
+		},
+		{
+			prevHighWaterStamps: map[roachpb.NodeID]int64{i1.NodeID: 10, i2.NodeID: 20},
+			highWaterStamps:     map[roachpb.NodeID]int64{i1.NodeID: 20, i2.NodeID: 30},
+			expDiffStamps:       map[roachpb.NodeID]int64{i1.NodeID: 20, i2.NodeID: 30},
+		},
+	} {
+		// Explicitly set the high water timestamps.
+		is.highWaterStamps = tc.highWaterStamps
+
+		fullStamps, diffStamps := is.getHighWaterStampsWithDiff(tc.prevHighWaterStamps)
+		require.Equal(t, diffStamps, tc.expDiffStamps)
+		require.Equal(t, fullStamps, tc.highWaterStamps)
 	}
 }
 
@@ -322,7 +377,7 @@ func TestInfoStoreMostDistant(t *testing.T) {
 	scInfo := is.newInfo(nil, time.Second)
 	scInfo.Hops = 100
 	scInfo.NodeID = nodes[0]
-	if err := is.addInfo(KeySystemConfig, scInfo); err != nil {
+	if err := is.addInfo(KeyDistSQLDrainingPrefix, scInfo); err != nil {
 		t.Fatal(err)
 	}
 
@@ -424,22 +479,38 @@ func TestLeastUseful(t *testing.T) {
 }
 
 type callbackRecord struct {
-	keys []string
-	wg   *sync.WaitGroup
+	key       string
+	value     roachpb.Value
+	timestamp int64
+}
+
+type callbackRecords struct {
+	records []callbackRecord
+	wg      *sync.WaitGroup
 	syncutil.Mutex
 }
 
-func (cr *callbackRecord) Add(key string, _ roachpb.Value) {
+func (cr *callbackRecords) Add(key string, value roachpb.Value, origTs int64) {
 	cr.Lock()
 	defer cr.Unlock()
-	cr.keys = append(cr.keys, key)
+	cr.records = append(cr.records, callbackRecord{key, value, origTs})
 	cr.wg.Done()
 }
 
-func (cr *callbackRecord) Keys() []string {
+func (cr *callbackRecords) Keys() []string {
 	cr.Lock()
 	defer cr.Unlock()
-	return append([]string(nil), cr.keys...)
+	keys := make([]string, len(cr.records))
+	for i, record := range cr.records {
+		keys[i] = record.key
+	}
+	return keys
+}
+
+func (cr *callbackRecords) Records() []callbackRecord {
+	cr.Lock()
+	defer cr.Unlock()
+	return append([]callbackRecord(nil), cr.records...)
 }
 
 func TestCallbacks(t *testing.T) {
@@ -447,9 +518,9 @@ func TestCallbacks(t *testing.T) {
 	is, stopper := newTestInfoStore()
 	defer stopper.Stop(context.Background())
 	wg := &sync.WaitGroup{}
-	cb1 := callbackRecord{wg: wg}
-	cb2 := callbackRecord{wg: wg}
-	cbAll := callbackRecord{wg: wg}
+	cb1 := callbackRecords{wg: wg}
+	cb2 := callbackRecords{wg: wg}
+	cbAll := callbackRecords{wg: wg}
 
 	unregisterCB1 := is.registerCallback("key1", cb1.Add)
 	is.registerCallback("key2", cb2.Add)
@@ -548,18 +619,17 @@ func TestCallbacks(t *testing.T) {
 	}
 }
 
-// TestRegisterCallback verifies that a callback is invoked when
-// registered if there are items which match its regexp in the
-// infostore.
+// TestRegisterCallback verifies that a callback is invoked correctly when
+// registered if there are items which match its regexp in the infostore.
 func TestRegisterCallback(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	is, stopper := newTestInfoStore()
 	defer stopper.Stop(context.Background())
 	wg := &sync.WaitGroup{}
-	cb := callbackRecord{wg: wg}
+	cb := callbackRecords{wg: wg}
 
-	i1 := is.newInfo(nil, time.Second)
-	i2 := is.newInfo(nil, time.Second)
+	i1 := is.newInfo([]byte("val1"), time.Second)
+	i2 := is.newInfo([]byte("val2"), time.Second)
 	if err := is.addInfo("key1", i1); err != nil {
 		t.Fatal(err)
 	}
@@ -568,11 +638,118 @@ func TestRegisterCallback(t *testing.T) {
 	}
 
 	wg.Add(2)
+	// Register a callback after the infos are added.
 	is.registerCallback("key.*", cb.Add)
 	wg.Wait()
-	actKeys := cb.Keys()
-	sort.Strings(actKeys)
-	if expKeys := []string{"key1", "key2"}; !reflect.DeepEqual(actKeys, expKeys) {
-		t.Errorf("expected %v, got %v", expKeys, cb.Keys())
+	actRecords := cb.Records()
+	// Sort records by key since callback order is not guaranteed.
+	sort.Slice(actRecords, func(i, j int) bool {
+		return actRecords[i].key < actRecords[j].key
+	})
+
+	expectedRecords := []callbackRecord{
+		{key: "key1", value: i1.Value, timestamp: i1.OrigStamp},
+		{key: "key2", value: i2.Value, timestamp: i2.OrigStamp},
+	}
+
+	require.Equal(t, expectedRecords, actRecords)
+
+	// Verify callback fires for new matching info
+	i3 := is.newInfo([]byte("val3"), time.Second)
+	wg.Add(1)
+	if err := is.addInfo("key3", i3); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	actRecords = cb.Records()
+	sort.Slice(actRecords, func(i, j int) bool {
+		return actRecords[i].key < actRecords[j].key
+	})
+	expectedRecords = append(expectedRecords, callbackRecord{key: "key3", value: i3.Value, timestamp: i3.OrigStamp})
+	require.Equal(t, expectedRecords, actRecords)
+}
+
+// TestCallbacksCalledSequentially verifies that callbacks are called in a
+// sequential order. Meaning that if there is update1 followed by update2, the
+// callback will be called for update1 before update2. This is a property that
+// the gossip package guarantees.
+func TestCallbacksCalledSequentially(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	is, stopper := newTestInfoStore()
+	defer stopper.Stop(context.Background())
+
+	// Create a large number of updates to test the sequential order of callbacks.
+	const numUpdates = 10000
+
+	// Create a wait group to wait for all the callbacks to finish at the end of
+	// the test.
+	wg := &sync.WaitGroup{}
+
+	// Create a callback generator that will generate a callback that will
+	// assert that the keys are in sequential order.
+	callbackGenerator := func() func(key string, _ roachpb.Value, _ int64) {
+		// Add the number of updates to the wait group.
+		wg.Add(numUpdates)
+		// Initially, the expected next key is 0.
+		expectedNextKey := 0
+
+		// Return a callback that will assert the key is in sequential order.
+		return func(key string, _ roachpb.Value, _ int64) {
+			// Convert key to int and assert it matches the expected value.
+			keyInt, err := strconv.Atoi(key)
+			require.NoError(t, err)
+			require.Equal(t, expectedNextKey, keyInt)
+			// Increment the expected next key.
+			expectedNextKey++
+			wg.Done()
+		}
+	}
+
+	// Register three callbacks. We will unregister the second callback
+	// halfway through the test to assert that it doesn't impact the
+	// sequential order of the other callbacks.
+	is.registerCallback(".*", callbackGenerator())
+	unregister := is.registerCallback(".*", func(key string, _ roachpb.Value, _ int64) {})
+	is.registerCallback(".*", callbackGenerator())
+
+	for i := range numUpdates {
+		require.NoError(t, is.addInfo(fmt.Sprintf("%d", i), is.newInfo(nil, time.Second)))
+		if i == numUpdates/2 {
+			// Unregister the callback at the halfway point.
+			unregister()
+		}
+	}
+	wg.Wait()
+}
+
+// BenchmarkCallbackParallelism benchmarks the parallelism of the callback
+// worker. It registers multiple callbacks, and executes a fake workload
+// that sleeps for a short duration to simulate work done in the callback.
+func BenchmarkCallbackParallelism(b *testing.B) {
+	ctx := context.Background()
+	is, stopper := newTestInfoStore()
+	defer stopper.Stop(ctx)
+	wg := &sync.WaitGroup{}
+
+	callback := func(key string, val roachpb.Value, _ int64) {
+		// Sleep for a short duration to simulate work done in callback.
+		time.Sleep(time.Millisecond)
+		wg.Done()
+	}
+
+	// Register 5 callbacks.
+	numCallbacks := 5
+	callbacks := make([]func(), numCallbacks)
+	for i := range numCallbacks {
+		callbacks[i] = is.registerCallback("key.*", callback)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		wg.Add(numCallbacks)
+		require.NoError(b, is.addInfo(fmt.Sprintf("key%d", i), is.newInfo(nil, time.Second)))
+		// Wait for all the callback executions to finish before the next iteration.
+		wg.Wait()
 	}
 }

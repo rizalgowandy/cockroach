@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -19,7 +14,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -31,12 +28,21 @@ func TestSavepoints(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	datadriven.Walk(t, "testdata/savepoints", func(t *testing.T, path string) {
+	datadriven.Walk(t, datapathutils.TestDataPath(t, "savepoints"), func(t *testing.T, path string) {
 
 		params := base.TestServerArgs{}
-		s, origConn, _ := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(ctx)
+		srv, origConn, _ := serverutils.StartServer(t, params)
+		defer srv.Stopper().Stop(ctx)
+		s := srv.ApplicationLayer()
 
+		hostRunner := sqlutils.MakeSQLRunner(srv.SystemLayer().SQLConn(t))
+		// If we have buffered writes enabled, we must have the split lock
+		// reliability enabled (which can be tweaked metamorphically).
+		hostRunner.Exec(t, "SET CLUSTER SETTING kv.lock_table.unreplicated_lock_reliability.split.enabled = true")
+
+		if _, err := origConn.Exec(`SET CLUSTER SETTING kv.transaction.write_buffering.max_buffer_size = '2KiB';`); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := origConn.Exec(`CREATE TABLE progress(
       conn STRING,
     	n INT, 
@@ -63,8 +69,7 @@ func TestSavepoints(t *testing.T) {
 					var ok bool
 					sqlConn, ok = sqlConns[connName]
 					if !ok {
-						sqlConn = serverutils.OpenDBConn(
-							t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+						sqlConn = s.SQLConn(t, serverutils.DBName(params.UseDatabase))
 						sqlConns[connName] = sqlConn
 					}
 				}

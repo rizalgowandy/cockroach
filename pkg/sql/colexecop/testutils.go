@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecop
 
@@ -16,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -45,17 +41,17 @@ func (b *BatchBuffer) Add(batch coldata.Batch, _ []*types.T) {
 func (b *BatchBuffer) Init(context.Context) {}
 
 // Next is part of the Operator interface.
-func (b *BatchBuffer) Next() coldata.Batch {
+func (b *BatchBuffer) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	batch := b.buffer[0]
 	b.buffer = b.buffer[1:]
-	return batch
+	return batch, nil
 }
 
 // RepeatableBatchSource is an Operator that returns the same batch forever.
 type RepeatableBatchSource struct {
 	ZeroInputNode
 
-	colVecs  []coldata.Vec
+	colVecs  []*coldata.Vec
 	typs     []*types.T
 	sel      []int
 	batchLen int
@@ -103,13 +99,14 @@ func NewRepeatableBatchSource(
 }
 
 // Next is part of the Operator interface.
-func (s *RepeatableBatchSource) Next() coldata.Batch {
+func (s *RepeatableBatchSource) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	s.batchesReturned++
 	if s.batchesToReturn != 0 && s.batchesReturned > s.batchesToReturn {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
-	s.output.SetSelection(s.sel != nil)
+	s.output.ResetInternalBatch()
 	if s.sel != nil {
+		s.output.SetSelection(true)
 		copy(s.output.Selection()[:s.batchLen], s.sel[:s.batchLen])
 	}
 	for i, colVec := range s.colVecs {
@@ -122,7 +119,7 @@ func (s *RepeatableBatchSource) Next() coldata.Batch {
 		})
 	}
 	s.output.SetLength(s.batchLen)
-	return s.output
+	return s.output, nil
 }
 
 // Init is part of the Operator interface.
@@ -141,7 +138,7 @@ type CallbackOperator struct {
 	ZeroInputNode
 	InitCb  func(context.Context)
 	NextCb  func() coldata.Batch
-	CloseCb func() error
+	CloseCb func(ctx context.Context) error
 }
 
 var _ ClosableOperator = &CallbackOperator{}
@@ -155,19 +152,19 @@ func (o *CallbackOperator) Init(ctx context.Context) {
 }
 
 // Next is part of the Operator interface.
-func (o *CallbackOperator) Next() coldata.Batch {
+func (o *CallbackOperator) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if o.NextCb == nil {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
-	return o.NextCb()
+	return o.NextCb(), nil
 }
 
 // Close is part of the ClosableOperator interface.
-func (o *CallbackOperator) Close() error {
+func (o *CallbackOperator) Close(ctx context.Context) error {
 	if o.CloseCb == nil {
 		return nil
 	}
-	return o.CloseCb()
+	return o.CloseCb(ctx)
 }
 
 // TestingSemaphore is a semaphore.Semaphore that never blocks and is always

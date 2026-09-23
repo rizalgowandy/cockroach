@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -115,7 +110,7 @@ func BenchmarkDeselector(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					input.ResetBatchesToReturn(nBatches)
-					for b := op.Next(); b.Length() != 0; b = op.Next() {
+					for b := colexecop.NextNoMeta(op); b.Length() != 0; b = colexecop.NextNoMeta(op) {
 					}
 					// We don't need to reset the deselector because it doesn't keep any
 					// state. We do, however, want to keep its already allocated memory

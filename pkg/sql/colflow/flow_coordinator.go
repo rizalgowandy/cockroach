@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow
 
@@ -15,15 +10,18 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/obs/ash"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // FlowCoordinator is the execinfra.Processor that is responsible for shutting
@@ -57,7 +55,6 @@ func NewFlowCoordinator(
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	input execinfra.RowSource,
-	output execinfra.RowReceiver,
 	cancelFlow context.CancelFunc,
 ) *FlowCoordinator {
 	f := flowCoordinatorPool.Get().(*FlowCoordinator)
@@ -66,11 +63,7 @@ func NewFlowCoordinator(
 	f.Init(
 		f,
 		flowCtx,
-		// FlowCoordinator doesn't modify the eval context, so it is safe to
-		// reuse the one from the flow context.
-		flowCtx.EvalCtx,
 		processorID,
-		output,
 		execinfra.ProcStateOpts{
 			// We append input to inputs to drain below in order to reuse
 			// the same underlying slice from the pooled FlowCoordinator.
@@ -87,21 +80,21 @@ func NewFlowCoordinator(
 	return f
 }
 
-var _ execinfra.OpNode = &FlowCoordinator{}
+var _ execopnode.OpNode = &FlowCoordinator{}
 var _ execinfra.Processor = &FlowCoordinator{}
-var _ execinfra.Releasable = &FlowCoordinator{}
+var _ execreleasable.Releasable = &FlowCoordinator{}
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (f *FlowCoordinator) ChildCount(verbose bool) int {
 	return 1
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (f *FlowCoordinator) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (f *FlowCoordinator) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		// The input must be the execinfra.OpNode (it's either a materializer or
+		// The input must be the execopnode.OpNode (it's either a materializer or
 		// a wrapped row-execution processor).
-		return f.input.(execinfra.OpNode)
+		return f.input.(execopnode.OpNode)
 	}
 	colexecerror.InternalError(errors.AssertionFailedf("invalid index %d", nth))
 	// This code is unreachable, but the compiler cannot infer that.
@@ -115,7 +108,7 @@ func (f *FlowCoordinator) OutputTypes() []*types.T {
 
 // Start is part of the execinfra.RowSource interface.
 func (f *FlowCoordinator) Start(ctx context.Context) {
-	ctx = f.StartInternalNoSpan(ctx)
+	ctx = f.StartInternal(ctx, "flow coordinator" /* name */)
 	if err := colexecerror.CatchVectorizedRuntimeError(func() {
 		f.input.Start(ctx)
 	}); err != nil {
@@ -148,7 +141,17 @@ func (f *FlowCoordinator) nextAdapter() {
 // Next is part of the execinfra.RowSource interface.
 func (f *FlowCoordinator) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 	if err := colexecerror.CatchVectorizedRuntimeError(f.nextAdapter); err != nil {
-		f.MoveToDraining(err)
+		if f.State == execinfra.StateRunning {
+			f.MoveToDraining(err)
+		} else {
+			// We have encountered an error during draining, so we will just
+			// return the error as metadata directly. This could occur, for
+			// example, when accounting for the metadata footprint and exceeding
+			// the limit.
+			meta := execinfrapb.GetProducerMeta()
+			meta.Err = err
+			return nil, meta
+		}
 		return nil, f.DrainHelper()
 	}
 	return f.row, f.meta
@@ -190,9 +193,10 @@ type BatchFlowCoordinator struct {
 	input  colexecargs.OpWithMetaInfo
 	output execinfra.BatchReceiver
 
-	// batch is the result produced by calling input.Next stored here in order
-	// for that call to be wrapped in the panic-catcher.
+	// batch and meta is the result produced by calling input.Next stored here
+	// in order for that call to be wrapped in the panic-catcher.
 	batch coldata.Batch
+	meta  *execinfrapb.ProducerMetadata
 
 	// cancelFlow cancels the context of the flow.
 	cancelFlow context.CancelFunc
@@ -227,8 +231,8 @@ func NewBatchFlowCoordinator(
 	return f
 }
 
-var _ execinfra.OpNode = &BatchFlowCoordinator{}
-var _ execinfra.Releasable = &BatchFlowCoordinator{}
+var _ execopnode.OpNode = &BatchFlowCoordinator{}
+var _ execreleasable.Releasable = &BatchFlowCoordinator{}
 
 func (f *BatchFlowCoordinator) init(ctx context.Context) error {
 	return colexecerror.CatchVectorizedRuntimeError(func() {
@@ -237,7 +241,7 @@ func (f *BatchFlowCoordinator) init(ctx context.Context) error {
 }
 
 func (f *BatchFlowCoordinator) nextAdapter() {
-	f.batch = f.input.Root.Next()
+	f.batch, f.meta = f.input.Root.Next()
 }
 
 func (f *BatchFlowCoordinator) next() error {
@@ -254,23 +258,38 @@ func (f *BatchFlowCoordinator) pushError(err error) execinfra.ConsumerStatus {
 // then shuts it down.
 func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 	status := execinfra.NeedMoreRows
+
+	ctx, span := execinfra.ProcessorSpan(ctx, f.flowCtx, "batch flow coordinator", f.processorID)
+
+	// Set the ASH work state for this goroutine so that active sampling
+	// can attribute CPU work to the correct workload identity.
+	var ashCleanup func()
+	if f.flowCtx != nil && f.flowCtx.EvalCtx != nil {
+		var gatewayNodeID roachpb.NodeID
+		if f.flowCtx.NodeID != nil {
+			gatewayNodeID = roachpb.NodeID(f.flowCtx.NodeID.SQLInstanceID())
+		}
+		ashCleanup = ash.SetWorkState(
+			f.flowCtx.Codec().TenantID,
+			ash.WorkloadInfo{
+				WorkloadID:    f.flowCtx.EvalCtx.WorkloadID,
+				AppNameID:     f.flowCtx.EvalCtx.AppNameID,
+				GatewayNodeID: gatewayNodeID,
+				WorkloadType:  f.flowCtx.EvalCtx.WorkloadType,
+			},
+			ash.WorkCPU, "BatchFlowCoordinator")
+	}
+
 	// Make sure that we close the coordinator and notify the batch receiver in
 	// all cases.
 	defer func() {
-		if err := f.close(); err != nil && status != execinfra.ConsumerClosed {
-			f.pushError(err)
+		if ashCleanup != nil {
+			ashCleanup()
 		}
+		f.cancelFlow()
 		f.output.ProducerDone()
+		span.Finish()
 	}()
-
-	ctx, span := execinfra.ProcessorSpan(ctx, "batch flow coordinator")
-	if span != nil {
-		if span.IsVerbose() {
-			span.SetTag(execinfrapb.FlowIDTagKey, attribute.StringValue(f.flowCtx.ID.String()))
-			span.SetTag(execinfrapb.ProcessorIDTagKey, attribute.IntValue(int(f.processorID)))
-		}
-		defer span.Finish()
-	}
 
 	if err := f.init(ctx); err != nil {
 		f.pushError(err)
@@ -288,11 +307,11 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 			}
 			continue
 		}
-		if f.batch.Length() == 0 {
+		if f.meta == nil && f.batch.Length() == 0 {
 			// All rows have been exhausted, so we transition to draining.
 			break
 		}
-		switch status = f.output.PushBatch(f.batch, nil /* meta */); status {
+		switch status = f.output.PushBatch(f.batch, f.meta); status {
 		case execinfra.ConsumerClosed:
 			return
 		}
@@ -303,7 +322,7 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 		for _, s := range f.input.StatsCollectors {
 			span.RecordStructured(s.GetStats())
 		}
-		if meta := execinfra.GetTraceDataAsMetadata(span); meta != nil {
+		if meta := execinfra.GetTraceDataAsMetadata(f.flowCtx, span); meta != nil {
 			status = f.output.PushBatch(nil /* batch */, meta)
 			if status == execinfra.ConsumerClosed {
 				return
@@ -324,19 +343,6 @@ func (f *BatchFlowCoordinator) Run(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// close cancels the flow and closes all colexecop.Closers the coordinator is
-// responsible for.
-func (f *BatchFlowCoordinator) close() error {
-	f.cancelFlow()
-	var lastErr error
-	for _, toClose := range f.input.ToClose {
-		if err := toClose.Close(); err != nil {
-			lastErr = err
-		}
-	}
-	return lastErr
 }
 
 // Release implements the execinfra.Releasable interface.

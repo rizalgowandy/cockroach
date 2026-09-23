@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -22,24 +18,33 @@ import (
 )
 
 type cancelQueriesNode struct {
-	rows     planNode
+	singleInputPlanNode
+	rowsAffectedOutputHelper
 	ifExists bool
 }
 
-func (n *cancelQueriesNode) startExec(runParams) error {
-	return nil
+// startExec implements the planNode interface.
+func (n *cancelQueriesNode) startExec(params runParams) error {
+	// Execute the node to completion, keeping track of the affected row count.
+	for {
+		ok, err := n.cancelQuery(params)
+		if !ok || err != nil {
+			return err
+		}
+		n.incAffectedRows()
+	}
 }
 
-func (n *cancelQueriesNode) Next(params runParams) (bool, error) {
+func (n *cancelQueriesNode) cancelQuery(params runParams) (bool, error) {
 	// TODO(knz): instead of performing the cancels sequentially,
 	// accumulate all the query IDs and then send batches to each of the
 	// nodes.
 
-	if ok, err := n.rows.Next(params); err != nil || !ok {
+	if ok, err := n.input.Next(params); err != nil || !ok {
 		return ok, err
 	}
 
-	datum := n.rows.Values()[0]
+	datum := n.input.Values()[0]
 	if datum == tree.DNull {
 		return true, nil
 	}
@@ -49,7 +54,7 @@ func (n *cancelQueriesNode) Next(params runParams) (bool, error) {
 		return false, errors.AssertionFailedf("%q: expected *DString, found %T", datum, datum)
 	}
 
-	queryID, err := StringToClusterWideID(string(queryIDString))
+	queryID, err := clusterunique.IDFromString(string(queryIDString))
 	if err != nil {
 		return false, pgerror.Wrapf(err, pgcode.Syntax, "invalid query ID %s", datum)
 	}
@@ -75,8 +80,16 @@ func (n *cancelQueriesNode) Next(params runParams) (bool, error) {
 	return true, nil
 }
 
-func (*cancelQueriesNode) Values() tree.Datums { return nil }
+// Next implements the planNode interface.
+func (n *cancelQueriesNode) Next(_ runParams) (bool, error) {
+	return n.next(), nil
+}
+
+// Values implements the planNode interface.
+func (n *cancelQueriesNode) Values() tree.Datums {
+	return n.values()
+}
 
 func (n *cancelQueriesNode) Close(ctx context.Context) {
-	n.rows.Close(ctx)
+	n.input.Close(ctx)
 }

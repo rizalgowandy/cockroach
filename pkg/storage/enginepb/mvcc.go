@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package enginepb
 
@@ -51,66 +46,134 @@ const (
 	MaxTxnPriority TxnPriority = math.MaxInt32
 )
 
-// TxnSeqIsIgnored returns true iff the sequence number overlaps with
-// any range in the ignored array.
+// TxnSeqIsIgnored returns true iff the supplied sequence number overlaps with
+// any range in the ignored array. The caller should ensure that the ignored
+// array is non-overlapping, non-contiguous, and sorted in (increasing) sequence
+// number order.
 func TxnSeqIsIgnored(seq TxnSeq, ignored []IgnoredSeqNumRange) bool {
-	// The ignored seqnum ranges are guaranteed to be
-	// non-overlapping, non-contiguous, and guaranteed to be
-	// sorted in seqnum order. We're going to look from the end to
-	// see if the current intent seqnum is ignored.
-	for i := len(ignored) - 1; i >= 0; i-- {
-		if seq < ignored[i].Start {
-			// The history entry's sequence number is lower/older than
-			// the current ignored range. Go to the previous range
-			// and try again.
-			continue
-		}
+	i := sort.Search(len(ignored), func(i int) bool {
+		return seq <= ignored[i].End
+	})
+	// Did we find the smallest index i, such that seq <= ignored[i].End?
+	return i != len(ignored) &&
+		// AND does seq lie within with the range [start, end] at index i?
+		ignored[i].Start <= seq
+}
 
-		// Here we have a range where the start seqnum is lower than the current
-		// intent seqnum. Does it include it?
-		if seq > ignored[i].End {
-			// Here we have a range where the current history entry's seqnum
-			// is higher than the range's end seqnum. Given that the
-			// ranges are sorted, we're guaranteed that there won't
-			// be any further overlapping range at a lower value of i.
+// TxnSeqListExtends returns true if every interval in b is fully covered by an
+// interval in a.
+//
+// It assumes that the input intervals are non-overlapping, non-contiguous, and
+// sorted. It returns false if the two lists are disjoint.
+func TxnSeqListExtends(a, b []IgnoredSeqNumRange) bool {
+	idxA, idxB := 0, 0
+	for idxB < len(b) {
+		// No more intervals in a but we stil have intervals in b, b must not be
+		// fully covered.
+		if idxA >= len(a) {
 			return false
 		}
-		// Yes, it's included. We're going to skip over this
-		// intent seqnum and retry the search above.
-		return true
-	}
 
-	// Exhausted the ignore list. Not ignored.
-	return false
+		// If the current a start is greater than b start, then b extends to the left
+		// of a and therefore b must not be fully covered.
+		if a[idxA].Start > b[idxB].Start {
+			return false
+		}
+
+		// From above we know b's start is equal to or after the start of a. If a
+		// end is less than b end, then the current a is completely consumed and we
+		// need to move to the next a interval. Otherwise, the b interval is
+		// completely covered and we need to move to the next b interval.
+		if a[idxA].End < b[idxB].End {
+			idxA++
+		} else {
+			idxB++
+		}
+	}
+	return true
+}
+
+// TxnSeqListAppend returns a new slice with the given range added to the
+// given list of ignored seqnum ranges.
+//
+// The following invariants are assumed to hold and are preserved:
+// - the list contains no overlapping ranges
+// - the list contains no contiguous ranges
+// - the list is sorted, with larger seqnums at the end
+//
+// Additionally, the caller must ensure:
+//
+//  1. if the new range overlaps with some range in the list, then it
+//     also overlaps with every subsequent range in the list.
+//
+//  2. the new range's "end" seqnum is larger or equal to the "end"
+//     seqnum of the last element in the list.
+//
+// For example:
+//
+//	current list [3 5] [10 20] [22 24]
+//	new item:    [8 26]
+//	final list:  [3 5] [8 26]
+//
+//	current list [3 5] [10 20] [22 24]
+//	new item:    [28 32]
+//	final list:  [3 5] [10 20] [22 24] [28 32]
+//
+// This corresponds to savepoints semantics:
+//
+//   - Property 1 says that a rollback to an earlier savepoint
+//     rolls back over all writes following that savepoint.
+//   - Property 2 comes from that the new range's 'end' seqnum is the
+//     current write seqnum and thus larger than or equal to every
+//     previously seen value.
+func TxnSeqListAppend(list []IgnoredSeqNumRange, newRange IgnoredSeqNumRange) []IgnoredSeqNumRange {
+	i := sort.Search(len(list), func(i int) bool {
+		return list[i].End >= newRange.Start
+	})
+
+	cpy := make([]IgnoredSeqNumRange, i+1)
+	copy(cpy[:i], list[:i])
+	cpy[i] = newRange
+	return cpy
 }
 
 // Short returns a prefix of the transaction's ID.
 func (t TxnMeta) Short() redact.SafeString {
-	return redact.SafeString(t.ID.Short())
+	return redact.SafeString(t.ID.Short().String())
 }
 
 // Total returns the range size as the sum of the key and value
-// bytes. This includes all non-live keys and all versioned values.
+// bytes. This includes all non-live keys and all versioned values,
+// both for point and range keys.
 func (ms MVCCStats) Total() int64 {
-	return ms.KeyBytes + ms.ValBytes
+	return ms.KeyBytes + ms.ValBytes + ms.RangeKeyBytes + ms.RangeValBytes
 }
 
 // GCBytes is a convenience function which returns the number of gc bytes,
-// that is the key and value bytes excluding the live bytes.
+// that is the key and value bytes excluding the live bytes, both for
+// point keys and range keys.
 func (ms MVCCStats) GCBytes() int64 {
-	return ms.KeyBytes + ms.ValBytes - ms.LiveBytes
+	return ms.Total() - ms.LiveBytes
 }
 
-// AvgIntentAge returns the average age of outstanding intents,
+// HasNoUserData returns true if there is no user data in the range.
+// User data includes RangeKeyCount, KeyCount and IntentCount as those keys
+// are user writable. ContainsEstimates must also be zero to avoid false
+// positives where range actually has data.
+func (ms MVCCStats) HasNoUserData() bool {
+	return ms.ContainsEstimates == 0 && ms.RangeKeyCount == 0 && ms.KeyCount == 0 && ms.IntentCount == 0
+}
+
+// AvgLockAge returns the average age of outstanding locks,
 // based on current wall time specified via nowNanos.
-func (ms MVCCStats) AvgIntentAge(nowNanos int64) float64 {
-	if ms.IntentCount == 0 {
+func (ms MVCCStats) AvgLockAge(nowNanos int64) float64 {
+	if ms.LockCount == 0 {
 		return 0
 	}
 	// Advance age by any elapsed time since last computed. Note that
 	// we operate on a copy.
 	ms.AgeTo(nowNanos)
-	return float64(ms.IntentAge) / float64(ms.IntentCount)
+	return float64(ms.LockAge) / float64(ms.LockCount)
 }
 
 // GCByteAge returns the total age of outstanding gc'able
@@ -143,7 +206,7 @@ func (ms *MVCCStats) AgeTo(nowNanos int64) {
 	diffSeconds := nowNanos/1e9 - ms.LastUpdateNanos/1e9
 
 	ms.GCBytesAge += ms.GCBytes() * diffSeconds
-	ms.IntentAge += ms.IntentCount * diffSeconds
+	ms.LockAge += ms.LockCount * diffSeconds
 	ms.LastUpdateNanos = nowNanos
 }
 
@@ -158,7 +221,7 @@ func (ms *MVCCStats) Add(oms MVCCStats) {
 	ms.ContainsEstimates += oms.ContainsEstimates
 
 	// Now that we've done that, we may just add them.
-	ms.IntentAge += oms.IntentAge
+	ms.LockAge += oms.LockAge
 	ms.GCBytesAge += oms.GCBytesAge
 	ms.LiveBytes += oms.LiveBytes
 	ms.KeyBytes += oms.KeyBytes
@@ -168,7 +231,12 @@ func (ms *MVCCStats) Add(oms MVCCStats) {
 	ms.KeyCount += oms.KeyCount
 	ms.ValCount += oms.ValCount
 	ms.IntentCount += oms.IntentCount
-	ms.SeparatedIntentCount += oms.SeparatedIntentCount
+	ms.LockBytes += oms.LockBytes
+	ms.LockCount += oms.LockCount
+	ms.RangeKeyCount += oms.RangeKeyCount
+	ms.RangeKeyBytes += oms.RangeKeyBytes
+	ms.RangeValCount += oms.RangeValCount
+	ms.RangeValBytes += oms.RangeValBytes
 	ms.SysBytes += oms.SysBytes
 	ms.SysCount += oms.SysCount
 	ms.AbortSpanBytes += oms.AbortSpanBytes
@@ -185,7 +253,7 @@ func (ms *MVCCStats) Subtract(oms MVCCStats) {
 	ms.ContainsEstimates -= oms.ContainsEstimates
 
 	// Now that we've done that, we may subtract.
-	ms.IntentAge -= oms.IntentAge
+	ms.LockAge -= oms.LockAge
 	ms.GCBytesAge -= oms.GCBytesAge
 	ms.LiveBytes -= oms.LiveBytes
 	ms.KeyBytes -= oms.KeyBytes
@@ -195,21 +263,78 @@ func (ms *MVCCStats) Subtract(oms MVCCStats) {
 	ms.KeyCount -= oms.KeyCount
 	ms.ValCount -= oms.ValCount
 	ms.IntentCount -= oms.IntentCount
-	ms.SeparatedIntentCount -= oms.SeparatedIntentCount
+	ms.LockBytes -= oms.LockBytes
+	ms.LockCount -= oms.LockCount
+	ms.RangeKeyCount -= oms.RangeKeyCount
+	ms.RangeKeyBytes -= oms.RangeKeyBytes
+	ms.RangeValCount -= oms.RangeValCount
+	ms.RangeValBytes -= oms.RangeValBytes
 	ms.SysBytes -= oms.SysBytes
 	ms.SysCount -= oms.SysCount
 	ms.AbortSpanBytes -= oms.AbortSpanBytes
 }
 
+// Scale scales all statistics by the given factor.
+func (ms *MVCCStats) Scale(factor float32) {
+	ms.LockAge = int64(float32(ms.LockAge) * factor)
+	ms.GCBytesAge = int64(float32(ms.GCBytesAge) * factor)
+	ms.LiveBytes = int64(float32(ms.LiveBytes) * factor)
+	ms.KeyBytes = int64(float32(ms.KeyBytes) * factor)
+	ms.ValBytes = int64(float32(ms.ValBytes) * factor)
+	ms.IntentBytes = int64(float32(ms.IntentBytes) * factor)
+	ms.LiveCount = int64(float32(ms.LiveCount) * factor)
+	ms.KeyCount = int64(float32(ms.KeyCount) * factor)
+	ms.ValCount = int64(float32(ms.ValCount) * factor)
+	ms.IntentCount = int64(float32(ms.IntentCount) * factor)
+	ms.LockBytes = int64(float32(ms.LockBytes) * factor)
+	ms.LockCount = int64(float32(ms.LockCount) * factor)
+	ms.RangeKeyCount = int64(float32(ms.RangeKeyCount) * factor)
+	ms.RangeKeyBytes = int64(float32(ms.RangeKeyBytes) * factor)
+	ms.RangeValCount = int64(float32(ms.RangeValCount) * factor)
+	ms.RangeValBytes = int64(float32(ms.RangeValBytes) * factor)
+	ms.SysBytes = int64(float32(ms.SysBytes) * factor)
+	ms.SysCount = int64(float32(ms.SysCount) * factor)
+	ms.AbortSpanBytes = int64(float32(ms.AbortSpanBytes) * factor)
+}
+
+// HasUserDataCloseTo compares the fields corresponding to user data and returns
+// whether their absolute difference is within a certain limit. Separate limits
+// are passed in for stats measures in count and bytes.
+func (ms *MVCCStats) HasUserDataCloseTo(
+	oms MVCCStats, maxCountDiff int64, maxBytesDiff int64,
+) bool {
+	abs := func(x int64) int64 {
+		if x < 0 {
+			return -x
+		}
+		return x
+	}
+	countWithinLimit := func(v1 int64, v2 int64) bool {
+		return abs(v1-v2) <= maxCountDiff
+	}
+	bytesWithinLimit := func(v1 int64, v2 int64) bool {
+		return abs(v1-v2) <= maxBytesDiff
+	}
+
+	return countWithinLimit(ms.KeyCount, oms.KeyCount) &&
+		bytesWithinLimit(ms.KeyBytes, oms.KeyBytes) &&
+		countWithinLimit(ms.ValCount, oms.ValCount) &&
+		bytesWithinLimit(ms.ValBytes, oms.ValBytes) &&
+		countWithinLimit(ms.LiveCount, oms.LiveCount) &&
+		bytesWithinLimit(ms.LiveBytes, oms.LiveBytes) &&
+		countWithinLimit(ms.IntentCount, oms.IntentCount) &&
+		bytesWithinLimit(ms.IntentBytes, oms.IntentBytes) &&
+		countWithinLimit(ms.LockCount, oms.LockCount) &&
+		bytesWithinLimit(ms.LockBytes, oms.LockBytes) &&
+		countWithinLimit(ms.RangeKeyCount, oms.RangeKeyCount) &&
+		bytesWithinLimit(ms.RangeKeyBytes, oms.RangeKeyBytes) &&
+		countWithinLimit(ms.RangeValCount, oms.RangeValCount) &&
+		bytesWithinLimit(ms.RangeValBytes, oms.RangeValBytes)
+}
+
 // IsInline returns true if the value is inlined in the metadata.
 func (meta MVCCMetadata) IsInline() bool {
 	return meta.RawBytes != nil
-}
-
-// AddToIntentHistory adds the sequence and value to the intent history.
-func (meta *MVCCMetadata) AddToIntentHistory(seq TxnSeq, val []byte) {
-	meta.IntentHistory = append(meta.IntentHistory,
-		MVCCMetadata_SequencedIntent{Sequence: seq, Value: val})
 }
 
 // GetPrevIntentSeq goes through the intent history and finds the previous
@@ -330,9 +455,10 @@ func (t TxnMeta) SafeFormat(w redact.SafePrinter, _ rune) {
 	// Compute priority as a floating point number from 0-100 for readability.
 	floatPri := 100 * float64(t.Priority) / float64(math.MaxInt32)
 	w.Printf(
-		"id=%s key=%s pri=%.8f epo=%d ts=%s min=%s seq=%d",
+		"id=%s key=%s iso=%s pri=%.8f epo=%d ts=%s min=%s seq=%d",
 		t.Short(),
 		FormatBytesAsKey(t.Key),
+		t.IsoLevel,
 		floatPri,
 		t.Epoch,
 		t.WriteTimestamp,
@@ -341,13 +467,11 @@ func (t TxnMeta) SafeFormat(w redact.SafePrinter, _ rune) {
 }
 
 // FormatBytesAsKey is injected by module roachpb as dependency upon initialization.
-// TODO(sarkesian): Make this explicitly redactable.  See #70288
-var FormatBytesAsKey = func(k []byte) string {
-	return string(k)
+var FormatBytesAsKey = func(k []byte) redact.RedactableString {
+	return redact.Sprint(string(k))
 }
 
 // FormatBytesAsValue is injected by module roachpb as dependency upon initialization.
-// TODO(sarkesian): Make this explicitly redactable.  See #70288
-var FormatBytesAsValue = func(v []byte) string {
-	return string(v)
+var FormatBytesAsValue = func(v []byte) redact.RedactableString {
+	return redact.Sprint(string(v))
 }

@@ -1,27 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
-import { merge } from "lodash";
+import merge from "lodash/merge";
+
 import { DOMAIN_NAME } from "../utils";
-import { createSelector } from "reselect";
-import { AppState } from "../reducers";
 
 export type UIConfigState = {
   isTenant: boolean;
   pages: {
     statementDetails: {
       showStatementDiagnosticsLink: boolean;
-    };
-    sessionDetails: {
-      showGatewayNodeLink: boolean;
     };
   };
 };
@@ -31,9 +22,6 @@ const initialState: UIConfigState = {
   pages: {
     statementDetails: {
       showStatementDiagnosticsLink: true,
-    },
-    sessionDetails: {
-      showGatewayNodeLink: false,
     },
   },
 };
@@ -53,15 +41,5 @@ const uiConfigSlice = createSlice({
     },
   },
 });
-
-export const selectUIConfig = createSelector(
-  (state: AppState) => state.adminUI.uiConfig,
-  uiConfig => uiConfig,
-);
-
-export const selectIsTenant = createSelector(
-  selectUIConfig,
-  uiConfig => uiConfig.isTenant,
-);
 
 export const { actions, reducer } = uiConfigSlice;

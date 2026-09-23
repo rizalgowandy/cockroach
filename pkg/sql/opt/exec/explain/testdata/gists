@@ -17,21 +17,20 @@ CREATE TABLE xyz (x INT PRIMARY KEY, y INT, z INT)
 
 # ConstructScan/ConstructSerializingProject
 gist-explain-roundtrip
-SELECT * from foo LIMIT 1
+SELECT * from foo LIMIT 10
 ----
 hash: 12007264394566425707
 plan-gist: AgFqAgAHAAACBgY=
 explain(shape):
 • scan
-  missing stats
   table: foo@foo_pkey
   spans: LIMITED SCAN
-  limit: 1
+  limit: 10
 explain(gist):
 • scan
   table: foo@foo_pkey
   spans: LIMITED SCAN
-  limit: 1
+  limit
 
 # ConstructFilter
 gist-explain-roundtrip
@@ -41,9 +40,22 @@ hash: 16614037866652733243
 plan-gist: AgFqAgAHAgAABgY=
 explain(shape):
 • scan
-  missing stats
+  table: foo@foo_pkey
+  spans: 1+ spans
+explain(gist):
+• scan
   table: foo@foo_pkey
   spans: 1 span
+
+gist-explain-roundtrip
+SELECT * from foo WHERE a IN (1, 3, 5)
+----
+hash: 16614037866652733243
+plan-gist: AgFqAgAHAgAABgY=
+explain(shape):
+• scan
+  table: foo@foo_pkey
+  spans: 1+ spans
 explain(gist):
 • scan
   table: foo@foo_pkey
@@ -60,9 +72,8 @@ explain(shape):
 │ table: foo@foo_pkey
 │
 └── • scan
-      missing stats
       table: foo@b_inverted_index
-      spans: 1 span
+      spans: 1+ spans
 explain(gist):
 • index join
 │ table: foo@foo_pkey
@@ -82,9 +93,8 @@ explain(shape):
 │ table: foo@foo_pkey
 │
 └── • scan
-      missing stats
       table: foo@c_idx
-      spans: 1 span
+      spans: 1+ spans
 explain(gist):
 • index join
 │ table: foo@foo_pkey
@@ -103,7 +113,6 @@ explain(shape):
 • render
 │
 └── • scan
-      missing stats
       table: foo@c_idx
       spans: FULL SCAN
 explain(gist):
@@ -123,10 +132,15 @@ explain(shape):
 • apply join (semi)
 │ pred: column1 = a
 │
-└── • scan
-      missing stats
-      table: abc@abc_pkey
-      spans: FULL SCAN
+├── • scan
+│     table: abc@abc_pkey
+│     spans: FULL SCAN
+│
+└── • inner loop (unoptimized)
+    │
+    └── • values
+           ├── (a,)
+           └── (b,)
 explain(gist):
 • apply join (semi)
 │
@@ -147,12 +161,10 @@ explain(shape):
 │ right cols are key
 │
 ├── • scan
-│     missing stats
 │     table: foo@foo_pkey
 │     spans: FULL SCAN
 │
 └── • scan
-      missing stats
       table: bar@bar_pkey
       spans: FULL SCAN
 explain(gist):
@@ -182,12 +194,10 @@ explain(shape):
 │ right cols are key
 │
 ├── • scan
-│     missing stats
 │     table: foo@foo_pkey
 │     spans: FULL SCAN
 │
 └── • scan
-      missing stats
       table: bar@bar_pkey
       spans: FULL SCAN
 explain(gist):
@@ -213,14 +223,12 @@ explain(shape):
 └── • cross join
     │
     ├── • scan
-    │     missing stats
     │     table: bar@bar_pkey
     │     spans: FULL SCAN
     │
     └── • scan
-          missing stats
           table: foo@foo_pkey
-          spans: 1 span
+          spans: 1+ spans
 explain(gist):
 • group (hash)
 │
@@ -244,7 +252,6 @@ explain(shape):
 • group (scalar)
 │
 └── • scan
-      missing stats
       table: foo@c_idx
       spans: FULL SCAN
 explain(gist):
@@ -282,7 +289,6 @@ explain(shape):
 │ distinct on: b, c
 │
 └── • scan
-      missing stats
       table: abc@abc_pkey
       spans: FULL SCAN
 explain(gist):
@@ -303,12 +309,10 @@ explain(shape):
 • intersect all
 │
 ├── • scan
-│     missing stats
 │     table: abc@abc_pkey
 │     spans: FULL SCAN
 │
 └── • scan
-      missing stats
       table: abc@abc_pkey
       spans: FULL SCAN
 explain(gist):
@@ -338,7 +342,6 @@ explain(shape):
     │   │ order: +b,+a
     │   │
     │   └── • scan
-    │         missing stats
     │         table: abc@abc_pkey
     │         spans: FULL SCAN
     │
@@ -346,7 +349,6 @@ explain(shape):
         │ order: +b,+a
         │
         └── • scan
-              missing stats
               table: abc@abc_pkey
               spans: FULL SCAN
 explain(gist):
@@ -379,12 +381,10 @@ explain(shape):
 • union all
 │
 ├── • scan
-│     missing stats
 │     table: abc@abc_pkey
 │     spans: FULL SCAN
 │
 └── • scan
-      missing stats
       table: abc@abc_pkey
       spans: FULL SCAN
 explain(gist):
@@ -408,7 +408,6 @@ explain(shape):
 • ordinality
 │
 └── • scan
-      missing stats
       table: abc@abc_pkey
       spans: FULL SCAN
 explain(gist):
@@ -431,7 +430,6 @@ explain(shape):
 │ equality cols are key
 │
 └── • scan
-      missing stats
       table: foo@foo_pkey
       spans: FULL SCAN
 explain(gist):
@@ -448,13 +446,12 @@ explain(gist):
 gist-explain-roundtrip
 SELECT * FROM foo JOIN bar ON b @> ARRAY[1,2]
 ----
-hash: 11584704012200057713
-plan-gist: AgFsAgABAAAAFmoEagQUAGoCAgEJAAAAAAAGCA==
+hash: 16294150205124361254
+plan-gist: AgFsAgABAAAAFmoEagQFAhQAagICAQkAAAAAAAYI
 explain(shape):
 • cross join
 │
 ├── • scan
-│     missing stats
 │     table: bar@bar_pkey
 │     spans: FULL SCAN
 │
@@ -462,14 +459,13 @@ explain(shape):
     │ table: foo@foo_pkey
     │ equality: (a) = (a)
     │ equality cols are key
-    │ pred: b @> _
     │
     └── • zigzag join
           left table: foo@b_inverted_index
-          left columns: (a)
+          left columns: (a, b_inverted_key)
           left fixed values: 1 column
           right table: foo@b_inverted_index
-          right columns: ()
+          right columns: (a, b_inverted_key)
           right fixed values: 1 column
 explain(gist):
 • cross join
@@ -493,8 +489,8 @@ explain(gist):
 gist-explain-roundtrip
 SELECT * FROM abc WHERE b = 2 AND c = 3
 ----
-hash: 8337208311400991564
-plan-gist: AhZuBG4GBgY=
+hash: 17226082265909993113
+plan-gist: AhZuBG4GBQYGBg==
 explain(shape):
 • zigzag join
   pred: (b = _) AND (c = _)
@@ -502,7 +498,7 @@ explain(shape):
   left columns: (a, b)
   left fixed values: 1 column
   right table: abc@abc_c_idx
-  right columns: (c)
+  right columns: (a, c)
   right fixed values: 1 column
 explain(gist):
 • zigzag join
@@ -529,10 +525,8 @@ explain(shape):
     │ exec mode: one row
     │
     └── • max1row
-        │ estimated row count: 1
         │
         └── • scan
-              missing stats
               table: abc@abc_b_idx
               spans: FULL SCAN
               locking strength: for update
@@ -560,7 +554,6 @@ hash: 3230693242836472611
 plan-gist: AgICABoCBgI=
 explain(shape):
 • project set
-│ estimated row count: 10
 │
 └── • emptyrow
 explain(gist):
@@ -578,7 +571,6 @@ explain(shape):
 • window
 │
 └── • scan
-      missing stats
       table: abc@abc_b_idx
       spans: FULL SCAN
 explain(gist):
@@ -633,7 +625,6 @@ explain(shape):
 │ auto commit
 │
 └── • scan
-      missing stats
       table: abc@abc_pkey
       spans: FULL SCAN
 explain(gist):
@@ -660,9 +651,9 @@ explain(shape):
 └── • render
     │
     └── • scan
-          missing stats
           table: abc@abc_pkey
-          spans: 1 span
+          spans: 1+ spans
+          locking strength: for update
 explain(gist):
 • update
 │ table: abc
@@ -693,9 +684,9 @@ explain(shape):
     │     size: 3 columns, 1 row
     │
     └── • scan
-          missing stats
           table: abc@abc_pkey
-          spans: 1 span
+          spans: 1+ spans
+          locking strength: for update
 explain(gist):
 • upsert
 │ into: abc()
@@ -723,9 +714,9 @@ explain(shape):
 │ auto commit
 │
 └── • scan
-      missing stats
       table: foo@foo_pkey
       spans: FULL SCAN
+      locking strength: for update
 explain(gist):
 • delete
 │ from: foo
@@ -747,9 +738,9 @@ explain(shape):
 │ auto commit
 │
 └── • scan
-      missing stats
       table: foo@foo_pkey
-      spans: 1 span
+      spans: 1+ spans
+      locking strength: for update
 explain(gist):
 • delete
 │ from: foo
@@ -782,7 +773,6 @@ explain(shape):
 └── • render
     │
     └── • scan
-          missing stats
           table: abc@abc_pkey
           spans: FULL SCAN
 explain(gist):
@@ -821,7 +811,6 @@ explain(shape):
 │ k: 10
 │
 └── • scan
-      missing stats
       table: xyz@xyz_pkey
       spans: FULL SCAN
 explain(gist):
@@ -841,7 +830,6 @@ hash: 4348909884410007975
 plan-gist: AigGBg==
 explain(shape):
 • sequence select
-  estimated row count: 1
 explain(gist):
 • sequence select
 
@@ -858,11 +846,14 @@ hash: 12193483658718214527
 plan-gist: AgICAgYCLGoCBgY=
 explain(shape):
 • split
+│ index: foo@foo_pkey
+│ expiry: CAST(_ AS STRING)
 │
 └── • values
       size: 1 column, 1 row
 explain(gist):
 • split
+│ index: foo@foo_pkey
 │
 └── • values
       size: 1 column, 1 row
@@ -875,11 +866,13 @@ hash: 8861506885543083786
 plan-gist: AgICAgYCLWoCBgQ=
 explain(shape):
 • unsplit
+│ index: foo@foo_pkey
 │
 └── • values
       size: 1 column, 1 row
 explain(gist):
 • unsplit
+│ index: foo@foo_pkey
 │
 └── • values
       size: 1 column, 1 row
@@ -893,8 +886,10 @@ hash: 16533768908468588919
 plan-gist: Ai5qAgYE
 explain(shape):
 • unsplit all
+  index: foo@foo_pkey
 explain(gist):
 • unsplit all
+  index: foo@foo_pkey
 
 # alterTableRelocateOp
 gist-explain-roundtrip
@@ -903,12 +898,14 @@ ALTER TABLE abc EXPERIMENTAL_RELOCATE VALUES (ARRAY[1],1)
 hash: 8656743312841134920
 plan-gist: AgICBAYEL24CBgQ=
 explain(shape):
-• relocate
+• relocate table
+│ index: abc@abc_pkey
 │
 └── • values
       size: 2 columns, 1 row
 explain(gist):
-• relocate
+• relocate table
+│ index: abc@abc_pkey
 │
 └── • values
       size: 2 columns, 1 row
@@ -931,7 +928,7 @@ explain(shape):
 └── • subquery
     │ id: @S1
     │ original sql: INSERT INTO abc SELECT a, b, c FROM abc RETURNING a
-    │ exec mode: all rows
+    │ exec mode: discard all rows
     │
     └── • buffer
         │ label: buffer 1
@@ -940,7 +937,6 @@ explain(shape):
             │ into: abc(a, b, c)
             │
             └── • scan
-                  missing stats
                   table: abc@abc_pkey
                   spans: FULL SCAN
 explain(gist):
@@ -1059,8 +1055,8 @@ explain(gist):
 gist-explain-roundtrip
 CREATE STATISTICS s1 FROM foo
 ----
-hash: 590681868797177008
-plan-gist: Ajc=
+hash: 17953548722684387642
+plan-gist: AjdqAg==
 explain(shape):
 • create statistics
 explain(gist):
@@ -1076,7 +1072,6 @@ explain(shape):
 • export
 │
 └── • scan
-      missing stats
       table: foo@foo_pkey
       spans: FULL SCAN
 explain(gist):
@@ -1110,3 +1105,104 @@ explain(shape):
 • explain
 explain(gist):
 • explain
+
+# Regression test for #85324
+explain-plan-gist
+AgHyAQIA//8HHgAAByoFKiHyAQAA
+----
+• update
+│ table: ?
+│ set
+│
+└── • render
+    │
+    └── • scan
+          table: ?@?
+          spans: 1 span
+
+# ConstructShowCompletions
+gist-explain-roundtrip
+SHOW COMPLETIONS AT OFFSET 10 FOR 'select 123'
+----
+hash: 4360397581899285807
+plan-gist: AjwGCg==
+explain(shape):
+• show completions
+  offset: 10
+  syntax: "select 123"
+explain(gist):
+• show completions
+
+exec-ddl
+CREATE TABLE ts (a int, b STRING)
+----
+
+gist-explain-roundtrip
+SELECT max(a), b FROM ts WHERE a = 1 AND b LIKE '$ internal%' GROUP BY b
+----
+hash: 6959966538333657501
+plan-gist: AgF0AgADAAAAAwsCBgQ=
+explain(shape):
+• group (hash)
+│ group by: b
+│
+└── • filter
+    │ filter: (a = _) AND (b LIKE _)
+    │
+    └── • scan
+          table: ts@ts_pkey
+          spans: FULL SCAN
+explain(gist):
+• group (hash)
+│ group by: a
+│
+└── • filter
+    │
+    └── • scan
+          table: ts@ts_pkey
+          spans: FULL SCAN
+
+# The above query produces this gist when run via EXPLAIN (GIST) in a real DB and when
+# run in a DB w/o that table panics, this tests that the panic is fixed.  Essentially we're
+# exercising the "unknown" table code.
+explain-plan-gist
+AgHQAQIAAwAAAAMLAgYE
+----
+• group (hash)
+│ group by: unknownCol-0
+│
+└── • filter
+    │
+    └── • scan
+          table: ?@?
+          spans: FULL SCAN
+
+# Regression for #111346
+explain-plan-gist
+AgFWBgCPAQIAABNWCgsGBwwHHA0UAXoCBgEFUCJ6AQ==
+----
+• upsert
+│ into: ?()
+│ auto commit
+│
+└── • lookup join (left outer)
+    │ table: ?@?
+    │ equality: (_, _, _) = (?, ?, ?)
+    │ equality cols are key
+    │
+    └── • distinct
+        │ distinct on
+        │
+        └── • render
+            │
+            └── • render
+                │
+                └── • group (hash)
+                    │ group by: _, _, _
+                    │
+                    └── • index join
+                        │ table: ?@?
+                        │
+                        └── • scan
+                              table: ?@?
+                              spans: 1 span

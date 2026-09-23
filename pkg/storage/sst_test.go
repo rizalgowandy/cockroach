@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
@@ -15,40 +10,51 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
-	"os"
-	"runtime/pprof"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/stretchr/testify/require"
 )
 
-func TestCheckSSTConflictsMaxIntents(t *testing.T) {
+func TestCheckSSTConflictsMaxLockConflicts(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	keys := []string{"aa", "bb", "cc", "dd"}
 	intents := []string{"a", "b", "c"}
+	locks := []string{"d", "e"}
 	start, end := "a", "z"
 
 	testcases := []struct {
-		maxIntents    int64
-		expectIntents []string
+		maxLockConflicts        int64
+		targetLockConflictBytes int64
+		expectLockConflicts     []string
 	}{
-		{maxIntents: -1, expectIntents: []string{"a"}},
-		{maxIntents: 0, expectIntents: []string{"a"}},
-		{maxIntents: 1, expectIntents: []string{"a"}},
-		{maxIntents: 2, expectIntents: []string{"a", "b"}},
-		{maxIntents: 3, expectIntents: []string{"a", "b", "c"}},
-		{maxIntents: 4, expectIntents: []string{"a", "b", "c"}},
+		{maxLockConflicts: 0, expectLockConflicts: []string{"a", "b", "c", "d", "e"}}, // 0 means no limit
+		{maxLockConflicts: 1, expectLockConflicts: []string{"a"}},
+		{maxLockConflicts: 2, expectLockConflicts: []string{"a", "b"}},
+		{maxLockConflicts: 3, expectLockConflicts: []string{"a", "b", "c"}},
+		{maxLockConflicts: 4, expectLockConflicts: []string{"a", "b", "c", "d"}},
+		{maxLockConflicts: 5, expectLockConflicts: []string{"a", "b", "c", "d", "e"}},
+		{maxLockConflicts: 6, expectLockConflicts: []string{"a", "b", "c", "d", "e"}},
+		// each intent has the size of 50 bytes
+		{maxLockConflicts: 6, targetLockConflictBytes: 195, expectLockConflicts: []string{"a", "b", "c", "d"}},
+		{maxLockConflicts: 6, targetLockConflictBytes: 215, expectLockConflicts: []string{"a", "b", "c", "d", "e"}},
 	}
 
 	// Create SST with keys equal to intents at txn2TS.
-	sstFile := &MemFile{}
-	sstWriter := MakeBackupSSTWriter(sstFile)
+	cs := cluster.MakeTestingClusterSettings()
+	var sstFile objstorage.MemObj
+	sstWriter := MakeTransportSSTWriter(context.Background(), cs, &sstFile)
 	defer sstWriter.Close()
 	for _, k := range intents {
 		key := MVCCKey{Key: roachpb.Key(k), Timestamp: txn2TS}
@@ -60,39 +66,53 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 	require.NoError(t, sstWriter.Finish())
 	sstWriter.Close()
 
-	for _, engineImpl := range mvccEngineImpls {
-		t.Run(engineImpl.name, func(t *testing.T) {
-			ctx := context.Background()
-			engine := engineImpl.create()
-			defer engine.Close()
+	ctx := context.Background()
+	engine, err := Open(context.Background(), InMemory(), cs, MaxSizeBytes(1<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
 
-			// Write some committed keys and intents at txn1TS.
-			batch := engine.NewBatch()
-			for _, key := range keys {
-				require.NoError(t, batch.PutMVCC(MVCCKey{Key: roachpb.Key(key), Timestamp: txn1TS}, []byte("value")))
-			}
-			for _, key := range intents {
-				require.NoError(t, MVCCPut(ctx, batch, nil, roachpb.Key(key), txn1TS, roachpb.MakeValueFromString("intent"), txn1))
-			}
-			require.NoError(t, batch.Commit(true))
-			batch.Close()
-			require.NoError(t, engine.Flush())
+	// Write some committed keys and intents at txn1TS.
+	batch := engine.NewBatch()
+	for _, key := range keys {
+		mvccKey := MVCCKey{Key: roachpb.Key(key), Timestamp: txn1TS}
+		mvccValue := MVCCValue{Value: roachpb.MakeValueFromString("value")}
+		require.NoError(t, batch.PutMVCC(mvccKey, mvccValue))
+	}
+	for _, key := range intents {
+		_, err := MVCCPut(ctx, batch, roachpb.Key(key), txn1TS, roachpb.MakeValueFromString("intent"), MVCCWriteOptions{Txn: txn1})
+		require.NoError(t, err)
+	}
+	// Also write some replicated locks held by txn1.
+	for i, key := range locks {
+		str := lock.Shared
+		if i%2 != 0 {
+			str = lock.Exclusive
+		}
+		require.NoError(t, MVCCAcquireLock(ctx, batch, &txn1.TxnMeta, txn1.IgnoredSeqNums, str, roachpb.Key(key), nil, 0, 0, false))
+	}
+	require.NoError(t, batch.Commit(true))
+	batch.Close()
+	require.NoError(t, engine.Flush())
 
-			for _, tc := range testcases {
-				t.Run(fmt.Sprintf("maxIntents=%d", tc.maxIntents), func(t *testing.T) {
-					// Provoke and check WriteIntentErrors.
+	for _, tc := range testcases {
+		t.Run(fmt.Sprintf("maxLockConflicts=%d", tc.maxLockConflicts), func(t *testing.T) {
+			for _, usePrefixSeek := range []bool{false, true} {
+				t.Run(fmt.Sprintf("usePrefixSeek=%v", usePrefixSeek), func(t *testing.T) {
+					// Provoke and check LockConflictError.
 					startKey, endKey := MVCCKey{Key: roachpb.Key(start)}, MVCCKey{Key: roachpb.Key(end)}
-					_, err := CheckSSTConflicts(ctx, sstFile.Bytes(), engine, startKey, endKey,
-						false /*disallowShadowing*/, hlc.Timestamp{} /*disallowShadowingBelow*/, tc.maxIntents)
+					_, err := CheckSSTConflicts(ctx, sstFile.Data(), engine, startKey, endKey, startKey.Key, endKey.Key.Next(),
+						hlc.Timestamp{} /* disallowShadowingBelow */, hlc.Timestamp{} /* sstReqTS */, tc.maxLockConflicts, tc.targetLockConflictBytes, usePrefixSeek)
 					require.Error(t, err)
-					writeIntentErr := &roachpb.WriteIntentError{}
-					require.ErrorAs(t, err, &writeIntentErr)
+					lcErr := &kvpb.LockConflictError{}
+					require.ErrorAs(t, err, &lcErr)
 
 					actual := []string{}
-					for _, i := range writeIntentErr.Intents {
+					for _, i := range lcErr.Locks {
 						actual = append(actual, string(i.Key))
 					}
-					require.Equal(t, tc.expectIntents, actual)
+					require.Equal(t, tc.expectLockConflicts, actual)
 				})
 			}
 		})
@@ -100,72 +120,62 @@ func TestCheckSSTConflictsMaxIntents(t *testing.T) {
 }
 
 func BenchmarkUpdateSSTTimestamps(b *testing.B) {
-	const (
-		modeZero    = iota + 1 // all zeroes
-		modeCounter            // uint64 counter in first 8 bytes
-		modeRandom             // random values
+	defer log.Scope(b).Close(b)
+	skip.UnderShort(b)
 
-		sstSize   = 0
-		keyCount  = 500000
-		valueSize = 8
-		valueMode = modeRandom
-		profile   = false // cpuprofile.pprof
-	)
+	ctx := context.Background()
 
-	if sstSize > 0 && keyCount > 0 {
-		b.Fatal("Can't set both sstSize and keyCount")
+	for _, numKeys := range []int{1, 10, 100, 1000, 10000, 100000} {
+		b.Run(fmt.Sprintf("numKeys=%d", numKeys), func(b *testing.B) {
+			for _, concurrency := range []int{0, 1, 2, 4, 8} { // 0 uses naïve read/write loop
+				b.Run(fmt.Sprintf("concurrency=%d", concurrency), func(b *testing.B) {
+					runUpdateSSTTimestamps(ctx, b, numKeys, concurrency)
+				})
+			}
+		})
 	}
+}
 
-	b.StopTimer()
+func runUpdateSSTTimestamps(ctx context.Context, b *testing.B, numKeys int, concurrency int) {
+	const valueSize = 8
 
 	r := rand.New(rand.NewSource(7))
-
-	sstFile := &MemFile{}
-	writer := MakeIngestionSSTWriter(sstFile)
+	st := cluster.MakeTestingClusterSettings()
+	sstFile := &MemObject{}
+	writer := MakeIngestionSSTWriter(ctx, st, sstFile)
 	defer writer.Close()
+
+	sstTimestamp := hlc.MinTimestamp
+	reqTimestamp := hlc.Timestamp{WallTime: 1634899098417970999, Logical: 9}
 
 	key := make([]byte, 8)
 	value := make([]byte, valueSize)
-	ts := hlc.Timestamp{WallTime: 1}
-	var i uint64
-	for i = 0; (keyCount > 0 && i < keyCount) || (sstSize > 0 && sstFile.Len() < sstSize); i++ {
-		binary.BigEndian.PutUint64(key, i)
+	for i := 0; i < numKeys; i++ {
+		binary.BigEndian.PutUint64(key, uint64(i))
+		r.Read(value)
 
-		switch valueMode {
-		case modeZero:
-		case modeCounter:
-			binary.BigEndian.PutUint64(value, i)
-			ts.WallTime++
-		case modeRandom:
-			r.Read(value)
-			ts.WallTime = r.Int63()
-			ts.Logical = r.Int31()
-		default:
-			b.Fatalf("unknown value mode %d", valueMode)
+		var mvccValue MVCCValue
+		mvccValue.Value.SetBytes(value)
+		mvccValue.Value.InitChecksum(key)
+
+		if err := writer.PutMVCC(MVCCKey{Key: key, Timestamp: sstTimestamp}, mvccValue); err != nil {
+			require.NoError(b, err) // for performance
 		}
-
-		var v roachpb.Value
-		v.SetBytes(value)
-		v.InitChecksum(key)
-
-		require.NoError(b, writer.PutMVCC(MVCCKey{Key: key, Timestamp: ts}, v.RawBytes))
 	}
-	writer.Close()
-	b.Logf("%vMB %v keys", sstFile.Len()/1e6, i)
+	require.NoError(b, writer.Finish())
 
-	if profile {
-		f, err := os.Create("cpuprofile.pprof")
-		require.NoError(b, err)
-		defer f.Close()
+	b.SetBytes(int64(numKeys * (len(key) + len(value))))
+	b.ResetTimer()
 
-		require.NoError(b, pprof.StartCPUProfile(f))
-		defer pprof.StopCPUProfile()
-	}
-
-	b.StartTimer()
+	var res []byte
 	for i := 0; i < b.N; i++ {
-		ts := hlc.Timestamp{WallTime: 1634899098417970999, Logical: 9}
-		_, err := UpdateSSTTimestamps(sstFile.Bytes(), ts)
-		require.NoError(b, err)
+		var ms enginepb.MVCCStats
+		var err error
+		res, _, err = UpdateSSTTimestamps(
+			ctx, st, sstFile.Bytes(), sstTimestamp, reqTimestamp, concurrency, &ms)
+		if err != nil {
+			require.NoError(b, err) // for performance
+		}
 	}
+	_ = res
 }

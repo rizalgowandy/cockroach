@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracker
 
@@ -108,7 +103,7 @@ func (h *heapTracker) Track(ctx context.Context, ts hlc.Timestamp) RemovalToken 
 func (h *heapTracker) Untrack(ctx context.Context, tok RemovalToken) {
 	idx := tok.(heapToken).index
 	if idx == -1 {
-		log.Fatalf(ctx, "attempting to untrack already-untracked item")
+		log.KvExec.Fatalf(ctx, "attempting to untrack already-untracked item")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()

@@ -1,20 +1,30 @@
-FROM registry.access.redhat.com/ubi8/ubi-minimal
+# We use a docker image mirror to avoid pulling from 3rd party repos, which sometimes have reliability issues.
+# See https://cockroachlabs.atlassian.net/wiki/spaces/devinf/pages/3462594561/Docker+image+sync for the details.
+FROM us-east1-docker.pkg.dev/crl-docker-sync/registry-access-redhat-com/ubi10/ubi-minimal
 
-# For deployment, we need the following additionally installed:
-# tzdata - for time zone functions; reinstalled to replace the missing
-#          files in /usr/share/zoneinfo/
+# For deployment, we need the following additional packages:
+# ca-certificates - to validate TLS certs
 # hostname - used in cockroach k8s manifests
-# tar - used by kubectl cp
-RUN microdnf update -y \
-    && rpm --erase --nodeps tzdata \
-    && microdnf install tzdata hostname tar -y \
+# tar, gzip, xz - used by kubectl cp
+# tzdata - for time zone functions
+RUN microdnf update -y && microdnf install -y \
+      ca-certificates \
+      tzdata \
+      hostname \
+      tar \
+      gzip \
+      xz \
     && rm -rf /var/cache/yum
 
-RUN mkdir /usr/local/lib/cockroach /cockroach /licenses
-COPY cockroach.sh cockroach /cockroach/
-COPY licenses/* /licenses/
+# TARGETARCH is set automatically by `docker buildx build --platform`.
+# The build context must place per-arch files under ${TARGETARCH}/ subdirectories
+# (e.g. amd64/cockroach, amd64/cockroach.sh, amd64/libgeos.so, etc.).
+ARG TARGETARCH
+RUN mkdir /usr/local/lib/cockroach /cockroach /licenses /docker-entrypoint-initdb.d
+COPY ${TARGETARCH}/cockroach.sh ${TARGETARCH}/cockroach /cockroach/
+COPY ${TARGETARCH}/LICENSE ${TARGETARCH}/THIRD-PARTY-NOTICES.txt /licenses/
 # Install GEOS libraries.
-COPY libgeos.so libgeos_c.so /usr/local/lib/cockroach/
+COPY ${TARGETARCH}/libgeos.so ${TARGETARCH}/libgeos_c.so /usr/local/lib/cockroach/
 
 # Set working directory so that relative paths
 # are resolved appropriately when passed as args.

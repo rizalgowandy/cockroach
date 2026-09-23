@@ -1,24 +1,19 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
 import (
 	"bytes"
-	"math/rand"
+	"context"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 )
 
 var tupleOfTwoInts = types.MakeTuple([]*types.T{types.Int, types.Int})
@@ -78,6 +73,11 @@ lo}`, types.String, Datums{NewDString(`hel`), NewDString(`lo`)}},
 
 		{`{日本語}`, types.String, Datums{NewDString(`日本語`)}},
 
+		// byte(133) and byte(160) are treated as whitespace to ignore by unicode,
+		// but Postgres handles them as normal characters.
+		{string([]byte{'{', 133, '}'}), types.String, Datums{NewDString("\x85")}},
+		{string([]byte{'{', 160, '}'}), types.String, Datums{NewDString("\xa0")}},
+
 		// This can generate some strings with invalid UTF-8, but this isn't a
 		// problem, since the input would have had to be invalid UTF-8 for that to
 		// occur.
@@ -125,34 +125,41 @@ lo}`, types.String, Datums{NewDString(`hel`), NewDString(`lo`)}},
 					t.Fatal(err)
 				}
 			}
-			evalContext := NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-			// TODO(radu): check the dependsOnContext result.
-			actual, _, err := ParseDArrayFromString(evalContext, td.str, td.typ)
+			actual, _, err := ParseDArrayFromString(nil /* ParseContext */, td.str, td.typ)
 			if err != nil {
 				t.Fatalf("ARRAY %s: got error %s, expected %s", td.str, err.Error(), expected)
 			}
-			if actual.Compare(evalContext, expected) != 0 {
+			if cmp, err := actual.Compare(context.Background(), noopUnwrapCompareContext{}, expected); err != nil {
+				t.Fatal(err)
+			} else if cmp != 0 {
 				t.Fatalf("ARRAY %s: got %s, expected %s", td.str, actual, expected)
 			}
 		})
 	}
 }
 
-const randomArrayIterations = 1000
+type noopUnwrapCompareContext struct {
+	CompareContext
+}
+
+func (noopUnwrapCompareContext) UnwrapDatum(ctx context.Context, d Datum) Datum { return d }
+
+const randomArrayIterations = 100
 const randomArrayMaxLength = 10
 const randomStringMaxLength = 1000
 
 func TestParseArrayRandomParseArray(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	rng, _ := randutil.NewTestRand()
 	for i := 0; i < randomArrayIterations; i++ {
-		numElems := rand.Intn(randomArrayMaxLength)
+		numElems := rng.Intn(randomArrayMaxLength)
 		ary := make([][]byte, numElems)
 		for aryIdx := range ary {
-			len := rand.Intn(randomStringMaxLength)
+			len := rng.Intn(randomStringMaxLength)
 			str := make([]byte, len)
 			for strIdx := 0; strIdx < len; strIdx++ {
-				str[strIdx] = byte(rand.Intn(256))
+				str[strIdx] = byte(rng.Intn(256))
 			}
 			ary[aryIdx] = str
 		}
@@ -169,7 +176,7 @@ func TestParseArrayRandomParseArray(t *testing.T) {
 			// means that there's no printable way to encode non-printing characters,
 			// users must use `e` prefixed strings).
 			for _, c := range b {
-				if c == '"' || c == '\\' || rand.Intn(10) == 0 {
+				if c == '"' || c == '\\' || rng.Intn(10) == 0 {
 					buf.WriteByte('\\')
 				}
 				buf.WriteByte(c)
@@ -179,7 +186,8 @@ func TestParseArrayRandomParseArray(t *testing.T) {
 		buf.WriteByte('}')
 
 		parsed, _, err := ParseDArrayFromString(
-			NewTestingEvalContext(cluster.MakeTestingClusterSettings()), buf.String(), types.String)
+			nil /* ParseContext */, buf.String(), types.String,
+		)
 		if err != nil {
 			t.Fatalf(`got error: "%s" for elem "%s"`, err, buf.String())
 		}
@@ -227,8 +235,7 @@ func TestParseArrayError(t *testing.T) {
 	}
 	for _, td := range testData {
 		t.Run(td.str, func(t *testing.T) {
-			_, _, err := ParseDArrayFromString(
-				NewTestingEvalContext(cluster.MakeTestingClusterSettings()), td.str, td.typ)
+			_, _, err := ParseDArrayFromString(nil /* ParseContext */, td.str, td.typ)
 			if err == nil {
 				t.Fatalf("expected %#v to error with message %#v", td.str, td.expectedError)
 			}

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colflow
 
@@ -24,11 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/marusama/semaphore"
@@ -37,7 +34,7 @@ import (
 // routerOutput is an interface implemented by router outputs. It exists for
 // easier test mocking of outputs.
 type routerOutput interface {
-	execinfra.OpNode
+	execopnode.OpNode
 	// initWithHashRouter passes a reference to the HashRouter that will be
 	// pushing batches to this output.
 	initWithHashRouter(*HashRouter)
@@ -53,6 +50,8 @@ type routerOutput interface {
 	// Calling forwardErr multiple times will result in the most recent error
 	// overwriting the previous error.
 	forwardErr(error)
+	// forwardMeta forwards a metadata object to the output.
+	forwardMeta(metadata *execinfrapb.ProducerMetadata)
 	// resetForTests resets the routerOutput for a benchmark or test run.
 	resetForTests(context.Context)
 }
@@ -103,7 +102,7 @@ type drainCoordinator interface {
 type routerOutputOp struct {
 	colexecop.InitHelper
 	// input is a reference to our router.
-	input execinfra.OpNode
+	input execopnode.OpNode
 	// drainCoordinator is a reference to the HashRouter to be able to notify it
 	// if the output encounters an error or transitions to a draining state.
 	drainCoordinator drainCoordinator
@@ -120,7 +119,10 @@ type routerOutputOp struct {
 		// forwardedErr is an error that was forwarded by the HashRouter. If set,
 		// any subsequent calls to Next will return this error.
 		forwardedErr error
-		cond         *sync.Cond
+		// forwardedMeta contains all metadata that this output is responsible
+		// for communicating, ideally in the streaming fashion.
+		forwardedMeta []execinfrapb.ProducerMetadata
+		cond          *sync.Cond
 		// data is a SpillingQueue, a circular buffer backed by a disk queue.
 		data      *colexecutils.SpillingQueue
 		numUnread int
@@ -134,7 +136,7 @@ func (o *routerOutputOp) ChildCount(verbose bool) int {
 	return 1
 }
 
-func (o *routerOutputOp) Child(nth int, verbose bool) execinfra.OpNode {
+func (o *routerOutputOp) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
 		return o.input
 	}
@@ -143,7 +145,7 @@ func (o *routerOutputOp) Child(nth int, verbose bool) execinfra.OpNode {
 	return nil
 }
 
-var _ colexecop.Operator = &routerOutputOp{}
+var _ colexecop.DrainableClosableOperator = &routerOutputOp{}
 
 type routerOutputOpTestingKnobs struct {
 	// blockedThreshold is the number of buffered values above which we consider
@@ -176,10 +178,11 @@ type routerOutputOpArgs struct {
 	unlimitedAllocator *colmem.Allocator
 	// memoryLimit acts as a soft limit to allow the router output to use disk
 	// when it is exceeded.
-	memoryLimit int64
-	diskAcc     *mon.BoundAccount
-	cfg         colcontainer.DiskQueueCfg
-	fdSemaphore semaphore.Semaphore
+	memoryLimit     int64
+	diskAcc         *mon.BoundAccount
+	diskQueueMemAcc *mon.BoundAccount
+	cfg             colcontainer.DiskQueueCfg
+	fdSemaphore     semaphore.Semaphore
 
 	// unblockedEventsChan must be a buffered channel.
 	unblockedEventsChan chan<- struct{}
@@ -208,6 +211,7 @@ func newRouterOutputOp(args routerOutputOpArgs) *routerOutputOp {
 			DiskQueueCfg:       args.cfg,
 			FDSemaphore:        args.fdSemaphore,
 			DiskAcc:            args.diskAcc,
+			DiskQueueMemAcc:    args.diskQueueMemAcc,
 		},
 	)
 
@@ -232,10 +236,11 @@ func (o *routerOutputOp) nextErrorLocked(err error) {
 // Next returns the next coldata.Batch from the routerOutputOp. Note that Next
 // is designed for only one concurrent caller and will block until data is
 // ready.
-func (o *routerOutputOp) Next() coldata.Batch {
+func (o *routerOutputOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for o.mu.forwardedErr == nil && o.mu.state == routerOutputOpRunning && o.mu.data.Empty() {
+	for o.mu.forwardedErr == nil && len(o.mu.forwardedMeta) == 0 &&
+		o.mu.state == routerOutputOpRunning && o.mu.data.Empty() {
 		// Wait until there is data to read or the output is canceled.
 		o.mu.cond.Wait()
 	}
@@ -243,7 +248,13 @@ func (o *routerOutputOp) Next() coldata.Batch {
 		colexecerror.ExpectedError(o.mu.forwardedErr)
 	}
 	if o.mu.state == routerOutputOpDraining {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
+	}
+	if len(o.mu.forwardedMeta) > 0 {
+		meta := o.mu.forwardedMeta[0]
+		o.mu.forwardedMeta[0] = execinfrapb.ProducerMetadata{}
+		o.mu.forwardedMeta = o.mu.forwardedMeta[1:]
+		return nil, &meta
 	}
 	b, err := o.mu.data.Dequeue(o.Ctx)
 	if err == nil && o.testingKnobs.nextTestInducedErrorCb != nil {
@@ -262,20 +273,32 @@ func (o *routerOutputOp) Next() coldata.Batch {
 				o.nextErrorLocked(err)
 			}
 		}
-		// This is the last batch. closeLocked will set done to protect against
-		// further calls to Next since this is allowed by the interface as well as
-		// cleaning up and releasing possible disk infrastructure.
+		// This is the last batch. closeLocked will set the state of the output
+		// to draining to protect against further calls to Next since this is
+		// allowed by the interface as well as cleaning up and releasing
+		// possible disk infrastructure.
 		o.closeLocked(o.Ctx)
 	}
-	return b
+	return b, nil
 }
 
 func (o *routerOutputOp) DrainMeta() []execinfrapb.ProducerMetadata {
 	o.mu.Lock()
-	o.mu.state = routerOutputOpDraining
 	o.maybeUnblockLocked()
+	// The call to DrainMeta() indicates that the caller will no longer need any
+	// more data from this output, so we can close it.
+	o.closeLocked(o.Ctx)
+	forwardedMeta := o.mu.forwardedMeta
+	o.mu.forwardedMeta = nil
 	o.mu.Unlock()
-	return o.drainCoordinator.drainMeta()
+	return append(forwardedMeta, o.drainCoordinator.drainMeta()...)
+}
+
+func (o *routerOutputOp) Close(ctx context.Context) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closeLocked(ctx)
+	return nil
 }
 
 func (o *routerOutputOp) initWithHashRouter(r *HashRouter) {
@@ -283,13 +306,15 @@ func (o *routerOutputOp) initWithHashRouter(r *HashRouter) {
 	o.drainCoordinator = r
 }
 
+// closeLocked sets the state of the output to 'draining' as well as releases
+// possible disk infrastructure. It is safe to be called multiple times.
 func (o *routerOutputOp) closeLocked(ctx context.Context) {
 	o.mu.state = routerOutputOpDraining
 	if err := o.mu.data.Close(ctx); err != nil {
 		// This log message is Info instead of Warning because the flow will also
 		// attempt to clean up the parent directory, so this failure might not have
 		// any effect.
-		log.Infof(ctx, "error closing vectorized hash router output, files may be left over: %s", err)
+		log.Dev.Infof(ctx, "error closing vectorized hash router output, files may be left over: %s", err)
 	}
 }
 
@@ -308,7 +333,7 @@ func (o *routerOutputOp) cancel(ctx context.Context, err error) {
 }
 
 func (o *routerOutputOp) forwardErrLocked(err error) {
-	if err != nil {
+	if err != nil && o.mu.forwardedErr == nil {
 		o.mu.forwardedErr = err
 	}
 }
@@ -320,14 +345,22 @@ func (o *routerOutputOp) forwardErr(err error) {
 	o.mu.cond.Signal()
 }
 
+func (o *routerOutputOp) forwardMeta(meta *execinfrapb.ProducerMetadata) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.mu.forwardedMeta = append(o.mu.forwardedMeta, *meta)
+	o.mu.cond.Signal()
+}
+
 // addBatch copies the batch (according to its selection vector) into an
 // internal buffer. Zero-length batch should be passed-in to indicate that no
 // more batches will be added.
 // TODO(asubiotto): We should explore pipelining addBatch if disk-spilling
-//  performance becomes a concern. The main router goroutine will be writing to
-//  disk as the code is written, meaning that we impact the performance of
-//  writing rows to a fast output if we have to write to disk for a single
-//  slow output.
+//
+//	performance becomes a concern. The main router goroutine will be writing to
+//	disk as the code is written, meaning that we impact the performance of
+//	writing rows to a fast output if we have to write to disk for a single
+//	slow output.
 func (o *routerOutputOp) addBatch(ctx context.Context, batch coldata.Batch) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -379,6 +412,7 @@ func (o *routerOutputOp) resetForTests(ctx context.Context) {
 	defer o.mu.Unlock()
 	o.mu.state = routerOutputOpRunning
 	o.mu.forwardedErr = nil
+	o.mu.forwardedMeta = nil
 	o.mu.data.Reset(ctx)
 	o.mu.numUnread = 0
 	o.mu.blocked = false
@@ -408,6 +442,8 @@ const (
 // returned by the constructor.
 type HashRouter struct {
 	colexecop.OneInputNode
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
 	// inputMetaInfo contains all of the meta components that the hash router
 	// is responsible for. Root field is exactly the same as OneInputNode.Input.
 	inputMetaInfo colexecargs.OpWithMetaInfo
@@ -423,8 +459,6 @@ type HashRouter struct {
 	unblockedEventsChan <-chan struct{}
 	numBlockedOutputs   int
 
-	bufferedMeta []execinfrapb.ProducerMetadata
-
 	// atomics is shared state between the Run goroutine and any routerOutput
 	// goroutines that call drainMeta.
 	atomics struct {
@@ -434,9 +468,9 @@ type HashRouter struct {
 		numDrainedOutputs int32
 	}
 
-	// waitForMetadata is a channel that the last output to drain will read from
-	// to pass on any metadata buffered through the Run goroutine.
-	waitForMetadata chan []execinfrapb.ProducerMetadata
+	// waitForDrainedMetadata is a channel that the last output to drain will
+	// read from to pass on any drained metadata from the input.
+	waitForDrainedMetadata chan []execinfrapb.ProducerMetadata
 
 	// tupleDistributor is used to decide to which output a particular tuple
 	// should be routed.
@@ -452,8 +486,11 @@ type HashRouter struct {
 // Operator must have an independent allocator (this means that each allocator
 // should be linked to an independent mem account) as Operator.Next will usually
 // be called concurrently between different outputs. Similarly, each output
-// needs to have a separate disk account.
+// needs to have a separate disk account and a separate converter memory
+// account.
 func NewHashRouter(
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
 	unlimitedAllocators []*colmem.Allocator,
 	input colexecargs.OpWithMetaInfo,
 	types []*types.T,
@@ -462,9 +499,10 @@ func NewHashRouter(
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
 	diskAccounts []*mon.BoundAccount,
-) (*HashRouter, []colexecop.DrainableOperator) {
+	diskQueueMemAccounts []*mon.BoundAccount,
+) (*HashRouter, []colexecop.DrainableClosableOperator) {
 	outputs := make([]routerOutput, len(unlimitedAllocators))
-	outputsAsOps := make([]colexecop.DrainableOperator, len(unlimitedAllocators))
+	outputsAsOps := make([]colexecop.DrainableClosableOperator, len(unlimitedAllocators))
 	// unblockEventsChan is buffered to 2*numOutputs as we don't want the outputs
 	// writing to it to block.
 	// Unblock events only happen after a corresponding block event. Since these
@@ -487,6 +525,7 @@ func NewHashRouter(
 				unlimitedAllocator:  unlimitedAllocators[i],
 				memoryLimit:         memoryLimitPerOutput,
 				diskAcc:             diskAccounts[i],
+				diskQueueMemAcc:     diskQueueMemAccounts[i],
 				cfg:                 diskQueueCfg,
 				fdSemaphore:         fdSemaphore,
 				unblockedEventsChan: unblockEventsChan,
@@ -495,7 +534,10 @@ func NewHashRouter(
 		outputs[i] = op
 		outputsAsOps[i] = op
 	}
-	return newHashRouterWithOutputs(input, hashCols, unblockEventsChan, outputs), outputsAsOps
+	r := newHashRouterWithOutputs(input, hashCols, unblockEventsChan, outputs)
+	r.flowCtx = flowCtx
+	r.processorID = processorID
+	return r, outputsAsOps
 }
 
 func newHashRouterWithOutputs(
@@ -510,10 +552,10 @@ func newHashRouterWithOutputs(
 		hashCols:            hashCols,
 		outputs:             outputs,
 		unblockedEventsChan: unblockEventsChan,
-		// waitForMetadata is a buffered channel to avoid blocking if nobody will
-		// read the metadata.
-		waitForMetadata:  make(chan []execinfrapb.ProducerMetadata, 1),
-		tupleDistributor: colexechash.NewTupleHashDistributor(colexechash.DefaultInitHashValue, len(outputs)),
+		// waitForDrainedMetadata is a buffered channel to avoid blocking if
+		// nobody will read the metadata.
+		waitForDrainedMetadata: make(chan []execinfrapb.ProducerMetadata, 1),
+		tupleDistributor:       colexechash.NewTupleHashDistributor(colexechash.DefaultInitHashValue, len(outputs)),
 	}
 	for i := range outputs {
 		outputs[i].initWithHashRouter(r)
@@ -549,8 +591,10 @@ func (r *HashRouter) getDrainState() hashRouterDrainState {
 // output calculated by hashing columns. Cancel the given context to terminate
 // early.
 func (r *HashRouter) Run(ctx context.Context) {
+	var cpuStopWatch timeutil.CPUStopWatch
+	cpuStopWatch.Start()
 	var span *tracing.Span
-	ctx, span = execinfra.ProcessorSpan(ctx, "hash router")
+	ctx, span = execinfra.ProcessorSpan(ctx, r.flowCtx, "hash router", r.processorID)
 	if span != nil {
 		defer span.Finish()
 	}
@@ -615,6 +659,8 @@ func (r *HashRouter) Run(ctx context.Context) {
 	}); err != nil {
 		r.cancelOutputs(ctx, err)
 	}
+
+	var drainedMeta []execinfrapb.ProducerMetadata
 	if inputInitialized {
 		// Retrieving stats and draining the metadata is only safe if the input
 		// to the hash router was properly initialized.
@@ -622,25 +668,38 @@ func (r *HashRouter) Run(ctx context.Context) {
 			for _, s := range r.inputMetaInfo.StatsCollectors {
 				span.RecordStructured(s.GetStats())
 			}
-			if meta := execinfra.GetTraceDataAsMetadata(span); meta != nil {
-				r.bufferedMeta = append(r.bufferedMeta, *meta)
+			if meta := execinfra.GetTraceDataAsMetadata(r.flowCtx, span); meta != nil {
+				drainedMeta = append(drainedMeta, *meta)
 			}
 		}
-		r.bufferedMeta = append(r.bufferedMeta, r.inputMetaInfo.MetadataSources.DrainMeta()...)
+		drainedMeta = append(drainedMeta, r.inputMetaInfo.MetadataSources.DrainMeta()...)
+	}
+	// Emit this goroutine's CPU time as metadata. The hash router goroutine
+	// executes upstream operators via Input.Next(), so its CPU includes all
+	// upstream operator work.
+	if delta := cpuStopWatch.Stop(); delta > 0 {
+		grunningMeta := execinfrapb.ProducerMetadata{}
+		grunningMeta.Metrics = execinfrapb.GetMetricsMeta()
+		grunningMeta.Metrics.RawSQLCPUTime = int64(delta)
+		drainedMeta = append(drainedMeta, grunningMeta)
 	}
 	// Non-blocking send of metadata so that one of the outputs can return it
 	// in DrainMeta.
-	r.waitForMetadata <- r.bufferedMeta
-	close(r.waitForMetadata)
-
-	r.inputMetaInfo.ToClose.CloseAndLogOnErr(ctx, "hash router")
+	r.waitForDrainedMetadata <- drainedMeta
+	close(r.waitForDrainedMetadata)
 }
 
 // processNextBatch reads the next batch from its input, hashes it and adds
 // each column to its corresponding output, returning whether the input is
 // done.
 func (r *HashRouter) processNextBatch(ctx context.Context) bool {
-	b := r.Input.Next()
+	b, meta := r.Input.Next()
+	if meta != nil {
+		// Forward the metadata to the first stream (similar to what we do in
+		// rowflow.routerBase.fwdMetadata).
+		r.outputs[0].forwardMeta(meta)
+		return false
+	}
 	n := b.Length()
 	if n == 0 {
 		// Done. Push an empty batch to outputs to tell them the data is done as
@@ -673,9 +732,8 @@ func (r *HashRouter) resetForTests(ctx context.Context) {
 		i.Reset(ctx)
 	}
 	r.setDrainState(hashRouterDrainStateRunning)
-	r.waitForMetadata = make(chan []execinfrapb.ProducerMetadata, 1)
+	r.waitForDrainedMetadata = make(chan []execinfrapb.ProducerMetadata, 1)
 	r.atomics.numDrainedOutputs = 0
-	r.bufferedMeta = nil
 	r.numBlockedOutputs = 0
 	for moreToRead := true; moreToRead; {
 		select {
@@ -702,10 +760,10 @@ func (r *HashRouter) drainMeta() []execinfrapb.ProducerMetadata {
 	if int(atomic.AddInt32(&r.atomics.numDrainedOutputs, 1)) != len(r.outputs) {
 		return nil
 	}
-	// All outputs have been drained, return any buffered metadata to the last
+	// All outputs have been drained, return any drained metadata to the last
 	// output to call drainMeta.
 	r.setDrainState(hashRouterDrainStateRequested)
-	meta := <-r.waitForMetadata
+	meta := <-r.waitForDrainedMetadata
 	r.setDrainState(hashRouterDrainStateCompleted)
 	return meta
 }

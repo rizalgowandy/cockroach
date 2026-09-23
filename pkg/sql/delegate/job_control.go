@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package delegate
 
@@ -30,11 +25,11 @@ type ControlJobsDelegate struct {
 
 // protoNameForType maps job types to the matching protobuf names for Payload.details in jobs.proto
 // This is also used to enumerate the types of jobs that we actually handle
-var protobufNameForType = map[string]string{
-	"changefeed": "changefeed",
-	"backup":     "backup",
-	"import":     "import",
-	"restore":    "restore",
+var jobTypes = map[string]string{
+	"changefeed": "CHANGEFEED",
+	"backup":     "BACKUP",
+	"import":     "IMPORT",
+	"restore":    "RESTORE",
 }
 
 func (d *delegator) delegateJobControl(stmt ControlJobsDelegate) (tree.Statement, error) {
@@ -46,10 +41,10 @@ func (d *delegator) delegateJobControl(stmt ControlJobsDelegate) (tree.Statement
 	// from the control specific methods in pkg/jobs/jobs.go. All other states are
 	// either invalid starting states or result in no-ops.
 
-	validStartStatusForCommand := map[tree.JobCommand][]jobs.Status{
-		tree.PauseJob:  {jobs.StatusPending, jobs.StatusRunning, jobs.StatusReverting},
-		tree.ResumeJob: {jobs.StatusPaused},
-		tree.CancelJob: {jobs.StatusPending, jobs.StatusRunning, jobs.StatusPaused},
+	validStartStatusForCommand := map[tree.JobCommand][]jobs.State{
+		tree.PauseJob:  {jobs.StatePending, jobs.StateRunning, jobs.StateReverting},
+		tree.ResumeJob: {jobs.StatePaused},
+		tree.CancelJob: {jobs.StatePending, jobs.StateRunning, jobs.StatePaused},
 	}
 
 	var filterExprs []string
@@ -70,33 +65,18 @@ func (d *delegator) delegateJobControl(stmt ControlJobsDelegate) (tree.Statement
 	// nodes.
 
 	if stmt.Schedules != nil {
-		return parse(fmt.Sprintf(`%s JOBS SELECT id FROM system.jobs WHERE jobs.created_by_type = '%s' 
+		return d.parse(fmt.Sprintf(`%s JOBS SELECT id FROM system.jobs WHERE jobs.created_by_type = '%s' 
 AND jobs.status IN (%s) AND jobs.created_by_id IN (%s)`,
 			tree.JobCommandToStatement[stmt.Command], jobs.CreatedByScheduledJobs, filterClause,
 			stmt.Schedules))
 	}
 
 	if stmt.Type != "" {
-		if _, ok := protobufNameForType[stmt.Type]; !ok {
-			return nil, errors.New("Unsupported job type")
+		if _, ok := jobTypes[stmt.Type]; !ok {
+			return nil, errors.New("unsupported job type")
 		}
-		queryStrFormat := `%s JOBS (
-  SELECT id
-  FROM (
-        SELECT id,
-               status,
-               (
-                crdb_internal.pb_to_json(
-                  'cockroach.sql.jobs.jobspb.Payload',
-                  payload, false, true
-                )->'%s'
-               ) IS NOT NULL AS correct_type
-          FROM system.jobs
-         WHERE status IN (%s)
-       )
-  WHERE correct_type
-);`
-		return parse(fmt.Sprintf(queryStrFormat, tree.JobCommandToStatement[stmt.Command], protobufNameForType[stmt.Type], filterClause))
+		return d.parse(fmt.Sprintf(`%s JOBS SELECT id FROM system.jobs WHERE job_type = '%s' AND status IN (%s)`,
+			tree.JobCommandToStatement[stmt.Command], jobTypes[stmt.Type], filterClause))
 	}
 
 	return nil, errors.AssertionFailedf("Missing Schedules or Type clause in delegate parameters")

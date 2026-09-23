@@ -1,70 +1,60 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"context"
 	gosql "database/sql"
-	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/stretchr/testify/require"
 )
 
 func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
-	c.Put(ctx, t.Cockroach(), "./cockroach")
-
-	t.L().Printf("retrieving VM addresses")
-	addrs, err := c.InternalAddr(ctx, c.All())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// TODO(tbg): this should never happen, but I saw it locally. The result
-	// is the test hanging forever, because all nodes will create their own
-	// single node cluster and waitForFullReplication never returns.
-	if addrs[0] == "" {
-		t.Fatal("no address for first node")
-	}
-
 	// We start all nodes with the same join flags and then issue an "init"
 	// command to one of the nodes. We do this twice, since roachtest has some
 	// special casing for the first node in a cluster (the join flags of all nodes
 	// default to just the first node) and we want to make sure that we're not
 	// relying on it.
+	startOpts := option.DefaultStartOpts()
+
+	// We don't want roachprod to auto-init this cluster.
+	startOpts.RoachprodOpts.SkipInit = true
+
+	// We need to point all nodes at all other nodes. By default,
+	// roachprod will point all nodes at the first node, but this
+	// won't allow init'ing any but the first node - we require
+	// that all nodes can discover the init'ed node (transitively)
+	// via the join targets.
+	startOpts.RoachprodOpts.JoinTargets = c.All()
+
+	// Start the cluster in insecure mode to allow it to test both
+	// authenticated and unauthenticated code paths.
+	settings := install.MakeClusterSettings(install.SimpleSecureOption(false))
+
 	for _, initNode := range []int{2, 1} {
 		c.Wipe(ctx)
 		t.L().Printf("starting test with init node %d", initNode)
-		c.Start(ctx, option.StartArgs(
-			// We don't want roachprod to auto-init this cluster.
-			"--skip-init",
-			// We need to point all nodes at all other nodes. By default
-			// roachprod will point all nodes at the first node, but this
-			// won't allow init'ing any but the first node - we require
-			// that all nodes can discover the init'ed node (transitively)
-			// via their join flags.
-			"--args", "--join="+strings.Join(addrs, ","),
-		))
+		c.Start(ctx, t.L(), startOpts, settings)
 
 		urlMap := make(map[int]string)
-		adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, c.All())
+		adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, t.L(), c.All())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -89,8 +79,8 @@ func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 		var dbs []*gosql.DB
 		for i := 1; i <= c.Spec().NodeCount; i++ {
-			db := c.Conn(ctx, i)
-			defer db.Close()
+			db := c.Conn(ctx, t.L(), i)
+			defer db.Close() //nolint:deferloop
 			dbs = append(dbs, db)
 		}
 
@@ -98,11 +88,11 @@ func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
 		t.L().Printf("checking that the SQL conns are not failing immediately")
 		errCh := make(chan error, len(dbs))
 		for _, db := range dbs {
-			db := db
-			go func() {
+			t.Go(func(taskCtx context.Context, _ *logger.Logger) error {
 				var val int
-				errCh <- db.QueryRow("SELECT 1").Scan(&val)
-			}()
+				errCh <- db.QueryRowContext(taskCtx, "SELECT 1").Scan(&val)
+				return nil
+			})
 		}
 
 		// Give them time to get a "connection refused" or similar error if
@@ -135,7 +125,7 @@ func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
 					// Prevent regression of #25771 by also sending authenticated
 					// requests, like would be sent if an admin UI were open against
 					// this node while it booted.
-					cookie, err := server.EncodeSessionCookie(&serverpb.SessionCookie{
+					cookie, err := authserver.EncodeSessionCookie(&serverpb.SessionCookie{
 						// The actual contents of the cookie don't matter; the presence of
 						// a valid encoded cookie is enough to trigger the authentication
 						// code paths.
@@ -145,35 +135,36 @@ func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
 					}
 					req.AddCookie(cookie)
 				}
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					t.Fatalf("unexpected error hitting %s endpoint: %v", tc.endpoint, err)
-				}
-				defer resp.Body.Close()
-				if resp.StatusCode != tc.expectedStatus {
-					bodyBytes, _ := ioutil.ReadAll(resp.Body)
-					t.Fatalf("unexpected response code %d (expected %d) hitting %s endpoint: %v",
-						resp.StatusCode, tc.expectedStatus, tc.endpoint, string(bodyBytes))
-				}
+				func() {
+					resp, err := http.DefaultClient.Do(req)
+					if err != nil {
+						t.Fatalf("unexpected error hitting %s endpoint: %v", tc.endpoint, err)
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode != tc.expectedStatus {
+						bodyBytes, _ := io.ReadAll(resp.Body)
+						t.Fatalf("unexpected response code %d (expected %d) hitting %s endpoint: %v",
+							resp.StatusCode, tc.expectedStatus, tc.endpoint, string(bodyBytes))
+					}
+				}()
 			}
-
 		}
 
 		t.L().Printf("sending init command to node %d", initNode)
-		c.Run(ctx, c.Node(initNode),
-			fmt.Sprintf(`./cockroach init --insecure --port={pgport:%d}`, initNode))
+		c.Run(ctx, option.WithNodes(c.Node(initNode)), `./cockroach init --url={pgurl:1}`)
 
 		// This will only succeed if 3 nodes joined the cluster.
-		WaitFor3XReplication(t, dbs[0])
+		err = roachtestutil.WaitFor3XReplication(ctx, t.L(), dbs[0])
+		require.NoError(t, err)
 
 		execCLI := func(runNode int, extraArgs ...string) (string, error) {
 			args := []string{"./cockroach"}
 			args = append(args, extraArgs...)
-			args = append(args, "--insecure")
-			args = append(args, fmt.Sprintf("--port={pgport:%d}", runNode))
-			buf, err := c.RunWithBuffer(ctx, t.L(), c.Node(runNode), args...)
-			t.L().Printf("%s\n", buf)
-			return string(buf), err
+			args = append(args, "--url={pgurl:1}")
+			result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.Node(runNode)), args...)
+			combinedOutput := result.Stdout + result.Stderr
+			t.L().Printf("%s\n", combinedOutput)
+			return combinedOutput, err
 		}
 
 		{

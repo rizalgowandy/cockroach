@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -33,8 +29,8 @@ func NewZeroOp(input colexecop.Operator) colexecop.Operator {
 	return &zeroOperator{OneInputHelper: colexecop.MakeOneInputHelper(input)}
 }
 
-func (s *zeroOperator) Next() coldata.Batch {
-	return coldata.ZeroBatch
+func (s *zeroOperator) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	return coldata.ZeroBatch, nil
 }
 
 type fixedNumTuplesNoInputOp struct {
@@ -72,9 +68,9 @@ func (s *fixedNumTuplesNoInputOp) Init(ctx context.Context) {
 	}
 }
 
-func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
+func (s *fixedNumTuplesNoInputOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	if s.numTuplesLeft == 0 {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
 	s.batch.ResetInternalBatch()
 	length := s.numTuplesLeft
@@ -83,7 +79,29 @@ func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
 	}
 	s.numTuplesLeft -= length
 	s.batch.SetLength(length)
-	return s.batch
+	return s.batch, nil
+}
+
+type rawBatchOp struct {
+	colexecop.ZeroInputNode
+	batch coldata.Batch
+}
+
+var _ colexecop.Operator = &rawBatchOp{}
+
+func (s *rawBatchOp) Init(ctx context.Context) {
+}
+
+func (s *rawBatchOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	b := s.batch
+	s.batch = coldata.ZeroBatch
+	return b, nil
+}
+
+// NewRawColDataBatchOp allocates a rawBatchOp. This is used by COPY to perform
+// vectorized inserts.
+func NewRawColDataBatchOp(b coldata.Batch) colexecop.Operator {
+	return &rawBatchOp{batch: b}
 }
 
 // vectorTypeEnforcer is a utility Operator that on every call to Next
@@ -99,24 +117,22 @@ func (s *fixedNumTuplesNoInputOp) Next() coldata.Batch {
 //
 // The intended diagram is as follows:
 //
-//       original input                (with schema [t1, ..., tN])
-//       --------------
-//             |
-//             ↓
-//     vectorTypeEnforcer              (will enforce that tN+1 = outputType)
-//     ------------------
-//             |
-//             ↓
-//   "projecting" operator             (projects its output of type outputType
-//   ---------------------              in column at position of N+1)
-//
+//	    original input                (with schema [t1, ..., tN])
+//	    --------------
+//	          |
+//	          ↓
+//	  vectorTypeEnforcer              (will enforce that tN+1 = outputType)
+//	  ------------------
+//	          |
+//	          ↓
+//	"projecting" operator             (projects its output of type outputType
+//	---------------------              in column at position of N+1)
 type vectorTypeEnforcer struct {
-	colexecop.OneInputInitCloserHelper
 	colexecop.NonExplainable
-
 	allocator *colmem.Allocator
 	typ       *types.T
-	idx       int
+	colexecop.OneInputInitCloserHelper
+	idx int
 }
 
 var _ colexecop.ResettableOperator = &vectorTypeEnforcer{}
@@ -133,13 +149,16 @@ func NewVectorTypeEnforcer(
 	}
 }
 
-func (e *vectorTypeEnforcer) Next() coldata.Batch {
-	b := e.Input.Next()
+func (e *vectorTypeEnforcer) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	b, meta := e.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	if b.Length() == 0 {
-		return b
+		return b, nil
 	}
 	e.allocator.MaybeAppendColumn(b, e.typ, e.idx)
-	return b
+	return b, nil
 }
 
 func (e *vectorTypeEnforcer) Reset(ctx context.Context) {
@@ -200,15 +219,18 @@ func (e *BatchSchemaSubsetEnforcer) Init(ctx context.Context) {
 }
 
 // Next implements the colexecop.Operator interface.
-func (e *BatchSchemaSubsetEnforcer) Next() coldata.Batch {
-	b := e.Input.Next()
+func (e *BatchSchemaSubsetEnforcer) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	b, meta := e.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	if b.Length() == 0 {
-		return b
+		return b, nil
 	}
 	for i := e.subsetStartIdx; i < e.subsetEndIdx; i++ {
 		e.allocator.MaybeAppendColumn(b, e.typs[i], i)
 	}
-	return b
+	return b, nil
 }
 
 // SetTypes sets the types of this schema subset enforcer, and sets the end

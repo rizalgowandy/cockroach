@@ -1,38 +1,50 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lease
 
 import (
 	"context"
-	"fmt"
-	"time"
+	"sync/atomic"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // A lease stored in system.lease.
 type storedLease struct {
 	id         descpb.ID
+	prefix     []byte
 	version    int
 	expiration tree.DTimestamp
+	sessionID  []byte
 }
 
 func (s *storedLease) String() string {
-	return fmt.Sprintf("ID = %d ver=%d expiration=%s", s.id, s.version, s.expiration)
+	return redact.StringWithoutMarkers(s)
+}
+
+var _ redact.SafeFormatter = (*storedLease)(nil)
+
+// SafeFormat implements redact.SafeFormatter.
+func (s *storedLease) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Printf("ID=%d ver=%d expiration=%s", s.id, s.version, s.expiration)
+}
+
+// getByteSize returns the full size of stored lease.
+func (s *storedLease) getByteSize() int64 {
+	return int64(len(s.prefix)+len(s.sessionID)+int(s.expiration.Size())) +
+		int64(unsafe.Sizeof(*s))
 }
 
 // descriptorVersionState holds the state for a descriptor version. This
@@ -45,19 +57,24 @@ type descriptorVersionState struct {
 	// Care must be taken to not modify it.
 	catalog.Descriptor
 
+	refcount atomic.Int32
+
+	// The session that was used to acquire this descriptor version.
+	session atomic.Pointer[sqlliveness.Session]
+
+	// The expiration time for the descriptor version, which will be non-nil
+	// if one exists (i.e. only for the previous descriptor versions). A transaction with
+	// timestamp T can use this descriptor version iff
+	// Descriptor.GetDescriptorModificationTime() <= T < expiration.
+	//
+	// The expiration time is either the expiration time of the lease when a lease
+	// is associated with the version, or the ModificationTime of the next version
+	// when the version isn't associated with a lease.
+	expiration atomic.Pointer[hlc.Timestamp]
+
 	mu struct {
 		syncutil.Mutex
 
-		// The expiration time for the descriptor version. A transaction with
-		// timestamp T can use this descriptor version iff
-		// Descriptor.GetDescriptorModificationTime() <= T < expiration
-		//
-		// The expiration time is either the expiration time of the lease when a lease
-		// is associated with the version, or the ModificationTime of the next version
-		// when the version isn't associated with a lease.
-		expiration hlc.Timestamp
-
-		refcount int
 		// Set if the node has a lease on this descriptor version.
 		// Leases can only be held for the two latest versions of
 		// a descriptor. The latest version known to a node
@@ -66,6 +83,9 @@ type descriptorVersionState struct {
 		// a node might not necessarily be associated with a lease.
 		lease *storedLease
 	}
+	// byteSize is the size of this structure when it was initially
+	// allocated.
+	byteSize int64
 }
 
 func (s *descriptorVersionState) Release(ctx context.Context) {
@@ -76,64 +96,80 @@ func (s *descriptorVersionState) Underlying() catalog.Descriptor {
 	return s.Descriptor
 }
 
-func (s *descriptorVersionState) Expiration() hlc.Timestamp {
-	return s.getExpiration()
+func (s *descriptorVersionState) Expiration(ctx context.Context) hlc.Timestamp {
+	return s.getExpiration(ctx)
 }
 
-func (s *descriptorVersionState) SafeMessage() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return fmt.Sprintf("%d ver=%d:%s, refcount=%d", s.GetID(), s.GetVersion(), s.mu.expiration, s.mu.refcount)
+// SafeFormat implements redact.SafeFormatter.
+func (s *descriptorVersionState) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Print(s.redactedString())
+}
+
+// getByteSize returns the size of the structure during the initial
+// allocation.
+func (s *descriptorVersionState) getByteSize() int64 {
+	return s.byteSize
+}
+
+// calculateByteSize initializes the byte size of the structure.
+func (s *descriptorVersionState) calculateByteSize() int64 {
+	// Confirm this is only used to initialize the structure.
+	if s.byteSize != 0 {
+		panic(errors.AssertionFailedf("size calculated after it has already been initialized."))
+	}
+	size := s.ByteSize() + int64(unsafe.Sizeof(*s))
+	if s.mu.lease != nil {
+		size += s.mu.lease.getByteSize()
+	}
+	return size
 }
 
 func (s *descriptorVersionState) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stringLocked()
+	return redact.StringWithoutMarkers(s)
 }
 
-// stringLocked reads mu.refcount and thus needs to have mu held.
-func (s *descriptorVersionState) stringLocked() string {
-	return fmt.Sprintf("%d(%q) ver=%d:%s, refcount=%d", s.GetID(), s.GetName(), s.GetVersion(), s.mu.expiration, s.mu.refcount)
+// redactedString reads refcount and thus no longer needs mu held.
+func (s *descriptorVersionState) redactedString() redact.RedactableString {
+	var sessionID string
+	if session := s.session.Load(); session != nil {
+		sessionID = (*session).ID().String()
+	}
+	var expiration hlc.Timestamp
+	if exp := s.expiration.Load(); exp != nil && !exp.IsEmpty() {
+		expiration = *exp
+	}
+	return redact.Sprintf("%d(%q,%s) ver=%d:%s, refcount=%d", s.GetID(), s.GetName(), redact.SafeString(sessionID), s.GetVersion(), expiration, s.refcount.Load())
+}
+
+// getSessionID returns the current session ID from the lease.
+func (s *descriptorVersionState) getSessionID() sqlliveness.SessionID {
+	return (*s.session.Load()).ID()
 }
 
 // hasExpired checks if the descriptor is too old to be used (by a txn
 // operating) at the given timestamp.
-func (s *descriptorVersionState) hasExpired(timestamp hlc.Timestamp) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasExpiredLocked(timestamp)
+func (s *descriptorVersionState) hasExpired(ctx context.Context, timestamp hlc.Timestamp) bool {
+	return s.getExpiration(ctx).LessEq(timestamp)
 }
 
-// hasExpired checks if the descriptor is too old to be used (by a txn
-// operating) at the given timestamp.
-func (s *descriptorVersionState) hasExpiredLocked(timestamp hlc.Timestamp) bool {
-	return s.mu.expiration.LessEq(timestamp)
+// hasFixedExpiration returns if the descriptor has a fixed expiration.
+func (s *descriptorVersionState) hasFixedExpiration() bool {
+	return s.expiration.Load() != nil
 }
 
 func (s *descriptorVersionState) incRefCount(ctx context.Context, expensiveLogEnabled bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.incRefCountLocked(ctx, expensiveLogEnabled)
-}
-
-func (s *descriptorVersionState) incRefCountLocked(ctx context.Context, expensiveLogEnabled bool) {
-	s.mu.refcount++
+	s.refcount.Add(1)
 	if expensiveLogEnabled {
-		log.VEventf(ctx, 2, "descriptorVersionState.incRefCount: %s", s.stringLocked())
+		log.VEventf(ctx, 2, "descriptorVersionState.incRefCount: %s", s.redactedString())
 	}
 }
 
-func (s *descriptorVersionState) getExpiration() hlc.Timestamp {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.mu.expiration
-}
-
-// The lease expiration stored in the database is of a different type.
-// We've decided that it's too much work to change the type to
-// hlc.Timestamp, so we're using this method to give us the stored
-// type: tree.DTimestamp.
-func storedLeaseExpiration(expiration hlc.Timestamp) tree.DTimestamp {
-	return tree.DTimestamp{Time: timeutil.Unix(0, expiration.WallTime).Round(time.Microsecond)}
+func (s *descriptorVersionState) getExpiration(ctx context.Context) hlc.Timestamp {
+	// If an expiration is set then this descriptor is a stale version,
+	// and will be eventually removed.
+	if exp := s.expiration.Load(); exp != nil && !exp.IsEmpty() {
+		return *exp
+	}
+	// Otherwise, the expiration is tied to sqlliveness.
+	return (*s.session.Load()).Expiration()
 }

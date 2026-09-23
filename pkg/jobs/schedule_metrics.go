@@ -1,19 +1,16 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	io_prometheus_client "github.com/prometheus/client_model/go"
 )
 
 // ExecutorMetrics describes metrics related to scheduled
@@ -24,19 +21,32 @@ type ExecutorMetrics struct {
 	NumFailed    *metric.Counter
 }
 
+// ExecutorPTSMetrics describes metrics related to protected
+// timestamp system for executors that maintain PTS records.
+type ExecutorPTSMetrics struct {
+	NumWithPTS *metric.Gauge
+	PTSAge     *metric.Gauge
+}
+
+// PTSMetrics is a marker interface indicating that executor metrics
+// also keep track of PTS related metrics.
+type PTSMetrics interface {
+	PTSMetrics() *ExecutorPTSMetrics
+}
+
 var _ metric.Struct = &ExecutorMetrics{}
+var _ metric.Struct = &ExecutorPTSMetrics{}
 
 // MetricStruct implements metric.Struct interface
 func (m *ExecutorMetrics) MetricStruct() {}
 
+// MetricStruct implements metric.Struct interface.
+func (m *ExecutorPTSMetrics) MetricStruct() {}
+
 // SchedulerMetrics are metrics specific to job scheduler daemon.
 type SchedulerMetrics struct {
-	// Number of schedules that were ready to execute.
-	ReadyToRun *metric.Gauge
 	// Number of scheduled jobs started.
 	NumStarted *metric.Gauge
-	// Number of jobs started by schedules that are currently running.
-	NumRunning *metric.Gauge
 	// Number of schedules rescheduled due to SKIP policy.
 	RescheduleSkip *metric.Gauge
 	// Number of schedules rescheduled due to WAIT policy.
@@ -51,20 +61,6 @@ type SchedulerMetrics struct {
 // MakeSchedulerMetrics returns metrics for scheduled job daemon.
 func MakeSchedulerMetrics() SchedulerMetrics {
 	return SchedulerMetrics{
-		ReadyToRun: metric.NewGauge(metric.Metadata{
-			Name:        "schedules.round.schedules-ready-to-run",
-			Help:        "The number of jobs ready to execute",
-			Measurement: "Schedules",
-			Unit:        metric.Unit_COUNT,
-		}),
-
-		NumRunning: metric.NewGauge(metric.Metadata{
-			Name:        "schedules.round.num-jobs-running",
-			Help:        "The number of jobs started by schedules that are currently running",
-			Measurement: "Jobs",
-			Unit:        metric.Unit_COUNT,
-		}),
-
 		NumStarted: metric.NewGauge(metric.Metadata{
 			Name:        "schedules.round.jobs-started",
 			Help:        "The number of jobs started",
@@ -109,12 +105,17 @@ var _ metric.Struct = &SchedulerMetrics{}
 
 // MakeExecutorMetrics creates metrics for scheduled job executor.
 func MakeExecutorMetrics(name string) ExecutorMetrics {
-	return ExecutorMetrics{
+	m := ExecutorMetrics{
 		NumStarted: metric.NewCounter(metric.Metadata{
 			Name:        fmt.Sprintf("schedules.%s.started", name),
 			Help:        fmt.Sprintf("Number of %s jobs started", name),
 			Measurement: "Jobs",
 			Unit:        metric.Unit_COUNT,
+			LabeledName: "schedules",
+			StaticLabels: metric.MakeLabelPairs(
+				metric.LabelName, name,
+				metric.LabelStatus, "started",
+			),
 		}),
 
 		NumSucceeded: metric.NewCounter(metric.Metadata{
@@ -122,6 +123,11 @@ func MakeExecutorMetrics(name string) ExecutorMetrics {
 			Help:        fmt.Sprintf("Number of %s jobs succeeded", name),
 			Measurement: "Jobs",
 			Unit:        metric.Unit_COUNT,
+			LabeledName: "schedules",
+			StaticLabels: metric.MakeLabelPairs(
+				metric.LabelName, name,
+				metric.LabelStatus, "succeeded",
+			),
 		}),
 
 		NumFailed: metric.NewCounter(metric.Metadata{
@@ -129,6 +135,53 @@ func MakeExecutorMetrics(name string) ExecutorMetrics {
 			Help:        fmt.Sprintf("Number of %s jobs failed", name),
 			Measurement: "Jobs",
 			Unit:        metric.Unit_COUNT,
+			LabeledName: "schedules",
+			StaticLabels: metric.MakeLabelPairs(
+				metric.LabelName, name,
+				metric.LabelStatus, "failed",
+			),
+		}),
+	}
+
+	if name == tree.ScheduledBackupExecutor.UserName() {
+		m.NumFailed.Visibility = metric.Metadata_ESSENTIAL
+		m.NumFailed.Category = metric.Metadata_SQL
+		m.NumFailed.HowToUse = `Monitor this metric and investigate backup job failures.`
+	}
+
+	if name == tree.ScheduledRowLevelTTLExecutor.InternalName() {
+		m.NumFailed.Visibility = metric.Metadata_ESSENTIAL
+		m.NumFailed.Category = metric.Metadata_TTL
+		m.NumFailed.HowToUse = `Monitor this metric to ensure the Row Level TTL job is running. If it is non-zero, it means the job could not be created.`
+	}
+
+	return m
+}
+
+// MakeExecutorPTSMetrics creates PTS metrics.
+func MakeExecutorPTSMetrics(name string) ExecutorPTSMetrics {
+	return ExecutorPTSMetrics{
+		NumWithPTS: metric.NewGauge(metric.Metadata{
+			Name:        fmt.Sprintf("schedules.%s.protected_record_count", name),
+			Help:        fmt.Sprintf("Number of PTS records held by %s schedules", name),
+			Measurement: "Records",
+			Unit:        metric.Unit_COUNT,
+			MetricType:  io_prometheus_client.MetricType_GAUGE,
+			LabeledName: "schedules.protected_record_count",
+			StaticLabels: metric.MakeLabelPairs(
+				metric.LabelName, name,
+			),
+		}),
+		PTSAge: metric.NewGauge(metric.Metadata{
+			Name:        fmt.Sprintf("schedules.%s.protected_age_sec", name),
+			Help:        fmt.Sprintf("The age of the oldest PTS record protected by %s schedules", name),
+			Measurement: "Seconds",
+			Unit:        metric.Unit_SECONDS,
+			MetricType:  io_prometheus_client.MetricType_GAUGE,
+			LabeledName: "schedules.protected_age_sec",
+			StaticLabels: metric.MakeLabelPairs(
+				metric.LabelName, name,
+			),
 		}),
 	}
 }

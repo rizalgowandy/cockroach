@@ -14,11 +14,13 @@ expr
 explain
  ├── mode: opt, verbose
  ├── stats: [rows=10]
- ├── cost: 1074.54
+ ├── cost: 1078.54
+ ├── cost-flags: unbounded-cardinality
  └── scan t.public.abc
       ├── columns: t.public.abc.a:1(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.52
+      ├── cost: 1078.52
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (1)
       └── interesting orderings: (+1)
 
@@ -34,11 +36,13 @@ expr
 explain
  ├── mode: verbose
  ├── stats: [rows=10]
- ├── cost: 1074.54
+ ├── cost: 1078.54
+ ├── cost-flags: unbounded-cardinality
  └── scan t.public.abc
       ├── columns: t.public.abc.a:1(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.52
+      ├── cost: 1078.52
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (1)
       └── interesting orderings: (+1)
 
@@ -54,11 +58,13 @@ expr
 explain
  ├── mode: opt
  ├── stats: [rows=10]
- ├── cost: 1074.54
+ ├── cost: 1078.54
+ ├── cost-flags: unbounded-cardinality
  └── scan t.public.abc
       ├── columns: t.public.abc.a:1(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.52
+      ├── cost: 1078.52
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (1)
       └── interesting orderings: (+1)
 
@@ -81,17 +87,20 @@ expr
 explain
  ├── mode: opt
  ├── stats: [rows=10]
- ├── cost: 1324.12194
+ ├── cost: 1328.12194
+ ├── cost-flags: unbounded-cardinality
  └── sort
       ├── columns: a:1(int)  [hidden: t.public.abc.b:2(int)]
       ├── stats: [rows=1000]
-      ├── cost: 1324.10194
+      ├── cost: 1328.10194
+      ├── cost-flags: unbounded-cardinality
       ├── ordering: +2
       ├── interesting orderings: (+1,+2)
       └── scan t.public.abc
            ├── columns: t.public.abc.a:1(int) t.public.abc.b:2(int)
            ├── stats: [rows=1000]
-           ├── cost: 1084.62
+           ├── cost: 1088.62
+           ├── cost-flags: unbounded-cardinality
            └── interesting orderings: (+1,+2)
 
 expr
@@ -106,10 +115,12 @@ expr
 explain
  ├── mode: distsql
  ├── stats: [rows=10]
- ├── cost: 1074.54
+ ├── cost: 1078.54
+ ├── cost-flags: unbounded-cardinality
  └── scan t.public.abc
       ├── columns: t.public.abc.a:1(int)
       ├── stats: [rows=1000]
-      ├── cost: 1074.52
+      ├── cost: 1078.52
+      ├── cost-flags: unbounded-cardinality
       ├── prune: (1)
       └── interesting orderings: (+1)

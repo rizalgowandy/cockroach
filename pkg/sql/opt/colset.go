@@ -1,27 +1,22 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package opt
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
 // ColSet efficiently stores an unordered set of column ids.
 type ColSet struct {
-	set util.FastIntSet
+	set intsets.Fast
 }
 
-// We offset the ColumnIDs in the underlying FastIntSet by 1, so that the
+// We offset the ColumnIDs in the underlying Fast by 1, so that the
 // internal set fast-path can be used for ColumnIDs in the range [1, 64] instead
 // of [0, 63]. ColumnID 0 is reserved as an unknown ColumnID, and a ColSet
 // should never contain it, so this shift allows us to make use of the set
@@ -29,12 +24,16 @@ type ColSet struct {
 const offset = 1
 
 // setVal returns the value to store in the internal set for the given ColumnID.
+//
+//gcassert:inline
 func setVal(col ColumnID) int {
 	return int(col - offset)
 }
 
 // retVal returns the ColumnID to return for the given value in the internal
 // set.
+//
+//gcassert:inline
 func retVal(i int) ColumnID {
 	return ColumnID(i + offset)
 }
@@ -50,7 +49,7 @@ func MakeColSet(vals ...ColumnID) ColSet {
 
 // Add adds a column to the set. No-op if the column is already in the set.
 func (s *ColSet) Add(col ColumnID) {
-	if col <= 0 {
+	if buildutil.CrdbTestBuild && col <= 0 {
 		panic(errors.AssertionFailedf("col must be greater than 0"))
 	}
 	s.set.Add(setVal(col))
@@ -108,11 +107,18 @@ func (s ColSet) Equals(rhs ColSet) bool { return s.set.Equals(rhs.set) }
 // SubsetOf returns true if rhs contains all the elements in s.
 func (s ColSet) SubsetOf(rhs ColSet) bool { return s.set.SubsetOf(rhs.set) }
 
+// SingletonOf returns true if the set is a singleton that contains col.
+func (s ColSet) SingletonOf(col ColumnID) bool {
+	// TODO(mgartner): A s.HasLen(l int) function that short-circuits could
+	// speed this up for large sets.
+	return s.Len() == 1 && s.Contains(col)
+}
+
 // String returns a list representation of elements. Sequential runs of positive
 // numbers are shown as ranges. For example, for the set {1, 2, 3  5, 6, 10},
 // the output is "(1-3,5,6,10)".
 func (s ColSet) String() string {
-	var noOffset util.FastIntSet
+	var noOffset intsets.Fast
 	s.ForEach(func(col ColumnID) {
 		noOffset.Add(int(col))
 	})
@@ -138,6 +144,21 @@ func (s ColSet) ToList() ColList {
 	return res
 }
 
+// CopyAndMaybeRemap looks up each ColumnID from s in the colMap. If present,
+// the mapped ColumnID is added to a new ColSet, otherwise the unmapped ColumnID
+// is added. The new ColSet is returned to the caller.
+func (s ColSet) CopyAndMaybeRemap(colMap ColMap) ColSet {
+	newCols := ColSet{}
+	for srcCol, ok := s.Next(0); ok; srcCol, ok = s.Next(srcCol + 1) {
+		if newColID, ok := colMap.Get(int(srcCol)); ok {
+			newCols.Add(ColumnID(newColID))
+		} else {
+			newCols.Add(srcCol)
+		}
+	}
+	return newCols
+}
+
 // TranslateColSet is used to translate a ColSet from one set of column IDs
 // to an equivalent set. This is relevant for set operations such as UNION,
 // INTERSECT and EXCEPT, and can be used to map a ColSet defined on the left
@@ -145,14 +166,16 @@ func (s ColSet) ToList() ColList {
 // relations with a defined column mapping).
 //
 // For example, suppose we have a UNION with the following column mapping:
-//   Left:  1, 2, 3
-//   Right: 4, 5, 6
-//   Out:   7, 8, 9
+//
+//	Left:  1, 2, 3
+//	Right: 4, 5, 6
+//	Out:   7, 8, 9
 //
 // Here are some possible calls to TranslateColSet and their results:
-//   TranslateColSet(ColSet{1, 2}, Left, Right) -> ColSet{4, 5}
-//   TranslateColSet(ColSet{5, 6}, Right, Out)  -> ColSet{8, 9}
-//   TranslateColSet(ColSet{9}, Out, Right)     -> ColSet{6}
+//
+//	TranslateColSet(ColSet{1, 2}, Left, Right) -> ColSet{4, 5}
+//	TranslateColSet(ColSet{5, 6}, Right, Out)  -> ColSet{8, 9}
+//	TranslateColSet(ColSet{9}, Out, Right)     -> ColSet{6}
 //
 // Any columns in the input set that do not appear in the from list are ignored.
 //
@@ -160,7 +183,7 @@ func (s ColSet) ToList() ColList {
 // possible for the input and output sets to have different cardinality.
 // Consider the following case:
 //
-//   SELECT x, x, y FROM xyz UNION SELECT a, b, c FROM abc
+//	SELECT x, x, y FROM xyz UNION SELECT a, b, c FROM abc
 //
 // TranslateColSet(ColSet{x, y}, {x, x, y}, {a, b, c}) returns ColSet{a, b, c}.
 //

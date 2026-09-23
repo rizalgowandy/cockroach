@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package props
 
@@ -109,11 +104,10 @@ type testRelation []testRow
 
 // String prints out the test relation in the following format:
 //
-//   1     2     3
-//   -------------
-//   NULL  1     2
-//   3     NULL  4
-//
+//	1     2     3
+//	-------------
+//	NULL  1     2
+//	3     NULL  4
 func (tr testRelation) String() string {
 	if len(tr) == 0 {
 		return "  <empty>\n"
@@ -170,26 +164,26 @@ func (tr testRelation) checkKey(key opt.ColSet, typ keyType) error {
 	return nil
 }
 
+func (tr testRelation) checkEquiv(group opt.ColSet) error {
+	// An equivalence FD is easy to check row-by-row.
+	for _, r := range tr {
+		c, _ := group.Next(0)
+		val := r.value(c)
+		fail := false
+		group.ForEach(func(col opt.ColumnID) {
+			if r.value(col) != val {
+				fail = true
+			}
+		})
+		if fail {
+			return fmt.Errorf("FD %s==%s doesn't hold on row %s", group, group, r)
+		}
+	}
+	return nil
+}
+
 // checkFD verifies that a certain FD holds for the test relation.
 func (tr testRelation) checkFD(dep funcDep) error {
-	if dep.equiv {
-		// An equivalence FD is easy to check row-by-row.
-		for _, r := range tr {
-			c, _ := dep.from.Next(0)
-			val := r.value(c)
-			fail := false
-			dep.to.ForEach(func(col opt.ColumnID) {
-				if r.value(col) != val {
-					fail = true
-				}
-			})
-			if fail {
-				return fmt.Errorf("FD %s doesn't hold on row %s", &dep, r)
-			}
-		}
-		return nil
-	}
-
 	// We split the rows into groups (keyed on the `from` columns), picking the
 	// first row in each group as the "representative" of that group. All other
 	// rows in the group are checked against the representative row.
@@ -221,6 +215,11 @@ func (tr testRelation) checkFDs(fd *FuncDepSet) error {
 			return err
 		}
 	}
+	for i := 0; i < fd.equiv.GroupCount(); i++ {
+		if err := tr.checkEquiv(fd.equiv.Group(i)); err != nil {
+			return err
+		}
+	}
 
 	// Check keys.
 	if fd.hasKey != noKey {
@@ -249,9 +248,9 @@ func (tr testRelation) notNullCols(numCols int) opt.ColSet {
 
 // joinTestRelations creates a possible result of joining two testRelations,
 // specifically:
-//  - an inner join if both leftOuter and rightOuter are false;
-//  - a left/right outer join if one of them is true;
-//  - a full outer join if both are true.
+//   - an inner join if both leftOuter and rightOuter are false;
+//   - a left/right outer join if one of them is true;
+//   - a full outer join if both are true.
 func joinTestRelations(
 	numLeftCols int,
 	left testRelation,
@@ -696,6 +695,67 @@ func (o *addSynthOp) ApplyToFDs(fd FuncDepSet) FuncDepSet {
 	return out
 }
 
+// addStrictDepOp is a test operation corresponding to AddStrictDependency.
+type addStrictDepOp struct {
+	from, to opt.ColSet
+}
+
+func genAddStrictDep(minCols, maxCols int) testOpGenerator {
+	return func(tc *testConfig) testOp {
+		from := tc.randColSet(minCols, maxCols)
+		to := tc.randColSet(minCols, maxCols)
+		from.DifferenceWith(to)
+		return &addStrictDepOp{
+			from: from,
+			to:   to,
+		}
+	}
+}
+
+func (o *addStrictDepOp) String() string {
+	return fmt.Sprintf("AddStrictDependency(%s, %s)", o.from, o.to)
+}
+
+func (o *addStrictDepOp) FilterRelation(tr testRelation) testRelation {
+	// Filter out rows where the from->to FD doesn't hold. The code here parallels
+	// that in testRelation.checkKey.
+	//
+	// We split the rows into groups (keyed on the `from` columns), picking the
+	// first row in each group as the "representative" of that group. All other
+	// rows in the group are checked against the representative row.
+	var out testRelation
+	m := make(map[rowKey]testRow)
+	perm := rand.Perm(len(tr))
+	for _, rowIdx := range perm {
+		r := tr[rowIdx]
+		k, _ := r.key(o.from)
+		if first, ok := m[k]; ok {
+			shouldFilter := false
+			for col, ok := o.to.Next(0); ok; col, ok = o.to.Next(col + 1) {
+				if first.value(col) != r.value(col) {
+					// Filter out row.
+					shouldFilter = true
+					break
+				}
+			}
+			if shouldFilter {
+				continue
+			}
+		} else {
+			m[k] = r
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func (o *addStrictDepOp) ApplyToFDs(fd FuncDepSet) FuncDepSet {
+	var out FuncDepSet
+	out.CopyFrom(&fd)
+	out.AddStrictDependency(o.from, o.to)
+	return out
+}
+
 // testState corresponds to a chain of applied test operations. The head of a
 // testStates chain has no parent and no op and just corresponds to the initial
 // (empty) FDs and test relation.
@@ -720,14 +780,14 @@ func (ts *testState) format(b *strings.Builder) {
 
 // String describes the chain of operations and corresponding FDs.
 // For example:
-//   initial numCols=3 valRange=3
-//    => MakeNotNull(2)
-//       FDs:
-//    => AddConstants(1,3) values {NULL,1}
-//       FDs: ()-->(1,3)
-//    => AddLaxKey(3)
-//       FDs: ()-->(1-3)
 //
+//	initial numCols=3 valRange=3
+//	 => MakeNotNull(2)
+//	    FDs:
+//	 => AddConstants(1,3) values {NULL,1}
+//	    FDs: ()-->(1,3)
+//	 => AddLaxKey(3)
+//	    FDs: ()-->(1-3)
 func (ts *testState) String() string {
 	var b strings.Builder
 	ts.format(&b)
@@ -781,7 +841,6 @@ func (ts *testState) child(t *testing.T, op testOp) *testState {
 // To reuse work, instead of generating one chain of operations at a time, we
 // generate a tree of operations; each path from root to a leaf is a chain that
 // is getting tested.
-//
 func TestFuncDepOpsRandom(t *testing.T) {
 	type testParams struct {
 		testConfig
@@ -810,6 +869,7 @@ func TestFuncDepOpsRandom(t *testing.T) {
 				genAddConst(1 /* minCols */, 3 /* maxCols */),
 				genAddEquiv(),
 				genAddSynth(0 /* minCols */, 3 /* maxCols */),
+				genAddStrictDep(0 /* minCols */, 3 /* maxCols */),
 			},
 		},
 
@@ -826,6 +886,7 @@ func TestFuncDepOpsRandom(t *testing.T) {
 				genAddConst(1 /* minCols */, 4 /* maxCols */),
 				genAddEquiv(),
 				genAddSynth(0 /* minCols */, 3 /* maxCols */),
+				genAddStrictDep(0 /* minCols */, 3 /* maxCols */),
 			},
 		},
 	}
@@ -1037,6 +1098,9 @@ func shiftColumns(fd FuncDepSet, delta int) FuncDepSet {
 		d := &res.deps[i]
 		d.from = shiftSet(d.from, delta)
 		d.to = shiftSet(d.to, delta)
+	}
+	for i := range res.equiv.groups {
+		res.equiv.groups[i] = shiftSet(res.equiv.groups[i], delta)
 	}
 	res.key = shiftSet(res.key, delta)
 	return res

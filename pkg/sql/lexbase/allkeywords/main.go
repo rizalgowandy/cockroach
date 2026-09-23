@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // all-keywords generates sql/lexbase/keywords.go from sql.y.
 //
@@ -112,18 +107,21 @@ var KeywordNames = []string{
 {{end -}}
 }
 
+var keywordID = map[string]int32{
+{{range . -}}
+	"{{.Keyword}}": {{.Ident}},
+{{end -}}
+}
+
 // GetKeywordID returns the lex id of the SQL keyword k or IDENT if k is
 // not a keyword.
+//
+//gcassert:inline
 func GetKeywordID(k string) int32 {
-	// The previous implementation generated a map that did a string ->
-	// id lookup. Various ideas were benchmarked and the implementation below
-	// was the fastest of those, between 3% and 10% faster (at parsing, so the
-	// scanning speedup is even more) than the map implementation.
-	switch k {
-	{{range . -}}
-	case "{{.Keyword}}": return {{.Ident}}
-	{{end -}}
-	default: return IDENT
+	id, ok := keywordID[k]
+	if !ok {
+		return IDENT
 	}
+	return id
 }
 `

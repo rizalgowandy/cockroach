@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -15,7 +10,9 @@ import (
 	gojson "encoding/json"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -25,9 +22,9 @@ import (
 // AlterTable is a partial implementation of the ALTER TABLE statement.
 //
 // Supported commands:
-//  - INJECT STATISTICS: imports table statistics from a JSON object.
-//  - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
-//
+//   - INJECT STATISTICS: imports table statistics from a JSON object.
+//   - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
+//   - {ENABLE | DISABLE} ROW LEVEL SECURITY: enables or disables RLS policies for the table.
 func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	tn := stmt.Table.ToTableName()
 	// Update the table name to include catalog and schema if not provided.
@@ -37,7 +34,10 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	for _, cmd := range stmt.Cmds {
 		switch t := cmd.(type) {
 		case *tree.AlterTableInjectStats:
-			injectTableStats(tab, t.Stats)
+			injectTableStats(tab, t.Stats, tc)
+
+		case *tree.AlterTableSetRLSMode:
+			toggleRLSMode(tab, t.Mode)
 
 		case *tree.AlterTableAddConstraint:
 			switch d := t.ConstraintDef.(type) {
@@ -54,18 +54,38 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	}
 }
 
-// injectTableStats sets the table statistics as specified by a JSON object.
-func injectTableStats(tt *Table, statsExpr tree.Expr) {
-	ctx := context.Background()
-	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	typedExpr, err := tree.TypeCheckAndRequire(
-		ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS",
-	)
+// AlterTableOwner is an implementation of the ALTER TABLE ... OWNER statement.
+func (tc *Catalog) AlterTableOwner(stmt *tree.AlterTableOwner) {
+	if stmt.IfExists || stmt.IsView || stmt.IsMaterialized || stmt.IsSequence {
+		panic(errors.AssertionFailedf("unsupported options with ALTER TABLE ... OWNER: %v", stmt))
+	}
+
+	tn := stmt.Name.ToTableName()
+	tc.qualifyTableName(&tn)
+	tab := tc.Table(&tn)
+
+	user, err := username.MakeSQLUsernameFromUserInput(stmt.Owner.Name, username.PurposeValidation)
 	if err != nil {
 		panic(err)
 	}
-	val, err := typedExpr.Eval(&evalCtx)
+	_, found := tc.users[user]
+	if !found {
+		panic(errors.Newf(`user %q does not exist`, stmt.Owner.Name))
+	}
+
+	tab.Owner = user
+}
+
+// injectTableStats sets the table statistics as specified by a JSON object.
+func injectTableStats(tt *Table, statsExpr tree.Expr, tc *Catalog) {
+	ctx := context.Background()
+	semaCtx := tree.MakeSemaContext(nil /* resolver */)
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	typedExpr, err := tree.TypeCheckAndRequire(ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS")
+	if err != nil {
+		panic(err)
+	}
+	val, err := eval.Expr(ctx, &evalCtx, typedExpr)
 	if err != nil {
 		panic(err)
 	}
@@ -80,7 +100,7 @@ func injectTableStats(tt *Table, statsExpr tree.Expr) {
 	}
 	tt.Stats = make([]*TableStat, len(stats))
 	for i := range stats {
-		tt.Stats[i] = &TableStat{js: stats[i], tt: tt}
+		tt.Stats[i] = &TableStat{js: stats[i], tt: tt, evalCtx: &evalCtx, tc: tc}
 	}
 	// Call ColumnOrdinal on all possible columns to assert that
 	// the column names are valid.
@@ -92,4 +112,22 @@ func injectTableStats(tt *Table, statsExpr tree.Expr) {
 
 	// Finally, sort the stats with most recent first.
 	sort.Sort(tt.Stats)
+}
+
+// toggleRLSMode will change the row-level security enabled field in the table.
+func toggleRLSMode(tt *Table, mode tree.TableRLSMode) {
+	switch mode {
+	case tree.TableRLSEnable:
+		tt.rlsEnabled = true
+		tt.addRLSConstraint()
+	case tree.TableRLSDisable:
+		tt.rlsEnabled = false
+		tt.removeRLSConstraint()
+	case tree.TableRLSForce:
+		tt.rlsForced = true
+	case tree.TableRLSNoForce:
+		tt.rlsForced = false
+	default:
+		panic(errors.AssertionFailedf("unsupported RLS mode %v", mode))
+	}
 }

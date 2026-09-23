@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -16,26 +11,31 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 const (
-	intervalBaseSettingKey         = "jobs.registry.interval.base"
-	adoptIntervalSettingKey        = "jobs.registry.interval.adopt"
-	cancelIntervalSettingKey       = "jobs.registry.interval.cancel"
-	gcIntervalSettingKey           = "jobs.registry.interval.gc"
-	retentionTimeSettingKey        = "jobs.retention_time"
-	cancelUpdateLimitKey           = "jobs.cancel_update_limit"
-	retryInitialDelaySettingKey    = "jobs.registry.retry.initial_delay"
-	retryMaxDelaySettingKey        = "jobs.registry.retry.max_delay"
-	executionErrorsMaxEntriesKey   = "jobs.execution_errors.max_entries"
-	executionErrorsMaxEntrySizeKey = "jobs.execution_errors.max_entry_size"
+	intervalBaseSettingKey     = "jobs.registry.interval.base"
+	adoptIntervalSettingKey    = "jobs.registry.interval.adopt"
+	cancelIntervalSettingKey   = "jobs.registry.interval.cancel"
+	gcIntervalSettingKey       = "jobs.registry.interval.gc"
+	maxAdoptionsPerLoopKey     = "jobs.registry.max_adoptions_per_loop"
+	retentionTimeSettingKey    = "jobs.retention_time"
+	cancelUpdateLimitKey       = "jobs.cancel_update_limit"
+	debugPausePointsSettingKey = "jobs.debug.pausepoints"
+	metricsPollingIntervalKey  = "jobs.metrics.interval.poll"
+	claimQueryTimeoutKey       = "jobs.registry.claim_query.timeout"
+	useSelectForUpdateKey      = "jobs.registry.claim_query.select_for_update.enabled"
 )
 
 const (
 	// defaultAdoptInterval is the default adopt interval.
 	defaultAdoptInterval = 30 * time.Second
+
+	// defaultMaxAdoptionsPerLoop is the default maximum number of jobs a node
+	// can adopt in one adoption loop.
+	defaultMaxAdoptionsPerLoop = 10
 
 	// defaultCancelInterval is the default cancel interval.
 	defaultCancelInterval = 10 * time.Second
@@ -54,25 +54,14 @@ const (
 	// updated when canceling jobs concurrently from dead sessions.
 	defaultCancellationsUpdateLimit int64 = 1000
 
-	// defaultRetryInitialDelay is the initial delay in the calculation of exponentially
-	// increasing delays to retry failed jobs.
-	defaultRetryInitialDelay = 30 * time.Second
-
-	// defaultRetryMaxDelay is the maximum delay to retry a failed job.
-	defaultRetryMaxDelay = 24 * time.Hour
-
-	// defaultExecutionErrorsMaxEntries is the default number of error entries
-	// which will be retained.
-	defaultExecutionErrorsMaxEntries = 3
-
-	// defaultExecutionErrorsMaxEntrySize is the maximum allowed size of an
-	// error. If this size is exceeded, the error will be formatted as a string
-	// and then truncated to fit the size.
-	defaultExecutionErrorsMaxEntrySize = 64 << 10 // 64 KiB
+	// defaultPollForMetricsInterval is the default interval to poll the jobs
+	// table for metrics.
+	defaultPollForMetricsInterval = 30 * time.Second
 )
 
 var (
 	intervalBaseSetting = settings.RegisterFloatSetting(
+		settings.ApplicationLevel,
 		intervalBaseSettingKey,
 		"the base multiplier for other intervals such as adopt, cancel, and gc",
 		defaultIntervalBase,
@@ -80,6 +69,7 @@ var (
 	)
 
 	adoptIntervalSetting = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
 		adoptIntervalSettingKey,
 		"the interval at which a node (a) claims some of the pending jobs and "+
 			"(b) restart its already claimed jobs that are in running or reverting "+
@@ -88,7 +78,16 @@ var (
 		settings.PositiveDuration,
 	)
 
+	maxAdoptionsPerLoop = settings.RegisterIntSetting(
+		settings.ApplicationLevel,
+		maxAdoptionsPerLoopKey,
+		"the maximum number of jobs a node can adopt in one adoption loop",
+		defaultMaxAdoptionsPerLoop,
+		settings.PositiveInt,
+	)
+
 	cancelIntervalSetting = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
 		cancelIntervalSettingKey,
 		"the interval at which a node cancels the jobs belonging to the known "+
 			"dead sessions",
@@ -96,7 +95,18 @@ var (
 		settings.PositiveDuration,
 	)
 
+	// PollJobsMetricsInterval is the interval at which a tenant in the cluster
+	// will poll the jobs table for metrics
+	PollJobsMetricsInterval = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
+		metricsPollingIntervalKey,
+		"the interval at which a node in the cluster will poll the jobs table for metrics",
+		defaultPollForMetricsInterval,
+		settings.PositiveDuration,
+	)
+
 	gcIntervalSetting = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
 		gcIntervalSettingKey,
 		"the interval a node deletes expired job records that have exceeded their "+
 			"retention duration",
@@ -104,49 +114,44 @@ var (
 		settings.PositiveDuration,
 	)
 
-	retentionTimeSetting = settings.RegisterDurationSetting(
+	// RetentionTimeSetting wraps "jobs.retention_timehelpers_test.go".
+	RetentionTimeSetting = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
 		retentionTimeSettingKey,
-		"the amount of time to retain records for completed jobs before",
+		"the amount of time for which records for completed jobs are retained",
 		defaultRetentionTime,
 		settings.PositiveDuration,
-	).WithPublic()
+		settings.WithPublic)
 
 	cancellationsUpdateLimitSetting = settings.RegisterIntSetting(
+		settings.ApplicationLevel,
 		cancelUpdateLimitKey,
 		"the number of jobs that can be updated when canceling jobs concurrently from dead sessions",
 		defaultCancellationsUpdateLimit,
 		settings.NonNegativeInt,
 	)
 
-	retryInitialDelaySetting = settings.RegisterDurationSetting(
-		retryInitialDelaySettingKey,
-		"the starting duration of exponential-backoff delay"+
-			" to retry a job which encountered a retryable error or had its coordinator"+
-			" fail. The delay doubles after each retry.",
-		defaultRetryInitialDelay,
-		settings.NonNegativeDuration,
+	debugPausepoints = settings.RegisterStringSetting(
+		settings.ApplicationLevel,
+		debugPausePointsSettingKey,
+		"the list, comma separated, of named pausepoints currently enabled for debugging",
+		"",
 	)
 
-	retryMaxDelaySetting = settings.RegisterDurationSetting(
-		retryMaxDelaySettingKey,
-		"the maximum duration by which a job can be delayed to retry",
-		defaultRetryMaxDelay,
+	claimQueryTimeout = settings.RegisterDurationSetting(
+		settings.ApplicationLevel,
+		claimQueryTimeoutKey,
+		"the timeout for the claim query used when adopting jobs",
+		time.Minute,
 		settings.PositiveDuration,
 	)
 
-	executionErrorsMaxEntriesSetting = settings.RegisterIntSetting(
-		executionErrorsMaxEntriesKey,
-		"the maximum number of retriable error entries which will be stored for introspection",
-		defaultExecutionErrorsMaxEntries,
-		settings.NonNegativeInt,
-	)
-
-	executionErrorsMaxEntrySize = settings.RegisterByteSizeSetting(
-		executionErrorsMaxEntrySizeKey,
-		"the maximum byte size of individual error entries which will be stored"+
-			" for introspection",
-		defaultExecutionErrorsMaxEntrySize,
-		settings.NonNegativeInt,
+	UseSelectForUpdate = settings.RegisterBoolSetting(
+		settings.ApplicationLevel,
+		useSelectForUpdateKey,
+		"when true, uses SELECT FOR UPDATE in the claim loop to prevent deadlock; "+
+			"when false, uses the legacy single-query UPDATE RETURNING approach",
+		metamorphic.ConstantWithTestBool("jobs-claim-use-sfu", true),
 	)
 )
 
@@ -166,20 +171,20 @@ func jitter(dur time.Duration) time.Duration {
 // using lastRun, which is updated in onExecute().
 //
 // Common usage pattern:
-//  lc, cleanup := makeLoopController(...)
-//  defer cleanup()
-//  for {
-//    select {
-//    case <- lc.update:
-//      lc.onUpdate() or lc.onUpdateWithBound()
-//    case <- lc.timer.C:
-//      executeJob()
-//      lc.onExecute() or lc.onExecuteWithBound
-//    }
-//  }
 //
+//	lc := makeLoopController(...)
+//	defer lc.cleanup()
+//	for {
+//	  select {
+//	  case <- lc.update:
+//	    lc.onUpdate() or lc.onUpdateWithBound()
+//	  case <- lc.timer.C:
+//	    executeJob()
+//	    lc.onExecute() or lc.onExecuteWithBound
+//	  }
+//	}
 type loopController struct {
-	timer   *timeutil.Timer
+	timer   timeutil.Timer
 	lastRun time.Time
 	updated chan struct{}
 	// getInterval returns the value of the associated cluster setting.
@@ -187,22 +192,16 @@ type loopController struct {
 }
 
 // makeLoopController returns a structure that controls the execution of a job
-// at regular intervals. Moreover, it returns a cleanup function that should be
-// deferred to execute before destroying the instantiated structure.
+// at regular intervals. The structure's cleanup method should be deferred to
+// execute before destroying the instantiated structure.
 func makeLoopController(
-	st *cluster.Settings, s *settings.DurationSetting, overrideKnob *time.Duration,
-) (loopController, func()) {
+	r *Registry, s *settings.DurationSetting, overrideKnob *time.Duration,
+) loopController {
 	lc := loopController{
-		timer:   timeutil.NewTimer(),
 		lastRun: timeutil.Now(),
 		updated: make(chan struct{}, 1),
-		// getInterval returns the value of the associated cluster setting. If
-		// overrideKnob is not nil, it overrides the cluster setting.
 		getInterval: func() time.Duration {
-			if overrideKnob != nil {
-				return *overrideKnob
-			}
-			return time.Duration(intervalBaseSetting.Get(&st.SV) * float64(s.Get(&st.SV)))
+			return r.GetLoopInterval(s, overrideKnob)
 		},
 	}
 
@@ -216,11 +215,11 @@ func makeLoopController(
 	}
 
 	// register onChange() to get a notification when the cluster is updated.
-	s.SetOnChange(&st.SV, onChange)
-	intervalBaseSetting.SetOnChange(&st.SV, onChange)
+	s.SetOnChange(&r.settings.SV, onChange)
+	intervalBaseSetting.SetOnChange(&r.settings.SV, onChange)
 
 	lc.timer.Reset(jitter(lc.getInterval()))
-	return lc, func() { lc.timer.Stop() }
+	return lc
 }
 
 // onUpdate is called when the associated interval setting gets updated.
@@ -232,4 +231,9 @@ func (lc *loopController) onUpdate() {
 func (lc *loopController) onExecute() {
 	lc.lastRun = timeutil.Now()
 	lc.timer.Reset(jitter(lc.getInterval()))
+}
+
+// cleanup stops the loop controller's timer.
+func (lc *loopController) cleanup() {
+	lc.timer.Stop()
 }

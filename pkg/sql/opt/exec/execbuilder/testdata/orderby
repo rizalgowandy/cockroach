@@ -12,7 +12,6 @@ query T
 EXPLAIN SELECT a, b FROM t ORDER BY b
 ----
 distribution: local
-vectorized: true
 ·
 • sort
 │ order: +b
@@ -26,7 +25,6 @@ query T
 EXPLAIN SELECT a, b FROM t ORDER BY b DESC
 ----
 distribution: local
-vectorized: true
 ·
 • sort
 │ order: -b
@@ -41,7 +39,6 @@ query T
 EXPLAIN SELECT a, b FROM t ORDER BY b LIMIT 2
 ----
 distribution: local
-vectorized: true
 ·
 • top-k
 │ order: +b
@@ -60,7 +57,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (c, b)
-│ ordering: +b
 │ estimated row count: 2 (missing stats)
 │ order: +b
 │ k: 2
@@ -80,7 +76,6 @@ query T
 EXPLAIN SELECT b FROM t ORDER BY a DESC
 ----
 distribution: local
-vectorized: true
 ·
 • revscan
   missing stats
@@ -92,7 +87,6 @@ query T
 EXPLAIN SELECT b FROM t ORDER BY a LIMIT 1
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -104,7 +98,6 @@ query T
 EXPLAIN SELECT b FROM t ORDER BY a DESC, b ASC
 ----
 distribution: local
-vectorized: true
 ·
 • revscan
   missing stats
@@ -115,7 +108,6 @@ query T
 EXPLAIN SELECT b FROM t ORDER BY a DESC, b DESC
 ----
 distribution: local
-vectorized: true
 ·
 • revscan
   missing stats
@@ -130,7 +122,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -148,7 +139,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -166,7 +156,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -184,7 +173,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c)
-│ ordering: +b,+a
 │ estimated row count: 1,000 (missing stats)
 │ order: +b,+a
 │
@@ -199,7 +187,6 @@ query T
 EXPLAIN SELECT * FROM t ORDER BY 1+2
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -210,7 +197,6 @@ query T
 EXPLAIN SELECT 1, * FROM t ORDER BY 1
 ----
 distribution: local
-vectorized: true
 ·
 • render
 │
@@ -223,7 +209,6 @@ query T
 EXPLAIN SELECT * FROM t ORDER BY length('abc')
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -239,13 +224,11 @@ vectorized: true
 ·
 • sort
 │ columns: (r)
-│ ordering: +r
 │ estimated row count: 1,000 (missing stats)
 │ order: +r
 │
 └── • render
     │ columns: (r)
-    │ estimated row count: 1,000 (missing stats)
     │ render r: b + 2
     │
     └── • scan
@@ -263,13 +246,11 @@ vectorized: true
 ·
 • sort
 │ columns: (y)
-│ ordering: +y
 │ estimated row count: 1,000 (missing stats)
 │ order: +y
 │
 └── • render
     │ columns: (y)
-    │ estimated row count: 1,000 (missing stats)
     │ render y: b + 2
     │
     └── • scan
@@ -302,10 +283,10 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /abc/abc_pkey/1/2/3 -> NULL
-fetched: /abc/abc_pkey/1/2/3/d -> 'one'
-fetched: /abc/abc_pkey/4/5/6 -> NULL
-fetched: /abc/abc_pkey/4/5/6/d -> 'Two'
+fetched: /abc/abc_pkey/1/2/3:cf=0 -> <undecoded>
+fetched: /abc/abc_pkey/1/2/3/d:cf=1 -> 'one'
+fetched: /abc/abc_pkey/4/5/6:cf=0 -> <undecoded>
+fetched: /abc/abc_pkey/4/5/6/d:cf=1 -> 'Two'
 output row: [1 2 3 'one']
 output row: [4 5 6 'Two']
 
@@ -317,8 +298,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /abc/ba/2/1/3 -> NULL
-fetched: /abc/ba/5/4/6 -> NULL
+fetched: /abc/ba/2/1/? -> <undecoded>
+fetched: /abc/ba/5/4/? -> <undecoded>
 output row: [1 2]
 output row: [4 5]
 
@@ -328,7 +309,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abc ORDER BY b, a, c
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -340,7 +320,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abc WHERE b > 10 AND b < 15 ORDER BY b, a, d
 ----
 distribution: local
-vectorized: true
 ·
 • sort
 │ order: +b,+a,+d
@@ -359,7 +338,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abc WHERE b > 10 ORDER BY b, a, d
 ----
 distribution: local
-vectorized: true
 ·
 • sort
 │ order: +b,+a,+d
@@ -392,7 +370,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b, c, d)
-│ ordering: +b,+a,+c
 │ estimated row count: 333 (missing stats)
 │ order: +b,+a,+c
 │
@@ -411,7 +388,6 @@ query T
 EXPLAIN SELECT a, b FROM abc ORDER BY b, c
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -438,7 +414,6 @@ query T
 EXPLAIN SELECT a, b FROM abc ORDER BY b, c, a
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -449,7 +424,6 @@ query T
 EXPLAIN SELECT a, b FROM abc ORDER BY b, c, a DESC
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -464,8 +438,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /abc/bc/2/3 -> /1
-fetched: /abc/bc/5/6 -> /4
+fetched: /abc/bc/2/3 -> /?
+fetched: /abc/bc/5/6 -> /?
 output row: [2 3]
 output row: [5 6]
 
@@ -490,10 +464,10 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /abc/abc_pkey/4/5/6/d -> 'Two'
-fetched: /abc/abc_pkey/4/5/6 -> NULL
-fetched: /abc/abc_pkey/1/2/3/d -> 'one'
-fetched: /abc/abc_pkey/1/2/3 -> NULL
+fetched: /abc/abc_pkey/4/?/?:cf=1 -> <undecoded>
+fetched: /abc/abc_pkey/4/?/?:cf=0 -> <undecoded>
+fetched: /abc/abc_pkey/1/?/?:cf=1 -> <undecoded>
+fetched: /abc/abc_pkey/1/?/?:cf=0 -> <undecoded>
 output row: [4]
 output row: [1]
 
@@ -501,7 +475,6 @@ query T
 EXPLAIN SELECT a FROM abc ORDER BY a DESC
 ----
 distribution: local
-vectorized: true
 ·
 • revscan
   missing stats
@@ -512,7 +485,6 @@ query T
 EXPLAIN SELECT c FROM abc WHERE b = 2 ORDER BY c
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -523,7 +495,6 @@ query T
 EXPLAIN SELECT c FROM abc WHERE b = 2 ORDER BY c DESC
 ----
 distribution: local
-vectorized: true
 ·
 • revscan
   missing stats
@@ -540,7 +511,6 @@ vectorized: true
 • project
 │ columns: (b, c)
 │ ordering: +b,+c
-│ estimated row count: 10 (missing stats)
 │
 └── • scan
       columns: (a, b, c)
@@ -584,7 +554,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abcd@abc WHERE (a, b) = (1, 4) ORDER BY c
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -595,7 +564,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abcd@abc WHERE (a, b) = (1, 4) ORDER BY c, b, a
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -606,7 +574,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abcd@abc WHERE (a, b) = (1, 4) ORDER BY b, a, c
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -617,7 +584,6 @@ query T
 EXPLAIN SELECT a, b, c FROM abcd@abc WHERE (a, b) = (1, 4) ORDER BY b, c, a
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -644,7 +610,6 @@ query T
 EXPLAIN SELECT * FROM (VALUES ('a'), ('b'), ('c')) WITH ORDINALITY ORDER BY ordinality ASC
 ----
 distribution: local
-vectorized: true
 ·
 • ordinality
 │ estimated row count: 3
@@ -656,7 +621,6 @@ query T
 EXPLAIN SELECT * FROM (VALUES ('a'), ('b'), ('c')) WITH ORDINALITY ORDER BY ordinality DESC
 ----
 distribution: local
-vectorized: true
 ·
 • sort
 │ estimated row count: 3
@@ -697,7 +661,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (column1)
-    │ ordering: +column1
     │ estimated row count: 3
     │ order: +column1
     │
@@ -717,7 +680,6 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 1
 │
 └── • insert fast path
       columns: (a, b)
@@ -737,7 +699,6 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 1 (missing stats)
 │
 └── • delete
     │ columns: (a, b)
@@ -750,6 +711,7 @@ vectorized: true
           estimated row count: 1 (missing stats)
           table: t@t_pkey
           spans: /3/0
+          locking strength: for update
 
 query T
 EXPLAIN (VERBOSE) UPDATE t SET c = TRUE RETURNING b
@@ -759,7 +721,6 @@ vectorized: true
 ·
 • project
 │ columns: (b)
-│ estimated row count: 1,000 (missing stats)
 │
 └── • update
     │ columns: (a, b)
@@ -770,7 +731,6 @@ vectorized: true
     │
     └── • render
         │ columns: (a, b, c, c_new)
-        │ estimated row count: 1,000 (missing stats)
         │ render c_new: true
         │ render a: a
         │ render b: b
@@ -845,6 +805,9 @@ vectorized: true
 statement ok
 CREATE TABLE foo(a INT, b CHAR)
 
+statement ok
+SET allow_ordinal_column_references=true
+
 # Check that sort by ordinal picks up the existing render.
 query T
 EXPLAIN (VERBOSE) SELECT b, a FROM foo ORDER BY @1
@@ -856,16 +819,14 @@ vectorized: true
 │ columns: (b, a)
 │
 └── • render
-    │ columns: (column6, a, b)
+    │ columns: (column8, a, b)
     │ ordering: +a
-    │ estimated row count: 1,000 (missing stats)
-    │ render column6: a
+    │ render column8: a
     │ render a: a
     │ render b: b
     │
     └── • sort
         │ columns: (a, b)
-        │ ordering: +a
         │ estimated row count: 1,000 (missing stats)
         │ order: +a
         │
@@ -885,16 +846,14 @@ vectorized: true
 │ columns: (b, a)
 │
 └── • render
-    │ columns: (column6, a, b)
+    │ columns: (column8, a, b)
     │ ordering: +b
-    │ estimated row count: 1,000 (missing stats)
-    │ render column6: b
+    │ render column8: b
     │ render a: a
     │ render b: b
     │
     └── • sort
         │ columns: (a, b)
-        │ ordering: +b
         │ estimated row count: 1,000 (missing stats)
         │ order: +b
         │
@@ -903,6 +862,9 @@ vectorized: true
               estimated row count: 1,000 (missing stats)
               table: foo@foo_pkey
               spans: FULL SCAN
+
+statement ok
+SET allow_ordinal_column_references=false
 
 # ------------------------------------------------------------------------------
 # Check star expansion in ORDER BY.
@@ -918,7 +880,6 @@ vectorized: true
 ·
 • sort
 │ columns: (x, y)
-│ ordering: +x,+y
 │ estimated row count: 1,000 (missing stats)
 │ order: +x,+y
 │
@@ -936,7 +897,6 @@ vectorized: true
 ·
 • sort
 │ columns: (x, y)
-│ ordering: +x,+y
 │ estimated row count: 1,000 (missing stats)
 │ order: +x,+y
 │
@@ -1013,7 +973,6 @@ vectorized: true
 │
 └── • sort
     │ columns: (k, v)
-    │ ordering: +v,+k
     │ estimated row count: 1,000 (missing stats)
     │ order: +v,+k
     │
@@ -1105,13 +1064,11 @@ vectorized: true
 │
 └── • sort
     │ columns: (k, v)
-    │ ordering: -v,+k
     │ estimated row count: 2 (missing stats)
     │ order: -v,+k
     │
     └── • project
         │ columns: (k, v)
-        │ estimated row count: 2 (missing stats)
         │
         └── • lookup join (inner)
             │ columns: (column1, k, v)
@@ -1119,6 +1076,7 @@ vectorized: true
             │ table: kv@kv_pkey
             │ equality: (column1) = (k)
             │ equality cols are key
+            │ parallel
             │
             └── • values
                   columns: (column1)
@@ -1138,7 +1096,6 @@ vectorized: true
 └── • project
     │ columns: (k, k, v)
     │ ordering: -v,+k
-    │ estimated row count: 10 (missing stats)
     │
     └── • merge join (inner)
         │ columns: (k, v, k, v)
@@ -1176,7 +1133,7 @@ vectorized: true
 • filter
 │ columns: (x, y, z)
 │ ordering: +y
-│ estimated row count: 0 (missing stats)
+│ estimated row count: 1 (missing stats)
 │ filter: x = y
 │
 └── • index join
@@ -1185,6 +1142,7 @@ vectorized: true
     │ estimated row count: 10 (missing stats)
     │ table: xyz@xyz_pkey
     │ key columns: rowid
+    │ parallel
     │
     └── • scan
           columns: (y, z, rowid)
@@ -1206,7 +1164,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b)
-│ ordering: +b
 │ estimated row count: 1,000 (missing stats)
 │ order: +b
 │
@@ -1227,13 +1184,11 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, a, b)
-    │ ordering: +nulls_ordering_b,+b
     │ estimated row count: 1,000 (missing stats)
     │ order: +nulls_ordering_b,+b
     │
     └── • render
         │ columns: (nulls_ordering_b, a, b)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render a: a
         │ render b: b
@@ -1255,13 +1210,11 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, a, b)
-    │ ordering: -nulls_ordering_b,-b
     │ estimated row count: 1,000 (missing stats)
     │ order: -nulls_ordering_b,-b
     │
     └── • render
         │ columns: (nulls_ordering_b, a, b)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render a: a
         │ render b: b
@@ -1280,7 +1233,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a, b)
-│ ordering: -b
 │ estimated row count: 1,000 (missing stats)
 │ order: -b
 │
@@ -1301,13 +1253,11 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, nulls_ordering_c, a, b, c)
-    │ ordering: -nulls_ordering_b,-b,+nulls_ordering_c,+c
     │ estimated row count: 1,000 (missing stats)
     │ order: -nulls_ordering_b,-b,+nulls_ordering_c,+c
     │
     └── • render
         │ columns: (nulls_ordering_b, nulls_ordering_c, a, b, c)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render nulls_ordering_c: c IS NULL
         │ render a: a
@@ -1337,13 +1287,11 @@ vectorized: true
 │
 └── • sort
     │ columns: (nulls_ordering_b, a, b)
-    │ ordering: +nulls_ordering_b,+b
     │ estimated row count: 1,000 (missing stats)
     │ order: +nulls_ordering_b,+b
     │
     └── • render
         │ columns: (nulls_ordering_b, a, b)
-        │ estimated row count: 1,000 (missing stats)
         │ render nulls_ordering_b: b IS NULL
         │ render a: a
         │ render b: b

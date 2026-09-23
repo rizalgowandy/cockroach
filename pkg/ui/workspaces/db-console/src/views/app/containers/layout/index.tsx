@@ -1,31 +1,13 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { Badge, useCluster, useClusterLabel } from "@cockroachlabs/cluster-ui";
+import React, { useEffect, useRef } from "react";
 import { Helmet } from "react-helmet";
-import { RouteComponentProps, withRouter } from "react-router-dom";
-import { connect } from "react-redux";
+import { useLocation } from "react-router-dom";
 
-import NavigationBar from "src/views/app/components/layoutSidebar";
-import ErrorBoundary from "src/views/app/components/errorMessage/errorBoundary";
-import TimeWindowManager from "src/views/app/containers/timewindow";
-import AlertBanner from "src/views/app/containers/alertBanner";
-import RequireLogin from "src/views/login/requireLogin";
-import {
-  clusterIdSelector,
-  clusterNameSelector,
-  singleVersionSelector,
-} from "src/redux/nodes";
-import { AdminUIState } from "src/redux/state";
-import LoginIndicator from "src/views/app/components/loginIndicator";
-import FeedbackSurveyLink from "src/views/app/components/feedbackSurveyLink/feedbackSurveyLink";
 import {
   GlobalNavigation,
   CockroachLabsLockupIcon,
@@ -34,16 +16,27 @@ import {
   PageHeader,
   Text,
   TextTypes,
-  Badge,
 } from "src/components";
+import { AnalyticsProvider } from "src/contexts/analyticsProvider";
+import { TimezoneProvider } from "src/contexts/timezoneProvider";
+import { getDataFromServer } from "src/util/dataFromServer";
+import ErrorBoundary from "src/views/app/components/errorMessage/errorBoundary";
+import NavigationBar from "src/views/app/components/layoutSidebar";
+import LoginIndicator from "src/views/app/components/loginIndicator";
+import AlertBanner from "src/views/app/containers/alertBanner";
+import { HealthMonitor } from "src/views/app/containers/healthMonitor";
+import TimeWindowManager from "src/views/app/containers/metricsTimeManager";
+import RequireLogin from "src/views/login/requireLogin";
+import { ThrottleNotificationBar } from "src/views/shared/components/alertBar/alertBar";
 
-import "./layout.styl";
-import "./layoutPanel.styl";
+import "./layout.scss";
+import "./layoutPanel.scss";
 
-export interface LayoutProps {
-  clusterName: string;
-  clusterVersion: string;
-  clusterId: string;
+import TenantDropdown from "../../components/tenantDropdown/tenantDropdown";
+import { LicenseNotification } from "../licenseNotification/licenseNotification";
+
+interface LayoutProps {
+  children?: React.ReactNode;
 }
 
 /**
@@ -52,69 +45,77 @@ export interface LayoutProps {
  *
  * Individual pages provide their content via react-router.
  */
-class Layout extends React.Component<LayoutProps & RouteComponentProps> {
-  contentRef = React.createRef<HTMLDivElement>();
+function Layout({ children }: LayoutProps): React.ReactElement {
+  const { clusterName, clusterVersion } = useClusterLabel();
+  const { data } = useCluster();
+  const clusterId = data?.cluster_id;
+  const location = useLocation();
+  const contentRef = useRef<HTMLDivElement>(null);
 
-  componentDidUpdate(prevProps: RouteComponentProps) {
-    // `react-router` doesn't handle scroll restoration (https://reactrouter.com/react-router/web/guides/scroll-restoration)
-    // and when location changed with react-router's Link it preserves scroll position whenever it is.
-    // AdminUI layout keeps left and top panels have fixed position on a screen and has internal scrolling for content div
-    // element which has to be scrolled back on top with navigation change.
-    if (this.props.location.pathname !== prevProps.location.pathname) {
-      this.contentRef.current.scrollTo(0, 0);
+  // `react-router` doesn't handle scroll restoration (https://reactrouter.com/react-router/web/guides/scroll-restoration)
+  // and when location changed with react-router's Link it preserves scroll position wherever it is.
+  // AdminUI layout keeps left and top panels at fixed position on screen and has internal scrolling for content div
+  // element which has to be scrolled back to top with navigation change.
+  useEffect(() => {
+    if (
+      contentRef.current &&
+      typeof contentRef.current.scrollTo === "function"
+    ) {
+      contentRef.current.scrollTo(0, 0);
     }
-  }
+  }, [location.pathname]);
 
-  render() {
-    const { clusterName, clusterVersion, clusterId } = this.props;
-    return (
-      <RequireLogin>
-        <Helmet
-          titleTemplate="%s | Cockroach Console"
-          defaultTitle="Cockroach Console"
-        />
-        <TimeWindowManager />
-        <AlertBanner />
-        <div className="layout-panel">
-          <div className="layout-panel__header">
-            <GlobalNavigation>
-              <Left>
-                <CockroachLabsLockupIcon height={26} />
-              </Left>
-              <Right>
-                <FeedbackSurveyLink />
-                <LoginIndicator />
-              </Right>
-            </GlobalNavigation>
-          </div>
-          <div className="layout-panel__navigation-bar">
-            <PageHeader>
-              <Text textType={TextTypes.Heading2} noWrap>
-                {clusterName || `Cluster id: ${clusterId || ""}`}
-              </Text>
-              <Badge text={clusterVersion} />
-            </PageHeader>
-          </div>
-          <div className="layout-panel__body">
-            <div className="layout-panel__sidebar">
-              <NavigationBar />
+  return (
+    <RequireLogin>
+      <TimezoneProvider>
+        <AnalyticsProvider>
+          <Helmet
+            titleTemplate="%s | Cockroach Console"
+            defaultTitle="Cockroach Console"
+          />
+          <TimeWindowManager />
+          <HealthMonitor />
+          <AlertBanner />
+          <div className="layout-panel">
+            <div className="layout-panel__header">
+              <GlobalNavigation>
+                <Left>
+                  <CockroachLabsLockupIcon height={26} />
+                </Left>
+                <Right>
+                  <LicenseNotification />
+                  <LoginIndicator />
+                </Right>
+              </GlobalNavigation>
             </div>
-            <div ref={this.contentRef} className="layout-panel__content">
-              <ErrorBoundary>{this.props.children}</ErrorBoundary>
+            <div className="layout-panel__navigation-bar">
+              <PageHeader>
+                <Text textType={TextTypes.Heading2} noWrap>
+                  {getDataFromServer().FeatureFlags.is_observability_service
+                    ? "(Obs Service) "
+                    : ""}
+                  {clusterName || `Cluster id: ${clusterId || ""}`}
+                </Text>
+                <Badge text={clusterVersion} />
+                <TenantDropdown />
+              </PageHeader>
+            </div>
+            <ThrottleNotificationBar />
+            <div className="layout-panel__body">
+              <div className="layout-panel__sidebar">
+                <NavigationBar />
+              </div>
+              <div ref={contentRef} className="layout-panel__content">
+                <ErrorBoundary key={location.pathname}>
+                  {children}
+                </ErrorBoundary>
+              </div>
             </div>
           </div>
-        </div>
-      </RequireLogin>
-    );
-  }
+        </AnalyticsProvider>
+      </TimezoneProvider>
+    </RequireLogin>
+  );
 }
 
-const mapStateToProps = (state: AdminUIState) => {
-  return {
-    clusterName: clusterNameSelector(state),
-    clusterVersion: singleVersionSelector(state),
-    clusterId: clusterIdSelector(state),
-  };
-};
-
-export default withRouter(connect(mapStateToProps)(Layout));
+export default Layout;

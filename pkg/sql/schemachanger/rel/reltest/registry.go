@@ -1,22 +1,18 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package reltest
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 // Registry stores entities by name. It helps to serialize things in an
@@ -85,6 +81,17 @@ func (r *Registry) MustGetName(t *testing.T, v interface{}) string {
 
 // GetName is like MustGetName but does not enforce that it exists.
 func (r *Registry) GetName(i interface{}) (string, bool) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if re, ok := r.(runtime.Error); ok &&
+			strings.Contains(re.Error(), "hash of unhashable type") {
+			return
+		}
+		panic(r)
+	}()
 	got, ok := r.valueToName[i]
 	return got, ok
 }

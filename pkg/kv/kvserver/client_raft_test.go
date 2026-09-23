@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
@@ -17,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -27,39 +23,58 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/node_rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvtestutils"
+	"github.com/cockroachdb/cockroach/pkg/raft"
+	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/storage/mvccencoding"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/circuit"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/etcd/raft/v3"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 	"google.golang.org/grpc"
+	"storj.io/drpc"
+	"storj.io/drpc/drpcclient"
 )
 
 // mustGetInt decodes an int64 value from the bytes field of the receiver
@@ -81,23 +96,24 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
 			ServerArgs: base.TestServerArgs{
 				StoreSpecs: []base.StoreSpec{
 					{
-						InMemory:               true,
-						StickyInMemoryEngineID: "1",
+						InMemory:    true,
+						StickyVFSID: "1",
 					},
 				},
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						StickyEngineRegistry: stickyEngineRegistry,
+						StickyVFSRegistry: fs.NewStickyRegistry(),
 					},
 				},
 			},
@@ -110,11 +126,11 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 
 	get := func(store *kvserver.Store, key roachpb.Key) int64 {
 		args := getArgs(key)
-		resp, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, args)
+		resp, err := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, args)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return mustGetInt(resp.(*roachpb.GetResponse).Value)
+		return mustGetInt(resp.(*kvpb.GetResponse).Value)
 	}
 	validate := func(store *kvserver.Store) {
 		if val := get(store, key1); val != 13 {
@@ -129,10 +145,10 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 	// that both predate and postdate the split.
 	func() {
 		store := tc.GetFirstStoreFromServer(t, 0)
-		increment := func(key roachpb.Key, value int64) (*roachpb.IncrementResponse, *roachpb.Error) {
+		increment := func(key roachpb.Key, value int64) (*kvpb.IncrementResponse, *kvpb.Error) {
 			args := incrementArgs(key, value)
-			resp, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, args)
-			incResp, _ := resp.(*roachpb.IncrementResponse)
+			resp, err := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, args)
+			incResp, _ := resp.(*kvpb.IncrementResponse)
 			return incResp, err
 		}
 
@@ -174,7 +190,7 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	incArgs = incrementArgs(key2, 0)
-	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{}, incArgs); err != nil {
+	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), kvpb.Header{}, incArgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -187,8 +203,9 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	numIncrements := 0
 	keyA := roachpb.Key("a")
@@ -196,16 +213,17 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						StickyEngineRegistry: stickyEngineRegistry,
+						StickyVFSRegistry: stickyVFSRegistry,
 					},
 					Store: &kvserver.StoreTestingKnobs{
 						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-							TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
-								_, ok := filterArgs.Req.(*roachpb.IncrementRequest)
+							TestingEvalFilter: func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
+								_, ok := filterArgs.Req.(*kvpb.IncrementRequest)
 								if ok && filterArgs.Req.Header().Key.Equal(keyA) {
 									numIncrements++
 								}
@@ -216,8 +234,8 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 				},
 				StoreSpecs: []base.StoreSpec{
 					{
-						InMemory:               true,
-						StickyInMemoryEngineID: "1",
+						InMemory:    true,
+						StickyVFSID: "1",
 					},
 				},
 			},
@@ -287,7 +305,7 @@ func TestReplicateRange(t *testing.T) {
 	// Verify no intent remains on range descriptor key.
 	key := keys.RangeDescriptorKey(rhsDesc.StartKey)
 	desc := roachpb.RangeDescriptor{}
-	if ok, err := storage.MVCCGetProto(ctx, store.Engine(), key,
+	if ok, err := storage.MVCCGetProto(ctx, store.StateEngine(), key,
 		store.Clock().Now(), &desc, storage.MVCCGetOptions{}); err != nil {
 		t.Fatal(err)
 	} else if !ok {
@@ -300,7 +318,7 @@ func TestReplicateRange(t *testing.T) {
 		meta1 := keys.RangeMetaKey(meta2)
 		for _, key := range []roachpb.RKey{meta2, meta1} {
 			metaDesc := roachpb.RangeDescriptor{}
-			if ok, err := storage.MVCCGetProto(ctx, store.Engine(), key.AsRawKey(),
+			if ok, err := storage.MVCCGetProto(ctx, store.StateEngine(), key.AsRawKey(),
 				store.Clock().Now(), &metaDesc, storage.MVCCGetOptions{}); err != nil {
 				return err
 			} else if !ok {
@@ -313,11 +331,11 @@ func TestReplicateRange(t *testing.T) {
 	// Verify that the same data is available on the replica.
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs(keyA)
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(5), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(5), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -330,8 +348,9 @@ func TestRestoreReplicas(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	const numServers int = 2
 	stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -339,13 +358,13 @@ func TestRestoreReplicas(t *testing.T) {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: stickyVFSRegistry,
 				},
 			},
 		}
@@ -354,8 +373,9 @@ func TestRestoreReplicas(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 2,
 		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 	store := tc.GetFirstStoreFromServer(t, 0)
@@ -365,46 +385,44 @@ func TestRestoreReplicas(t *testing.T) {
 
 	// Perform an increment before replication to ensure that commands are not
 	// repeated on restarts.
-	incArgs := incrementArgs([]byte("a"), 23)
-	if _, err := kv.SendWrapped(ctx,
-		store.TestSender(), incArgs); err != nil {
-		t.Fatal(err)
-	}
+	incArgs := incrementArgs(key, 23)
+	_, pErr := kv.SendWrapped(ctx, store.TestSender(), incArgs)
+	require.NoError(t, pErr.GoError())
 
 	tc.AddVotersOrFatal(t, key, tc.Target(1))
 
 	require.NoError(t, tc.Restart())
 
-	incArgs = incrementArgs([]byte("a"), 5)
-	failures := 0
-	successes := 0
-	// Send a command on each store. It should only succeed on the lease holder.
-	var followerStore *kvserver.Store
-	for i := 0; i < len(tc.Servers); i++ {
-		if _, pErr := kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, i).TestSender(), incArgs); pErr != nil {
-			failures++
-			if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); !ok {
-				t.Fatalf("expected not lease holder error; got %s", pErr)
-			}
-			followerStore = tc.GetFirstStoreFromServer(t, i)
-		} else {
-			successes++
-		}
-	}
-	require.Equal(t, failures, 1)
-	require.Equal(t, successes, 1)
-
+	// The restart may cause the Raft leadership and the lease to bounce around a
+	// bit, so we loop until we find the leaseholder and able to propose the
+	// second increment.
+	incArgs = incrementArgs(key, 5)
 	testutils.SucceedsSoon(t, func() error {
-		getArgs := getArgs([]byte("a"))
-		if reply, err := kv.SendWrappedWith(ctx, followerStore.TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
-		}, getArgs); err != nil {
-			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(28), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
-			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
+		var pErr *kvpb.Error
+		for i := 0; i < tc.NumServers(); i++ {
+			_, pErr = kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, i).TestSender(), incArgs)
+			if pErr == nil {
+				return nil
+			}
+			require.IsType(t, &kvpb.NotLeaseHolderError{}, pErr.GetDetail())
 		}
-		return nil
+		return pErr.GoError()
 	})
+
+	// Both servers should eventually observe the new value.
+	for i := 0; i < tc.NumServers(); i++ {
+		testutils.SucceedsSoon(t, func() error {
+			getArgs := getArgs(key)
+			if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, i).TestSender(), kvpb.Header{
+				ReadConsistency: kvpb.INCONSISTENT,
+			}, getArgs); err != nil {
+				return errors.Errorf("failed to read data: %s", err)
+			} else if e, v := int64(28), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
+				return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
+			}
+			return nil
+		})
+	}
 
 	validate := func(s *kvserver.Store) {
 		repl := s.LookupReplica(key)
@@ -435,11 +453,11 @@ func TestFailedReplicaChange(t *testing.T) {
 	var runFilter atomic.Value
 	runFilter.Store(true)
 
-	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
+	testingEvalFilter := func(filterArgs kvserverbase.FilterArgs) *kvpb.Error {
 		if runFilter.Load().(bool) {
-			if et, ok := filterArgs.Req.(*roachpb.EndTxnRequest); ok && et.Commit &&
+			if et, ok := filterArgs.Req.(*kvpb.EndTxnRequest); ok && et.Commit &&
 				et.InternalCommitTrigger != nil && et.InternalCommitTrigger.ChangeReplicasTrigger != nil {
-				return roachpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
+				return kvpb.NewErrorWithTxn(errors.Errorf("boom"), filterArgs.Hdr.Txn)
 			}
 		}
 		return nil
@@ -452,7 +470,7 @@ func TestFailedReplicaChange(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 					Store: &kvserver.StoreTestingKnobs{
 						EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
@@ -516,10 +534,7 @@ func TestReplicateAfterTruncation(t *testing.T) {
 
 	repl := store.LookupReplica(key)
 	// Get that command's log index.
-	index, err := repl.GetLastIndex()
-	if err != nil {
-		t.Fatal(err)
-	}
+	index := repl.GetLastIndex()
 
 	// Truncate the log at index+1 (log entries < N are removed, so this includes
 	// the increment).
@@ -540,11 +555,11 @@ func TestReplicateAfterTruncation(t *testing.T) {
 	// Once it catches up, the effects of both commands can be seen.
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs([]byte("a"))
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(16), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(16), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -568,11 +583,11 @@ func TestReplicateAfterTruncation(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs([]byte("a"))
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(39), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(39), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -601,46 +616,31 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 
 	repl := store.LookupReplica(key)
 	require.NotNil(t, repl)
-	index, err := repl.GetLastIndex()
-	if err != nil {
-		t.Fatal(err)
-	}
+	index := repl.GetLastIndex()
 
-	// Verifies the recomputed log size against what we track in `r.mu.raftLogSize`.
-	assertCorrectRaftLogSize := func() error {
-		// Recompute under raft lock so that the log doesn't change while we
-		// compute its size.
+	// Verifies the recomputed log size against what we track in log storage.
+	assertCorrectRaftLogSize := func() {
+		// Lock raftMu so that the log doesn't change while we compute its size.
 		repl.RaftLock()
-		realSize, err := kvserver.ComputeRaftLogSize(
-			ctx, repl.RangeID, repl.Engine(), repl.SideloadedRaftMuLocked(),
-		)
+		realSize, err := repl.LogStorageRaftMuLocked().ComputeSize(ctx)
 		size, _ := repl.GetRaftLogSize()
 		repl.RaftUnlock()
-
-		if err != nil {
-			t.Fatal(err)
-		}
-
+		require.NoError(t, err)
 		// If the size isn't trusted, it won't have to match (and in fact
 		// likely won't). In this test, this is because the upreplication
 		// elides old Raft log entries in the snapshot it uses.
-		if size != realSize {
-			return fmt.Errorf("%s: raft log claims size %d, but is in fact %d", repl, size, realSize)
-		}
-		return nil
+		require.Equal(t, size, realSize)
 	}
 
-	assert.NoError(t, assertCorrectRaftLogSize())
-
+	assertCorrectRaftLogSize()
 	truncArgs := truncateLogArgs(index+1, repl.GetRangeID())
 	if _, err := kv.SendWrapped(ctx, store.TestSender(), truncArgs); err != nil {
 		t.Fatal(err)
 	}
-
 	// Note that if there were multiple nodes, the Raft log sizes would not
 	// be correct for the followers as they would have received a shorter
 	// Raft log than the leader.
-	assert.NoError(t, assertCorrectRaftLogSize())
+	assertCorrectRaftLogSize()
 }
 
 // TestSnapshotAfterTruncation tests that Raft will properly send a snapshot
@@ -654,8 +654,8 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 			name = "differentTerm"
 		}
 		t.Run(name, func(t *testing.T) {
-			stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-			defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+			lisReg := listenerutil.NewListenerRegistry()
+			defer lisReg.Close()
 
 			const numServers int = 3
 			stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -663,13 +663,13 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 				stickyServerArgs[i] = base.TestServerArgs{
 					StoreSpecs: []base.StoreSpec{
 						{
-							InMemory:               true,
-							StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+							InMemory:    true,
+							StickyVFSID: strconv.FormatInt(int64(i), 10),
 						},
 					},
 					Knobs: base.TestingKnobs{
 						Server: &server.TestingKnobs{
-							StickyEngineRegistry: stickyEngineRegistry,
+							StickyVFSRegistry: fs.NewStickyRegistry(),
 						},
 					},
 				}
@@ -678,8 +678,9 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 			ctx := context.Background()
 			tc := testcluster.StartTestCluster(t, numServers,
 				base.TestClusterArgs{
-					ReplicationMode:   base.ReplicationManual,
-					ServerArgsPerNode: stickyServerArgs,
+					ReplicationMode:     base.ReplicationManual,
+					ReusableListenerReg: lisReg,
+					ServerArgsPerNode:   stickyServerArgs,
 				})
 			defer tc.Stopper().Stop(ctx)
 			store := tc.GetFirstStoreFromServer(t, 0)
@@ -716,13 +717,10 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			tc.WaitForValues(t, key, []int64{incAB, incA, incAB})
+			tc.WaitForValues(t, key, []int64{incAB, 0 /* stopped server */, incAB})
 
 			repl0 := store.LookupReplica(key)
-			index, err := repl0.GetLastIndex()
-			if err != nil {
-				t.Fatal(err)
-			}
+			index := repl0.GetLastIndex()
 
 			// Truncate the log at index+1 (log entries < N are removed, so this
 			// includes the increment).
@@ -769,13 +767,24 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 						if status == nil {
 							return errors.New("raft status not initialized")
 						}
-						if status.RaftState == raft.StateLeader {
+						if status.RaftState == raftpb.StateLeader {
 							hasLeader = true
 						}
 						if term == 0 {
 							term = status.Term
 						} else if status.Term != term {
 							return errors.Errorf("terms do not agree: %d vs %d", status.Term, term)
+						}
+						if !hasLeader {
+							// If we haven't been able to establish a  leader yet, send a get
+							// request to force the issue.
+							getReq := getArgs(key)
+							_, err := kv.SendWrapped(ctx, tc.GetFirstStoreFromServer(t, i).TestSender(), getReq)
+							// It should be fine if we get a NLHE for some reason.
+							nlhe := &kvpb.NotLeaseHolderError{}
+							if !errors.As(err.GetDetail(), &nlhe) {
+								return err.GetDetail()
+							}
 						}
 					}
 					if !hasLeader {
@@ -803,13 +812,13 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 				// persistently unavailable range.
 				repl0 = tc.GetFirstStoreFromServer(t, otherStore1).LookupReplica(key)
 				require.NotNil(t, repl0)
-				expectedLastIndex, _ := repl0.GetLastIndex()
+				expectedLastIndex := repl0.GetLastIndex()
 				expectedLastTerm := repl0.GetCachedLastTerm()
 
 				verifyIndexAndTerm := func(i int) error {
 					repl1 := tc.GetFirstStoreFromServer(t, i).LookupReplica(key)
 					require.NotNil(t, repl1)
-					if lastIndex, _ := repl1.GetLastIndex(); expectedLastIndex != lastIndex {
+					if lastIndex := repl1.GetLastIndex(); expectedLastIndex != lastIndex {
 						return fmt.Errorf("%d: expected last index %d, but found %d", i, expectedLastIndex, lastIndex)
 					}
 					if lastTerm := repl1.GetCachedLastTerm(); expectedLastTerm != lastTerm {
@@ -829,6 +838,17 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 	}
 }
 
+func waitForTruncationForTesting(t *testing.T, r *kvserver.Replica, compacted kvpb.RaftIndex) {
+	testutils.SucceedsSoon(t, func() error {
+		// Flush the engine to advance durability, which triggers truncation.
+		require.NoError(t, r.Store().StateEngine().Flush())
+		if index := r.GetCompactedIndex(); index != compacted {
+			return errors.Errorf("expected compacted index == %d, got %d", compacted, index)
+		}
+		return nil
+	})
+}
+
 // TestSnapshotAfterTruncationWithUncommittedTail is similar in spirit to
 // TestSnapshotAfterTruncation/differentTerm. However, it differs in that we
 // take care to ensure that the partitioned Replica has a long uncommitted tail
@@ -842,14 +862,18 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	// Only run the test with Leader leases.
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseLeader)
 	manualClock := hlc.NewHybridManualClock()
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -900,30 +924,18 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 	//        x      x
 	//      [1]<---->[2]
 	//
-	log.Infof(ctx, "test: installing unreliable Raft transports")
-	for _, s := range []int{0, 1, 2} {
-		h := &unreliableRaftHandler{
-			rangeID:            partRepl.RangeID,
-			RaftMessageHandler: tc.GetFirstStoreFromServer(t, s),
-		}
-		if s != partStore {
-			// Only filter messages from the partitioned store on the other
-			// two stores.
-			h.dropReq = func(req *kvserver.RaftMessageRequest) bool {
-				return req.FromReplica.StoreID == partRepl.StoreID()
-			}
-			h.dropHB = func(hb *kvserver.RaftHeartbeat) bool {
-				return hb.FromReplicaID == partReplDesc.ReplicaID
-			}
-		}
-		tc.Servers[s].RaftTransport().Listen(tc.Target(s).StoreID, h)
-	}
+	log.KvExec.Infof(ctx, "test: partitioning n1 from n2, n3")
+	desc, err := tc.LookupRange(key)
+	require.NoError(t, err)
+	dropRaftMessagesFrom(t, tc.Servers[1], desc, []roachpb.ReplicaID{1}, nil)
+	dropRaftMessagesFrom(t, tc.Servers[2], desc, []roachpb.ReplicaID{1}, nil)
+	dropRaftMessagesFrom(t, tc.Servers[0], desc, []roachpb.ReplicaID{2, 3}, nil)
 
 	// Perform a series of writes on the partitioned replica. The writes will
 	// not succeed before their context is canceled, but they will be appended
 	// to the partitioned replica's Raft log because it is currently the Raft
 	// leader.
-	log.Infof(ctx, "test: sending writes to partitioned replica")
+	log.KvExec.Infof(ctx, "test: sending writes to partitioned replica")
 	g := ctxgroup.WithContext(ctx)
 	otherKeys := make([]roachpb.Key, 32)
 	otherKeys[0] = key.Next()
@@ -949,87 +961,96 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Transfer the lease to one of the followers and perform a write. The
-	// partition ensures that this will require a Raft leadership change. It's
-	// unpredictable which one of the followers will become leader. Only the
-	// leader will be allowed to acquire the lease (see
-	// TestSnapshotAfterTruncationWithUncommittedTail), so it's also unpredictable
-	// who will get the lease. We try repeatedly sending requests to both
-	// candidates until one of them succeeds.
-	var nonPartitionedSenders [2]kv.Sender
-	nonPartitionedSenders[0] = tc.GetFirstStoreFromServer(t, 1).TestSender()
-	nonPartitionedSenders[1] = tc.GetFirstStoreFromServer(t, 2).TestSender()
+	// The partition ensures that the Raft leadership changes. The previous leader
+	// (1) will step down and one of the followers (2 or 3) will become the new
+	// leader. Either one can, and when one does, it'll be able to acquire the
+	// lease. We'll first wait for a new leader to be established, have it acquire
+	// the lease, and service a write request.
+	log.KvExec.Infof(ctx, "test: establishing new leader/leaseholder and sending writes")
 
-	log.Infof(ctx, "test: sending write to transfer lease")
+	const otherStoreIdx = 1
+	otherStore := tc.GetFirstStoreFromServer(t, otherStoreIdx)
+	otherRepl, err := otherStore.GetReplica(desc.RangeID)
+	require.NoError(t, err)
+
 	incArgs = incrementArgs(key, incB)
-	var i int
 	var newLeaderRepl *kvserver.Replica
 	var newLeaderReplSender kv.Sender
+
+	// Have StoreLiveness support for the partitioned store expire.
+	manualClock.Increment(store.GetStoreConfig().LeaseExpiration())
+
 	testutils.SucceedsSoon(t, func() error {
-		manualClock.Increment(store.GetStoreConfig().LeaseExpiration())
-		i++
-		sender := nonPartitionedSenders[i%2]
-		_, pErr := kv.SendWrapped(ctx, sender, incArgs)
-		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok {
-			return pErr.GoError()
-		} else if pErr != nil {
-			t.Fatal(pErr)
+		if partRepl.RaftStatus().RaftState == raftpb.StateLeader {
+			return errors.New("partitioned replica should have stepped down")
+		}
+		lead := otherRepl.RaftStatus().Lead
+		if lead == raft.None {
+			return errors.New("no leader yet")
+		}
+		if roachpb.ReplicaID(lead) == partReplDesc.ReplicaID {
+			return errors.New("partitioned replica is still leader")
 		}
 
-		// A request succeeded, proving that there is a new leader and leaseholder.
-		// Remember who that is.
-		newLeaderStoreIdx := 1 + (i % 2)
-		newLeaderRepl = tc.GetFirstStoreFromServer(t, newLeaderStoreIdx).LookupReplica(roachpb.RKey(key))
-		newLeaderReplSender = tc.GetFirstStoreFromServer(t, newLeaderStoreIdx).TestSender()
+		// Remember who the leader/leaseholder is and also send it a write request.
+		newLeaderReplDesc, found := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(lead))
+		require.True(t, found)
+		newLeaderRepl = tc.GetFirstStoreFromServer(t, int(newLeaderReplDesc.NodeID-1)).LookupReplica(roachpb.RKey(key))
+		newLeaderReplSender = tc.GetFirstStoreFromServer(t, int(newLeaderReplDesc.NodeID-1)).TestSender()
+		_, pErr := kv.SendWrapped(ctx, newLeaderReplSender, incArgs)
+		require.Nil(t, pErr)
 		return nil
 	})
-	log.Infof(ctx, "test: waiting for values...")
-	tc.WaitForValues(t, key, []int64{incA, incAB, incAB})
-	log.Infof(ctx, "test: waiting for values... done")
 
-	index, err := newLeaderRepl.GetLastIndex()
-	if err != nil {
-		t.Fatal(err)
-	}
+	log.KvExec.Infof(ctx, "test: waiting for values...")
+	tc.WaitForValues(t, key, []int64{incA, incAB, incAB})
+	log.KvExec.Infof(ctx, "test: waiting for values... done")
+
+	index := newLeaderRepl.GetLastIndex()
 
 	// Truncate the log at index+1 (log entries < N are removed, so this
 	// includes the increment).
-	log.Infof(ctx, "test: truncating log")
+	log.KvExec.Infof(ctx, "test: truncating log")
 	truncArgs := truncateLogArgs(index+1, partRepl.RangeID)
 	truncArgs.Key = partRepl.Desc().StartKey.AsRawKey()
 	testutils.SucceedsSoon(t, func() error {
 		manualClock.Increment(store.GetStoreConfig().LeaseExpiration())
-		_, pErr := kv.SendWrappedWith(ctx, newLeaderReplSender, roachpb.Header{RangeID: partRepl.RangeID}, truncArgs)
-		if _, ok := pErr.GetDetail().(*roachpb.NotLeaseHolderError); ok {
+		_, pErr := kv.SendWrappedWith(ctx, newLeaderReplSender, kvpb.Header{RangeID: partRepl.RangeID}, truncArgs)
+		if _, ok := pErr.GetDetail().(*kvpb.NotLeaseHolderError); ok {
 			return pErr.GoError()
 		} else if pErr != nil {
 			t.Fatal(pErr)
 		}
 		return nil
 	})
+	waitForTruncationForTesting(t, newLeaderRepl, index)
 
 	snapsMetric := tc.GetFirstStoreFromServer(t, partStore).Metrics().RangeSnapshotsAppliedByVoters
 	snapsBefore := snapsMetric.Count()
 
 	// Remove the partition. Snapshot should follow.
-	log.Infof(ctx, "test: removing the partition")
+	log.KvExec.Infof(ctx, "test: removing the partition")
 	for _, s := range []int{0, 1, 2} {
-		tc.Servers[s].RaftTransport().Listen(tc.Target(s).StoreID, &unreliableRaftHandler{
-			rangeID:            partRepl.RangeID,
-			RaftMessageHandler: tc.GetFirstStoreFromServer(t, s),
-			unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
-				dropReq: func(req *kvserver.RaftMessageRequest) bool {
+		tc.Servers[s].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(tc.Target(s).StoreID, &kvtestutils.UnreliableRaftHandler{
+			RangeID:                    partRepl.RangeID,
+			IncomingRaftMessageHandler: tc.GetFirstStoreFromServer(t, s),
+			UnreliableRaftHandlerFuncs: kvtestutils.UnreliableRaftHandlerFuncs{
+				DropReq: func(req *kvserverpb.RaftMessageRequest) bool {
 					// Make sure that even going forward no MsgApp for what we just truncated can
 					// make it through. The Raft transport is asynchronous so this is necessary
 					// to make the test pass reliably.
 					// NB: the Index on the message is the log index that _precedes_ any of the
 					// entries in the MsgApp, so filter where msg.Index < index, not <= index.
-					return req.Message.Type == raftpb.MsgApp && req.Message.Index < index
+					return req.Message.Type == raftpb.MsgApp && kvpb.RaftIndex(req.Message.Index) < index
 				},
-				dropHB:   func(*kvserver.RaftHeartbeat) bool { return false },
-				dropResp: func(*kvserver.RaftMessageResponse) bool { return false },
+				DropHB:   func(*kvserverpb.RaftHeartbeat) bool { return false },
+				DropResp: func(*kvserverpb.RaftMessageResponse) bool { return false },
 			},
 		})
+		store := tc.GetFirstStoreFromServer(t, s)
+		store.StoreLivenessTransport().ListenMessages(
+			store.StoreID(), store.TestingStoreLivenessSupportManager(),
+		)
 	}
 
 	// The partitioned replica should catch up after a snapshot.
@@ -1045,7 +1066,7 @@ func TestSnapshotAfterTruncationWithUncommittedTail(t *testing.T) {
 	// Perform another write. The partitioned replica should be able to receive
 	// replicated updates.
 	incArgs = incrementArgs(key, incC)
-	if _, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSender(), incArgs); pErr != nil {
+	if _, pErr := kv.SendWrapped(ctx, tc.Servers[0].DistSenderI().(kv.Sender), incArgs); pErr != nil {
 		t.Fatal(pErr)
 	}
 	tc.WaitForValues(t, key, []int64{incABC, incABC, incABC})
@@ -1066,233 +1087,581 @@ func TestRequestsOnLaggingReplica(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
+	// Increase the verbosity of the test to help investigate failures.
+	testutils.SetVModule(t, "replica_range_lease=3,raft=4,replica_raft_quiesce=3,verify=2")
+
+	testutils.RunTrueAndFalse(t, "symmetric", func(t *testing.T, symmetric bool) {
+		st := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseLeader)
+		// TODO(arul): Once https://github.com/cockroachdb/cockroach/issues/118435 we
+		// can remove this. Leader leases require us to reject lease requests on
+		// replicas that are not the leader.
+		kvserver.RejectLeaseOnLeaderUnknown.Override(ctx, &st.SV, true)
+
+		clusterArgs := base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Settings: st,
+				// Reduce the election timeout some to speed up the test.
+				RaftConfig: base.RaftConfig{RaftElectionTimeoutTicks: 10},
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						// We eliminate clock offsets in order to eliminate the stasis
+						// period of leases, in order to speed up the test.
+						MaxOffset: time.Nanosecond,
+					},
+				},
+			},
+		}
+
+		tc := testcluster.StartTestCluster(t, 3, clusterArgs)
+		defer tc.Stopper().Stop(ctx)
+
+		_, rngDesc, err := tc.Servers[0].ScratchRangeEx()
+		require.NoError(t, err)
+		key := rngDesc.StartKey.AsRawKey()
+		// Add replicas on all the stores.
+		rngDesc = tc.AddVotersOrFatal(t, rngDesc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
+
+		{
+			// Write a value so that the respective key is present in all stores and
+			// we can increment it again later.
+			_, err := tc.Server(0).DB().Inc(ctx, key, 1)
+			require.NoError(t, err)
+			log.KvExec.Infof(ctx, "test: waiting for initial values...")
+			tc.WaitForValues(t, key, []int64{1, 1, 1})
+			log.KvExec.Infof(ctx, "test: waiting for initial values... done")
+		}
+
+		// Partition the original leader from its followers. We do this by
+		// installing unreliableRaftHandler listeners on all three Stores. The
+		// handler on the partitioned store filters out all messages while the
+		// handler on the other two stores only filters out messages from the
+		// partitioned store. The configuration looks like:
+		//
+		//     [symmetric=false]      [symmetric=true]
+		//           [0]                     [0]
+		//          ^  ^                    x   x
+		//         /    \                  /     \
+		//        x      x                x       x
+		//      [1]<---->[2]            [1]<----->[2]
+		//
+		log.KvExec.Infof(ctx, "test: partitioning node")
+		const partitionNodeIdx = 0
+		partitionStore := tc.GetFirstStoreFromServer(t, partitionNodeIdx)
+		partitionedStoreSender := partitionStore.TestSender()
+		const otherStoreIdx = 1
+		otherStore := tc.GetFirstStoreFromServer(t, otherStoreIdx)
+		otherRepl, err := otherStore.GetReplica(rngDesc.RangeID)
+		require.NoError(t, err)
+
+		dropRaftMessagesFrom(t, tc.Servers[1], rngDesc, []roachpb.ReplicaID{1}, nil)
+		dropRaftMessagesFrom(t, tc.Servers[2], rngDesc, []roachpb.ReplicaID{1}, nil)
+		if symmetric {
+			dropRaftMessagesFrom(t, tc.Servers[0], rngDesc, []roachpb.ReplicaID{2, 3}, nil)
+		}
+
+		leaderReplicaID := waitForPartitionedLeaderStepDownAndNewLeaderToStepUp(
+			t, tc, rngDesc, partitionNodeIdx, otherStoreIdx,
+		)
+		log.KvExec.Infof(ctx, "test: the leader is replica ID %d", leaderReplicaID)
+		if leaderReplicaID != 2 && leaderReplicaID != 3 {
+			t.Fatalf("expected leader to be 1 or 2, was: %d", leaderReplicaID)
+		}
+		leaderNodeIdx := int(leaderReplicaID - 1)
+		leaderNode := tc.Server(leaderNodeIdx)
+		leaderStore, err := leaderNode.GetStores().(*kvserver.Stores).GetStore(leaderNode.GetFirstStoreID())
+		require.NoError(t, err)
+
+		// Now that the leadership has transferred, the lease should've expired too.
+		log.KvExec.Infof(ctx, "test: ensuring the lease expired")
+		partitionedReplica, err := partitionStore.GetReplica(rngDesc.RangeID)
+		require.NoError(t, err)
+		status := partitionedReplica.CurrentLeaseStatus(ctx)
+		// We're partitioned, so we won't know about a new lease elsewhere, even if
+		// it exists.
+		require.True(t,
+			status.Lease.OwnedBy(partitionStore.StoreID()), "someone else got the lease: %s", status)
+		require.True(t, status.IsExpired())
+		log.KvExec.Infof(ctx, "test: lease expired")
+
+		{
+			// Write something to generate some Raft log entries and then truncate the
+			// log.
+			log.KvExec.Infof(ctx, "test: incrementing")
+			incArgs := incrementArgs(key, 1)
+			sender := leaderStore.TestSender()
+			_, pErr := kv.SendWrapped(ctx, sender, incArgs)
+			require.Nil(t, pErr)
+		}
+
+		tc.WaitForValues(t, key, []int64{1, 2, 2})
+		index := otherRepl.GetLastIndex()
+
+		// Truncate the log at index+1 (log entries < N are removed, so this includes
+		// the increment). This means that the partitioned replica will need a
+		// snapshot to catch up.
+		log.KvExec.Infof(ctx, "test: truncating log...")
+		truncArgs := &kvpb.TruncateLogRequest{
+			RequestHeader: kvpb.RequestHeader{
+				Key: key,
+			},
+			Index:   index,
+			RangeID: rngDesc.RangeID,
+		}
+		{
+			_, pErr := kv.SendWrapped(ctx, leaderStore.TestSender(), truncArgs)
+			require.NoError(t, pErr.GoError())
+		}
+
+		timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		// Before resolving the partition, send a request to the partitioned
+		// replica. Ensure that it doesn't block, but instead returns a
+		// NotLeaseholderError (with an empty leaseholder).
+		//
+		// NB: This relies on RejectLeaseOnLeaderUnknown being set to true.
+		log.KvExec.Infof(ctx, "test: sending request to partitioned replica")
+
+		if !symmetric {
+			// In asymmetric partition, wait for the partitioned node to learn about
+			// the new leader before continuing. We do this because we expect it to
+			// reply with a speculative lease below.
+			testutils.SucceedsSoon(t, func() error {
+				status := partitionedReplica.RaftStatus()
+				if status.Lead != 2 && status.Lead != 3 {
+					return errors.Errorf("partitioned replica doesn't know about new leader yet: lead=%d",
+						status.Lead)
+				}
+				return nil
+			})
+		}
+
+		getRequest := getArgs(key)
+		_, pErr := kv.SendWrapped(timeoutCtx, partitionedStoreSender, getRequest)
+		require.Error(t, pErr.GoError(), "unexpected success")
+		nlhe := &kvpb.NotLeaseHolderError{}
+		require.ErrorAs(t, pErr.GetDetail(), &nlhe, pErr)
+
+		if symmetric {
+			// In symmetric=true, we expect that the partitioned replica to not know
+			// about the leader. As a result, it returns a NotLeaseHolderError without
+			// a speculative lease.
+			require.True(t, nlhe.Lease.Empty(), "expected empty lease, got %v", nlhe.Lease)
+		} else {
+			require.False(t, nlhe.Lease.Empty())
+			require.Equal(t, leaderReplicaID, nlhe.Lease.Replica.ReplicaID)
+		}
+
+		// Resolve the partition, but continue blocking snapshots destined for the
+		// previously-partitioned replica. The point of blocking the snapshots is to
+		// prevent the respective replica from catching up and becoming eligible to
+		// become the leader/leaseholder. The point of resolving the partition is to
+		// allow the replica in question to figure out who the new leader is.
+		log.KvExec.Infof(ctx, "test: removing partition")
+		slowSnapHandler := &slowSnapRaftHandler{
+			rangeID:                    rngDesc.RangeID,
+			waitCh:                     make(chan struct{}),
+			IncomingRaftMessageHandler: partitionStore,
+		}
+		defer slowSnapHandler.unblock()
+		partitionStore.Transport().ListenIncomingRaftMessages(partitionStore.Ident.StoreID, slowSnapHandler)
+		if symmetric {
+			// Let StoreLiveness heartbeats go through. We override the RaftTransport
+			// above, so we don't have to worry about Raft messages other than
+			// snapshots being dropped.
+			partitionStore.StoreLivenessTransport().ListenMessages(
+				partitionStore.Ident.StoreID, partitionStore.TestingStoreLivenessSupportManager(),
+			)
+		}
+		// Remove the unreliable transport from the other stores, so that messages
+		// sent by the partitioned store can reach them.
+		for _, i := range []int{0, 1, 2} {
+			if i == partitionNodeIdx {
+				// We've handled the partitioned store above.
+				continue
+			}
+			store := tc.GetFirstStoreFromServer(t, i)
+			store.Transport().ListenIncomingRaftMessages(store.StoreID(), store)
+			store.StoreLivenessTransport().ListenMessages(
+				store.StoreID(), store.TestingStoreLivenessSupportManager(),
+			)
+		}
+
+		// Now we're going to send a request to the behind replica, and we expect it
+		// to not block; we expect a redirection to the leader (once it's learned of
+		// the leader).
+		log.KvExec.Infof(ctx, "test: sending request after partition has healed")
+		for {
+			getRequest := getArgs(key)
+			_, pErr := kv.SendWrapped(timeoutCtx, partitionedStoreSender, getRequest)
+			require.Error(t, pErr.GoError(), "unexpected success")
+			nlhe := &kvpb.NotLeaseHolderError{}
+			require.ErrorAs(t, pErr.GetDetail(), &nlhe, "%v", pErr)
+			// When the old leader is partitioned, it will step down due to
+			// CheckQuorum. Immediately after the partition is healed, the replica
+			// will not know who the new leader is, so it will return a
+			// NotLeaseholderError with an empty lease. This is expected and better
+			// than blocking. Still, we have the test retry to make sure that the new
+			// leader is eventually discovered and that after that point, the
+			// NotLeaseholderErrors start including a lease which points to the new
+			// leader.
+			if nlhe.Lease.Empty() {
+				t.Logf("got %s, retrying", nlhe)
+				continue
+			}
+			require.Equal(t, leaderReplicaID, nlhe.Lease.Replica.ReplicaID)
+			break
+		}
+	})
+}
+
+// TestRequestsOnFollowerWithNonLiveLeaseholder tests the availability of a
+// range that has an expired epoch-based lease and a live Raft leader that is
+// unable to heartbeat its liveness record. Such a range should recover once
+// Raft leadership moves off the partitioned Raft leader to one of the followers
+// that can reach node liveness.
+//
+// This test relies on follower replicas campaigning for Raft leadership in
+// certain cases when refusing to forward lease acquisition requests to the
+// leader. In these cases where they determine that the leader is non-live
+// according to node liveness, they will attempt to steal Raft leadership and,
+// if successful, will be able to perform future lease acquisition attempts.
+func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	var installPartition int32
+	partitionFilter := func(_ context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+		if atomic.LoadInt32(&installPartition) == 0 {
+			return nil
+		}
+		if ba.GatewayNodeID == 1 && ba.Replica.NodeID == 4 {
+			return kvpb.NewError(context.Canceled)
+		}
+		return nil
+	}
+
+	st := cluster.MakeTestingClusterSettings()
+	// This test is specifically designed for epoch based leases.
+	kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseEpoch)
+
+	manualClock := hlc.NewHybridManualClock()
 	clusterArgs := base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
-			// Reduce the election timeout some to speed up the test.
-			RaftConfig: base.RaftConfig{RaftElectionTimeoutTicks: 10},
+			Settings: st,
+			RaftConfig: base.RaftConfig{
+				// Reduce the election timeout some to speed up the test.
+				RaftElectionTimeoutTicks: 10,
+				// This should work with PreVote+CheckQuorum too.
+				RaftEnableCheckQuorum: true,
+			},
 			Knobs: base.TestingKnobs{
-				NodeLiveness: kvserver.NodeLivenessTestingKnobs{
-					// This test waits for an epoch-based lease to expire, so we're
-					// setting the liveness duration as low as possible while still
-					// keeping the test stable.
-					LivenessDuration: 3000 * time.Millisecond,
-					RenewalDuration:  1500 * time.Millisecond,
+				Server: &server.TestingKnobs{
+					WallClock: manualClock,
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					// We eliminate clock offsets in order to eliminate the stasis period
 					// of leases, in order to speed up the test.
-					MaxOffset: time.Nanosecond,
+					MaxOffset:            time.Nanosecond,
+					TestingRequestFilter: partitionFilter,
 				},
 			},
 		},
 	}
 
-	tc := testcluster.StartTestCluster(t, 3, clusterArgs)
+	tc := testcluster.StartTestCluster(t, 4, clusterArgs)
 	defer tc.Stopper().Stop(ctx)
 
+	{
+		// Move the liveness range to node 4.
+		desc := tc.LookupRangeOrFatal(t, keys.NodeLivenessPrefix)
+		tc.RebalanceVoterOrFatal(ctx, t, desc.StartKey.AsRawKey(), tc.Target(0), tc.Target(3))
+	}
+
+	// Create a new range.
 	_, rngDesc, err := tc.Servers[0].ScratchRangeEx()
 	require.NoError(t, err)
 	key := rngDesc.StartKey.AsRawKey()
 	// Add replicas on all the stores.
 	tc.AddVotersOrFatal(t, rngDesc.StartKey.AsRawKey(), tc.Target(1), tc.Target(2))
 
+	// Store 0 holds the lease.
+	store0 := tc.GetFirstStoreFromServer(t, 0)
+	store0Repl, err := store0.GetReplica(rngDesc.RangeID)
+	require.NoError(t, err)
+	leaseStatus := store0Repl.CurrentLeaseStatus(ctx)
+	require.True(t, leaseStatus.OwnedBy(store0.StoreID()))
+
 	{
 		// Write a value so that the respective key is present in all stores and we
 		// can increment it again later.
 		_, err := tc.Server(0).DB().Inc(ctx, key, 1)
 		require.NoError(t, err)
-		log.Infof(ctx, "test: waiting for initial values...")
-		tc.WaitForValues(t, key, []int64{1, 1, 1})
-		log.Infof(ctx, "test: waiting for initial values... done")
+		log.KvExec.Infof(ctx, "test: waiting for initial values...")
+		tc.WaitForValues(t, key, []int64{1, 1, 1, 0})
+		log.KvExec.Infof(ctx, "test: waiting for initial values... done")
 	}
 
-	// Partition the original leader from its followers. We do this by installing
-	// unreliableRaftHandler listeners on all three Stores. The handler on the
-	// partitioned store filters out all messages while the handler on the other
-	// two stores only filters out messages from the partitioned store. The
-	// configuration looks like:
+	// Begin dropping all node liveness heartbeats from the original raft leader
+	// while allowing the leader to maintain Raft leadership and otherwise behave
+	// normally. This mimics cases where the raft leader is partitioned away from
+	// the liveness range but can otherwise reach its followers. In these cases,
+	// it is still possible that the followers can reach the liveness range and
+	// see that the leader becomes non-live. For example, the configuration could
+	// look like:
 	//
-	//           [0]
-	//          x  x
-	//         /    \
-	//        x      x
-	//      [1]<---->[2]
+	//          [0]       raft leader
+	//           ^
+	//          / \
+	//         /   \
+	//        v     v
+	//      [1]<--->[2]   raft followers
+	//        ^     ^
+	//         \   /
+	//          \ /
+	//           v
+	//          [3]       liveness range
 	//
-	log.Infof(ctx, "test: partitioning node")
-	const partitionNodeIdx = 0
-	partitionStore := tc.GetFirstStoreFromServer(t, partitionNodeIdx)
-	partRepl, err := partitionStore.GetReplica(rngDesc.RangeID)
-	require.NoError(t, err)
-	partReplDesc, err := partRepl.GetReplicaDescriptor()
-	require.NoError(t, err)
-	partitionedStoreSender := partitionStore.TestSender()
-	const otherStoreIdx = 1
-	otherStore := tc.GetFirstStoreFromServer(t, otherStoreIdx)
-	otherRepl, err := otherStore.GetReplica(rngDesc.RangeID)
-	require.NoError(t, err)
-
-	for _, i := range []int{0, 1, 2} {
-		store := tc.GetFirstStoreFromServer(t, i)
-		h := &unreliableRaftHandler{
-			name:               fmt.Sprintf("store %d", i),
-			rangeID:            rngDesc.RangeID,
-			RaftMessageHandler: store,
-		}
-		if i != partitionNodeIdx {
-			// Only filter messages from the partitioned store on the other two
-			// stores.
-			h.dropReq = func(req *kvserver.RaftMessageRequest) bool {
-				return req.FromReplica.StoreID == partRepl.StoreID()
-			}
-			h.dropHB = func(hb *kvserver.RaftHeartbeat) bool {
-				return hb.FromReplicaID == partReplDesc.ReplicaID
-			}
-		}
-		store.Transport().Listen(store.Ident.StoreID, h)
-	}
-
-	// Stop the heartbeats so that n1's lease can expire.
-	log.Infof(ctx, "test: suspending heartbeats for n1")
-	resumeN1Heartbeats := partitionStore.GetStoreConfig().NodeLiveness.PauseAllHeartbeatsForTest()
-
-	// Wait until another replica campaigns and becomes leader, replacing the
-	// partitioned one.
-	log.Infof(ctx, "test: waiting for leadership transfer")
-	testutils.SucceedsSoon(t, func() error {
-		// Make sure this replica has not inadvertently quiesced. We need the
-		// replica ticking so that it campaigns.
-		if otherRepl.IsQuiescent() {
-			otherRepl.UnquiesceAndWakeLeader()
-		}
-		lead := otherRepl.RaftStatus().Lead
-		if lead == raft.None {
-			return errors.New("no leader yet")
-		}
-		if roachpb.ReplicaID(lead) == partReplDesc.ReplicaID {
-			return errors.New("partitioned replica is still leader")
-		}
-		return nil
-	})
-
-	leaderReplicaID := roachpb.ReplicaID(otherRepl.RaftStatus().Lead)
-	log.Infof(ctx, "test: the leader is replica ID %d", leaderReplicaID)
-	if leaderReplicaID != 2 && leaderReplicaID != 3 {
-		t.Fatalf("expected leader to be 1 or 2, was: %d", leaderReplicaID)
-	}
-	leaderNodeIdx := int(leaderReplicaID - 1)
-	leaderNode := tc.Server(leaderNodeIdx).(*server.TestServer)
-	leaderStore, err := leaderNode.GetStores().(*kvserver.Stores).GetStore(leaderNode.GetFirstStoreID())
-	require.NoError(t, err)
+	log.KvExec.Infof(ctx, "test: partitioning node")
+	atomic.StoreInt32(&installPartition, 1)
 
 	// Wait until the lease expires.
-	log.Infof(ctx, "test: waiting for lease expiration")
-	partitionedReplica, err := partitionStore.GetReplica(rngDesc.RangeID)
-	require.NoError(t, err)
+	log.KvExec.Infof(ctx, "test: waiting for lease expiration on r%d", store0Repl.RangeID)
 	testutils.SucceedsSoon(t, func() error {
-		status := partitionedReplica.CurrentLeaseStatus(ctx)
-		require.True(t,
-			status.Lease.OwnedBy(partitionStore.StoreID()), "someone else got the lease: %s", status)
-		if status.State == kvserverpb.LeaseState_VALID {
-			return errors.New("lease still valid")
-		}
-		// We need to wait for the stasis state to pass too; during stasis other
-		// replicas can't take the lease.
-		if status.State == kvserverpb.LeaseState_UNUSABLE {
-			return errors.New("lease still in stasis")
+		dur, _ := store0.GetStoreConfig().NodeLivenessDurations()
+		manualClock.Increment(dur.Nanoseconds())
+		leaseStatus = store0Repl.CurrentLeaseStatus(ctx)
+		// If we failed to pin the lease, it likely won't ever expire due to the particular
+		// partition we've set up. Bail early instead of wasting 45s.
+		require.True(t, leaseStatus.Lease.OwnedBy(store0.StoreID()), "failed to pin lease")
+
+		// Lease is on s1, and it should be invalid now. The only reason there's a
+		// retry loop is that there could be a race where we bump the clock while a
+		// heartbeat is inflight (and which picks up the new expiration).
+		if leaseStatus.IsValid() {
+			return errors.Errorf("lease still valid: %+v", leaseStatus)
 		}
 		return nil
 	})
-	log.Infof(ctx, "test: lease expired")
+	log.KvExec.Infof(ctx, "test: lease expired")
 
 	{
-		// Write something to generate some Raft log entries and then truncate the log.
-		log.Infof(ctx, "test: incrementing")
-		incArgs := incrementArgs(key, 1)
-		sender := leaderStore.TestSender()
-		_, pErr := kv.SendWrapped(ctx, sender, incArgs)
-		require.Nil(t, pErr)
+		tBegin := timeutil.Now()
+		// Increment the initial value again, which requires range availability. To
+		// get there, the request will need to trigger a lease request on a follower
+		// replica, which will call a Raft election, acquire Raft leadership, then
+		// acquire the range lease.
+		log.KvExec.Infof(ctx, "test: waiting for new lease...")
+		_, err := tc.Server(0).DB().Inc(ctx, key, 1)
+		require.NoError(t, err)
+		tc.WaitForValues(t, key, []int64{2, 2, 2, 0})
+		log.KvExec.Infof(ctx, "test: waiting for new lease... done [%.2fs]", timeutil.Since(tBegin).Seconds())
 	}
 
-	tc.WaitForValues(t, key, []int64{1, 2, 2})
-	index, err := otherRepl.GetLastIndex()
-	require.NoError(t, err)
-
-	// Truncate the log at index+1 (log entries < N are removed, so this includes
-	// the increment). This means that the partitioned replica will need a
-	// snapshot to catch up.
-	log.Infof(ctx, "test: truncating log...")
-	truncArgs := &roachpb.TruncateLogRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key: key,
-		},
-		Index:   index,
-		RangeID: rngDesc.RangeID,
-	}
-	{
-		_, pErr := kv.SendWrapped(ctx, leaderStore.TestSender(), truncArgs)
-		require.NoError(t, pErr.GoError())
-	}
-
-	// Resume n1's heartbeats and wait for it to become live again. This is to
-	// ensure that the rest of the test does not somehow fool itself because n1 is
-	// not live.
-	log.Infof(ctx, "test: resuming n1 heartbeats")
-	resumeN1Heartbeats()
-
-	// Resolve the partition, but continue blocking snapshots destined for the
-	// previously-partitioned replica. The point of blocking the snapshots is to
-	// prevent the respective replica from catching up and becoming eligible to
-	// become the leader/leaseholder. The point of resolving the partition is to
-	// allow the replica in question to figure out that it's not the leader any
-	// more. As long as it is completely partitioned, the replica continues
-	// believing that it is the leader, and lease acquisition requests block.
-	log.Infof(ctx, "test: removing partition")
-	slowSnapHandler := &slowSnapRaftHandler{
-		rangeID:            rngDesc.RangeID,
-		waitCh:             make(chan struct{}),
-		RaftMessageHandler: partitionStore,
-	}
-	defer slowSnapHandler.unblock()
-	partitionStore.Transport().Listen(partitionStore.Ident.StoreID, slowSnapHandler)
-	// Remove the unreliable transport from the other stores, so that messages
-	// sent by the partitioned store can reach them.
-	for _, i := range []int{0, 1, 2} {
-		if i == partitionNodeIdx {
-			// We've handled the partitioned store above.
-			continue
-		}
-		store := tc.GetFirstStoreFromServer(t, i)
-		store.Transport().Listen(store.Ident.StoreID, store)
-	}
-
-	// Now we're going to send a request to the behind replica, and we expect it
-	// to not block; we expect a redirection to the leader.
-	log.Infof(ctx, "test: sending request")
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	getRequest := getArgs(key)
-	_, pErr := kv.SendWrapped(timeoutCtx, partitionedStoreSender, getRequest)
-	require.NotNil(t, pErr, "unexpected success")
-	nlhe := pErr.GetDetail().(*roachpb.NotLeaseHolderError)
-	require.NotNil(t, nlhe, "expected NotLeaseholderError, got: %s", pErr)
-	require.NotNil(t, nlhe.LeaseHolder, "expected NotLeaseholderError with a known leaseholder, got: %s", pErr)
-	require.Equal(t, leaderReplicaID, nlhe.LeaseHolder.ReplicaID)
+	// Store 0 no longer holds the lease.
+	leaseStatus = store0Repl.CurrentLeaseStatus(ctx)
+	require.False(t, leaseStatus.OwnedBy(store0.StoreID()))
 }
 
 type fakeSnapshotStream struct {
-	nextReq *kvserver.SnapshotRequest
+	nextReq *kvserverpb.SnapshotRequest
 	nextErr error
 }
 
 // Recv implements the SnapshotResponseStream interface.
-func (c fakeSnapshotStream) Recv() (*kvserver.SnapshotRequest, error) {
+func (c fakeSnapshotStream) Recv() (*kvserverpb.SnapshotRequest, error) {
 	return c.nextReq, c.nextErr
 }
 
 // Send implements the SnapshotResponseStream interface.
-func (c fakeSnapshotStream) Send(request *kvserver.SnapshotResponse) error {
+func (c fakeSnapshotStream) Send(request *kvserverpb.SnapshotResponse) error {
 	return nil
+}
+
+type snapshotTestSignals struct {
+	// Receiver-side wait channels.
+	receiveErrCh        chan error
+	batchReceiveReadyCh chan struct{}
+
+	// Sender-side wait channels.
+	svrContextDone        <-chan struct{}
+	receiveStartedCh      chan struct{}
+	batchReceiveStartedCh chan struct{}
+	receiverDoneCh        chan struct{}
+}
+
+// TestReceiveSnapshotLogging tests that a snapshot receiver properly captures
+// the collected tracing spans in the last response, or logs the span if the
+// context is cancelled from the client side.
+func TestReceiveSnapshotLogging(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const senderNodeIdx = 0
+	const receiverNodeIdx = 1
+	const dummyEventMsg = "test receive snapshot logging - dummy event"
+
+	setupTest := func(t *testing.T) (context.Context, *testcluster.TestCluster, *roachpb.RangeDescriptor, *snapshotTestSignals) {
+		ctx := context.Background()
+
+		signals := &snapshotTestSignals{
+			receiveErrCh:        make(chan error),
+			batchReceiveReadyCh: make(chan struct{}),
+
+			svrContextDone:        nil,
+			receiveStartedCh:      make(chan struct{}),
+			batchReceiveStartedCh: make(chan struct{}),
+			receiverDoneCh:        make(chan struct{}, 1),
+		}
+
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				DefaultDRPCOption: base.TestDRPCDisabled,
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						DisableRaftSnapshotQueue: true,
+					},
+				},
+			},
+			ReplicationMode: base.ReplicationManual,
+			ServerArgsPerNode: map[int]base.TestServerArgs{
+				receiverNodeIdx: {
+					Knobs: base.TestingKnobs{
+						Store: &kvserver.StoreTestingKnobs{
+							DisableRaftSnapshotQueue: true,
+							ThrottleEmptySnapshots:   true,
+							ReceiveSnapshot: func(ctx context.Context, _ *kvserverpb.SnapshotRequest_Header) error {
+								t.Logf("incoming snapshot on n2")
+								log.Event(ctx, dummyEventMsg)
+								signals.svrContextDone = ctx.Done()
+								close(signals.receiveStartedCh)
+								return <-signals.receiveErrCh
+							},
+							BeforeRecvAcceptedSnapshot: func() {
+								t.Logf("receiving on n2")
+								signals.batchReceiveStartedCh <- struct{}{}
+								<-signals.batchReceiveReadyCh
+							},
+							HandleSnapshotDone: func() {
+								t.Logf("receiver on n2 completed")
+								signals.receiverDoneCh <- struct{}{}
+							},
+						},
+					},
+				},
+			},
+		})
+
+		_, scratchRange, err := tc.Servers[0].ScratchRangeEx()
+		require.NoError(t, err)
+
+		return ctx, tc, &scratchRange, signals
+	}
+
+	snapshotAndValidateLogs := func(t *testing.T, ctx context.Context, tc *testcluster.TestCluster, rngDesc *roachpb.RangeDescriptor, signals *snapshotTestSignals, expectTraceOnSender bool) error {
+		t.Helper()
+
+		repl := tc.GetFirstStoreFromServer(t, senderNodeIdx).LookupReplica(rngDesc.StartKey)
+		chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(receiverNodeIdx))
+
+		testStartTs := timeutil.Now()
+		_, pErr := repl.ChangeReplicas(ctx, rngDesc, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
+
+		// When ready, flush logs and check messages from store_raft.go since
+		// call to repl.ChangeReplicas(..).
+		<-signals.receiverDoneCh
+		log.FlushFiles()
+		entries, err := log.FetchEntriesFromFiles(testStartTs.UnixNano(),
+			math.MaxInt64, 100, regexp.MustCompile(`store_raft\.go`), log.WithMarkedSensitiveData)
+		require.NoError(t, err)
+
+		errRegexp, err := regexp.Compile(`incoming snapshot stream failed with error`)
+		require.NoError(t, err)
+		foundEntry := false
+		var entry logpb.Entry
+		for _, entry = range entries {
+			if errRegexp.MatchString(entry.Message) {
+				foundEntry = true
+				break
+			}
+		}
+		expectTraceOnReceiver := !expectTraceOnSender
+		require.Equal(t, expectTraceOnReceiver, foundEntry)
+		if expectTraceOnReceiver {
+			require.Contains(t, entry.Message, dummyEventMsg)
+		}
+
+		// Check that receiver traces were imported in sender's context on success.
+		clientTraces := tracing.SpanFromContext(ctx).GetConfiguredRecording()
+		_, receiverTraceFound := clientTraces.FindLogMessage(dummyEventMsg)
+		require.Equal(t, expectTraceOnSender, receiverTraceFound)
+
+		return pErr
+	}
+
+	t.Run("cancel on header", func(t *testing.T) {
+		ctx, tc, scratchRange, signals := setupTest(t)
+		defer tc.Stopper().Stop(ctx)
+
+		ctx, sp := tracing.EnsureChildSpan(ctx, tc.GetFirstStoreFromServer(t, senderNodeIdx).GetStoreConfig().Tracer(),
+			t.Name(), tracing.WithRecording(tracingpb.RecordingVerbose))
+		defer sp.Finish()
+
+		ctx, cancel := context.WithCancel(ctx)
+		go func() {
+			<-signals.receiveStartedCh
+			cancel()
+			<-signals.svrContextDone
+			time.Sleep(10 * time.Millisecond)
+			signals.receiveErrCh <- errors.Errorf("header is bad")
+		}()
+		err := snapshotAndValidateLogs(t, ctx, tc, scratchRange, signals, false /* expectTraceOnSender */)
+		require.Error(t, err)
+	})
+	t.Run("cancel during receive", func(t *testing.T) {
+		ctx, tc, scratchRange, signals := setupTest(t)
+		defer tc.Stopper().Stop(ctx)
+
+		ctx, sp := tracing.EnsureChildSpan(ctx, tc.GetFirstStoreFromServer(t, senderNodeIdx).GetStoreConfig().Tracer(),
+			t.Name(), tracing.WithRecording(tracingpb.RecordingVerbose))
+		defer sp.Finish()
+
+		ctx, cancel := context.WithCancel(ctx)
+		close(signals.receiveErrCh)
+		go func() {
+			<-signals.receiveStartedCh
+			<-signals.batchReceiveStartedCh
+			cancel()
+			<-signals.svrContextDone
+			time.Sleep(10 * time.Millisecond)
+			close(signals.batchReceiveReadyCh)
+		}()
+		err := snapshotAndValidateLogs(t, ctx, tc, scratchRange, signals, false /* expectTraceOnSender */)
+		require.Error(t, err)
+	})
+	t.Run("successful send", func(t *testing.T) {
+		ctx, tc, scratchRange, signals := setupTest(t)
+		defer tc.Stopper().Stop(ctx)
+
+		ctx, sp := tracing.EnsureChildSpan(ctx, tc.GetFirstStoreFromServer(t, senderNodeIdx).GetStoreConfig().Tracer(),
+			t.Name(), tracing.WithRecording(tracingpb.RecordingVerbose))
+		defer sp.Finish()
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		close(signals.receiveErrCh)
+		close(signals.batchReceiveReadyCh)
+		go func() {
+			<-signals.receiveStartedCh
+			<-signals.batchReceiveStartedCh
+		}()
+		err := snapshotAndValidateLogs(t, ctx, tc, scratchRange, signals, true /* expectTraceOnSender */)
+		require.NoError(t, err)
+	})
 }
 
 // TestFailedSnapshotFillsReservation tests that failing to finish applying an
@@ -1320,16 +1689,18 @@ func TestFailedSnapshotFillsReservation(t *testing.T) {
 	desc.AddReplica(2, 2, roachpb.LEARNER)
 	rep2Desc, found := desc.GetReplicaDescriptor(2)
 	require.True(t, found)
-	header := kvserver.SnapshotRequest_Header{
+	header := kvserverpb.SnapshotRequest_Header{
 		RangeSize: 100,
 		State:     kvserverpb.ReplicaState{Desc: desc},
-		RaftMessageRequest: kvserver.RaftMessageRequest{
+		RaftMessageRequest: kvserverpb.RaftMessageRequest{
 			RangeID:     rep.RangeID,
 			FromReplica: repDesc,
 			ToReplica:   rep2Desc,
 		},
 	}
-	header.RaftMessageRequest.Message.Snapshot.Data = uuid.UUID{}.GetBytes()
+	header.RaftMessageRequest.Message.Snapshot = &raftpb.Snapshot{
+		Data: uuid.UUID{}.GetBytes(),
+	}
 	// Cause this stream to return an error as soon as we ask it for something.
 	// This injects an error into HandleSnapshotStream when we try to send the
 	// "snapshot accepted" message.
@@ -1350,22 +1721,19 @@ func TestConcurrentRaftSnapshots(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 5
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
 				},
 			},
 		}
@@ -1412,12 +1780,9 @@ func TestConcurrentRaftSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tc.WaitForValues(t, key, []int64{incAB, incA, incA, incAB, incAB})
+	tc.WaitForValues(t, key, []int64{incAB, 0 /* stopped */, 0 /* stopped */, incAB, incAB})
 
-	index, err := repl.GetLastIndex()
-	if err != nil {
-		t.Fatal(err)
-	}
+	index := repl.GetLastIndex()
 
 	// Truncate the log at index+1 (log entries < N are removed, so this
 	// includes the increment).
@@ -1439,22 +1804,19 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					// Disable the replica GC queue so that it doesn't accidentally pick up the
@@ -1497,7 +1859,7 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 	// returned to us.
 	if _, err := tc.Servers[0].DB().AdminChangeReplicas(
 		ctx, splitKey, tc.LookupRangeOrFatal(t, splitKey),
-		roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(3)),
+		kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(3)),
 	); !kvserver.IsRetriableReplicationChangeError(err) {
 		t.Fatalf("unexpected error %v", err)
 	}
@@ -1512,178 +1874,182 @@ func TestReplicateAfterRemoveAndSplit(t *testing.T) {
 // Test that when a Raft group is not able to establish a quorum, its Raft log
 // does not grow without bound. It tests two different scenarios where this used
 // to be possible (see #27772):
-// 1. The leader proposes a command and cannot establish a quorum. The leader
-//    continually re-proposes the command.
-// 2. The follower proposes a command and forwards it to the leader, who cannot
-//    establish a quorum. The follower continually re-proposes and forwards the
-//    command to the leader.
+//  1. The leader proposes a command and cannot establish a quorum. The leader
+//     continually re-proposes the command.
+//  2. The follower proposes a command and forwards it to the leader, who cannot
+//     establish a quorum. The follower continually re-proposes and forwards the
+//     command to the leader.
 func TestLogGrowthWhenRefreshingPendingCommands(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		// Test proposing on leader and proposing on follower. Neither should result
+		// in unbounded raft log growth.
+		testutils.RunTrueAndFalse(t, "proposeOnFollower", func(t *testing.T, proposeOnFollower bool) {
+			ctx := context.Background()
+			settings := cluster.MakeTestingClusterSettings()
+			kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
 
-	raftConfig := base.RaftConfig{
-		// Drop the raft tick interval so the Raft group is ticked more.
-		RaftTickInterval: 10 * time.Millisecond,
-		// Don't timeout raft leader. We don't want leadership moving.
-		RaftElectionTimeoutTicks: 1000000,
-		// Reduce the max uncommitted entry size.
-		RaftMaxUncommittedEntriesSize: 64 << 10, // 64 KB
-		// RaftProposalQuota cannot exceed RaftMaxUncommittedEntriesSize.
-		RaftProposalQuota: int64(64 << 10),
-		// RaftMaxInflightMsgs * RaftMaxSizePerMsg cannot exceed RaftProposalQuota.
-		RaftMaxInflightMsgs: 16,
-		RaftMaxSizePerMsg:   1 << 10, // 1 KB
-	}
-
-	const numServers int = 5
-	stickyServerArgs := make(map[int]base.TestServerArgs)
-	for i := 0; i < numServers; i++ {
-		stickyServerArgs[i] = base.TestServerArgs{
-			StoreSpecs: []base.StoreSpec{
-				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
-				},
-			},
-			RaftConfig: raftConfig,
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-				},
-				Store: &kvserver.StoreTestingKnobs{
-					// Disable leader transfers during leaseholder changes so that we
-					// can easily create leader-not-leaseholder scenarios.
-					DisableLeaderFollowsLeaseholder: true,
-					// Refresh pending commands on every Raft group tick instead of
-					// every RaftElectionTimeoutTicks.
-					RefreshReasonTicksPeriod: 1,
-				},
-			},
-		}
-	}
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numServers,
-		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
-		})
-	defer tc.Stopper().Stop(ctx)
-	store := tc.GetFirstStoreFromServer(t, 0)
-
-	key := []byte("a")
-	tc.SplitRangeOrFatal(t, key)
-	tc.AddVotersOrFatal(t, key, tc.Targets(1, 2, 3, 4)...)
-
-	// Raft leadership is kept on node 0.
-	leaderRepl := store.LookupReplica(key)
-	require.NotNil(t, leaderRepl)
-
-	// Put some data in the range so we'll have something to test for.
-	incArgs := incrementArgs(key, 5)
-	if _, err := kv.SendWrapped(ctx, store.TestSender(), incArgs); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for all nodes to catch up.
-	tc.WaitForValues(t, key, []int64{5, 5, 5, 5, 5})
-
-	// Test proposing on leader and proposing on follower. Neither should result
-	// in unbounded raft log growth.
-	testutils.RunTrueAndFalse(t, "proposeOnFollower", func(t *testing.T, proposeOnFollower bool) {
-		// Restart any nodes that are down, we dont need to restart 2 since
-		// it started to finish the test case.
-		for _, s := range []int{3, 4} {
-			if tc.ServerStopped(s) {
-				require.NoError(t, tc.RestartServer(s))
+			raftConfig := base.RaftConfig{
+				// Drop the raft tick interval so the Raft group is ticked more.
+				RaftTickInterval: 10 * time.Millisecond,
+				// Suppress timeout-based elections to avoid leadership changes in ways
+				// this test doesn't expect. See DisablePreCampaignStoreLivenessCheck,
+				// which counteracts this knob's effect on leader leases.
+				RaftElectionTimeoutTicks: 1000000,
+				// Reduce the max uncommitted entry size.
+				RaftMaxUncommittedEntriesSize: 64 << 10, // 64 KB
+				// RaftProposalQuota cannot exceed RaftMaxUncommittedEntriesSize.
+				RaftProposalQuota: int64(64 << 10),
+				// RaftMaxInflightMsgs * RaftMaxSizePerMsg cannot exceed RaftProposalQuota.
+				RaftMaxInflightMsgs: 16,
+				RaftMaxSizePerMsg:   1 << 10, // 1 KB
 			}
-		}
-		// Determine which node to propose on. Transfer lease to that node.
-		var propIdx int
-		if !proposeOnFollower {
-			propIdx = 0
-		} else {
-			propIdx = 1
-		}
-		propNode := tc.GetFirstStoreFromServer(t, propIdx).TestSender()
-		tc.TransferRangeLeaseOrFatal(t, *leaderRepl.Desc(), tc.Target(propIdx))
-		testutils.SucceedsSoon(t, func() error {
-			// Lease transfers may not be immediately observed by the new
-			// leaseholder. Wait until the new leaseholder is aware.
-			repl, err := tc.GetFirstStoreFromServer(t, propIdx).GetReplica(leaderRepl.RangeID)
-			if err != nil {
+
+			const numServers int = 5
+			stickyServerArgs := make(map[int]base.TestServerArgs)
+			for i := 0; i < numServers; i++ {
+				stickyServerArgs[i] = base.TestServerArgs{
+					Settings: settings,
+					StoreSpecs: []base.StoreSpec{
+						{
+							InMemory:    true,
+							StickyVFSID: strconv.FormatInt(int64(i), 10),
+						},
+					},
+					RaftConfig: raftConfig,
+					Knobs: base.TestingKnobs{
+						Server: &server.TestingKnobs{
+							StickyVFSRegistry: fs.NewStickyRegistry(),
+						},
+						Store: &kvserver.StoreTestingKnobs{
+							// Disable leader transfers during leaseholder changes so that we
+							// can easily create leader-not-leaseholder scenarios.
+							DisableLeaderFollowsLeaseholder: true,
+							// Refresh pending commands on every Raft group tick instead of
+							// every RaftReproposalTimeoutTicks.
+							RefreshReasonTicksPeriod: 1,
+							RaftTestingKnobs: &raft.TestingKnobs{
+								// Due to high RaftElectionTimeoutTicks, we only have one
+								// opportunity to campaign which should not be missed. Under
+								// leader leases, in a "cold" cluster, a campaign can fail due
+								// to missing store liveness support from the node's peers.
+								// Disallow this check to ensure that the campaign succeeds.
+								DisablePreCampaignStoreLivenessCheck: true,
+							},
+						},
+					},
+				}
+			}
+
+			tc := testcluster.StartTestCluster(t, numServers,
+				base.TestClusterArgs{
+					ReplicationMode:   base.ReplicationManual,
+					ServerArgsPerNode: stickyServerArgs,
+				})
+			defer tc.Stopper().Stop(ctx)
+			store := tc.GetFirstStoreFromServer(t, 0)
+
+			key := []byte("a")
+			tc.SplitRangeOrFatal(t, key)
+			tc.AddVotersOrFatal(t, key, tc.Targets(1, 2, 3, 4)...)
+
+			// Raft leadership is kept on node 0.
+			leaderRepl := store.LookupReplica(key)
+			require.NotNil(t, leaderRepl)
+
+			// Put some data in the range so we'll have something to test for.
+			incArgs := incrementArgs(key, 5)
+			if _, err := kv.SendWrapped(ctx, store.TestSender(), incArgs); err != nil {
 				t.Fatal(err)
 			}
-			repDesc, err := repl.GetReplicaDescriptor()
-			if err != nil {
-				t.Fatal(err)
+
+			// Wait for all nodes to catch up.
+			tc.WaitForValues(t, key, []int64{5, 5, 5, 5, 5})
+
+			// Determine which node to propose on. Transfer lease to that node.
+			propIdx := 0
+			if proposeOnFollower {
+				propIdx = 1
 			}
-			if lease, _ := repl.GetLease(); !lease.Replica.Equal(repDesc) {
-				return errors.Errorf("lease not transferred yet; found %v", lease)
+			propNode := tc.GetFirstStoreFromServer(t, propIdx).TestSender()
+			tc.TransferRangeLeaseOrFatal(t, *leaderRepl.Desc(), tc.Target(propIdx))
+			// The test disables leader follows leaseholder, so we will never be able
+			// to upgrade to a leader lease.
+			if !(leaseType == roachpb.LeaseLeader && proposeOnFollower) {
+				tc.MaybeWaitForLeaseUpgrade(ctx, t, *leaderRepl.Desc())
 			}
-			return nil
+			testutils.SucceedsSoon(t, func() error {
+				// Lease transfers may not be immediately observed by the new
+				// leaseholder. Wait until the new leaseholder is aware.
+				repl, err := tc.GetFirstStoreFromServer(t, propIdx).GetReplica(leaderRepl.RangeID)
+				require.NoError(t, err)
+				repDesc, err := repl.GetReplicaDescriptor()
+				require.NoError(t, err)
+				if lease, _ := repl.GetLease(); !lease.Replica.Equal(repDesc) {
+					return errors.Errorf("lease not transferred yet; found %v", lease)
+				}
+				return nil
+			})
+
+			// Stop enough nodes to prevent a quorum.
+			for i := 2; i < len(tc.Servers); i++ {
+				tc.StopServer(i)
+			}
+
+			// Determine the current raft log size.
+			initLogSize, _ := leaderRepl.GetRaftLogSize()
+
+			// While a majority nodes are down, write some data.
+			putRes := make(chan *kvpb.Error)
+			go func() {
+				putArgs := putArgs([]byte("b"), make([]byte, raftConfig.RaftMaxUncommittedEntriesSize/8))
+				_, err := kv.SendWrapped(ctx, propNode, putArgs)
+				putRes <- err
+			}()
+
+			// Wait for a bit and watch for Raft log growth.
+			wait := time.After(500 * time.Millisecond)
+			ticker := time.Tick(50 * time.Millisecond)
+		Loop:
+			for {
+				select {
+				case <-wait:
+					break Loop
+				case <-ticker:
+					// Verify that the leader is node 0.
+					status := leaderRepl.RaftStatus()
+					if status == nil || status.RaftState != raftpb.StateLeader {
+						t.Fatalf("raft leader should be node 0, but got status %+v", status)
+					}
+
+					// Check the raft log size. We allow GetRaftLogSize to grow up
+					// to twice RaftMaxUncommittedEntriesSize because its total
+					// includes a little more state (the roachpb.Value checksum,
+					// etc.). The important thing here is that the log doesn't grow
+					// forever.
+					logSizeLimit := int64(2 * raftConfig.RaftMaxUncommittedEntriesSize)
+					curlogSize, _ := leaderRepl.GetRaftLogSize()
+					logSize := curlogSize - initLogSize
+					logSizeStr := humanizeutil.IBytes(logSize)
+					// Note that logSize could be negative if something got truncated.
+					if logSize > logSizeLimit {
+						t.Fatalf("raft log size grew to %s", logSizeStr)
+					}
+					t.Logf("raft log size grew to %s", logSizeStr)
+				case err := <-putRes:
+					t.Fatalf("write finished with quorum unavailable; err=%v", err)
+				}
+			}
+
+			// Start enough nodes to establish a quorum.
+			require.NoError(t, tc.RestartServer(2))
+
+			// The write should now succeed.
+			err := <-putRes
+			require.NoError(t, err.GoError())
 		})
-
-		// Stop enough nodes to prevent a quorum.
-		for i := 2; i < len(tc.Servers); i++ {
-			tc.StopServer(i)
-		}
-
-		// Determine the current raft log size.
-		initLogSize, _ := leaderRepl.GetRaftLogSize()
-
-		// While a majority nodes are down, write some data.
-		putRes := make(chan *roachpb.Error)
-		go func() {
-			putArgs := putArgs([]byte("b"), make([]byte, raftConfig.RaftMaxUncommittedEntriesSize/8))
-			_, err := kv.SendWrapped(ctx, propNode, putArgs)
-			putRes <- err
-		}()
-
-		// Wait for a bit and watch for Raft log growth.
-		wait := time.After(500 * time.Millisecond)
-		ticker := time.Tick(50 * time.Millisecond)
-	Loop:
-		for {
-			select {
-			case <-wait:
-				break Loop
-			case <-ticker:
-				// Verify that the leader is node 0.
-				status := leaderRepl.RaftStatus()
-				if status == nil || status.RaftState != raft.StateLeader {
-					t.Fatalf("raft leader should be node 0, but got status %+v", status)
-				}
-
-				// Check the raft log size. We allow GetRaftLogSize to grow up
-				// to twice RaftMaxUncommittedEntriesSize because its total
-				// includes a little more state (the roachpb.Value checksum,
-				// etc.). The important thing here is that the log doesn't grow
-				// forever.
-				logSizeLimit := int64(2 * raftConfig.RaftMaxUncommittedEntriesSize)
-				curlogSize, _ := leaderRepl.GetRaftLogSize()
-				logSize := curlogSize - initLogSize
-				logSizeStr := humanizeutil.IBytes(logSize)
-				// Note that logSize could be negative if something got truncated.
-				if logSize > logSizeLimit {
-					t.Fatalf("raft log size grew to %s", logSizeStr)
-				}
-				t.Logf("raft log size grew to %s", logSizeStr)
-			case err := <-putRes:
-				t.Fatalf("write finished with quorum unavailable; err=%v", err)
-			}
-		}
-
-		// Start enough nodes to establish a quorum.
-		require.NoError(t, tc.RestartServer(2))
-
-		// The write should now succeed.
-		if err := <-putRes; err != nil {
-			t.Fatal(err)
-		}
 	})
 }
 
@@ -1700,16 +2066,22 @@ func TestStoreRangeUpReplicate(t *testing.T) {
 		base.TestClusterArgs{
 			// Set to auto since we want the replication queue on.
 			ReplicationMode: base.ReplicationAuto,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{},
+				},
+			},
 		})
+
 	defer tc.Stopper().Stop(ctx)
-	store := tc.GetFirstStoreFromServer(t, 0)
 
 	// Once we know our peers, trigger a scan.
+	store := tc.GetFirstStoreFromServer(t, 0)
 	if err := store.ForceReplicationScanAndProcess(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait until all ranges are upreplicated to all nodes.
+	// Wait until all under-replicated ranges are up-replicated to all nodes.
 	var replicaCount int64
 	testutils.SucceedsSoon(t, func() error {
 		var replicaCounts [numServers]int64
@@ -1717,7 +2089,6 @@ func TestStoreRangeUpReplicate(t *testing.T) {
 			var err error
 			tc.GetFirstStoreFromServer(t, i).VisitReplicas(func(r *kvserver.Replica) bool {
 				replicaCounts[i]++
-				// Synchronize with the replica's raft processing goroutine.
 				r.RaftLock()
 				defer r.RaftUnlock()
 				if len(r.Desc().InternalReplicas) != 3 {
@@ -1784,8 +2155,8 @@ func TestChangeReplicasDescriptorInvariant(t *testing.T) {
 	require.NotNil(t, repl)
 
 	addReplica := func(storeNum int, desc *roachpb.RangeDescriptor) error {
-		chgs := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(storeNum))
-		_, err := repl.ChangeReplicas(ctx, desc, kvserver.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
+		chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(storeNum))
+		_, err := repl.ChangeReplicas(ctx, desc, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
 		return err
 	}
 
@@ -1845,22 +2216,19 @@ func TestProgressWithDownNode(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
 				},
 			},
 		}
@@ -1894,7 +2262,7 @@ func TestProgressWithDownNode(t *testing.T) {
 	}
 
 	// The new increment can be seen on both live replicas.
-	tc.WaitForValues(t, key, []int64{16, 5, 16})
+	tc.WaitForValues(t, key, []int64{16, 0 /* stopped */, 16})
 
 	// Once the downed node is restarted, it will catch up.
 	require.NoError(t, tc.RestartServer(1))
@@ -1930,29 +2298,27 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-					ClockSource:          manualClock.UnixNano,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
+					WallClock:         manualClock,
 				},
-			},
-			RaftConfig: base.RaftConfig{
-				// Don't timeout raft leaders or range leases (see the relation between
-				// RaftElectionTimeoutTicks and RangeLeaseActiveDuration). This test expects
-				// tc.Servers[0] to hold the range lease for the range under test.
-				RaftElectionTimeoutTicks: 1000000,
+				// In this test, under duress, we can occasionally fail enough
+				// heartbeats to exceed the 10s timeout in execChangeReplicasTxn to
+				// verify liveness of a post-change quorum.
+				//
+				// See: https://github.com/cockroachdb/cockroach/issues/156689
+				Store: &kvserver.StoreTestingKnobs{AllowDangerousReplicationChanges: true},
 			},
 		}
 	}
@@ -1987,10 +2353,7 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 	{
 		// Get the last increment's log index.
 		repl := store.LookupReplica(roachpb.RKey(key))
-		index, err := repl.GetLastIndex()
-		if err != nil {
-			t.Fatal(err)
-		}
+		index := repl.GetLastIndex()
 		// Truncate the log at index+1 (log entries < N are removed, so this includes
 		// the increment).
 		truncArgs := truncateLogArgs(index+1, repl.RangeID)
@@ -2005,7 +2368,7 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 		t.Fatal(err)
 	}
 
-	tc.WaitForValues(t, key, []int64{5, 2, 5})
+	tc.WaitForValues(t, key, []int64{5, 0 /* stopped */, 5})
 
 	// Re-add the store and restart it.
 	// TODO(dt): ben originally suggested we also attempt this in the other order.
@@ -2020,7 +2383,9 @@ func runReplicateRestartAfterTruncation(t *testing.T, removeBeforeTruncateAndReA
 		testutils.SucceedsSoon(t, func() error {
 			tc.GetFirstStoreFromServer(t, 1).MustForceReplicaGCScanAndProcess()
 			_, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
-			if !errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+			if !errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
+				// NB: errors.Wrapf(nil, ...) returns nil.
+				// nolint:errwrap
 				return errors.Errorf("expected replica to be garbage collected, got %v %T", err, err)
 			}
 			return nil
@@ -2036,23 +2401,20 @@ func testReplicaAddRemove(t *testing.T, addFirst bool) {
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 4
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-					ClockSource:          manualClock.UnixNano,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
+					WallClock:         manualClock,
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					// We're gonna want to validate the state of the store before and
@@ -2097,7 +2459,7 @@ func testReplicaAddRemove(t *testing.T, addFirst bool) {
 		tc.AddVotersOrFatal(t, key, tc.Target(2))
 	}
 	// The first increment is visible on the new replica.
-	tc.WaitForValues(t, key, []int64{inc1, inc1, inc1, inc1})
+	tc.WaitForValues(t, key, []int64{inc1, 0 /* stopped */, inc1, inc1})
 
 	// Ensure that the rest of the group can make progress.
 	inc2 := int64(11)
@@ -2107,7 +2469,7 @@ func testReplicaAddRemove(t *testing.T, addFirst bool) {
 			t.Fatal(err)
 		}
 	}
-	tc.WaitForValues(t, key, []int64{inc1 + inc2, inc1, inc1 + inc2, inc1 + inc2})
+	tc.WaitForValues(t, key, []int64{inc1 + inc2, 0 /* stopped */, inc1 + inc2, inc1 + inc2})
 
 	// Bring the downed store back up (required for a clean shutdown).
 	require.NoError(t, tc.RestartServer(1))
@@ -2164,14 +2526,26 @@ func TestQuotaPool(t *testing.T) {
 
 	ctx := context.Background()
 
+	settings := cluster.MakeTestingClusterSettings()
+	// Override the kvflowcontrol.Mode setting to apply_to_elastic, as when
+	// apply_to_all is set (metamorphically), the quota pool will be disabled.
+	// See getQuotaPoolEnabled.
+	kvflowcontrol.Mode.Override(ctx, &settings.SV, kvflowcontrol.ApplyToElastic)
+	// Disable metamorphism and always run with fortification enabled, as it helps
+	// guard against unexpected leadership changes that the test doesn't expect.
+	kvserver.RaftLeaderFortificationFractionEnabled.Override(ctx, &settings.SV, 1.0)
+	// Using a manual clock here ensures that StoreLiveness support, once
+	// established, never expires. By extension, leadership should stay sticky.
+	manualClock := hlc.NewHybridManualClock()
 	tc := testcluster.StartTestCluster(t, numReplicas,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
-				RaftConfig: base.RaftConfig{
-					// Suppress timeout-based elections to avoid leadership changes in ways
-					// this test doesn't expect.
-					RaftElectionTimeoutTicks: 100000,
+				Settings: settings,
+				Knobs: base.TestingKnobs{
+					Server: &server.TestingKnobs{
+						WallClock: manualClock,
+					},
 				},
 			},
 		})
@@ -2228,7 +2602,7 @@ func TestQuotaPool(t *testing.T) {
 	// We block the third replica effectively causing acquisition of quota
 	// without subsequent release.
 	raftLockReplica(followerRepl)
-	ch := make(chan *roachpb.Error, 1)
+	ch := make(chan *kvpb.Error, 1)
 
 	func() {
 		defer followerRepl.RaftUnlock()
@@ -2246,12 +2620,12 @@ func TestQuotaPool(t *testing.T) {
 		// to be the same as what we started with.
 		keyToWrite := key.Next()
 		value := bytes.Repeat([]byte("v"), (3*quota)/4)
-		var ba roachpb.BatchRequest
+		ba := &kvpb.BatchRequest{}
 		ba.Add(putArgs(keyToWrite, value))
-		if err := ba.SetActiveTimestamp(tc.Servers[0].Clock().Now); err != nil {
+		if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
 			t.Fatal(err)
 		}
-		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
+		if _, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 
@@ -2267,13 +2641,13 @@ func TestQuotaPool(t *testing.T) {
 		})
 
 		go func() {
-			var ba roachpb.BatchRequest
+			ba := &kvpb.BatchRequest{}
 			ba.Add(putArgs(keyToWrite, value))
-			if err := ba.SetActiveTimestamp(tc.Servers[0].Clock().Now); err != nil {
-				ch <- roachpb.NewError(err)
+			if err := ba.SetActiveTimestamp(tc.Servers[0].Clock()); err != nil {
+				ch <- kvpb.NewError(err)
 				return
 			}
-			_, pErr := leaderRepl.Send(ctx, ba)
+			_, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba)
 			ch <- pErr
 		}()
 	}()
@@ -2302,92 +2676,148 @@ func TestWedgedReplicaDetection(t *testing.T) {
 
 	const numReplicas = 3
 
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numReplicas,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs: base.TestServerArgs{
-				RaftConfig: base.RaftConfig{
-					// Suppress timeout-based elections to avoid leadership changes in ways
-					// this test doesn't expect.
-					RaftElectionTimeoutTicks: 100000,
-				},
-			},
-		})
-	defer tc.Stopper().Stop(ctx)
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		ctx := context.Background()
+		manual := hlc.NewHybridManualClock()
 
-	key := []byte("a")
-	tc.SplitRangeOrFatal(t, key)
-	tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+		settings := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
 
-	leaderRepl := tc.GetRaftLeader(t, key)
-	followerRepl := func() *kvserver.Replica {
-		for i := range tc.Servers {
-			repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(key)
-			require.NotNil(t, repl)
-			if repl == leaderRepl {
-				continue
+		// Suppress timeout-based elections to avoid leadership changes in ways this
+		// test doesn't expect. For leader leases, fortification itself provides us
+		// this guarantee.
+		var raftConfig base.RaftConfig
+		if leaseType != roachpb.LeaseLeader {
+			raftConfig = base.RaftConfig{
+				RaftElectionTimeoutTicks: 100000,
 			}
-			return repl
 		}
-		return nil
-	}()
-	if followerRepl == nil {
-		t.Fatal("could not get a handle on a follower replica")
-	}
 
-	// Lock the follower replica to prevent it from making progress from now
-	// on. NB: See TestRaftBlockedReplica/#9914 for why we use a separate
-	// goroutine.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		followerRepl.RaftLock()
-		wg.Done()
-	}()
-	wg.Wait()
-	defer followerRepl.RaftUnlock()
+		tc := testcluster.StartTestCluster(t, numReplicas,
+			base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+				ServerArgs: base.TestServerArgs{
+					Settings:   settings,
+					RaftConfig: raftConfig,
+					Knobs: base.TestingKnobs{
+						Server: &server.TestingKnobs{
+							WallClock: manual,
+						},
+					},
+				},
+			})
+		defer tc.Stopper().Stop(ctx)
 
-	// TODO(andrei): The test becomes flaky with a lower threshold because the
-	// follower is considered inactive just below. Figure out how to switch the
-	// test to a manual clock. The activity tracking for followers uses the
-	// physical clock.
-	inactivityThreshold := time.Second
+		// Pause the manual clock so that we can carefully control the perceived
+		// timing of the follower replica's activity.
+		manual.Pause()
+		t.Logf("paused clock at %s", manual.Now())
 
-	// Send a request to the leader replica. followerRepl is locked so it will
-	// not respond.
-	value := []byte("value")
-	var ba roachpb.BatchRequest
-	ba.Add(putArgs(key, value))
-	if err := ba.SetActiveTimestamp(tc.Servers[0].Clock().Now); err != nil {
-		t.Fatal(err)
-	}
-	if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
-		t.Fatal(pErr)
-	}
+		key := []byte("a")
+		tc.SplitRangeOrFatal(t, key)
+		tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
 
-	// The follower should still be active.
-	followerID := followerRepl.ReplicaID()
-	if !leaderRepl.IsFollowerActiveSince(ctx, followerID, inactivityThreshold) {
-		t.Fatalf("expected follower to still be considered active")
-	}
+		// Do a write; we'll use it to determine when the dust has settled.
+		_, err := tc.Servers[0].DB().Inc(ctx, key, 1)
+		require.Nil(t, err)
+		tc.WaitForValues(t, key, []int64{1, 1, 1})
 
-	// It is possible that there are in-flight heartbeat responses from
-	// followerRepl from before it was locked. The receipt of one of these
-	// would bump the last active timestamp on the leader. Because of this,
-	// we check whether the follower is eventually considered inactive.
-	testutils.SucceedsSoon(t, func() error {
-		// Send another request to the leader replica. followerRepl is locked
-		// so it will not respond.
-		if _, pErr := leaderRepl.Send(ctx, ba); pErr != nil {
+		// Get a handle on the leader and the follower replicas.
+		leaderRepl := tc.GetRaftLeader(t, key)
+		leaderClock := leaderRepl.Clock()
+		followerRepl := func() *kvserver.Replica {
+			for i := range tc.Servers {
+				repl := tc.GetFirstStoreFromServer(t, i).LookupReplica(key)
+				require.NotNil(t, repl)
+				if repl == leaderRepl {
+					continue
+				}
+				return repl
+			}
+			return nil
+		}()
+		if followerRepl == nil {
+			t.Fatal("could not get a handle on a follower replica")
+		}
+
+		// Wait for the leader replica to have three entries in its lastUpdateTimes
+		// map. It should already by this time because it was able to replicate a
+		// log entry to its two followers, but we wait here to be sure and to avoid
+		// flakiness. It is possible that the WaitForValues call above returned as
+		// soon as one of the followers appended and applied a log entry, but before
+		// its response was delivered to the leader.
+		testutils.SucceedsSoon(t, func() error {
+			lastUpdateTimes := leaderRepl.LastUpdateTimes()
+			if len(lastUpdateTimes) == 3 {
+				return nil
+			}
+			return errors.Errorf("expected leader replica to have 3 entries in lastUpdateTimes map, found %s", lastUpdateTimes)
+		})
+
+		// Lock the follower replica to prevent it from making progress from now
+		// on. NB: See TestRaftBlockedReplica/#9914 for why we use a separate
+		// goroutine.
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			followerRepl.RaftLock()
+			wg.Done()
+		}()
+		wg.Wait()
+		defer followerRepl.RaftUnlock()
+
+		// inactivityThreshold is the test's duration of inactivity after which the
+		// follower replica is considered inactive. In practice, this is set to the
+		// range lease duration.
+		inactivityThreshold := time.Second
+
+		// Increment the clock to be close to inactivityThreshold, but not past it.
+		manual.Increment(inactivityThreshold.Nanoseconds() - 1)
+
+		// Send a request to the leader replica. followerRepl is locked so it will
+		// not respond.
+		value := []byte("value")
+		ba := &kvpb.BatchRequest{}
+		ba.Add(putArgs(key, value))
+		if err := ba.SetActiveTimestamp(leaderClock); err != nil {
+			t.Fatal(err)
+		}
+		if _, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba); pErr != nil {
 			t.Fatal(pErr)
 		}
 
-		// The follower should no longer be considered active.
-		if leaderRepl.IsFollowerActiveSince(ctx, followerID, inactivityThreshold) {
-			return errors.New("expected follower to be considered inactive")
+		// The follower should still be active.
+		followerID := followerRepl.ReplicaID()
+		leaderNow := leaderClock.PhysicalTime()
+		if !leaderRepl.IsFollowerActiveSince(followerID, leaderNow, inactivityThreshold) {
+			t.Fatalf("expected follower to still be considered active; "+
+				"follower id: %d, last update times: %s, leader clock: %s",
+				followerID, leaderRepl.LastUpdateTimes(), leaderNow)
 		}
-		return nil
+
+		// It is possible that there are in-flight heartbeat responses from
+		// followerRepl from before it was locked. The receipt of one of these
+		// would bump the last active timestamp on the leader. Because of this,
+		// we check whether the follower is eventually considered inactive.
+		testutils.SucceedsSoon(t, func() error {
+			// Increment the clock to past inactivityThreshold.
+			manual.Increment(inactivityThreshold.Nanoseconds() + 1)
+
+			// Send another request to the leader replica. followerRepl is locked
+			// so it will not respond.
+			if _, pErr := kvserver.ToSenderForTesting(leaderRepl).Send(ctx, ba); pErr != nil {
+				t.Fatal(pErr)
+			}
+
+			// The follower should no longer be considered active.
+			leaderNow = leaderClock.PhysicalTime()
+			if leaderRepl.IsFollowerActiveSince(followerID, leaderNow, inactivityThreshold) {
+				return errors.Errorf("expected follower to be considered inactive; "+
+					"follower id: %d, last update times: %s, leader clock: %s",
+					followerID, leaderRepl.LastUpdateTimes(), leaderNow)
+			}
+			return nil
+		})
 	})
 }
 
@@ -2417,12 +2847,12 @@ func TestRaftHeartbeats(t *testing.T) {
 	// Wait for several ticks to elapse.
 	ticksToWait := 2 * store.GetStoreConfig().RaftElectionTimeoutTicks
 	ticks := store.Metrics().RaftTicks.Count
-	for targetTicks := ticks() + int64(ticksToWait); ticks() < targetTicks; {
+	for targetTicks := ticks() + ticksToWait; ticks() < targetTicks; {
 		time.Sleep(time.Millisecond)
 	}
 
 	status := leaderRepl.RaftStatus()
-	if status.SoftState.RaftState != raft.StateLeader {
+	if status.SoftState.RaftState != raftpb.StateLeader {
 		t.Errorf("expected node %d to be leader after sleeping but was %s", leaderRepl.NodeID(), status.SoftState.RaftState)
 	}
 	if status.Term != initialTerm {
@@ -2456,9 +2886,11 @@ func TestReportUnreachableHeartbeats(t *testing.T) {
 	// Shut down a raft transport via the circuit breaker, and wait for two
 	// election timeouts to trigger an election if reportUnreachable broke
 	// heartbeat transmission to the other store.
-	cb := tc.Servers[followerIdx].RaftTransport().GetCircuitBreaker(
-		tc.Target(followerIdx).NodeID, rpc.DefaultClass)
-	cb.Break()
+	b, ok := tc.Servers[followerIdx].RaftTransport().(*kvserver.RaftTransport).GetCircuitBreaker(
+		tc.Target(followerIdx).NodeID, rpcbase.DefaultClass)
+	require.True(t, ok)
+	undo := circuit.TestingSetTripped(b, errors.New("boom"))
+	defer undo()
 
 	// Send a command to ensure Raft is aware of lost follower so that it won't
 	// quiesce (which would prevent heartbeats).
@@ -2470,14 +2902,14 @@ func TestReportUnreachableHeartbeats(t *testing.T) {
 
 	ticksToWait := 2 * leaderStore.GetStoreConfig().RaftElectionTimeoutTicks
 	ticks := leaderStore.Metrics().RaftTicks.Count
-	for targetTicks := ticks() + int64(ticksToWait); ticks() < targetTicks; {
+	for targetTicks := ticks() + ticksToWait; ticks() < targetTicks; {
 		time.Sleep(time.Millisecond)
 	}
 
 	// Ensure that the leadership has not changed, to confirm that heartbeats
 	// are sent to the store with a functioning transport.
 	status := leaderRepl.RaftStatus()
-	if status.SoftState.RaftState != raft.StateLeader {
+	if status.SoftState.RaftState != raftpb.StateLeader {
 		t.Errorf("expected node %d to be leader after sleeping but was %s", leaderRepl.NodeID(), status.SoftState.RaftState)
 	}
 	if status.Term != initialTerm {
@@ -2513,7 +2945,7 @@ func TestReportUnreachableRemoveRace(t *testing.T) {
 			for idx := range tc.Servers {
 				repl := tc.GetFirstStoreFromServer(t, idx).LookupReplica(roachpb.RKey(key))
 				require.NotNil(t, repl)
-				if repl.RaftStatus().SoftState.RaftState == raft.StateLeader {
+				if repl.RaftStatus().SoftState.RaftState == raftpb.StateLeader {
 					leaderIdx = idx
 					leaderRepl = repl
 					return nil
@@ -2541,10 +2973,13 @@ func TestReportUnreachableRemoveRace(t *testing.T) {
 		// Pseudo-partition partitionedMaybeLeaseholderIdx away from everyone else. We do this by tripping
 		// the circuit breaker on all other nodes.
 		t.Logf("partitioning")
+		var undos []func()
 		for i := range tc.Servers {
 			if i != partitionedMaybeLeaseholderIdx {
-				cb := tc.Servers[i].RaftTransport().GetCircuitBreaker(tc.Target(partitionedMaybeLeaseholderIdx).NodeID, rpc.DefaultClass)
-				cb.Break()
+				b, ok := tc.Servers[i].RaftTransport().(*kvserver.RaftTransport).GetCircuitBreaker(
+					tc.Target(partitionedMaybeLeaseholderIdx).NodeID, rpcbase.DefaultClass)
+				require.True(t, ok)
+				undos = append(undos, circuit.TestingSetTripped(b, errors.New("boom")))
 			}
 		}
 
@@ -2552,11 +2987,8 @@ func TestReportUnreachableRemoveRace(t *testing.T) {
 		heartbeatInterval := tc.GetFirstStoreFromServer(t, partitionedMaybeLeaseholderIdx).GetStoreConfig().CoalescedHeartbeatsInterval
 		time.Sleep(heartbeatInterval)
 		t.Logf("resolving partition")
-		for i := range tc.Servers {
-			if i != partitionedMaybeLeaseholderIdx {
-				cb := tc.Servers[i].RaftTransport().GetCircuitBreaker(tc.Target(partitionedMaybeLeaseholderIdx).NodeID, rpc.DefaultClass)
-				cb.Reset()
-			}
+		for _, undo := range undos {
+			undo()
 		}
 
 		t.Logf("waiting for replicaGC of removed leader replica")
@@ -2602,24 +3034,24 @@ func TestReplicateAfterSplit(t *testing.T) {
 	// Issue an increment for later check.
 	incArgs := incrementArgs(key, 11)
 	if _, err := kv.SendWrappedWith(ctx, store0.TestSender(),
-		roachpb.Header{}, incArgs); err != nil {
+		kvpb.Header{}, incArgs); err != nil {
 		t.Fatal(err)
 	}
 	// Now add the second replica.
 	tc.AddVotersOrFatal(t, splitKey, tc.Target(1))
 
-	if tc.GetFirstStoreFromServer(t, 1).LookupReplica(roachpb.RKey(key)).GetMaxBytes() == 0 {
+	if tc.GetFirstStoreFromServer(t, 1).LookupReplica(roachpb.RKey(key)).GetMaxBytes(ctx) == 0 {
 		t.Error("Range MaxBytes is not set after snapshot applied")
 	}
 	// Once it catches up, the effects of increment commands can be seen.
 	testutils.SucceedsSoon(t, func() error {
 		getArgs := getArgs(key)
 		// Reading on non-lease holder replica should use inconsistent read
-		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), roachpb.Header{
-			ReadConsistency: roachpb.INCONSISTENT,
+		if reply, err := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 1).TestSender(), kvpb.Header{
+			ReadConsistency: kvpb.INCONSISTENT,
 		}, getArgs); err != nil {
 			return errors.Errorf("failed to read data: %s", err)
-		} else if e, v := int64(11), mustGetInt(reply.(*roachpb.GetResponse).Value); v != e {
+		} else if e, v := int64(11), mustGetInt(reply.(*kvpb.GetResponse).Value); v != e {
 			return errors.Errorf("failed to read correct data: expected %d, got %d", e, v)
 		}
 		return nil
@@ -2667,7 +3099,7 @@ func TestReplicaRemovalCampaign(t *testing.T) {
 			replica2 := store0.LookupReplica(roachpb.RKey(key2))
 
 			rg2 := func(s *kvserver.Store) kv.Sender {
-				return kv.Wrap(s, func(ba roachpb.BatchRequest) roachpb.BatchRequest {
+				return kv.Wrap(kvserver.ToSenderForTesting(s), func(ba *kvpb.BatchRequest) *kvpb.BatchRequest {
 					if ba.RangeID == 0 {
 						ba.RangeID = replica2.RangeID
 					}
@@ -2684,9 +3116,9 @@ func TestReplicaRemovalCampaign(t *testing.T) {
 
 			if td.remove {
 				// Simulate second replica being transferred by removing it.
-				if err := store0.RemoveReplica(ctx, replica2, replica2.Desc().NextReplicaID, kvserver.RemoveOptions{
-					DestroyData: true,
-				}); err != nil {
+				if err := store0.RemoveReplica(
+					ctx, replica2, replica2.Desc().NextReplicaID, redact.SafeString(t.Name()),
+				); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -2748,7 +3180,7 @@ func TestRaftAfterRemoveRange(t *testing.T) {
 		for i := range tc.Servers[1:] {
 			store := tc.GetFirstStoreFromServer(t, i)
 			_, err := store.GetReplica(desc.RangeID)
-			if !errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+			if !errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 				return errors.Wrapf(err, "range %d not yet removed from %s", desc.RangeID, store)
 			}
 		}
@@ -2770,17 +3202,17 @@ func TestRaftAfterRemoveRange(t *testing.T) {
 		StoreID:   target2.StoreID,
 	}
 
-	tc.Servers[2].RaftTransport().SendAsync(&kvserver.RaftMessageRequest{
+	tc.Servers[2].RaftTransport().(*kvserver.RaftTransport).SendAsync(&kvserverpb.RaftMessageRequest{
 		ToReplica:   replica1,
 		FromReplica: replica2,
-		Heartbeats: []kvserver.RaftHeartbeat{
+		Heartbeats: []kvserverpb.RaftHeartbeat{
 			{
 				RangeID:       desc.RangeID,
 				FromReplicaID: replica2.ReplicaID,
 				ToReplicaID:   replica1.ReplicaID,
 			},
 		},
-	}, rpc.DefaultClass)
+	}, rpcbase.DefaultClass)
 	// Execute another replica change to ensure that raft has processed
 	// the heartbeat just sent.
 	tc.AddVotersOrFatal(t, key, tc.Target(1))
@@ -2820,21 +3252,16 @@ func TestRaftRemoveRace(t *testing.T) {
 	}
 	tc.AddVotersOrFatal(t, key, targets...)
 
+	sl := kvstorage.MakeStateLoader(desc.RangeID)
+	s2 := tc.GetFirstStoreFromServer(t, 2)
 	for i := 0; i < 10; i++ {
 		tc.RemoveVotersOrFatal(t, key, tc.Target(2))
 		tc.AddVotersOrFatal(t, key, tc.Target(2))
 
-		// Verify the tombstone key does not exist. See #12130.
-		tombstoneKey := keys.RangeTombstoneKey(desc.RangeID)
-		var tombstone roachpb.RangeTombstone
-		if ok, err := storage.MVCCGetProto(
-			ctx, tc.GetFirstStoreFromServer(t, 2).Engine(), tombstoneKey,
-			hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
-		); err != nil {
-			t.Fatal(err)
-		} else if ok {
-			t.Fatal("tombstone should not exist")
-		}
+		// Verify the ReplicaMark does not indicate a destroyed replica. See #12130.
+		mark, err := sl.LoadReplicaMark(ctx, s2.StateEngine())
+		require.NoError(t, err)
+		require.True(t, mark.Exists(), "replica must exist")
 	}
 }
 
@@ -2862,13 +3289,13 @@ func TestRemovePlaceholderRace(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		for _, action := range []roachpb.ReplicaChangeType{roachpb.REMOVE_VOTER, roachpb.ADD_VOTER} {
 			for {
-				chgs := roachpb.MakeReplicationChanges(action, tc.Target(1))
-				if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserver.SnapshotRequest_REBALANCE, kvserverpb.ReasonUnknown, "", chgs); err != nil {
-					if kvserver.IsRetriableReplicationChangeError(err) {
+				chgs := kvpb.MakeReplicationChanges(action, tc.Target(1))
+				if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.ReasonUnknown, "", chgs); err != nil {
+					if kvserver.IsRetriableReplicationChangeError(err) ||
+						kvserver.IsReplicationChangeInProgressError(err) {
 						continue
-					} else {
-						t.Fatal(err)
 					}
+					t.Fatal(err)
 				}
 				break
 			}
@@ -2878,21 +3305,21 @@ func TestRemovePlaceholderRace(t *testing.T) {
 
 type noConfChangeTestHandler struct {
 	rangeID roachpb.RangeID
-	kvserver.RaftMessageHandler
+	kvserver.IncomingRaftMessageHandler
 }
 
 func (ncc *noConfChangeTestHandler) HandleRaftRequest(
 	ctx context.Context,
-	req *kvserver.RaftMessageRequest,
+	req *kvserverpb.RaftMessageRequest,
 	respStream kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+) *kvpb.Error {
 	for i, e := range req.Message.Entries {
 		if e.Type == raftpb.EntryConfChange {
 			var cc raftpb.ConfChange
 			if err := protoutil.Unmarshal(e.Data, &cc); err != nil {
 				panic(err)
 			}
-			var ccCtx kvserver.ConfChangeContext
+			var ccCtx kvserverpb.ConfChangeContext
 			if err := protoutil.Unmarshal(cc.Context, &ccCtx); err != nil {
 				panic(err)
 			}
@@ -2909,21 +3336,21 @@ func (ncc *noConfChangeTestHandler) HandleRaftRequest(
 			}
 		}
 	}
-	return ncc.RaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
+	return ncc.IncomingRaftMessageHandler.HandleRaftRequest(ctx, req, respStream)
 }
 
 func (ncc *noConfChangeTestHandler) HandleRaftResponse(
-	ctx context.Context, resp *kvserver.RaftMessageResponse,
+	ctx context.Context, resp *kvserverpb.RaftMessageResponse,
 ) error {
 	switch val := resp.Union.GetValue().(type) {
-	case *roachpb.Error:
+	case *kvpb.Error:
 		switch val.GetDetail().(type) {
-		case *roachpb.ReplicaTooOldError:
+		case *kvpb.ReplicaTooOldError:
 			// We're going to manually GC the replica, so ignore these errors.
 			return nil
 		}
 	}
-	return ncc.RaftMessageHandler.HandleRaftResponse(ctx, resp)
+	return ncc.IncomingRaftMessageHandler.HandleRaftResponse(ctx, resp)
 }
 
 func TestReplicaGCRace(t *testing.T) {
@@ -2946,10 +3373,10 @@ func TestReplicaGCRace(t *testing.T) {
 	toStore := tc.GetFirstStoreFromServer(t, 2)
 
 	// Prevent the victim replica from processing configuration changes.
-	tc.Servers[2].RaftTransport().Stop(toStore.Ident.StoreID)
-	tc.Servers[2].RaftTransport().Listen(toStore.Ident.StoreID, &noConfChangeTestHandler{
-		rangeID:            desc.RangeID,
-		RaftMessageHandler: toStore,
+	tc.Servers[2].RaftTransport().(*kvserver.RaftTransport).StopIncomingRaftMessages(toStore.Ident.StoreID)
+	tc.Servers[2].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(toStore.Ident.StoreID, &noConfChangeTestHandler{
+		rangeID:                    desc.RangeID,
+		IncomingRaftMessageHandler: toStore,
 	})
 
 	repl, err := leaderStore.GetReplica(desc.RangeID)
@@ -2961,11 +3388,11 @@ func TestReplicaGCRace(t *testing.T) {
 	// Add the victim replica. Note that it will receive a snapshot and raft log
 	// replays, but will not process the configuration change containing the new
 	// range descriptor, preventing it from learning of the new NextReplicaID.
-	chgs := roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, roachpb.ReplicationTarget{
+	chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, roachpb.ReplicationTarget{
 		NodeID:  toStore.Ident.NodeID,
 		StoreID: toStore.Ident.StoreID,
 	})
-	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserver.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs); err != nil {
+	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.ReasonRangeUnderReplicated, "", chgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2981,10 +3408,10 @@ func TestReplicaGCRace(t *testing.T) {
 		t.Fatalf("expected %s to have a replica on %s", rangeDesc, toStore)
 	}
 
-	hbReq := kvserver.RaftMessageRequest{
+	hbReq := kvserverpb.RaftMessageRequest{
 		FromReplica: fromReplicaDesc,
 		ToReplica:   toReplicaDesc,
-		Heartbeats: []kvserver.RaftHeartbeat{
+		Heartbeats: []kvserverpb.RaftHeartbeat{
 			{
 				RangeID:       desc.RangeID,
 				FromReplicaID: fromReplicaDesc.ReplicaID,
@@ -2998,7 +3425,7 @@ func TestReplicaGCRace(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		status := repl.RaftStatus()
 		progressByID := status.Progress
-		progress, ok := progressByID[uint64(toReplicaDesc.ReplicaID)]
+		progress, ok := progressByID[raftpb.PeerID(toReplicaDesc.ReplicaID)]
 		if !ok {
 			return errors.Errorf("%+v does not yet contain %s", progressByID, toReplicaDesc)
 		}
@@ -3006,15 +3433,15 @@ func TestReplicaGCRace(t *testing.T) {
 			return errors.Errorf("%+v has not yet advanced", progress)
 		}
 		for i := range hbReq.Heartbeats {
-			hbReq.Heartbeats[i].Term = status.Term
-			hbReq.Heartbeats[i].Commit = progress.Match
+			hbReq.Heartbeats[i].Term = kvpb.RaftTerm(status.Term)
+			hbReq.Heartbeats[i].Commit = kvpb.RaftIndex(progress.Match)
 		}
 		return nil
 	})
 
 	// Remove the victim replica and manually GC it.
 	chgs[0].ChangeType = roachpb.REMOVE_VOTER
-	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserver.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeOverReplicated, "", chgs); err != nil {
+	if _, err := repl.ChangeReplicas(ctx, repl.Desc(), kvserverpb.ReasonRangeOverReplicated, "", chgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3031,22 +3458,29 @@ func TestReplicaGCRace(t *testing.T) {
 	// Create a new transport for store 0. Error responses are passed
 	// back along the same grpc stream as the request so it's ok that
 	// there are two (this one and the one actually used by the store).
+	ambient := tc.Servers[0].AmbientCtx()
+	ambient.AddLogTag("test-raft-transport", nil)
 	fromTransport := kvserver.NewRaftTransport(
-		log.AmbientContext{Tracer: tc.Servers[0].RaftTransport().Tracer},
+		ambient,
 		cluster.MakeTestingClusterSettings(),
+		tc.Servers[0].Stopper(),
+		tc.Servers[0].Clock(),
 		nodedialer.New(tc.Servers[0].RPCContext(), gossip.AddressResolver(fromStore.Gossip())),
 		nil, /* grpcServer */
-		tc.Servers[0].Stopper(),
+		nil, /* drpcServer */
+		(*node_rac2.AdmittedPiggybacker)(nil),
+		nil, /* PiggybackedAdmittedResponseScheduler */
+		nil, /* knobs */
 	)
-	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
-	fromTransport.Listen(fromStore.StoreID(), errChan)
+	errChan := errorChannelTestHandler(make(chan *kvpb.Error, 1))
+	fromTransport.ListenIncomingRaftMessages(fromStore.StoreID(), errChan)
 
 	// Send the heartbeat. Boom. See #11591.
 	// We have to send this multiple times to protect against
 	// dropped messages (see #18355).
 	sendHeartbeat := func() (sent bool) {
 		r := hbReq
-		return fromTransport.SendAsync(&r, rpc.DefaultClass)
+		return fromTransport.SendAsync(&r, rpcbase.DefaultClass)
 	}
 	if sent := sendHeartbeat(); !sent {
 		t.Fatal("failed to send heartbeat")
@@ -3059,7 +3493,7 @@ func TestReplicaGCRace(t *testing.T) {
 	select {
 	case pErr := <-errChan:
 		switch pErr.GetDetail().(type) {
-		case *roachpb.RaftGroupDeletedError:
+		case *kvpb.RaftGroupDeletedError:
 		default:
 			t.Fatalf("unexpected error type %T: %s", pErr.GetDetail(), pErr)
 		}
@@ -3119,104 +3553,6 @@ HAVING
 	}
 }
 
-func TestDecommission(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Five nodes is too much to reliably run under testrace with our aggressive
-	// liveness timings.
-	skip.UnderRace(t, "#39807 and #37811")
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 5, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationAuto,
-	})
-	defer tc.Stopper().Stop(ctx)
-
-	k := tc.ScratchRange(t)
-	admin, err := tc.GetAdminClient(ctx, t, 0)
-	require.NoError(t, err)
-
-	// Decommission the first node, which holds most of the leases.
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{1},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	requireNoReplicas := func(storeID roachpb.StoreID, repFactor int) {
-		testutils.SucceedsSoon(t, func() error {
-			desc := tc.LookupRangeOrFatal(t, k)
-			for _, rDesc := range desc.Replicas().VoterDescriptors() {
-				store, err := tc.Servers[int(rDesc.NodeID-1)].Stores().GetStore(rDesc.StoreID)
-				require.NoError(t, err)
-				if err := store.ForceReplicationScanAndProcess(); err != nil {
-					return err
-				}
-			}
-			if sl := desc.Replicas().FilterToDescriptors(func(rDesc roachpb.ReplicaDescriptor) bool {
-				return rDesc.StoreID == storeID
-			}); len(sl) > 0 {
-				return errors.Errorf("still a replica on s%d: %s", storeID, &desc)
-			}
-			if len(desc.Replicas().VoterDescriptors()) != repFactor {
-				return errors.Errorf("expected %d replicas: %s", repFactor, &desc)
-			}
-			return nil
-		})
-	}
-
-	const triplicated = 3
-
-	requireNoReplicas(1, triplicated)
-
-	runner := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-	ts := timeutil.Now()
-
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{2},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	// Both s1 and s2 are out, so neither ought to have replicas.
-	requireNoReplicas(1, triplicated)
-	requireNoReplicas(2, triplicated)
-
-	// Going from three replicas to three replicas should have used atomic swaps
-	// only. We didn't verify this before the first decommissioning op because
-	// lots of ranges were over-replicated due to ranges recently having split
-	// off from the five-fold replicated system ranges.
-	requireOnlyAtomicChanges(t, runner, tc.LookupRangeOrFatal(t, k).RangeID, triplicated, ts)
-
-	sqlutils.SetZoneConfig(t, runner, "RANGE default", "num_replicas: 1")
-
-	const single = 1
-
-	// The range should drop down to one replica on a non-decommissioning store.
-	requireNoReplicas(1, single)
-	requireNoReplicas(2, single)
-
-	// Decommission two more nodes. Only n5 is left; getting the replicas there
-	// can't use atomic replica swaps because the leaseholder can't be removed.
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{3, 4},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	requireNoReplicas(1, single)
-	requireNoReplicas(2, single)
-	requireNoReplicas(3, single)
-	requireNoReplicas(4, single)
-}
-
 // TestReplicateRogueRemovedNode ensures that a rogue removed node
 // (i.e. a node that has been removed from the range but doesn't know
 // it yet because it was down or partitioned away when it happened)
@@ -3228,23 +3564,20 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-					ClockSource:          manualClock.UnixNano,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
+					WallClock:         manualClock,
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					// Newly-started stores (including the "rogue" one) should not GC
@@ -3267,7 +3600,7 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 	desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
 	// We're going to set up the cluster with partitioning so that we can
 	// partition node 0 from the others. The partition is not initially active.
-	partRange, err := setupPartitionedRange(tc, desc.RangeID, 0, 0, false /* activated */, unreliableRaftHandlerFuncs{})
+	partRange, err := setupPartitionedRange(tc, desc.RangeID, 0, 0, false /* activated */, kvtestutils.UnreliableRaftHandlerFuncs{})
 	require.NoError(t, err)
 
 	// Put some data in the range so we'll have something to test for.
@@ -3303,7 +3636,7 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 		tc.GetFirstStoreFromServer(t, 1).MustForceReplicaGCScanAndProcess()
 
 		actual := tc.ReadIntFromStores(key)
-		expected := []int64{16, 0, 5}
+		expected := []int64{16, 0, 0 /* stopped */}
 		if !reflect.DeepEqual(expected, actual) {
 			return errors.Errorf("expected %v, got %v", expected, actual)
 		}
@@ -3333,16 +3666,16 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 		_, pErr := kv.SendWrappedWith(
 			context.Background(),
 			tc.GetFirstStoreFromServer(t, 2).TestSender(),
-			roachpb.Header{
+			kvpb.Header{
 				Replica:   replicaDesc,
 				Timestamp: tc.Servers[2].Clock().Now(),
 			}, incArgs,
 		)
 		detail := pErr.GetDetail()
 		switch detail.(type) {
-		case *roachpb.RangeNotFoundError:
+		case *kvpb.RangeNotFoundError:
 			// The typical case.
-		case *roachpb.NotLeaseHolderError:
+		case *kvpb.NotLeaseHolderError:
 			// The atypical case - the lease may have expired and the
 			// lease acquisition may be refused.
 		default:
@@ -3398,29 +3731,35 @@ func TestReplicateRogueRemovedNode(t *testing.T) {
 	finishWG.Wait()
 }
 
-type errorChannelTestHandler chan *roachpb.Error
+type errorChannelTestHandler chan *kvpb.Error
 
 func (errorChannelTestHandler) HandleRaftRequest(
-	_ context.Context, _ *kvserver.RaftMessageRequest, _ kvserver.RaftMessageResponseStream,
-) *roachpb.Error {
+	_ context.Context, _ *kvserverpb.RaftMessageRequest, _ kvserver.RaftMessageResponseStream,
+) *kvpb.Error {
 	panic("unimplemented")
 }
 
 func (d errorChannelTestHandler) HandleRaftResponse(
-	ctx context.Context, resp *kvserver.RaftMessageResponse,
+	ctx context.Context, resp *kvserverpb.RaftMessageResponse,
 ) error {
 	switch val := resp.Union.GetValue().(type) {
-	case *roachpb.Error:
+	case *kvpb.Error:
 		d <- val
 	default:
-		log.Fatalf(ctx, "unexpected response type %T", val)
+		log.KvExec.Fatalf(ctx, "unexpected response type %T", val)
 	}
 	return nil
 }
 
 func (errorChannelTestHandler) HandleSnapshot(
-	_ context.Context, _ *kvserver.SnapshotRequest_Header, _ kvserver.SnapshotResponseStream,
+	_ context.Context, _ *kvserverpb.SnapshotRequest_Header, _ kvserver.SnapshotResponseStream,
 ) error {
+	panic("unimplemented")
+}
+
+func (errorChannelTestHandler) HandleDelegatedSnapshot(
+	_ context.Context, _ *kvserverpb.DelegateSendSnapshotRequest,
+) *kvserverpb.DelegateSnapshotResponse {
 	panic("unimplemented")
 }
 
@@ -3453,7 +3792,7 @@ func TestReplicateRemovedNodeDisruptiveElection(t *testing.T) {
 	// established after the first node's removal.
 	value := int64(5)
 	incArgs := incrementArgs(key, value)
-	if _, err := kv.SendWrapped(ctx, tc.Servers[1].DistSender(), incArgs); err != nil {
+	if _, err := kv.SendWrapped(ctx, tc.Servers[1].DistSenderI().(kv.Sender), incArgs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3514,29 +3853,34 @@ func TestReplicateRemovedNodeDisruptiveElection(t *testing.T) {
 	// so it's ok that there are two (this one and the one actually used by the
 	// store).
 	transport0 := kvserver.NewRaftTransport(
-		log.AmbientContext{Tracer: tc.Servers[0].RaftTransport().Tracer},
+		tc.Servers[0].AmbientCtx(),
 		cluster.MakeTestingClusterSettings(),
+		tc.Servers[0].Stopper(),
+		tc.Servers[0].Clock(),
 		nodedialer.New(tc.Servers[0].RPCContext(),
 			gossip.AddressResolver(tc.GetFirstStoreFromServer(t, 0).Gossip())),
 		nil, /* grpcServer */
-		tc.Servers[0].Stopper(),
+		nil, /* drpcServer */
+		(*node_rac2.AdmittedPiggybacker)(nil),
+		nil, /* PiggybackedAdmittedResponseScheduler */
+		nil, /* knobs */
 	)
-	errChan := errorChannelTestHandler(make(chan *roachpb.Error, 1))
-	transport0.Listen(target0.StoreID, errChan)
+	errChan := errorChannelTestHandler(make(chan *kvpb.Error, 1))
+	transport0.ListenIncomingRaftMessages(target0.StoreID, errChan)
 
 	// Simulate the removed node asking to trigger an election. Try and try again
 	// until we're reasonably sure the message was sent.
-	for !transport0.SendAsync(&kvserver.RaftMessageRequest{
+	for !transport0.SendAsync(&kvserverpb.RaftMessageRequest{
 		RangeID:     desc.RangeID,
 		ToReplica:   replica1,
 		FromReplica: replica0,
 		Message: raftpb.Message{
-			From: uint64(replica0.ReplicaID),
-			To:   uint64(replica1.ReplicaID),
+			From: raftpb.PeerID(replica0.ReplicaID),
+			To:   raftpb.PeerID(replica1.ReplicaID),
 			Type: raftpb.MsgVote,
 			Term: term + 1,
 		},
-	}, rpc.DefaultClass) {
+	}, rpcbase.DefaultClass) {
 	}
 
 	// The receiver of this message (i.e. replica1) should return an error telling
@@ -3544,7 +3888,7 @@ func TestReplicateRemovedNodeDisruptiveElection(t *testing.T) {
 	select {
 	case pErr := <-errChan:
 		switch pErr.GetDetail().(type) {
-		case *roachpb.ReplicaTooOldError:
+		case *kvpb.ReplicaTooOldError:
 		default:
 			t.Fatalf("unexpected error type %T: %s", pErr.GetDetail(), pErr)
 		}
@@ -3564,22 +3908,19 @@ func TestReplicaTooOldGC(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 4
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					DisableScanner: true,
@@ -3625,7 +3966,7 @@ func TestReplicaTooOldGC(t *testing.T) {
 	if _, err := kv.SendWrapped(ctx, store.TestSender(), incArgs); err != nil {
 		t.Fatal(err)
 	}
-	tc.WaitForValues(t, key, []int64{16, 16, 16, 5})
+	tc.WaitForValues(t, key, []int64{16, 16, 16, 0 /* stopped */})
 
 	// Wait for a bunch of raft ticks in order to flush any heartbeats through
 	// the system. In particular, a coalesced heartbeat containing a quiesce
@@ -3647,89 +3988,22 @@ func TestReplicaTooOldGC(t *testing.T) {
 	testutils.SucceedsSoon(t, func() error {
 		replica, err := tc.GetFirstStoreFromServer(t, 3).GetReplica(desc.RangeID)
 		if err != nil {
-			if errors.HasType(err, (*roachpb.RangeNotFoundError)(nil)) {
+			if errors.HasType(err, (*kvpb.RangeNotFoundError)(nil)) {
 				return nil
 			}
 			return err
 		} else if replica != nil {
 			// Make sure the replica is unquiesced so that it will tick and
 			// contact the leader to discover it's no longer part of the range.
-			replica.UnquiesceAndWakeLeader()
+			replica.MaybeUnquiesce()
 		}
 		return errors.Errorf("found %s, waiting for it to be GC'd", replica)
 	})
 }
 
-func TestReplicaLazyLoad(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
-	stickyServerArgs := base.TestServerArgs{
-		StoreSpecs: []base.StoreSpec{
-			{
-				InMemory:               true,
-				StickyInMemoryEngineID: "1",
-			},
-		},
-		RaftConfig: base.RaftConfig{
-			RaftTickInterval: 50 * time.Millisecond, // safe because there is only a single node
-		},
-		Knobs: base.TestingKnobs{
-			Server: &server.TestingKnobs{
-				StickyEngineRegistry: stickyEngineRegistry,
-			},
-			Store: &kvserver.StoreTestingKnobs{
-				DisableScanner: true,
-			},
-		},
-	}
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      stickyServerArgs,
-		})
-	defer tc.Stopper().Stop(ctx)
-
-	// Split so we can rely on RHS range being quiescent after a restart.
-	// We use UserTableDataMin to avoid having the range activated to
-	// gossip system table data.
-	splitKey := keys.UserTableDataMin
-	tc.SplitRangeOrFatal(t, splitKey)
-
-	tc.StopServer(0)
-	tc.AddAndStartServer(t, stickyServerArgs)
-
-	// Wait for a bunch of raft ticks.
-	ticks := tc.GetFirstStoreFromServer(t, 1).Metrics().RaftTicks.Count
-	for targetTicks := ticks() + 3; ticks() < targetTicks; {
-		time.Sleep(time.Millisecond)
-	}
-
-	splitKeyAddr, err := keys.Addr(splitKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	replica := tc.GetFirstStoreFromServer(t, 1).LookupReplica(splitKeyAddr)
-	if replica == nil {
-		t.Fatalf("lookup replica at key %q returned nil", splitKey)
-	}
-	if replica.RaftStatus() != nil {
-		t.Fatalf("expected replica Raft group to be uninitialized")
-	}
-}
-
 func TestReplicateReAddAfterDown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
 
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -3737,13 +4011,13 @@ func TestReplicateReAddAfterDown(t *testing.T) {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: fs.NewStickyRegistry(),
 				},
 			},
 		}
@@ -3784,7 +4058,7 @@ func TestReplicateReAddAfterDown(t *testing.T) {
 	if _, err := kv.SendWrapped(ctx, store.TestSender(), incArgs); err != nil {
 		t.Fatal(err)
 	}
-	tc.WaitForValues(t, key, []int64{16, 16, 5})
+	tc.WaitForValues(t, key, []int64{16, 16, 0 /* stopped */})
 
 	// Bring it back up and re-add the range. There is a race when the
 	// store applies its removal and re-addition back to back: the
@@ -3826,10 +4100,80 @@ func TestLeaseHolderRemoveSelf(t *testing.T) {
 
 	// Expect that we can still successfully do a get on the range.
 	getArgs := getArgs(key)
-	_, pErr := kv.SendWrappedWith(ctx, leaseHolder.TestSender(), roachpb.Header{}, getArgs)
+	_, pErr := kv.SendWrappedWith(ctx, leaseHolder.TestSender(), kvpb.Header{}, getArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
+}
+
+// TestVoterRemovalWithoutDemotion verifies that a voter replica cannot be
+// removed directly without first being demoted to a learner.
+func TestVoterRemovalWithoutDemotion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test modifies the range descriptor in the proposal filter, which is
+	// technically not allowed; see the comment in ReplicaState.Desc which talks
+	// about the RangeDescriptor needing to be immutable. As such, we're
+	// susceptible to benign test-only races, as seen in
+	// https://github.com/cockroachdb/cockroach/issues/142809.
+	skip.UnderRace(t, "modifies the range descriptor")
+
+	// Inject a filter which skips the demotion of a voter replica when removing
+	// it from the range. This will trigger the raft-level check which ensures
+	// that a voter replica cannot be removed directly.
+	type noDemotionKey struct{}
+	var removalTarget roachpb.ReplicationTarget
+	testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+		if args.Ctx.Value(noDemotionKey{}) != nil {
+			if state := args.Cmd.ReplicatedEvalResult.State; state != nil && state.Desc != nil {
+				repl, ok := state.Desc.GetReplicaDescriptor(removalTarget.StoreID)
+				if ok && repl.Type == roachpb.VOTER_DEMOTING_LEARNER {
+					t.Logf("intercepting proposal, skipping voter demotion: %+v", args.Cmd)
+					_, ok := state.Desc.RemoveReplica(repl.NodeID, repl.StoreID)
+					require.True(t, ok)
+				}
+			}
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 2,
+		base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						TestingProposalFilter: testingProposalFilter,
+					},
+				},
+			},
+		})
+	defer tc.Stopper().Stop(ctx)
+	removalTarget = tc.Target(1)
+
+	key := []byte("a")
+	tc.SplitRangeOrFatal(t, key)
+	tc.AddVotersOrFatal(t, key, removalTarget)
+
+	var beforeDesc roachpb.RangeDescriptor
+	db := tc.Servers[0].SystemLayer().DB()
+	require.NoError(t, db.GetProto(ctx, keys.RangeDescriptorKey(key), &beforeDesc))
+
+	// First attempt to remove the voter without demotion. Should fail.
+	expectedErr := "cannot remove voter .* directly; must first demote to learner"
+	noDemotionCtx := context.WithValue(ctx, noDemotionKey{}, struct{}{})
+	removeVoter := kvpb.MakeReplicationChanges(roachpb.REMOVE_VOTER, removalTarget)
+	_, err := db.AdminChangeReplicas(noDemotionCtx, key, beforeDesc, removeVoter)
+	require.Error(t, err)
+	require.Regexp(t, expectedErr, err)
+
+	// Now demote the voter to a learner and then remove it.
+	desc, err := db.AdminChangeReplicas(ctx, key, beforeDesc, removeVoter)
+	require.NoError(t, err)
+	_, ok := desc.GetReplicaDescriptor(removalTarget.StoreID)
+	require.False(t, ok)
 }
 
 // TestRemovedReplicaError verifies that a replica that has been removed from a
@@ -3847,7 +4191,7 @@ func TestRemovedReplicaError(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 					Store: &kvserver.StoreTestingKnobs{
 						// Disable the replica GC queues. This verifies that the replica is
@@ -3875,13 +4219,13 @@ func TestRemovedReplicaError(t *testing.T) {
 	// start seeing the RangeNotFoundError after a little bit of time has passed.
 	getArgs := getArgs(key)
 	testutils.SucceedsSoon(t, func() error {
-		_, pErr := kv.SendWrappedWith(ctx, store, roachpb.Header{}, getArgs)
+		_, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store), kvpb.Header{}, getArgs)
 		switch pErr.GetDetail().(type) {
-		case *roachpb.AmbiguousResultError:
+		case *kvpb.AmbiguousResultError:
 			return pErr.GoError()
-		case *roachpb.NotLeaseHolderError:
+		case *kvpb.NotLeaseHolderError:
 			return pErr.GoError()
-		case *roachpb.RangeNotFoundError:
+		case *kvpb.RangeNotFoundError:
 			return nil
 		default:
 		}
@@ -3895,74 +4239,68 @@ func TestTransferRaftLeadership(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 2,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs: base.TestServerArgs{
-				RaftConfig: base.RaftConfig{
-					// Suppress timeout-based elections (which also includes a previous
-					// leader stepping down due to a quorum check). Running tests on a
-					// heavily loaded CPU is enough to reach the raft election timeout
-					// and cause leadership to change hands in ways this test doesn't
-					// expect.
-					RaftElectionTimeoutTicks: 100000,
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(),
+		func(t *testing.T, leaseType roachpb.LeaseType) {
+			ctx := context.Background()
+			st := cluster.MakeTestingClusterSettings()
+			kvserver.OverrideDefaultLeaseType(ctx, &st.SV, leaseType)
+
+			tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+				ServerArgs: base.TestServerArgs{
+					Settings: st,
 				},
-			},
+			})
+			defer tc.Stopper().Stop(ctx)
+			store0 := tc.GetFirstStoreFromServer(t, 0)
+			store1 := tc.GetFirstStoreFromServer(t, 1)
+
+			key := tc.ScratchRangeWithExpirationLease(t)
+			repl0 := store0.LookupReplica(keys.MustAddr(key))
+			require.NotNil(t, repl0, "no replica found for key '%s'", key)
+			rd0, err := repl0.GetReplicaDescriptor()
+			require.NoError(t, err)
+
+			tc.AddVotersOrFatal(t, key, tc.Target(1))
+
+			// NB: if we don't wait until node 2 applies the config change and becomes
+			// voter, it may refuse to campaign for leadership. The large Raft election
+			// timeout set in this test will prevent the current leader from retrying the
+			// transfer. See issue #99213.
+			require.NoError(t, tc.WaitForVoters(key, tc.Target(1)))
+
+			repl1 := store1.LookupReplica(keys.MustAddr(key))
+			require.NotNil(t, repl1, "no replica found for key '%s'", key)
+			rd1, err := repl1.GetReplicaDescriptor()
+			require.NoError(t, err)
+			require.Equal(t, roachpb.VOTER_FULL, rd1.Type)
+
+			_, pErr := kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store0), kvpb.Header{RangeID: repl0.RangeID}, getArgs(key))
+			require.NoError(t, pErr.GoError())
+
+			status := repl0.RaftStatus()
+			require.NotNil(t, status)
+			require.Equal(t, raftpb.PeerID(rd0.ReplicaID), status.Lead)
+
+			origCount0 := store0.Metrics().RangeRaftLeaderTransfers.Count()
+			// Transfer the lease. We'll then check that the leadership follows
+			// automatically.
+			transferLeaseArgs := adminTransferLeaseArgs(key, store1.StoreID())
+			_, pErr = kv.SendWrappedWith(ctx, kvserver.ToSenderForTesting(store0), kvpb.Header{RangeID: repl0.RangeID}, transferLeaseArgs)
+			require.NoError(t, pErr.GoError())
+
+			// Verify leadership is transferred.
+			testutils.SucceedsSoon(t, func() error {
+				if status := repl0.RaftStatus(); status == nil {
+					return errors.New("raft status is nil")
+				} else if a, e := status.Lead, raftpb.PeerID(rd1.ReplicaID); a != e {
+					return errors.Errorf("expected raft leader be %d; got %d", e, a)
+				}
+				return nil
+			})
+			// And metrics are updated.
+			require.Greater(t, store0.Metrics().RangeRaftLeaderTransfers.Count(), origCount0)
 		})
-	defer tc.Stopper().Stop(ctx)
-	store0 := tc.GetFirstStoreFromServer(t, 0)
-	store1 := tc.GetFirstStoreFromServer(t, 1)
-
-	key := tc.ScratchRangeWithExpirationLease(t)
-	repl0 := store0.LookupReplica(keys.MustAddr(key))
-	if repl0 == nil {
-		t.Fatalf("no replica found for key '%s'", key)
-	}
-	rd0, err := repl0.GetReplicaDescriptor()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc.AddVotersOrFatal(t, key, tc.Target(1))
-
-	repl1 := store1.LookupReplica(keys.MustAddr(key))
-	if repl1 == nil {
-		t.Fatalf("no replica found for key '%s'", key)
-	}
-	rd1, err := repl1.GetReplicaDescriptor()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	getArgs := getArgs(key)
-	if _, pErr := kv.SendWrappedWith(
-		context.Background(), store0, roachpb.Header{RangeID: repl0.RangeID}, getArgs,
-	); pErr != nil {
-		t.Fatalf("expect get nil, actual get %v ", pErr)
-	}
-
-	status := repl0.RaftStatus()
-	if status == nil || status.Lead != uint64(rd0.ReplicaID) {
-		t.Fatalf("raft leader should be %d, but got status %+v", rd0.ReplicaID, status)
-	}
-
-	origCount0 := store0.Metrics().RangeRaftLeaderTransfers.Count()
-	// Transfer the lease. We'll then check that the leadership follows
-	// automatically.
-	transferLeaseArgs := adminTransferLeaseArgs(key, store1.StoreID())
-	_, pErr := kv.SendWrappedWith(ctx, store0, roachpb.Header{RangeID: repl0.RangeID}, transferLeaseArgs)
-	require.NoError(t, pErr.GoError())
-
-	// Verify leadership is transferred.
-	testutils.SucceedsSoon(t, func() error {
-		if a, e := repl0.RaftStatus().Lead, uint64(rd1.ReplicaID); a != e {
-			return errors.Errorf("expected raft leader be %d; got %d", e, a)
-		}
-		if a, e := store0.Metrics().RangeRaftLeaderTransfers.Count()-origCount0, int64(1); a < e {
-			return errors.Errorf("expected raft leader transfer count >= %d; got %d", e, a)
-		}
-		return nil
-	})
 }
 
 // Test that a single blocked replica does not block other replicas.
@@ -4026,17 +4364,23 @@ func TestRaftBlockedReplica(t *testing.T) {
 	tc.WaitForValues(t, roachpb.Key("a"), []int64{5, 5, 5})
 }
 
-// Test that ranges quiesce and if a follower unquiesces the leader is woken
-// up.
-func TestRangeQuiescence(t *testing.T) {
+// TestFollowersFallAsleep tests that followers fall asleep, and if the leader
+// crashes, the followers wake up and elects a new leader.
+func TestFollowersFallAsleep(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
+	st := cluster.MakeTestingClusterSettings()
+	// Only epoch based leases can be quiesced.
+	kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseLeader)
+	kvserver.RaftStoreLivenessQuiescenceEnabled.Override(ctx, &st.SV, true)
+
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
+				Settings: st,
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
 						DisableScanner: true,
@@ -4046,119 +4390,155 @@ func TestRangeQuiescence(t *testing.T) {
 		})
 	defer tc.Stopper().Stop(ctx)
 
-	pauseNodeLivenessHeartbeatLoops(tc)
 	key := tc.ScratchRange(t)
 	tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
 
-	waitForQuiescence := func(key roachpb.RKey) {
+	// Find the leader replica.
+	oldLeader := tc.GetRaftLeader(t, roachpb.RKey(key))
+	oldLeaderServerIdx := int(oldLeader.NodeID()) - 1
+
+	checkSleep := func(expected bool) {
 		testutils.SucceedsSoon(t, func() error {
 			for i := range tc.Servers {
-				rep := tc.GetFirstStoreFromServer(t, i).LookupReplica(key)
+				rep := tc.GetFirstStoreFromServer(t, i).LookupReplica(roachpb.RKey(key))
 				require.NotNil(t, rep)
-				if !rep.IsQuiescent() {
-					return errors.Errorf("%s not quiescent", rep)
+				isLeader := rep.ID() == oldLeader.ID()
+				if isLeader {
+					require.False(t, rep.IsAsleep())
+				} else {
+					if expected && !rep.IsAsleep() {
+						return errors.Errorf("%s not asleep yet", rep)
+					}
+					if !expected && rep.IsAsleep() {
+						return errors.Errorf("%s not awake yet", rep)
+					}
 				}
 			}
 			return nil
 		})
 	}
 
-	// Wait for the range to quiesce.
-	waitForQuiescence(roachpb.RKey(key))
+	// Wait for the followers to fall asleep.
+	checkSleep(true /* expected */)
 
-	// Find the leader replica.
-	leader := tc.GetRaftLeader(t, roachpb.RKey(key))
-
-	// Unquiesce a follower range, this should "wake the leader" and not result
-	// in an election.
-	followerIdx := int(leader.StoreID()) % len(tc.Servers)
-	tc.GetFirstStoreFromServer(t, followerIdx).EnqueueRaftUpdateCheck(tc.LookupRangeOrFatal(t, key).RangeID)
-
-	// Wait for a bunch of ticks to occur which will allow the follower time to
-	// campaign.
-	ticks := tc.GetFirstStoreFromServer(t, followerIdx).Metrics().RaftTicks.Count
-	for targetTicks := ticks() + int64(2*tc.GetFirstStoreFromServer(t, followerIdx).GetStoreConfig().RaftElectionTimeoutTicks); ticks() < targetTicks; {
-		time.Sleep(time.Millisecond)
-	}
-
-	// Wait for the range to quiesce again.
-	waitForQuiescence(roachpb.RKey(key))
-
-	// The leadership should not have changed.
-	if state := leader.RaftStatus().SoftState.RaftState; state != raft.StateLeader {
-		t.Fatalf("%s should be the leader: %s", leader, state)
-	}
+	// Stop the leader, and ensure a new leader is elected.
+	tc.StopServer(oldLeaderServerIdx)
+	checkSleep(false /* expected */)
+	testutils.SucceedsSoon(t, func() error {
+		newLeader := tc.GetRaftLeader(t, roachpb.RKey(key))
+		if oldLeader.ID() == newLeader.ID() {
+			return errors.Errorf("no new leader yet")
+		}
+		return nil
+	})
 }
 
-// TestInitRaftGroupOnRequest verifies that an uninitialized Raft group
-// is initialized if a request is received, even if the current range
-// lease points to a different replica.
-func TestInitRaftGroupOnRequest(t *testing.T) {
+// TestUninitializedReplicaQuiescence tests the uninitialized replica quiescence
+// behavior with various lease types.
+func TestUninitializedReplicaQuiescence(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	testutils.RunValues(t, "leaseType", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		ctx := context.Background()
+		st := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &st.SV, leaseType)
+		kvserver.RaftStoreLivenessQuiescenceEnabled.Override(ctx, &st.SV, true)
 
-	const numServers int = 2
-	stickyServerArgs := make(map[int]base.TestServerArgs)
-	for i := 0; i < numServers; i++ {
-		stickyServerArgs[i] = base.TestServerArgs{
-			StoreSpecs: []base.StoreSpec{
-				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
-				},
+		tc := testcluster.StartTestCluster(t, 2, base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				Settings: st,
 			},
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-				},
-			},
-		}
-	}
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numServers,
-		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
 		})
-	defer tc.Stopper().Stop(ctx)
+		defer tc.Stopper().Stop(ctx)
 
-	// Split so we can rely on RHS range being quiescent after a restart.
-	// We use UserTableDataMin to avoid having the range activated to
-	// gossip system table data.
-	splitKey := keys.UserTableDataMin
-	tc.SplitRangeOrFatal(t, splitKey)
-	tc.AddVotersOrFatal(t, splitKey, tc.Target(1))
-	desc := tc.LookupRangeOrFatal(t, splitKey)
-	leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
-	require.NoError(t, err)
+		_, desc, err := tc.Servers[0].ScratchRangeEx()
+		key := desc.StartKey.AsRawKey()
+		require.NoError(t, err)
+		require.NoError(t, tc.WaitForSplitAndInitialization(key))
 
-	require.NoError(t, tc.Restart())
+		// Block incoming snapshots on s2 until channel is signaled.
+		blockSnapshot := make(chan struct{})
+		handlerFuncs := kvtestutils.NoopRaftHandlerFuncs()
+		handlerFuncs.SnapErr = func(header *kvserverpb.SnapshotRequest_Header) error {
+			select {
+			case <-blockSnapshot:
+			case <-tc.Stopper().ShouldQuiesce():
+			}
+			return nil
+		}
+		s2, err := tc.Server(1).GetStores().(*kvserver.Stores).GetStore(tc.Server(1).GetFirstStoreID())
+		require.NoError(t, err)
+		tc.Servers[1].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(s2.StoreID(), &kvtestutils.UnreliableRaftHandler{
+			RangeID:                    desc.RangeID,
+			IncomingRaftMessageHandler: s2,
+			UnreliableRaftHandlerFuncs: handlerFuncs,
+		})
 
-	followerIdx := int(leaseHolder.StoreID) % numServers
-	followerStore := tc.GetFirstStoreFromServer(t, followerIdx)
+		// Try to up-replicate to s2. Should block on a learner snapshot after the new
+		// replica on s2 has been created, but before it has been initialized. While
+		// the replica is uninitialized, it should remain quiesced, even while it is
+		// receiving Raft traffic from the leader.
+		replicateErrChan := make(chan error)
+		go func() {
+			_, err := tc.AddVoters(key, tc.Target(1))
+			select {
+			case replicateErrChan <- err:
+			case <-tc.Stopper().ShouldQuiesce():
+			}
+		}()
+		testutils.SucceedsSoon(t, func() error {
+			repl, err := s2.GetReplica(desc.RangeID)
+			if err == nil {
+				// IMPORTANT: the replica should always be quiescent while uninitialized.
+				require.False(t, repl.IsInitialized())
+				require.True(t, repl.IsQuiescent())
+				// But it's always awake for the purposes of store liveness quiescence.
+				require.False(t, repl.IsAsleep())
+			}
+			return err
+		})
 
-	repl := followerStore.LookupReplica(roachpb.RKey(splitKey))
-	require.NotNil(t, repl)
-
-	// TODO(spencer): Raft messages seem to turn up
-	// occasionally on restart, which initialize the replica, so
-	// this is not a test failure. Not sure how to work around this
-	// problem.
-	// Verify the raft group isn't initialized yet.
-	if repl.IsRaftGroupInitialized() {
-		log.Errorf(ctx, "expected raft group to be uninitialized")
-	}
-	// Send an increment and verify that initializes the Raft group.
-	kv.SendWrapped(ctx,
-		followerStore.TestSender(), incrementArgs(splitKey, 1))
-
-	if !repl.IsRaftGroupInitialized() {
-		t.Fatal("expected raft group to be initialized")
-	}
+		// Let the snapshot through. The up-replication attempt should succeed. The
+		// replica should now be initialized, and the replica should quiesce again
+		// if it has an epoch based lease. If it holds a leader lease it should
+		// also fall asleep. Otherwise, if it holds an expiration based lease, it
+		// shouldn't quiesce or fall asleep.
+		close(blockSnapshot)
+		require.NoError(t, <-replicateErrChan)
+		repl, err := s2.GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		require.True(t, repl.IsInitialized())
+		require.False(t, repl.IsQuiescent())
+		switch leaseType {
+		case roachpb.LeaseEpoch:
+			testutils.SucceedsSoon(t, func() error {
+				if !repl.IsQuiescent() {
+					return errors.Errorf("%s not quiescent", repl)
+				}
+				return nil
+			})
+		case roachpb.LeaseLeader:
+			require.Never(t, func() bool {
+				return repl.IsQuiescent()
+			},
+				time.Second*3, 100*time.Millisecond, "replica shouldn't quiesce")
+			testutils.SucceedsSoon(t, func() error {
+				if !repl.IsAsleep() {
+					return errors.Errorf("%s not asleep", repl)
+				}
+				return nil
+			})
+		case roachpb.LeaseExpiration:
+			require.Never(t, func() bool {
+				return repl.IsQuiescent() || repl.IsAsleep()
+			},
+				time.Second*3, 100*time.Millisecond, "replica shouldn't quiesce or fall asleep")
+		default:
+			panic("unexpected lease type")
+		}
+	})
 }
 
 // TestFailedConfChange verifies correct behavior after a configuration change
@@ -4171,9 +4551,9 @@ func TestFailedConfChange(t *testing.T) {
 	// Trigger errors at apply time so they happen on both leaders and
 	// followers.
 	var filterActive int32
-	testingApplyFilter := func(filterArgs kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+	testingApplyFilter := func(filterArgs kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 		if atomic.LoadInt32(&filterActive) == 1 && filterArgs.ChangeReplicas != nil {
-			return 0, roachpb.NewErrorf("boom")
+			return 0, kvpb.NewErrorf("boom")
 		}
 		return 0, nil
 	}
@@ -4185,7 +4565,7 @@ func TestFailedConfChange(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Store: &kvserver.StoreTestingKnobs{
-						TestingApplyFilter: testingApplyFilter,
+						TestingApplyCalledTwiceFilter: testingApplyFilter,
 					},
 				},
 			},
@@ -4217,7 +4597,7 @@ func TestFailedConfChange(t *testing.T) {
 				i, l, repl.Desc())
 		}
 		status := repl.RaftStatus()
-		if status.RaftState != raft.StateLeader {
+		if status.RaftState != raftpb.StateLeader {
 			return errors.Errorf("store %d: expected StateLeader, was %s", i, status.RaftState)
 		}
 		// In issue #13506, the Progress map would be updated as if the
@@ -4241,7 +4621,7 @@ func TestFailedConfChange(t *testing.T) {
 			return err
 		}
 		status := repl.RaftStatus()
-		if status.RaftState != raft.StateLeader {
+		if status.RaftState != raftpb.StateLeader {
 			return errors.Errorf("store %d: expected StateLeader, was %s", 1, status.RaftState)
 		}
 		return nil
@@ -4256,174 +4636,188 @@ func TestStoreRangeWaitForApplication(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	var filterRangeIDAtomic int64
+	testutils.RunValues(t, "lease-type", roachpb.TestingAllLeaseTypes(),
+		func(t *testing.T, leaseType roachpb.LeaseType) {
+			var filterRangeIDAtomic int64
 
-	ctx := context.Background()
-	testingRequestFilter := func(_ context.Context, ba roachpb.BatchRequest) (retErr *roachpb.Error) {
-		if rangeID := roachpb.RangeID(atomic.LoadInt64(&filterRangeIDAtomic)); rangeID != ba.RangeID {
-			return nil
-		}
-		pErr := roachpb.NewErrorf("blocking %s in this test", ba.Summary())
-		if len(ba.Requests) != 1 {
-			return pErr
-		}
-		_, ok := ba.Requests[0].GetInner().(*roachpb.PutRequest)
-		if !ok {
-			return pErr
-		}
-		return nil
-	}
-
-	tc := testcluster.StartTestCluster(t, 3,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs: base.TestServerArgs{
-				Knobs: base.TestingKnobs{
-					Store: &kvserver.StoreTestingKnobs{
-						DisableReplicaGCQueue: true,
-						TestingRequestFilter:  testingRequestFilter,
-					},
-				},
-			},
-		})
-	defer tc.Stopper().Stop(ctx)
-
-	store0, store2 := tc.GetFirstStoreFromServer(t, 0), tc.GetFirstStoreFromServer(t, 2)
-	distSender := tc.Servers[0].DistSender()
-
-	key := []byte("a")
-	tc.SplitRangeOrFatal(t, key)
-	desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
-
-	repl0, err := store0.GetReplica(desc.RangeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	atomic.StoreInt64(&filterRangeIDAtomic, int64(desc.RangeID))
-
-	leaseIndex0 := repl0.LastAssignedLeaseIndex()
-
-	type target struct {
-		client kvserver.PerReplicaClient
-		header kvserver.StoreRequestHeader
-	}
-
-	var targets []target
-	for _, s := range tc.Servers {
-		conn, err := s.NodeDialer().(*nodedialer.Dialer).Dial(ctx, s.NodeID(), rpc.DefaultClass)
-		if err != nil {
-			t.Fatal(err)
-		}
-		targets = append(targets, target{
-			client: kvserver.NewPerReplicaClient(conn),
-			header: kvserver.StoreRequestHeader{NodeID: s.NodeID(), StoreID: s.GetFirstStoreID()},
-		})
-	}
-
-	// Wait for a command that is already applied. The request should return
-	// immediately.
-	for i, target := range targets {
-		_, err := target.client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
-			StoreRequestHeader: target.header,
-			RangeID:            desc.RangeID,
-			LeaseIndex:         leaseIndex0,
-		})
-		if err != nil {
-			t.Fatalf("%d: %+v", i, err)
-		}
-	}
-
-	const count = 5
-
-	// Wait for a command that is `count` indexes later.
-	var errChs []chan error
-	for _, target := range targets {
-		errCh := make(chan error)
-		errChs = append(errChs, errCh)
-		target := target
-		go func() {
-			_, err := target.client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
-				StoreRequestHeader: target.header,
-				RangeID:            desc.RangeID,
-				LeaseIndex:         leaseIndex0 + count,
-			})
-			errCh <- err
-		}()
-	}
-
-	// The request should not return when less than `count` commands have
-	// been issued.
-	putArgs := putArgs(roachpb.Key("foo"), []byte("bar"))
-	for i := 0; i < count-1; i++ {
-		if _, pErr := kv.SendWrapped(ctx, distSender, putArgs); pErr != nil {
-			t.Fatal(pErr)
-		}
-		// Wait a little bit to increase the likelihood that we observe an invalid
-		// ordering. This is not intended to be foolproof.
-		time.Sleep(10 * time.Millisecond)
-		for j, errCh := range errChs {
-			select {
-			case err := <-errCh:
-				t.Fatalf("%d: WaitForApplication returned early (request: %d, err: %v)", j, i, err)
-			default:
+			ctx := context.Background()
+			testingRequestFilter := func(_ context.Context, ba *kvpb.BatchRequest) (retErr *kvpb.Error) {
+				if rangeID := roachpb.RangeID(atomic.LoadInt64(&filterRangeIDAtomic)); rangeID != ba.RangeID {
+					return nil
+				}
+				pErr := kvpb.NewErrorf("blocking %s in this test", ba.Summary())
+				if len(ba.Requests) != 1 {
+					return pErr
+				}
+				_, ok := ba.Requests[0].GetInner().(*kvpb.PutRequest)
+				if !ok {
+					return pErr
+				}
+				return nil
 			}
-		}
-	}
 
-	// Once the `count`th command has been issued, the request should return.
-	if _, pErr := kv.SendWrapped(ctx, distSender, putArgs); pErr != nil {
-		t.Fatal(pErr)
-	}
-	for i, errCh := range errChs {
-		if err := <-errCh; err != nil {
-			t.Fatalf("%d: %+v", i, err)
-		}
-	}
+			settings := cluster.MakeTestingClusterSettings()
+			kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
+			tc := testcluster.StartTestCluster(t, 3,
+				base.TestClusterArgs{
+					ReplicationMode: base.ReplicationManual,
+					ServerArgs: base.TestServerArgs{
+						Settings: settings,
+						Knobs: base.TestingKnobs{
+							Store: &kvserver.StoreTestingKnobs{
+								TestingRequestFilter: testingRequestFilter,
+								// This test relies on a stable LAI, so we need to disable GC
+								// queue and async intent resolution to avoid the LAI being
+								// incremented in the middle of the test.
+								DisableReplicaGCQueue: true,
+								IntentResolverKnobs: kvserverbase.IntentResolverTestingKnobs{
+									DisableAsyncIntentResolution: true,
+								},
+							},
+						},
+					},
+				})
+			defer tc.Stopper().Stop(ctx)
 
-	atomic.StoreInt64(&filterRangeIDAtomic, 0)
+			store0, store2 := tc.GetFirstStoreFromServer(t, 0), tc.GetFirstStoreFromServer(t, 2)
+			distSender := tc.Servers[0].DistSenderI().(kv.Sender)
 
-	// GC the replica while a request is in progress. The request should return
-	// an error.
-	go func() {
-		_, err := targets[2].client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
-			StoreRequestHeader: targets[2].header,
-			RangeID:            desc.RangeID,
-			LeaseIndex:         math.MaxUint64,
+			key := []byte("a")
+			tc.SplitRangeOrFatal(t, key)
+			desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+
+			repl0, err := store0.GetReplica(desc.RangeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// We wait for lease upgrade to avoid the lease being upgraded after we
+			// capture the LAI.
+			tc.MaybeWaitForLeaseUpgrade(ctx, t, desc)
+			leaseIndex0 := repl0.GetLeaseAppliedIndex()
+
+			atomic.StoreInt64(&filterRangeIDAtomic, int64(desc.RangeID))
+			type target struct {
+				client kvserver.RPCPerReplicaClient
+				header kvserver.StoreRequestHeader
+			}
+
+			var targets []target
+			for _, s := range tc.Servers {
+				client, err := kvserver.DialPerReplicaClient(s.NodeDialer().(*nodedialer.Dialer), ctx, s.NodeID(), rpcbase.DefaultClass)
+				if err != nil {
+					t.Fatal(err)
+				}
+				targets = append(targets, target{
+					client: client,
+					header: kvserver.StoreRequestHeader{NodeID: s.NodeID(), StoreID: s.GetFirstStoreID()},
+				})
+			}
+
+			// Wait for a command that is already applied. The request should return
+			// immediately.
+			for i, target := range targets {
+				_, err := target.client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
+					StoreRequestHeader: target.header,
+					RangeID:            desc.RangeID,
+					LeaseIndex:         leaseIndex0,
+				})
+				if err != nil {
+					t.Fatalf("%d: %+v", i, err)
+				}
+			}
+
+			const count = 5
+
+			// Wait for a command that is `count` indexes later.
+			var errChs []chan error
+			for _, target := range targets {
+				errCh := make(chan error)
+				errChs = append(errChs, errCh)
+				target := target
+				go func() {
+					_, err := target.client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
+						StoreRequestHeader: target.header,
+						RangeID:            desc.RangeID,
+						LeaseIndex:         leaseIndex0 + count,
+					})
+					errCh <- err
+				}()
+			}
+
+			// The request should not return when less than `count` commands have
+			// been issued.
+			putArgs := putArgs(roachpb.Key("foo"), []byte("bar"))
+			for i := 0; i < count-1; i++ {
+				if _, pErr := kv.SendWrapped(ctx, distSender, putArgs); pErr != nil {
+					t.Fatal(pErr)
+				}
+				// Wait a little bit to increase the likelihood that we observe an invalid
+				// ordering. This is not intended to be foolproof.
+				time.Sleep(10 * time.Millisecond)
+				for j, errCh := range errChs {
+					select {
+					case err := <-errCh:
+						t.Fatalf("%d: WaitForApplication returned early (request: %d, err: %v)", j, i, err)
+					default:
+					}
+				}
+			}
+
+			// Once the `count`th command has been issued, the request should return.
+			if _, pErr := kv.SendWrapped(ctx, distSender, putArgs); pErr != nil {
+				t.Fatal(pErr)
+			}
+			for i, errCh := range errChs {
+				if err := <-errCh; err != nil {
+					t.Fatalf("%d: %+v", i, err)
+				}
+			}
+
+			atomic.StoreInt64(&filterRangeIDAtomic, 0)
+
+			// GC the replica while a request is in progress. The request should return
+			// an error.
+			go func() {
+				_, err := targets[2].client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
+					StoreRequestHeader: targets[2].header,
+					RangeID:            desc.RangeID,
+					LeaseIndex:         math.MaxInt64,
+				})
+				errChs[2] <- err
+			}()
+			repl2, err := store2.GetReplica(desc.RangeID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.RemoveVotersOrFatal(t, key, tc.Target(2))
+			if err := store2.ManualReplicaGC(repl2); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := repl2.IsDestroyed(); err == nil {
+				t.Fatalf("replica was not destroyed after gc on store2")
+			}
+			err = <-errChs[2]
+			if exp := fmt.Sprintf("r%d was not found", desc.RangeID); !testutils.IsError(err, exp) {
+				t.Fatalf("expected %q error, but got %v", exp, err)
+			}
+
+			// Allow the client context to time out while a request is in progress. The
+			// request should return an error.
+			{
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
+				defer cancel()
+				_, err := targets[0].client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
+					StoreRequestHeader: targets[0].header,
+					RangeID:            desc.RangeID,
+					LeaseIndex:         math.MaxInt64,
+				})
+				if exp := "context deadline exceeded"; !testutils.IsError(err, exp) {
+					t.Fatalf("expected %q error, but got %v", exp, err)
+				}
+			}
 		})
-		errChs[2] <- err
-	}()
-	repl2, err := store2.GetReplica(desc.RangeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc.RemoveVotersOrFatal(t, key, tc.Target(2))
-	if err := store2.ManualReplicaGC(repl2); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repl2.IsDestroyed(); err == nil {
-		t.Fatalf("replica was not destroyed after gc on store2")
-	}
-	err = <-errChs[2]
-	if exp := fmt.Sprintf("r%d was not found", desc.RangeID); !testutils.IsError(err, exp) {
-		t.Fatalf("expected %q error, but got %v", exp, err)
-	}
-
-	// Allow the client context to time out while a request is in progress. The
-	// request should return an error.
-	{
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 50*time.Millisecond)
-		defer cancel()
-		_, err := targets[0].client.WaitForApplication(ctx, &kvserver.WaitForApplicationRequest{
-			StoreRequestHeader: targets[0].header,
-			RangeID:            desc.RangeID,
-			LeaseIndex:         math.MaxUint64,
-		})
-		if exp := "context deadline exceeded"; !testutils.IsError(err, exp) {
-			t.Fatalf("expected %q error, but got %v", exp, err)
-		}
-	}
 }
 
 func TestStoreWaitForReplicaInit(t *testing.T) {
@@ -4438,11 +4832,10 @@ func TestStoreWaitForReplicaInit(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	store := tc.GetFirstStoreFromServer(t, 0)
 
-	conn, err := tc.Servers[0].NodeDialer().(*nodedialer.Dialer).Dial(ctx, store.Ident.NodeID, rpc.DefaultClass)
+	client, err := kvserver.DialPerReplicaClient(tc.Servers[0].NodeDialer().(*nodedialer.Dialer), ctx, store.Ident.NodeID, rpcbase.DefaultClass)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := kvserver.NewPerReplicaClient(conn)
 	storeHeader := kvserver.StoreRequestHeader{NodeID: store.Ident.NodeID, StoreID: store.Ident.StoreID}
 
 	// Test that WaitForReplicaInit returns successfully if the replica exists.
@@ -4470,31 +4863,32 @@ func TestStoreWaitForReplicaInit(t *testing.T) {
 	// Test that WaitForReplicaInit times out if the replica exists but is not
 	// initialized.
 	{
-		// Constructing an permanently-uninitialized replica is somewhat difficult.
+		// Constructing a permanently-uninitialized replica is somewhat difficult.
 		// Sending a fake Raft heartbeat for a range ID that the store hasn't seen
 		// before does the trick.
-		var repl44 *kvserver.Replica
+		const unusedRangeID = 1234
+		var repl *kvserver.Replica
 		testutils.SucceedsSoon(t, func() (err error) {
 			// Try several times, as the message may be dropped (see #18355).
-			tc.Servers[0].RaftTransport().SendAsync(&kvserver.RaftMessageRequest{
+			tc.Servers[0].RaftTransport().(*kvserver.RaftTransport).SendAsync(&kvserverpb.RaftMessageRequest{
 				ToReplica: roachpb.ReplicaDescriptor{
 					NodeID:  store.Ident.NodeID,
 					StoreID: store.Ident.StoreID,
 				},
-				Heartbeats: []kvserver.RaftHeartbeat{{RangeID: 44, ToReplicaID: 1}},
-			}, rpc.DefaultClass)
-			repl44, err = store.GetReplica(44)
+				Heartbeats: []kvserverpb.RaftHeartbeat{{RangeID: unusedRangeID, ToReplicaID: 1}},
+			}, rpcbase.DefaultClass)
+			repl, err = store.GetReplica(unusedRangeID)
 			return err
 		})
-		if repl44.IsInitialized() {
-			t.Fatalf("test bug: repl44 is initialized")
+		if repl.IsInitialized() {
+			t.Fatalf("test bug: range %d is initialized", unusedRangeID)
 		}
 
 		timeoutCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 		defer cancel()
 		_, err = client.WaitForReplicaInit(timeoutCtx, &kvserver.WaitForReplicaInitRequest{
 			StoreRequestHeader: storeHeader,
-			RangeID:            roachpb.RangeID(44),
+			RangeID:            roachpb.RangeID(unusedRangeID),
 		})
 		if exp := "context deadline exceeded"; !testutils.IsError(err, exp) {
 			t.Fatalf("expected %q error, but got %v", exp, err)
@@ -4532,11 +4926,11 @@ func TestTracingDoesNotRaceWithCancelation(t *testing.T) {
 	require.Nil(t, err)
 
 	for i := 0; i < 3; i++ {
-		tc.Servers[i].RaftTransport().Listen(tc.Target(i).StoreID, &unreliableRaftHandler{
-			rangeID:            ri.Desc.RangeID,
-			RaftMessageHandler: tc.GetFirstStoreFromServer(t, i),
-			unreliableRaftHandlerFuncs: unreliableRaftHandlerFuncs{
-				dropReq: func(req *kvserver.RaftMessageRequest) bool {
+		tc.Servers[i].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(tc.Target(i).StoreID, &kvtestutils.UnreliableRaftHandler{
+			RangeID:                    ri.Desc.RangeID,
+			IncomingRaftMessageHandler: tc.GetFirstStoreFromServer(t, i),
+			UnreliableRaftHandlerFuncs: kvtestutils.UnreliableRaftHandlerFuncs{
+				DropReq: func(req *kvserverpb.RaftMessageRequest) bool {
 					return rand.Intn(2) == 0
 				},
 			},
@@ -4564,16 +4958,71 @@ func TestTracingDoesNotRaceWithCancelation(t *testing.T) {
 	wg.Wait()
 }
 
+// disablingClientStream allows delaying rRPC messages based on a user provided
+// function. It is OK to arbitrarily delay messages, but if they are dropped, it
+// breaks application level expectations of in-order delivery. By returning nil
+// immediately, and then sending when the stream is not disabled, we don't break
+// the SendMsg contract. Note that this test is still a little too high level in
+// the sense that it is blocking at the gRPC layer, and not the TCP layer, but
+// that is much more complex to fully implement, and this should get equivalent
+// results.
 type disablingClientStream struct {
 	grpc.ClientStream
-	disabled *atomic.Value
+	wasDisabled bool
+	buffer      []interface{}
+	disabled    func() bool
 }
 
 func (cs *disablingClientStream) SendMsg(m interface{}) error {
-	if cs.disabled.Load().(bool) {
+	// When the stream is disabled, buffer all the messages, but don't send.
+	if cs.disabled() {
+		cs.buffer = append(cs.buffer, m)
+		cs.wasDisabled = true
 		return nil
 	}
+	// Now that it transitioned from disabled to not disabled, flush all the
+	// messages out in the same order as originally expected.
+	if cs.wasDisabled {
+		for _, buf := range cs.buffer {
+			_ = cs.ClientStream.SendMsg(buf)
+		}
+		cs.buffer = nil
+		cs.wasDisabled = false
+	}
+
 	return cs.ClientStream.SendMsg(m)
+}
+
+// disablingDRPCClientStream is the DRPC equivalent of disablingClientStream.
+// It wraps a drpc.Stream and delays MsgSend calls when the disabled function
+// returns true, buffering messages and flushing them when re-enabled.
+type disablingDRPCClientStream struct {
+	drpc.Stream
+	wasDisabled bool
+	buffer      []struct {
+		msg drpc.Message
+		enc drpc.Encoding
+	}
+	disabled func() bool
+}
+
+func (cs *disablingDRPCClientStream) MsgSend(msg drpc.Message, enc drpc.Encoding) error {
+	if cs.disabled() {
+		cs.buffer = append(cs.buffer, struct {
+			msg drpc.Message
+			enc drpc.Encoding
+		}{msg, enc})
+		cs.wasDisabled = true
+		return nil
+	}
+	if cs.wasDisabled {
+		for _, buf := range cs.buffer {
+			_ = cs.Stream.MsgSend(buf.msg, buf.enc)
+		}
+		cs.buffer = nil
+		cs.wasDisabled = false
+	}
+	return cs.Stream.MsgSend(msg, enc)
 }
 
 // TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic tests that
@@ -4583,20 +5032,25 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	stopper := stop.NewStopper()
 	ctx := context.Background()
 	defer stopper.Stop(ctx)
 
 	// disabled controls whether to disrupt DefaultClass streams.
-	var disabled atomic.Value
+	var disabled, disabledSystem atomic.Value
 	disabled.Store(false)
+	disabledSystem.Store(false)
 	knobs := rpc.ContextTestingKnobs{
-		StreamClientInterceptor: func(target string, class rpc.ConnectionClass) grpc.StreamClientInterceptor {
-			if class == rpc.SystemClass {
-				return nil
+		StreamClientInterceptor: func(target string, class rpcbase.ConnectionClass) grpc.StreamClientInterceptor {
+			disabledFunc := func() bool {
+				if class == rpcbase.SystemClass {
+					return disabledSystem.Load().(bool)
+				}
+				return disabled.Load().(bool)
 			}
 			return func(
 				ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
@@ -4607,27 +5061,55 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 					return nil, err
 				}
 				return &disablingClientStream{
-					disabled:     &disabled,
+					disabled:     disabledFunc,
 					ClientStream: cs,
+				}, nil
+			}
+		},
+		StreamClientInterceptorDRPC: func(target string, class rpcbase.ConnectionClass) drpcclient.StreamClientInterceptor {
+			disabledFunc := func() bool {
+				if class == rpcbase.SystemClass {
+					return disabledSystem.Load().(bool)
+				}
+				return disabled.Load().(bool)
+			}
+			return func(
+				ctx context.Context, rpc string, enc drpc.Encoding, cc *drpcclient.ClientConn,
+				streamer drpcclient.Streamer,
+			) (drpc.Stream, error) {
+				s, err := streamer(ctx, rpc, enc, cc)
+				if err != nil {
+					return nil, err
+				}
+				return &disablingDRPCClientStream{
+					disabled: disabledFunc,
+					Stream:   s,
 				}, nil
 			}
 		},
 	}
 
+	// This test relies on epoch leases being invalidated when a node restart,
+	// which isn't true for expiration leases, so we disable expiration lease
+	// metamorphism.
+	st := cluster.MakeTestingClusterSettings()
+	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
+
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	for i := 0; i < numServers; i++ {
 		stickyServerArgs[i] = base.TestServerArgs{
+			Settings: st,
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					ContextTestingKnobs:  knobs,
-					StickyEngineRegistry: stickyEngineRegistry,
+					ContextTestingKnobs: knobs,
+					StickyVFSRegistry:   stickyVFSRegistry,
 				},
 			},
 		}
@@ -4635,14 +5117,20 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 
 	tc := testcluster.StartTestCluster(t, numServers,
 		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 	// Make a key that's in the user data space.
 	keyA := append(keys.SystemSQLCodec.TablePrefix(100), 'a')
+	// Split so that we can assign voters to the range and assign all three.
 	tc.SplitRangeOrFatal(t, keyA)
-	desc := tc.AddVotersOrFatal(t, keyA, tc.Targets(1, 2)...)
+	tc.AddVotersOrFatal(t, keyA, tc.Targets(1, 2)...)
+
+	// We need a key in the meta range that we can add voters to. This range can't be split.
+	keyLiveness := append(keys.NodeLivenessPrefix, 'a')
+	tc.AddVotersOrFatal(t, keys.NodeLivenessPrefix, tc.Targets(1, 2)...)
 	// Create a test function so that we can run the test both immediately after
 	// up-replicating and after a restart.
 	runTest := func(t *testing.T) {
@@ -4654,44 +5142,48 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 		// Wait for all nodes to catch up.
 		tc.WaitForValues(t, keyA, []int64{1, 1, 1})
 		disabled.Store(true)
-		repl1, err := store.GetReplica(desc.RangeID)
-		require.Nil(t, err)
-		// Transfer the lease on the range. Make sure there's no pending transfer.
-		var lease roachpb.Lease
-		testutils.SucceedsSoon(t, func() error {
-			var next roachpb.Lease
-			lease, next = repl1.GetLease()
-			if next != (roachpb.Lease{}) {
-				return fmt.Errorf("lease transfer in process, next = %v", next)
-			}
-			return nil
+
+		// Create a pair of utilities to perform operations under suitable timeouts.
+		expSucceed := func(msg string, fn func(context.Context) error) {
+			// Set a long timeout so that this test doesn't flake under stress.
+			// We should never hit it.
+			ctxTimeout, cancel := context.WithTimeout(ctx, testutils.DefaultSucceedsSoonDuration)
+			defer cancel()
+			require.NoError(t, fn(ctxTimeout), "Expected success "+msg)
+		}
+		expTimeout := func(msg string, fn func(context.Context) error) {
+			// Set a relatively short timeout so that this test doesn't take too long.
+			// We should always hit it.
+			ctxTimeout, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			defer cancel()
+			require.ErrorIs(t, fn(ctxTimeout), context.DeadlineExceeded, "Expected timeout "+msg)
+		}
+
+		// Write to the liveness range on the System class.
+		expSucceed("writing to liveness range", func(ctx context.Context) error {
+			return db.Put(ctx, keyLiveness, 2)
 		})
 
-		// Use SucceedsSoon to deal with rare stress cases where the lease
-		// transfer may fail.
-		testutils.SucceedsSoon(t, func() error {
-			return tc.TransferRangeLease(*repl1.Desc(), roachpb.ReplicationTarget{
-				NodeID:  roachpb.NodeID(lease.Replica.StoreID),
-				StoreID: lease.Replica.StoreID})
-		})
-		// Set a relatively short timeout so that this test doesn't take too long.
-		// We should always hit it.
-		withTimeout, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-		defer cancel()
-		err = db.Put(withTimeout, keyA, 2)
-		require.True(t, testutils.IsError(err, "deadline exceeded"), err)
-		// Transfer the lease back to demonstrate that the system range is still live.
-		testutils.SucceedsSoon(t, func() error {
-			return tc.TransferRangeLease(desc, roachpb.ReplicationTarget{
-				NodeID:  roachpb.NodeID(lease.Replica.StoreID),
-				StoreID: lease.Replica.StoreID})
+		// Write to the standard range on the default class.
+		expTimeout("writing to key range", func(ctx context.Context) error {
+			return db.Put(ctx, keyA, 2)
 		})
 
-		// Heal the partition, the previous proposal may now succeed but it may have
+		// Write to the liveness range on the System class with system disabled to
+		// ensure the test is actually working.
+		disabledSystem.Store(true)
+		expTimeout("writing to liveness range", func(ctx context.Context) error {
+			return db.Put(ctx, keyLiveness, 2)
+		})
+		disabledSystem.Store(false)
+
+		// Heal the partition, the previous proposal may now succeed but it also may
 		// have been canceled.
 		disabled.Store(false)
 		// Overwrite with a new value and ensure that it propagates.
-		require.NoError(t, db.Put(ctx, keyA, 3))
+		expSucceed("after healed partition", func(ctx context.Context) error {
+			return db.Put(ctx, keyA, 3)
+		})
 		tc.WaitForValues(t, keyA, []int64{3, 3, 3})
 	}
 	t.Run("initial_run", runTest)
@@ -4709,11 +5201,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 		repls            int
 		expAckBeforeAppl bool
 	}{
-		// In a single-replica Range, each handleRaftReady iteration will append
-		// new entries to the Raft log and immediately apply them. This prevents
-		// "early acknowledgement" from being possible or useful. See the comment
-		// on apply.Task.AckCommittedEntriesBeforeApplication.
-		{1, false},
+
 		// In a three-replica Range, each handleRaftReady iteration will append
 		// a set of entries to the Raft log and then apply the previous set of
 		// entries. This makes "early acknowledgement" a major optimization, as
@@ -4721,13 +5209,16 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 		// to the Raft log out of the client-perceived latency of the previous
 		// set of entries.
 		{3, true},
+		// In the past, single-replica groups behaved differently but as of #89632
+		// they too rely on early-acks as a major performance improvement.
+		{1, true},
 	} {
 		t.Run(fmt.Sprintf("numRepls=%d", testcase.repls), func(t *testing.T) {
 			var filterActive int32
 			var magicTS hlc.Timestamp
 			blockPreApplication, blockPostApplication := make(chan struct{}), make(chan struct{})
 			applyFilterFn := func(ch chan struct{}) kvserverbase.ReplicaApplyFilter {
-				return func(filterArgs kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
+				return func(filterArgs kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
 					if atomic.LoadInt32(&filterActive) == 1 && filterArgs.WriteTimestamp == magicTS {
 						<-ch
 					}
@@ -4742,8 +5233,8 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 					ServerArgs: base.TestServerArgs{
 						Knobs: base.TestingKnobs{
 							Store: &kvserver.StoreTestingKnobs{
-								TestingApplyFilter:     applyFilterFn(blockPreApplication),
-								TestingPostApplyFilter: applyFilterFn(blockPostApplication),
+								TestingApplyCalledTwiceFilter: applyFilterFn(blockPreApplication),
+								TestingPostApplyFilter:        applyFilterFn(blockPostApplication),
 							},
 						},
 					},
@@ -4760,10 +5251,10 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 			// Begin peforming a write on the Range.
 			magicTS = tc.Servers[0].Clock().Now()
 			atomic.StoreInt32(&filterActive, 1)
-			ch := make(chan *roachpb.Error, 1)
+			ch := make(chan *kvpb.Error, 1)
 			go func() {
 				put := putArgs(key, []byte("val"))
-				_, pErr := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 0).TestSender(), roachpb.Header{
+				_, pErr := kv.SendWrappedWith(ctx, tc.GetFirstStoreFromServer(t, 0).TestSender(), kvpb.Header{
 					Timestamp: magicTS,
 				}, put)
 				ch <- pErr
@@ -4772,7 +5263,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 			expResult := func() {
 				t.Helper()
 				if pErr := <-ch; pErr != nil {
-					t.Fatalf("unexpected proposal result error: %v", pErr)
+					t.Errorf("unexpected proposal result error: %v", pErr)
 				}
 			}
 			dontExpResult := func() {
@@ -4781,7 +5272,7 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 				case <-time.After(10 * time.Millisecond):
 					// Expected.
 				case pErr := <-ch:
-					t.Fatalf("unexpected proposal acknowledged before TestingApplyFilter: %v", pErr)
+					t.Errorf("unexpected proposal acknowledged before TestingApplyCalledTwiceFilter: %v", pErr)
 				}
 			}
 
@@ -4810,646 +5301,35 @@ func TestAckWriteBeforeApplication(t *testing.T) {
 	}
 }
 
-// TestProcessSplitAfterRightHandSideHasBeenRemoved tests cases where we have
-// a follower replica which has received information about the RHS of a split
-// before it has processed that split. The replica can't both have an
-// initialized RHS and process the split but it can have (1) an uninitialized
-// RHS with a higher replica ID than in the split and (2) a RHS with an unknown
-// replica ID and a tombstone with a higher replica ID than in the split.
-// It may learn about a newer replica ID than the split without ever hearing
-// about the split replica. If it does not crash (3) it will know that the
-// split replica is too old and will not initialize it. If the node does
-// crash (4) it will forget it had learned about the higher replica ID and
-// will initialize the RHS as the split replica.
-//
-// Starting in 19.2 if a replica discovers from a raft message that it is an
-// old replica then it knows that it has been removed and re-added to the range.
-// In this case the Replica eagerly destroys itself and its data.
-//
-// Given this behavior there are 4 troubling cases with regards to splits.
-//
-//   *  In all cases we begin with s1 processing a presplit snapshot for
-//      r20. After the split the store should have r21/3.
-//
-// In the first two cases the following occurs:
-//
-//   *  s1 receives a message for r21/3 prior to acquiring the split lock
-//      in r21. This will create an uninitialized r21/3 which may write
-//      HardState.
-//
-//   *  Before the r20 processes the split r21 is removed and re-added to
-//      s1 as r21/4. s1 receives a raft message destined for r21/4 and proceeds
-//      to destroy its uninitialized r21/3, laying down a tombstone at 4 in the
-//      process.
-//
-//  (1) s1 processes the split and finds the RHS to be an uninitialized replica
-//      with a higher replica ID.
-//
-//  (2) s1 crashes before processing the split, forgetting the replica ID of the
-//      RHS but retaining its tombstone.
-//
-// In both cases we know that the RHS could not have committed anything because
-// it cannot have gotten a snapshot but we want to be sure to not synthesize a
-// HardState for the RHS that contains a non-zero commit index if we know that
-// the RHS will need another snapshot later.
-//
-// In the third and fourth cases:
-//
-//   *  s1 never receives a message for r21/3.
-//
-//   *  Before the r20 processes the split r21 is removed and re-added to
-//      s1 as r21/4. s1 receives a raft message destined for r21/4 and has never
-//      heard about r21/3.
-//
-//  (3) s1 processes the split and finds the RHS to be an uninitialized replica
-//      with a higher replica ID (but without a tombstone). This case is very
-//      similar to (1)
-//
-//  (4) s1 crashes still before processing the split, forgetting that it had
-//      known about r21/4. When it reboots r21/4 is totally partitioned and
-//      r20 becomes unpartitioned.
-//
-//   *  r20 processes the split successfully and initialized r21/3.
-//
-// In the 4th case we find that until we unpartition r21/4 (the RHS) and let it
-// learn about its removal with a ReplicaTooOldError that it will be initialized
-// with a CommitIndex at 10 as r21/3, the split's value. After r21/4 becomes
-// unpartitioned it will learn it is removed by either catching up on its
-// its log or receiving a ReplicaTooOldError which will lead to a tombstone.
-//
-func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-
-	noopProposalFilter := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
-		return nil
-	})
-	var proposalFilter atomic.Value
-	proposalFilter.Store(noopProposalFilter)
-	testingProposalFilter := func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
-		return proposalFilter.Load().(kvserverbase.ReplicaProposalFilter)(args)
-	}
-
-	increment := func(t *testing.T, db *kv.DB, key roachpb.Key, by int64) {
-		b := &kv.Batch{}
-		b.AddRawRequest(incrementArgs(key, by))
-		require.NoError(t, db.Run(ctx, b))
-	}
-	ensureNoTombstone := func(t *testing.T, store *kvserver.Store, rangeID roachpb.RangeID) {
-		t.Helper()
-		var tombstone roachpb.RangeTombstone
-		tombstoneKey := keys.RangeTombstoneKey(rangeID)
-		ok, err := storage.MVCCGetProto(
-			ctx, store.Engine(), tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
-		)
-		require.NoError(t, err)
-		require.False(t, ok)
-	}
-	getHardState := func(
-		t *testing.T, store *kvserver.Store, rangeID roachpb.RangeID,
-	) raftpb.HardState {
-		hs, err := stateloader.Make(rangeID).LoadHardState(ctx, store.Engine())
-		require.NoError(t, err)
-		return hs
-	}
-	partitionReplicaOnSplit := func(t *testing.T, tc *testcluster.TestCluster, key roachpb.Key, basePartition *testClusterPartitionedRange, partRange **testClusterPartitionedRange) {
-		// Set up a hook to partition the RHS range at its initial range ID
-		// before proposing the split trigger.
-		var setupOnce sync.Once
-		f := kvserverbase.ReplicaProposalFilter(func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
-			req, ok := args.Req.GetArg(roachpb.EndTxn)
-			if !ok {
-				return nil
-			}
-			endTxn := req.(*roachpb.EndTxnRequest)
-			if endTxn.InternalCommitTrigger == nil || endTxn.InternalCommitTrigger.SplitTrigger == nil {
-				return nil
-			}
-			split := endTxn.InternalCommitTrigger.SplitTrigger
-
-			if !split.RightDesc.StartKey.Equal(key) {
-				return nil
-			}
-			setupOnce.Do(func() {
-				replDesc, ok := split.RightDesc.GetReplicaDescriptor(1)
-				require.True(t, ok)
-				var err error
-				*partRange, err = basePartition.extend(tc, split.RightDesc.RangeID, replDesc.ReplicaID,
-					0 /* partitionedNode */, true /* activated */, unreliableRaftHandlerFuncs{})
-				require.NoError(t, err)
-				proposalFilter.Store(noopProposalFilter)
-			})
-			return nil
-		})
-		proposalFilter.Store(f)
-	}
-
-	// The basic setup for all of these tests are that we have a LHS range on 3
-	// nodes and we've partitioned store 0 for the LHS range. The tests will now
-	// perform a split, remove the RHS, add it back and validate assumptions.
-	//
-	// Different outcomes will occur depending on whether and how the RHS is
-	// partitioned and whether the server is killed. In all cases we want the
-	// split to succeed and the RHS to eventually also be on all 3 nodes.
-	setup := func(t *testing.T) (
-		tc *testcluster.TestCluster,
-		db *kv.DB,
-		keyA, keyB roachpb.Key,
-		lhsID roachpb.RangeID,
-		lhsPartition *testClusterPartitionedRange,
-		stickyEngineRegistry server.StickyInMemEnginesRegistry,
-	) {
-		stickyEngineRegistry = server.NewStickyInMemEnginesRegistry()
-		const numServers int = 3
-		stickyServerArgs := make(map[int]base.TestServerArgs)
-		for i := 0; i < numServers; i++ {
-			stickyServerArgs[i] = base.TestServerArgs{
-				StoreSpecs: []base.StoreSpec{
-					{
-						InMemory:               true,
-						StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
-					},
-				},
-				Knobs: base.TestingKnobs{
-					Server: &server.TestingKnobs{
-						StickyEngineRegistry: stickyEngineRegistry,
-					},
-					Store: &kvserver.StoreTestingKnobs{
-						// Newly-started stores (including the "rogue" one) should not GC
-						// their replicas. We'll turn this back on when needed.
-						DisableReplicaGCQueue: true,
-						TestingProposalFilter: testingProposalFilter,
-					},
-				},
-				RaftConfig: base.RaftConfig{
-					RaftDelaySplitToSuppressSnapshotTicks: 0,
-					// Make the tick interval short so we don't need to wait too long for the
-					// partitioned leader to time out. Also make the
-					// RangeLeaseRaftElectionTimeout multiplier high so that system ranges
-					// like node liveness can actually get leases.
-					RaftTickInterval:                        10 * time.Millisecond,
-					RangeLeaseRaftElectionTimeoutMultiplier: 1000,
-				},
-			}
-		}
-
-		tc = testcluster.StartTestCluster(t, numServers,
-			base.TestClusterArgs{
-				ReplicationMode:   base.ReplicationManual,
-				ServerArgsPerNode: stickyServerArgs,
-			})
-
-		db = tc.GetFirstStoreFromServer(t, 1).DB()
-
-		// Split off a non-system range so we don't have to account for node liveness
-		// traffic.
-		scratchTableKey := tc.ScratchRangeWithExpirationLease(t)
-		// Put some data in the range so we'll have something to test for.
-		keyA = append(append(roachpb.Key{}, scratchTableKey...), 'a')
-		keyB = append(append(roachpb.Key{}, scratchTableKey...), 'b')
-		// First put the range on all three nodes.
-		desc := tc.AddVotersOrFatal(t, scratchTableKey, tc.Targets(1, 2)...)
-
-		// Set up a partition for the LHS range only. Initially it is not active.
-		lhsPartition, err := setupPartitionedRange(tc, desc.RangeID,
-			0 /* replicaID */, 0 /* partitionedNode */, false /* activated */, unreliableRaftHandlerFuncs{})
-		require.NoError(t, err)
-		// Wait for all nodes to catch up.
-		increment(t, db, keyA, 5)
-		tc.WaitForValues(t, keyA, []int64{5, 5, 5})
-
-		// Transfer the lease off of node 0.
-		tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(2))
-
-		// Make sure everybody knows about that transfer.
-		increment(t, db, keyA, 1)
-		tc.WaitForValues(t, keyA, []int64{6, 6, 6})
-		lhsPartition.activate()
-
-		increment(t, db, keyA, 1)
-		tc.WaitForValues(t, keyA, []int64{6, 7, 7})
-		return tc, db, keyA, keyB, lhsID, lhsPartition, stickyEngineRegistry
-	}
-
-	// In this case we only have the LHS partitioned. The RHS will learn about its
-	// identity as the replica in the split and after being re-added will learn
-	// about the new replica ID and will lay down a tombstone. At this point we'll
-	// partition the RHS and ensure that the split does not clobber the RHS's hard
-	// state.
-	t.Run("(1) no RHS partition", func(t *testing.T) {
-		tc, db, keyA, keyB, _, lhsPartition, stickyEngineRegistry := setup(t)
-		defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
-		defer tc.Stopper().Stop(ctx)
-		tc.SplitRangeOrFatal(t, keyB)
-
-		// Write a value which we can observe to know when the split has been
-		// applied by the LHS.
-		increment(t, db, keyA, 1)
-		tc.WaitForValues(t, keyA, []int64{6, 8, 8})
-
-		increment(t, db, keyB, 6)
-		// Wait for all non-partitioned nodes to catch up.
-		tc.WaitForValues(t, keyB, []int64{0, 6, 6})
-
-		rhsInfo, err := getRangeInfo(ctx, db, keyB)
-		require.NoError(t, err)
-		rhsID := rhsInfo.Desc.RangeID
-		_, store0Exists := rhsInfo.Desc.GetReplicaDescriptor(1)
-		require.True(t, store0Exists)
-
-		// Remove and re-add the RHS to create a new uninitialized replica at
-		// a higher replica ID. This will lead to a tombstone being written.
-		tc.RemoveVotersOrFatal(t, keyB, tc.Target(0))
-		// Unsuccessful because the RHS will not accept the learner snapshot
-		// and will be rolled back. Nevertheless it will have learned that it
-		// has been removed at the old replica ID.
-		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
-		)
-		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
-
-		// Without a partitioned RHS we'll end up always writing a tombstone here because
-		// the RHS will be created at the initial replica ID because it will get
-		// raft message when the other nodes split and then after the above call
-		// it will find out about its new replica ID and write a tombstone for the
-		// old one.
-		waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).Engine(), rhsID)
-		lhsPartition.deactivate()
-		tc.WaitForValues(t, keyA, []int64{8, 8, 8})
-		hs := getHardState(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
-		require.Equal(t, uint64(0), hs.Commit)
-		testutils.SucceedsSoon(t, func() error {
-			_, err := tc.AddVoters(keyB, tc.Target(0))
-			return err
-		})
-		tc.WaitForValues(t, keyB, []int64{6, 6, 6})
-	})
-
-	// This case is like the previous case except the store crashes after
-	// laying down a tombstone.
-	t.Run("(2) no RHS partition, with restart", func(t *testing.T) {
-		tc, db, keyA, keyB, _, lhsPartition, stickyEngineRegistry := setup(t)
-		defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-		defer tc.Stopper().Stop(ctx)
-
-		tc.SplitRangeOrFatal(t, keyB)
-
-		// Write a value which we can observe to know when the split has been
-		// applied by the LHS.
-		increment(t, db, keyA, 1)
-		tc.WaitForValues(t, keyA, []int64{6, 8, 8})
-
-		increment(t, db, keyB, 6)
-		// Wait for all non-partitioned nodes to catch up.
-		tc.WaitForValues(t, keyB, []int64{0, 6, 6})
-
-		rhsInfo, err := getRangeInfo(ctx, db, keyB)
-		require.NoError(t, err)
-		rhsID := rhsInfo.Desc.RangeID
-		_, store0Exists := rhsInfo.Desc.GetReplicaDescriptor(1)
-		require.True(t, store0Exists)
-
-		// Remove and re-add the RHS to create a new uninitialized replica at
-		// a higher replica ID. This will lead to a tombstone being written.
-		tc.RemoveVotersOrFatal(t, keyB, tc.Target(0))
-		// Unsuccessfuly because the RHS will not accept the learner snapshot
-		// and will be rolled back. Nevertheless it will have learned that it
-		// has been removed at the old replica ID.
-		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
-		)
-		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
-
-		// Without a partitioned RHS we'll end up always writing a tombstone here because
-		// the RHS will be created at the initial replica ID because it will get
-		// raft message when the other nodes split and then after the above call
-		// it will find out about its new replica ID and write a tombstone for the
-		// old one.
-		waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).Engine(), rhsID)
-
-		// We do all of this incrementing to ensure that nobody will ever
-		// succeed in sending a message the new RHS replica after we restart
-		// the store. Previously there were races which could happen if we
-		// stopped the store immediately. Sleeps worked but this feels somehow
-		// more principled.
-		curB := int64(6)
-		for curB < 100 {
-			curB++
-			increment(t, db, keyB, 1)
-			tc.WaitForValues(t, keyB, []int64{0, curB, curB})
-		}
-
-		// Restart store 0 so that it forgets about the newer replicaID.
-		tc.StopServer(0)
-		lhsPartition.deactivate()
-		require.NoError(t, tc.RestartServer(0))
-
-		tc.WaitForValues(t, keyA, []int64{8, 8, 8})
-		hs := getHardState(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
-		require.Equal(t, uint64(0), hs.Commit)
-		testutils.SucceedsSoon(t, func() error {
-			_, err := tc.AddVoters(keyB, tc.Target(0))
-			return err
-		})
-		tc.WaitForValues(t, keyB, []int64{curB, curB, curB})
-	})
-
-	// In this case the RHS will be partitioned from hearing anything about
-	// the initial replica ID of the RHS after the split. It will learn about
-	// the higher replica ID and have that higher replica ID in memory when
-	// the split is processed. We partition the RHS's new replica ID before
-	// processing the split to ensure that the RHS doesn't get initialized.
-	t.Run("(3) initial replica RHS partition, no restart", func(t *testing.T) {
-		tc, db, keyA, keyB, _, lhsPartition, stickyEngineRegistry := setup(t)
-		defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-		defer tc.Stopper().Stop(ctx)
-		var rhsPartition *testClusterPartitionedRange
-		partitionReplicaOnSplit(t, tc, keyB, lhsPartition, &rhsPartition)
-		tc.SplitRangeOrFatal(t, keyB)
-
-		// Write a value which we can observe to know when the split has been
-		// applied by the LHS.
-		increment(t, db, keyA, 1)
-		tc.WaitForValues(t, keyA, []int64{6, 8, 8})
-
-		increment(t, db, keyB, 6)
-		// Wait for all non-partitioned nodes to catch up.
-		tc.WaitForValues(t, keyB, []int64{0, 6, 6})
-
-		rhsInfo, err := getRangeInfo(ctx, db, keyB)
-		require.NoError(t, err)
-		rhsID := rhsInfo.Desc.RangeID
-		_, store0Exists := rhsInfo.Desc.GetReplicaDescriptor(1)
-		require.True(t, store0Exists)
-
-		// Remove and re-add the RHS to create a new uninitialized replica at
-		// a higher replica ID. This will lead to a tombstone being written.
-		tc.RemoveVotersOrFatal(t, keyB, tc.Target(0))
-		// Unsuccessful because the RHS will not accept the learner snapshot and
-		// will be rolled back. Nevertheless it will have learned that it has been
-		// removed at the old replica ID. We don't use tc.AddVoters because that
-		// will retry until it runs out of time, since we're creating a
-		// retriable-looking situation here that will persist.
-		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
-		)
-		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
-		// Ensure that the replica exists with the higher replica ID.
-		repl, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(rhsInfo.Desc.RangeID)
-		require.NoError(t, err)
-		require.Equal(t, repl.ReplicaID(), rhsInfo.Desc.NextReplicaID)
-		rhsPartition.addReplica(rhsInfo.Desc.NextReplicaID)
-
-		// Ensure that there's no tombstone.
-		// The RHS on store 0 never should have heard about its original ID.
-		ensureNoTombstone(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
-		lhsPartition.deactivate()
-		tc.WaitForValues(t, keyA, []int64{8, 8, 8})
-		hs := getHardState(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
-		require.Equal(t, uint64(0), hs.Commit)
-		// Now succeed in adding the RHS. Use SucceedsSoon because in rare cases
-		// the learner snapshot can fail due to a race with a raft snapshot from
-		// a raft leader on a different node.
-		testutils.SucceedsSoon(t, func() error {
-			_, err := tc.AddVoters(keyB, tc.Target(0))
-			return err
-		})
-		tc.WaitForValues(t, keyB, []int64{6, 6, 6})
-	})
-
-	// This case is set up like the previous one except after the RHS learns about
-	// its higher replica ID the store crashes and forgets. The RHS replica gets
-	// initialized by the split.
-	t.Run("(4) initial replica RHS partition, with restart", func(t *testing.T) {
-		tc, db, keyA, keyB, _, lhsPartition, stickyEngineRegistry := setup(t)
-		defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-		defer tc.Stopper().Stop(ctx)
-		var rhsPartition *testClusterPartitionedRange
-
-		partitionReplicaOnSplit(t, tc, keyB, lhsPartition, &rhsPartition)
-		tc.SplitRangeOrFatal(t, keyB)
-
-		// Write a value which we can observe to know when the split has been
-		// applied by the LHS.
-		increment(t, db, keyA, 1)
-		tc.WaitForValues(t, keyA, []int64{6, 8, 8})
-
-		increment(t, db, keyB, 6)
-		// Wait for all non-partitioned nodes to catch up.
-		tc.WaitForValues(t, keyB, []int64{0, 6, 6})
-
-		rhsInfo, err := getRangeInfo(ctx, db, keyB)
-		require.NoError(t, err)
-		rhsID := rhsInfo.Desc.RangeID
-		_, store0Exists := rhsInfo.Desc.GetReplicaDescriptor(1)
-		require.True(t, store0Exists)
-
-		// Remove and re-add the RHS to create a new uninitialized replica at
-		// a higher replica ID. This will lead to a tombstone being written.
-		tc.RemoveVotersOrFatal(t, keyB, tc.Target(0))
-		// Unsuccessfuly because the RHS will not accept the learner snapshot
-		// and will be rolled back. Nevertheless it will have learned that it
-		// has been removed at the old replica ID.
-		//
-		// Not using tc.AddVoters because we expect an error, but that error
-		// would be retried internally.
-		_, err = tc.Servers[0].DB().AdminChangeReplicas(
-			ctx, keyB, tc.LookupRangeOrFatal(t, keyB),
-			roachpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(0)),
-		)
-		require.True(t, kvserver.IsRetriableReplicationChangeError(err), err)
-		// Ensure that there's no tombstone.
-		// The RHS on store 0 never should have heard about its original ID.
-		ensureNoTombstone(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
-
-		// Now, before we deactivate the LHS partition, partition the newer replica
-		// on the RHS too.
-		rhsPartition.addReplica(rhsInfo.Desc.NextReplicaID)
-
-		// We do all of this incrementing to ensure that nobody will ever
-		// succeed in sending a message the new RHS replica after we restart
-		// the store. Previously there were races which could happen if we
-		// stopped the store immediately. Sleeps worked but this feels somehow
-		// more principled.
-		curB := int64(6)
-		for curB < 100 {
-			curB++
-			increment(t, db, keyB, 1)
-			tc.WaitForValues(t, keyB, []int64{0, curB, curB})
-		}
-
-		tc.StopServer(0)
-		lhsPartition.deactivate()
-		require.NoError(t, tc.RestartServer(0))
-
-		tc.WaitForValues(t, keyA, []int64{8, 8, 8})
-		// In this case the store has forgotten that it knew the RHS of the split
-		// could not exist. We ensure that it has been initialized to the initial
-		// commit value, which is 10.
-		testutils.SucceedsSoon(t, func() error {
-			hs := getHardState(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
-			if hs.Commit != uint64(10) {
-				return errors.Errorf("hard state not yet initialized: got %v, expected %v",
-					hs.Commit, uint64(10))
-			}
-			return nil
-		})
-		rhsPartition.deactivate()
-		testutils.SucceedsSoon(t, func() error {
-			_, err := tc.AddVoters(keyB, tc.Target(0))
-			return err
-		})
-		tc.WaitForValues(t, keyB, []int64{curB, curB, curB})
-	})
-}
-
-// TestReplicaRemovalClosesProposalQuota is a somewhat contrived test to ensure
-// that when a replica is removed that it closes its proposal quota if it has
-// one. This used to not be the case though it wasn't really very consequential.
-// Firstly, it's rare that a removed replica has a proposal quota to begin with.
-// Replicas which believe they are they leaseholder can only be removed if they
-// have lost the lease and are behind. This requires a network partition.
-// Regardless, there was never actually a problem because once the replica has
-// been removed, all commands will eventually fail and remove themselves from
-// the quota pool. This potentially adds latency as every pending request will
-// need to acquire and release their quota. This is almost always very fast as
-// it is rarely the case that there are more outstanding requests than there is
-// quota. Nevertheless, we have this test to ensure that the pool does get
-// closed if only to avoid asking the question and to ensure that that case is
-// tested.
-func TestReplicaRemovalClosesProposalQuota(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	// These variables track the request count to make sure that all of the
-	// requests have made it to the Replica.
-	var (
-		rangeID         int64
-		putRequestCount int64
-	)
-	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
-				DisableReplicaGCQueue: true,
-				TestingRequestFilter: kvserverbase.ReplicaRequestFilter(func(_ context.Context, r roachpb.BatchRequest) *roachpb.Error {
-					if r.RangeID == roachpb.RangeID(atomic.LoadInt64(&rangeID)) {
-						if _, isPut := r.GetArg(roachpb.Put); isPut {
-							atomic.AddInt64(&putRequestCount, 1)
-						}
-					}
-					return nil
-				}),
-			}},
-			RaftConfig: base.RaftConfig{
-				// Set the proposal quota to a tiny amount so that each write will
-				// exceed it.
-				RaftProposalQuota: 512,
-				// RaftMaxInflightMsgs * RaftMaxSizePerMsg cannot exceed RaftProposalQuota.
-				RaftMaxInflightMsgs: 2,
-				RaftMaxSizePerMsg:   256,
-			},
-		},
-		ReplicationMode: base.ReplicationManual,
-	})
-	defer tc.Stopper().Stop(ctx)
-
-	key := tc.ScratchRange(t)
-	require.NoError(t, tc.WaitForSplitAndInitialization(key))
-	desc, err := tc.LookupRange(key)
-	require.NoError(t, err)
-	atomic.StoreInt64(&rangeID, int64(desc.RangeID))
-	tc.AddVotersOrFatal(t, key, tc.Target(1), tc.Target(2))
-	// Partition node 1 from receiving any requests or responses.
-	// This will prevent it from successfully replicating anything.
-	require.NoError(t, tc.WaitForSplitAndInitialization(key))
-	require.NoError(t, tc.TransferRangeLease(desc, tc.Target(0)))
-	store, repl := getFirstStoreReplica(t, tc.Server(0), key)
-	funcs := unreliableRaftHandlerFuncs{}
-	tc.Servers[0].RaftTransport().Listen(store.StoreID(), &unreliableRaftHandler{
-		rangeID:                    desc.RangeID,
-		RaftMessageHandler:         store,
-		unreliableRaftHandlerFuncs: funcs,
-	})
-	// NB: We need to be sure that our Replica is the leaseholder for this
-	// test to make sense. It usually is.
-	lease, pendingLease := repl.GetLease()
-	if pendingLease != (roachpb.Lease{}) || lease.OwnedBy(store.StoreID()) {
-		skip.IgnoreLint(t, "the replica is not the leaseholder, this happens rarely under stressrace")
-	}
-	var wg sync.WaitGroup
-	const N = 100
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			k := append(key[0:len(key):len(key)], strconv.Itoa(i)...)
-			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
-				RangeID: desc.RangeID,
-			}, putArgs(k, bytes.Repeat([]byte{'a'}, 1000)))
-			require.Regexp(t,
-				`result is ambiguous \(replica removed\)|`+
-					`r`+strconv.Itoa(int(desc.RangeID))+" was not found on s1", pErr.GoError())
-		}(i)
-	}
-	testutils.SucceedsSoon(t, func() error {
-		if seen := atomic.LoadInt64(&putRequestCount); seen < N {
-			return fmt.Errorf("saw %d, waiting for %d", seen, N)
-		}
-		return nil
-	})
-	desc = *repl.Desc()
-	fromReplDesc, found := desc.GetReplicaDescriptor(3)
-	require.True(t, found)
-	replDesc, found := desc.GetReplicaDescriptor(store.StoreID())
-	require.True(t, found)
-	newReplDesc := replDesc
-	newReplDesc.ReplicaID = desc.NextReplicaID
-	require.Nil(t, store.HandleRaftRequest(ctx, &kvserver.RaftMessageRequest{
-		RangeID:       desc.RangeID,
-		RangeStartKey: desc.StartKey,
-		FromReplica:   fromReplDesc,
-		ToReplica:     newReplDesc,
-		Message:       raftpb.Message{Type: raftpb.MsgVote, Term: 2},
-	}, noopRaftMessageResponseStream{}))
-	ts := waitForTombstone(t, store.Engine(), desc.RangeID)
-	require.Equal(t, ts.NextReplicaID, desc.NextReplicaID)
-	wg.Wait()
-	_, err = repl.GetProposalQuota().Acquire(ctx, 1)
-	require.Regexp(t, "closed.*destroyed", err)
-}
-
 type noopRaftMessageResponseStream struct{}
 
-func (n noopRaftMessageResponseStream) Send(*kvserver.RaftMessageResponse) error {
+func (n noopRaftMessageResponseStream) Send(*kvserverpb.RaftMessageResponse) error {
 	return nil
 }
 
 var _ kvserver.RaftMessageResponseStream = noopRaftMessageResponseStream{}
 
-// TestElectionAfterRestart is an end-to-end test for shouldCampaignOnWakeLocked
-// (see TestReplicaShouldCampaignOnWake for the corresponding unit test). It sets
-// up a cluster, makes 100 ranges, restarts the cluster, and verifies that the
+// TestElectionAfterRestart is an end-to-end test for shouldCampaignOnWake (see
+// TestReplicaShouldCampaignOnWake for the corresponding unit test). It sets up
+// a cluster, makes 100 ranges, restarts the cluster, and verifies that the
 // cluster serves a full table scan over these ranges without incurring any raft
-// elections that are triggered by a timeout.
+// elections that are triggered by a timeout. It also tests that in a
+// single-node cluster, the node establishes store liveness support before the
+// initial campaign, and will thus avoid a timeout-based campaign.
 //
-// For technical reasons, this uses a single-node cluster. The test can also be
-// run on multi-node clusters, though it is very difficult to deflake it there
-// as there can be rare but hard to avoid election stalemates if requests arrive
-// on multiple nodes at once.
+// This test uses a single-node cluster. With expiration and epoch leases, the
+// test can be adapted to run on multinode clusters, though it has been very
+// difficult to deflake it in the past, as there can be rare but hard to avoid
+// election stalemates if requests arrive at multiple nodes at once. With leader
+// leases, in a multinode setting, we are guaranteed to see timeout-based
+// elections for all ranges that failed to establish StoreLiveness support
+// before the initial campaign.
 func TestElectionAfterRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	// We use a single node to avoid rare flakes due to dueling elections.
-	// The code is set up to support multiple nodes, though the test will
-	// be flaky as we have no way to control that each range receives only
-	// one request at a single replica.
+	// See the top comment for why we use a single-node cluster.
 	const numNodes = 1
 
 	// Hard-code the election timeouts here for a 6s timeout. We want to make sure
@@ -5460,36 +5340,29 @@ func TestElectionAfterRestart(t *testing.T) {
 	const electionTimeoutTicks = 30
 	const raftTickInterval = 200 * time.Millisecond
 
-	r := server.NewStickyInMemEnginesRegistry()
-	defer r.CloseAllStickyInMemEngines()
-
-	newTCArgs := func(parallel bool, replMode base.TestClusterReplicationMode, onTimeoutCampaign func(roachpb.RangeID)) base.TestClusterArgs {
-		return base.TestClusterArgs{
-			ReplicationMode: replMode,
-			ParallelStart:   parallel,
-			ServerArgs: base.TestServerArgs{
-				RaftConfig: base.RaftConfig{
-					RaftElectionTimeoutTicks: electionTimeoutTicks,
-					RaftTickInterval:         raftTickInterval,
+	r := fs.NewStickyRegistry()
+	clusterArgs := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: base.RaftConfig{
+				RaftElectionTimeoutTicks: electionTimeoutTicks,
+				RaftTickInterval:         raftTickInterval,
+			},
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					StickyVFSRegistry: r,
 				},
-				Knobs: base.TestingKnobs{
-					Server: &server.TestingKnobs{
-						StickyEngineRegistry: r,
-					},
-					Store: &kvserver.StoreTestingKnobs{
-						OnRaftTimeoutCampaign: onTimeoutCampaign,
+				Store: &kvserver.StoreTestingKnobs{
+					OnRaftTimeoutCampaign: func(_ roachpb.RangeID) {
+						t.Errorf("saw timeout-based election")
 					},
 				},
 			},
-		}
+		},
 	}
 
 	const numRanges = 100
-
-	rangeIDs := map[roachpb.RangeID]int{} // ranges in our table -> election timeouts seen
 	func() {
-		tc := testcluster.NewTestCluster(
-			t, numNodes, newTCArgs(false /* parallel */, base.ReplicationAuto, nil /* onTimeoutCampaign */))
+		tc := testcluster.NewTestCluster(t, numNodes, clusterArgs)
 		tc.Start(t)
 		defer t.Log("stopped cluster")
 		defer tc.Stopper().Stop(ctx)
@@ -5500,91 +5373,10 @@ func TestElectionAfterRestart(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, tc.WaitForFullReplication())
 
-		for _, row := range sqlutils.MakeSQLRunner(tc.Conns[0]).QueryStr(
-			t, `SELECT range_id FROM crdb_internal.ranges_no_leases WHERE table_name = 't';`,
-		) {
-			n, err := strconv.Atoi(row[0])
-			require.NoError(t, err)
-			rangeIDs[roachpb.RangeID(n)] = 0
-		}
-		require.Len(t, rangeIDs, numRanges)
 		t.Logf("created %d ranges", numRanges)
-
-		// Make sure that the ranges have all followers fully caught up. Otherwise,
-		// as we stop the server and restart it later, the follower that
-		// auto-campaigns may not be fully caught up and so will fail to win the
-		// election, so the raft group will have for someone else to campaign after
-		// a timeout and this is what we want to make sure doesn't happen in this
-		// test.
-		//
-		// Note that none of this is needed for numNodes=1, but we want to make sure
-		// that the test is not more flaky than it needs to be when run with
-		// numNodes>1.
-		testutils.SucceedsSoon(t, func() error {
-			for rangeID := range rangeIDs {
-				var err error
-				var lastIndex uint64
-				for _, srv := range tc.Servers {
-					_ = srv.Stores().VisitStores(func(s *kvserver.Store) error {
-						s.VisitReplicas(func(replica *kvserver.Replica) (more bool) {
-							if replica.RangeID != rangeID {
-								return
-							}
-
-							cur := replica.State(ctx).LastIndex
-							if lastIndex == 0 {
-								lastIndex = cur
-							}
-							if lastIndex > cur {
-								err = errors.Errorf("last indexes not equal: %d != %d", lastIndex, cur)
-							}
-							return err == nil // more
-						})
-						return nil
-					})
-				}
-				if err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		for _, srv := range tc.Servers {
-			require.NoError(t, srv.Stores().VisitStores(func(s *kvserver.Store) error {
-				return s.Engine().Flush()
-			}))
-		}
-		t.Log("waited for all followers to be caught up")
 	}()
 
-	// Annoyingly, with the increased tick interval in this test, this cluster takes
-	// a long time to re-start. The reason is that the "campaign" heuristic on the
-	// node liveness range (and maybe some other system ranges) typically fires before
-	// all nodes are available, meaning that the vote request messages are silently
-	// dropped. The group will then be in StatePreCandidate and will have to sit out
-	// an election timeout. One way to fix this could be to start n2 and n3
-	// before n1. Or we could selectively change the tick interval only for the
-	// ranges we care about, or allow changing it on a running cluster (but that
-	// last option is going to be flaky, since we only approximately control when
-	// the raft instances we care about are initialized after the restart).
-	tc := testcluster.NewTestCluster(
-		t,
-		numNodes,
-		newTCArgs(true /* parallel */, base.ReplicationManual, func(rangeID roachpb.RangeID) {
-			if _, ok := rangeIDs[rangeID]; ok {
-				rangeIDs[rangeID]++
-			} else {
-				if numNodes == 1 {
-					t.Errorf("saw election from untracked range r%d", rangeID)
-				} else {
-					// We don't want this to happen, but it can and it shouldn't fail
-					// the test. The duel is much more frequent on some of the system
-					// ranges.
-					t.Logf("ignoring election from untracked range r%d", rangeID)
-				}
-			}
-		}),
-	)
+	tc := testcluster.NewTestCluster(t, numNodes, clusterArgs)
 	tc.Start(t)
 	t.Log("started cluster")
 	defer tc.Stopper().Stop(ctx)
@@ -5594,8 +5386,1063 @@ func TestElectionAfterRestart(t *testing.T) {
 	require.Equal(t, fmt.Sprint(numRanges-1), runner.QueryStr(t, `SELECT count(1) FROM t`)[0][0])
 	dur := timeutil.Since(tBegin)
 	t.Logf("scanned full table in %.2fs (%s/range)", dur.Seconds(), dur/time.Duration(numRanges))
+}
 
-	for rangeID, n := range rangeIDs {
-		assert.Zero(t, n, "unexpected election after timeout on r%d", rangeID)
+// TestRaftSnapshotsWithMVCCRangeKeys tests that snapshots carry MVCC range keys
+// (i.e. MVCC range tombstones).
+func TestRaftSnapshotsWithMVCCRangeKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+	ts := tc.Server(0)
+	sender := ts.DB().NonTransactionalSender()
+
+	// Split off a range at "a".
+	keyA := roachpb.Key("a")
+	tc.SplitRangeOrFatal(t, keyA)
+
+	// Write a couple of overlapping MVCC range tombstones across [a-d) and [b-e), and
+	// record their timestamps.
+	ts1 := ts.Clock().Now()
+	_, pErr := kv.SendWrappedWith(ctx, sender, kvpb.Header{
+		Timestamp: ts1,
+	}, &kvpb.DeleteRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    roachpb.Key("a"),
+			EndKey: roachpb.Key("d"),
+		},
+		UseRangeTombstone: true,
+	})
+	require.NoError(t, pErr.GoError())
+
+	ts2 := ts.Clock().Now()
+	_, pErr = kv.SendWrappedWith(ctx, sender, kvpb.Header{
+		Timestamp: ts2,
+	}, &kvpb.DeleteRangeRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key:    roachpb.Key("b"),
+			EndKey: roachpb.Key("e"),
+		},
+		UseRangeTombstone: true,
+	})
+	require.NoError(t, pErr.GoError())
+
+	// Split off a range at "c", in the middle of the range keys.
+	keyC := roachpb.Key("c")
+	descA, descC := tc.SplitRangeOrFatal(t, keyC)
+
+	// Upreplicate both ranges.
+	tc.AddVotersOrFatal(t, keyA, tc.Targets(1, 2)...)
+	tc.AddVotersOrFatal(t, keyC, tc.Targets(1, 2)...)
+	require.NoError(t, tc.WaitForVoters(keyA, tc.Targets(1, 2)...))
+	require.NoError(t, tc.WaitForVoters(keyC, tc.Targets(1, 2)...))
+
+	// Read them back from all stores.
+	for _, srv := range tc.Servers {
+		store, err := srv.GetStores().(*kvserver.Stores).GetStore(srv.GetFirstStoreID())
+		require.NoError(t, err)
+		require.Equal(t, kvs{
+			rangeKVWithTS("a", "b", ts1, storage.MVCCValue{}),
+			rangeKVWithTS("b", "c", ts2, storage.MVCCValue{}),
+			rangeKVWithTS("b", "c", ts1, storage.MVCCValue{}),
+		}, storageutils.ScanRange(t, store.StateEngine(), descA))
+		require.Equal(t, kvs{
+			rangeKVWithTS("c", "d", ts2, storage.MVCCValue{}),
+			rangeKVWithTS("c", "d", ts1, storage.MVCCValue{}),
+			rangeKVWithTS("d", "e", ts2, storage.MVCCValue{}),
+		}, storageutils.ScanRange(t, store.StateEngine(), descC))
 	}
+
+	// Quick check of MVCC stats.
+	_, replA := getFirstStoreReplica(t, ts, keyA)
+	ms := replA.GetMVCCStats()
+	require.EqualValues(t, 2, ms.RangeKeyCount)
+	require.EqualValues(t, 3, ms.RangeValCount)
+
+	_, replL := getFirstStoreReplica(t, ts, keyC)
+	ms = replL.GetMVCCStats()
+	require.EqualValues(t, 2, ms.RangeKeyCount)
+	require.EqualValues(t, 3, ms.RangeValCount)
+
+	// Run a consistency check.
+	checkConsistency := func(desc roachpb.RangeDescriptor) {
+		resp, pErr := kv.SendWrapped(ctx, sender, checkConsistencyArgs(&desc))
+		require.NoError(t, pErr.GoError())
+		ccResp := resp.(*kvpb.CheckConsistencyResponse)
+		require.Len(t, ccResp.Result, 1)
+		result := ccResp.Result[0]
+		require.Equal(t, desc.RangeID, result.RangeID)
+		require.Equal(t, kvpb.CheckConsistencyResponse_RANGE_CONSISTENT, result.Status, "%+v", result)
+	}
+
+	checkConsistency(descA)
+	checkConsistency(descC)
+}
+
+// TestRaftSnapshotsWithMVCCRangeKeysEverywhere tests that snapshots carry MVCC
+// range keys in every key range (even though we normally only expect to see
+// them in the user key range).
+func TestRaftSnapshotsWithMVCCRangeKeysEverywhere(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+	})
+	defer tc.Stopper().Stop(ctx)
+	srv := tc.Server(0)
+	store := tc.GetFirstStoreFromServer(t, 0)
+	engine := store.StateEngine()
+	sender := srv.DB().NonTransactionalSender()
+
+	// Split off ranges at "a" and "b".
+	keyA, keyB := roachpb.Key("a"), roachpb.Key("b")
+	tc.SplitRangeOrFatal(t, keyA)
+	descA, descB := tc.SplitRangeOrFatal(t, keyB)
+	descs := []roachpb.RangeDescriptor{descA, descB}
+
+	// Write MVCC range keys [a-z) in each replicated key range of each range.
+	// Throw in a local timestamp, to make sure the value is replicated too.
+	now := srv.Clock().Now()
+	valueLocalTS := storage.MVCCValue{
+		MVCCValueHeader: enginepb.MVCCValueHeader{
+			LocalTimestamp: now.WallPrev().UnsafeToClockTimestamp(),
+		},
+	}
+	valueLocalTSRaw, err := storage.EncodeMVCCValue(valueLocalTS)
+	require.NoError(t, err)
+
+	for _, desc := range descs {
+		for _, span := range rditer.MakeReplicatedKeySpans(&desc) {
+			prefix := append(span.Key.Clone(), ':')
+			require.NoError(t, engine.PutMVCCRangeKey(storage.MVCCRangeKey{
+				StartKey:  append(prefix.Clone(), 'a'),
+				EndKey:    append(prefix.Clone(), 'z'),
+				Timestamp: now,
+			}, valueLocalTS))
+		}
+	}
+
+	// Recompute stats, since the above writes didn't update stats. We just do
+	// this so that we can run a consistency check, since the stats may or may not
+	// pick up the range keys in different key ranges.
+	for _, desc := range descs {
+		_, pErr := kv.SendWrapped(ctx, sender, &kvpb.RecomputeStatsRequest{
+			RequestHeader: kvpb.RequestHeader{
+				Key: desc.StartKey.AsRawKey(),
+			},
+		})
+		require.NoError(t, pErr.GoError())
+	}
+
+	// Upreplicate both ranges.
+	for _, desc := range descs {
+		tc.AddVotersOrFatal(t, desc.StartKey.AsRawKey(), tc.Targets(1, 2)...)
+		require.NoError(t, tc.WaitForVoters(desc.StartKey.AsRawKey(), tc.Targets(1, 2)...))
+	}
+
+	// Look for the range keys on the other servers.
+	for _, srvIdx := range []int{1, 2} {
+		e := tc.GetFirstStoreFromServer(t, srvIdx).StateEngine()
+		for _, desc := range descs {
+			for _, span := range rditer.MakeReplicatedKeySpans(&desc) {
+				prefix := append(span.Key.Clone(), ':')
+
+				iter, err := e.NewEngineIterator(context.Background(), storage.IterOptions{
+					KeyTypes:   storage.IterKeyTypeRangesOnly,
+					LowerBound: span.Key,
+					UpperBound: span.EndKey,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer iter.Close()
+
+				ok, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: span.Key})
+				require.NoError(t, err)
+				require.True(t, ok)
+				bounds, err := iter.EngineRangeBounds()
+				require.NoError(t, err)
+				require.Equal(t, roachpb.Span{
+					Key:    append(prefix.Clone(), 'a'),
+					EndKey: append(prefix.Clone(), 'z'),
+				}, bounds)
+				require.Equal(t, []storage.EngineRangeKeyValue{{
+					Version: mvccencoding.EncodeMVCCTimestampSuffix(now),
+					Value:   valueLocalTSRaw,
+				}}, iter.EngineRangeKeys())
+
+				ok, err = iter.NextEngineKey()
+				require.NoError(t, err)
+				require.False(t, ok)
+			}
+		}
+	}
+
+	// Run consistency checks.
+	for _, desc := range descs {
+		resp, pErr := kv.SendWrapped(ctx, sender, checkConsistencyArgs(&desc))
+		require.NoError(t, pErr.GoError())
+		ccResp := resp.(*kvpb.CheckConsistencyResponse)
+		require.Len(t, ccResp.Result, 1)
+		result := ccResp.Result[0]
+		require.Equal(t, desc.RangeID, result.RangeID)
+		require.Equal(t, kvpb.CheckConsistencyResponse_RANGE_CONSISTENT, result.Status, "%+v", result)
+	}
+}
+
+// TestRaftCampaignPreVoteCheckQuorum tests that campaignLocked() respects
+// PreVote+CheckQuorum, by not granting prevotes if there is an active leader.
+func TestRaftCampaignPreVoteCheckQuorum(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Timing-sensitive, so skip under deadlock detector and race.
+	skip.UnderDeadlock(t)
+	skip.UnderRace(t)
+
+	ctx := context.Background()
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: base.RaftConfig{
+				RaftEnableCheckQuorum: true,
+				RaftTickInterval:      100 * time.Millisecond, // speed up test
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	logStatus := func(s *raft.Status) {
+		t.Helper()
+		require.NotNil(t, s)
+		t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
+	}
+
+	sender := tc.GetFirstStoreFromServer(t, 0).TestSender()
+
+	// Create a range, upreplicate it, and replicate a write.
+	key := tc.ScratchRange(t)
+	desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+	_, pErr := kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+	require.NoError(t, pErr.GoError())
+	tc.WaitForValues(t, key, []int64{1, 1, 1})
+
+	repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+	repl2, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+	repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+	repls := []*kvserver.Replica{repl1, repl2, repl3}
+
+	// Make sure n1 is leader.
+	initialStatus := repl1.RaftStatus()
+	require.Equal(t, raftpb.StateLeader, initialStatus.RaftState)
+	logStatus(initialStatus)
+	t.Logf("n1 is leader")
+
+	// Campaign n3. It shouldn't win prevotes, reverting to follower
+	// in the current term.
+	repl3.Campaign(ctx)
+	t.Logf("n3 campaigning")
+
+	require.Eventually(t, func() bool {
+		status := repl3.RaftStatus()
+		logStatus(status)
+		return status.RaftState == raftpb.StateFollower
+	}, 10*time.Second, 500*time.Millisecond)
+	t.Logf("n3 reverted to follower")
+
+	// n1 should still be the leader in the same term, with n2 and n3 followers.
+	for _, repl := range repls {
+		st := repl.RaftStatus()
+		logStatus(st)
+		if st.ID == 1 {
+			require.Equal(t, raftpb.StateLeader, st.RaftState)
+		} else {
+			require.Equal(t, raftpb.StateFollower, st.RaftState)
+		}
+		require.Equal(t, initialStatus.Term, st.Term)
+	}
+}
+
+// TestRaftForceCampaignPreVoteCheckQuorum tests that forceCampaignLocked()
+// ignores PreVote+CheckQuorum, transitioning directly to candidate and bumping
+// the term. It may not actually win or hold onto leadership, but bumping the
+// term is proof enough that it called an election.
+func TestRaftForceCampaignPreVoteCheckQuorum(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Timing-sensitive, so skip under deadlock detector and race.
+	skip.UnderDeadlock(t)
+	skip.UnderRace(t)
+
+	ctx := context.Background()
+
+	tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{
+			RaftConfig: base.RaftConfig{
+				RaftEnableCheckQuorum:      true,
+				RaftTickInterval:           200 * time.Millisecond, // speed up test
+				RaftHeartbeatIntervalTicks: 10,                     // allow n3 to win the election
+				RaftElectionTimeoutTicks:   20,
+			},
+		},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	logStatus := func(s *raft.Status) {
+		t.Helper()
+		require.NotNil(t, s)
+		t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
+	}
+
+	sender := tc.GetFirstStoreFromServer(t, 0).TestSender()
+
+	// Create a range, upreplicate it, and replicate a write.
+	key := tc.ScratchRange(t)
+	desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+	// Wait for the config changes corresponding to adding voters to be finalized.
+	// Otherwise, the forced campaign can fail and not retry. See #152555.
+	require.NoError(t, tc.WaitForVoters(key, tc.Targets(0, 1, 2)...))
+	_, pErr := kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+	require.NoError(t, pErr.GoError())
+	tc.WaitForValues(t, key, []int64{1, 1, 1})
+
+	repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+	repl2, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+	repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(desc.RangeID)
+	require.NoError(t, err)
+	repls := []*kvserver.Replica{repl1, repl2, repl3}
+
+	// Make sure n1 is leader.
+	initialStatus := repl1.RaftStatus()
+	require.Equal(t, raftpb.StateLeader, initialStatus.RaftState)
+	logStatus(initialStatus)
+	t.Logf("n1 is leader in term %d", initialStatus.Term)
+
+	// Force-campaign n3. It may not win or hold onto leadership, but it's enough
+	// to know that it bumped the term.
+	repl3.ForceCampaign(ctx, initialStatus.BasicStatus)
+	t.Logf("n3 campaigning")
+
+	var leaderStatus *raft.Status
+	require.Eventually(t, func() bool {
+		for _, repl := range repls {
+			st := repl.RaftStatus()
+			logStatus(st)
+			if st.Term <= initialStatus.Term {
+				return false
+			}
+			if st.RaftState == raftpb.StateLeader {
+				leaderStatus = st
+			}
+		}
+		return leaderStatus != nil
+	}, 10*time.Second, 500*time.Millisecond)
+	t.Logf("n%d is leader, with bumped term %d", leaderStatus.ID, leaderStatus.Term)
+}
+
+// TestRaftPreVote tests that Raft PreVote works properly, including the recent
+// leader check only enabled via CheckQuorum. Specifically, a replica that's
+// partitioned away from the leader (or restarted) should not be able to call an
+// election, even if it's still up-to-date on the log, because followers should
+// not grant prevotes if they've heard from a leader in the past election
+// timeout.
+//
+// We set up a partial partition as such:
+//
+//	               n1 (leader)
+//	              /  x
+//	             /    x
+//	(follower) n2 ---- n3 (partitioned)
+//
+// This will cause n3 to send prevote requests to n2, which should not succeed,
+// leaving the current leader n1 alone. We make sure there are no writes on the
+// range, to keep n3's log up-to-date such that it's eligible for prevotes.
+//
+// We test several combinations:
+//
+// - a partial and full partition of n3.
+// - leader leases and expiration-based leases.
+func TestRaftPreVote(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Timing-sensitive, so skip it under deadlock detector, race detector, and
+	// stress.
+	skip.UnderDuress(t, "takes >1 m")
+
+	testutils.RunTrueAndFalse(t, "partial", func(t *testing.T, partial bool) {
+		testutils.RunTrueAndFalse(t, "expLease", func(t *testing.T, expLease bool) {
+			if !partial && !expLease {
+				// A full partition with leader leases won't transition n3 to a
+				// pre-candidate, as it will be partitioned away from both n1 and n2,
+				// meaning it won't have adequate StoreLiveness support to become a
+				// pre-candidate.
+				return
+			}
+			ctx := context.Background()
+
+			// We don't want any writes to the range, to avoid the follower from
+			// falling behind on the log and failing prevotes only because of that.
+			// We install a proposal filter which rejects proposals to the range
+			// during the partition (typically txn record cleanup via GC requests,
+			// but also e.g. lease extensions).
+			var partitioned, blocked atomic.Bool
+			var rangeID roachpb.RangeID
+			propFilter := func(args kvserverbase.ProposalFilterArgs) *kvpb.Error {
+				if blocked.Load() && args.Req.RangeID == rangeID {
+					t.Logf("r%d proposal rejected: %s", rangeID, args.Req)
+					return kvpb.NewError(errors.New("rejected"))
+				}
+				return nil
+			}
+
+			// We also disable lease extensions and expiration-based lease
+			// transfers, to avoid range writes.
+			st := cluster.MakeTestingClusterSettings()
+			kvserver.TransferExpirationLeasesFirstEnabled.Override(ctx, &st.SV, false)
+			if expLease {
+				kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseExpiration)
+			} else {
+				kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseLeader)
+			}
+
+			tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+				ServerArgs: base.TestServerArgs{
+					Settings: st,
+					RaftConfig: base.RaftConfig{
+						RaftEnableCheckQuorum: true,
+						RaftTickInterval:      200 * time.Millisecond, // speed up test
+					},
+					Knobs: base.TestingKnobs{
+						Store: &kvserver.StoreTestingKnobs{
+							TestingProposalFilter:        propFilter,
+							DisableAutomaticLeaseRenewal: true,
+						},
+					},
+				},
+			})
+			defer tc.Stopper().Stop(ctx)
+
+			logStatus := func(s *raft.Status) {
+				t.Helper()
+				require.NotNil(t, s)
+				t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
+			}
+
+			// Create a range, upreplicate it, and replicate a write.
+			sender := tc.GetFirstStoreFromServer(t, 0).TestSender()
+			key := tc.ScratchRange(t)
+			desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+			rangeID = desc.RangeID
+
+			_, pErr := kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+			require.NoError(t, pErr.GoError())
+			tc.WaitForValues(t, key, []int64{1, 1, 1})
+
+			repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(rangeID)
+			require.NoError(t, err)
+			repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(rangeID)
+			require.NoError(t, err)
+
+			// Configure the partition, but don't activate it yet.
+			if partial {
+				// Partition n3 away from n1, in both directions.
+				dropRaftMessagesFrom(t, tc.Servers[0], desc, []roachpb.ReplicaID{3}, &partitioned)
+				dropRaftMessagesFrom(t, tc.Servers[2], desc, []roachpb.ReplicaID{1}, &partitioned)
+			} else {
+				// Partition n3 away from both of n1 and n2, in both directions.
+				dropRaftMessagesFrom(t, tc.Servers[0], desc, []roachpb.ReplicaID{3}, &partitioned)
+				dropRaftMessagesFrom(t, tc.Servers[1], desc, []roachpb.ReplicaID{3}, &partitioned)
+				dropRaftMessagesFrom(t, tc.Servers[2], desc, []roachpb.ReplicaID{1, 2}, &partitioned)
+			}
+
+			// Make sure the lease is on n1 and that everyone has applied it.
+			tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(0))
+			_, pErr = kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+			require.NoError(t, pErr.GoError())
+			tc.WaitForValues(t, key, []int64{2, 2, 2})
+			t.Logf("n1 has lease")
+
+			// Block new proposals to the range.
+			blocked.Store(true)
+			t.Logf("n1 proposals blocked")
+
+			var lastIndex uint64
+			var lastChanged time.Time
+			require.Eventually(t, func() bool {
+				status := repl1.RaftStatus()
+				require.Equal(t, raftpb.StateLeader, status.RaftState)
+				if i := status.Progress[1].Match; i > lastIndex {
+					t.Logf("n1 last index changed: %d -> %d", lastIndex, i)
+					lastIndex, lastChanged = i, time.Now()
+					return false
+				}
+				for i, pr := range status.Progress {
+					if pr.Match != lastIndex {
+						t.Logf("n%d match %d not at n1 last index %d, waiting", i, pr.Match, lastIndex)
+						return false
+					}
+				}
+				if since := time.Since(lastChanged); since < time.Second {
+					t.Logf("n1 last index %d changed %s ago, waiting",
+						lastIndex, since.Truncate(time.Millisecond))
+					return false
+				}
+				return true
+			}, 10*time.Second, 200*time.Millisecond)
+			t.Logf("n1 stabilized range")
+			logStatus(repl1.RaftStatus())
+
+			// Partition n3.
+			partitioned.Store(true)
+			t.Logf("n3 partitioned")
+
+			// Fetch the leader's initial status.
+			initialStatus := repl1.RaftStatus()
+			require.Equal(t, raftpb.StateLeader, initialStatus.RaftState)
+			logStatus(initialStatus)
+
+			// Wait for the follower to become a candidate.
+			require.Eventually(t, func() bool {
+				status := repl3.RaftStatus()
+				logStatus(status)
+				return status.RaftState == raftpb.StatePreCandidate
+			}, 45*time.Second, 500*time.Millisecond)
+			t.Logf("n3 became pre-candidate")
+
+			// The candidate shouldn't change state for some time, i.e.  it
+			// shouldn't move into Candidate or Follower because it received
+			// prevotes or other messages.
+			require.Never(t, func() bool {
+				status := repl3.RaftStatus()
+				logStatus(status)
+				return status.RaftState != raftpb.StatePreCandidate
+			}, 3*time.Second, time.Second)
+			t.Logf("n3 is still pre-candidate")
+
+			// Make sure the leader and term are still the same, and that there were
+			// no writes to the range. In the case of a quiesced range under a
+			// partial partition we have to account for a possible unquiesce entry,
+			// due to the prevote received by n2 which will wake the leader.
+			leaderStatus := repl1.RaftStatus()
+			logStatus(leaderStatus)
+			require.Equal(t, raftpb.StateLeader, leaderStatus.RaftState)
+			require.Equal(t, initialStatus.Term, leaderStatus.Term)
+			require.LessOrEqual(t, leaderStatus.Commit, initialStatus.Commit+1)
+			t.Logf("n1 is still leader")
+
+			// Heal the partition and unblock proposals, then wait for the replica
+			// to become a follower.
+			blocked.Store(false)
+			partitioned.Store(false)
+			t.Logf("n3 partition healed")
+
+			require.Eventually(t, func() bool {
+				status := repl3.RaftStatus()
+				logStatus(status)
+				return status.RaftState == raftpb.StateFollower
+			}, 10*time.Second, 500*time.Millisecond)
+			t.Logf("n3 became follower")
+
+			// Make sure the leader and term are still the same.
+			leaderStatus = repl1.RaftStatus()
+			logStatus(leaderStatus)
+			require.Equal(t, raftpb.StateLeader, leaderStatus.RaftState)
+			require.Equal(t, initialStatus.Term, leaderStatus.Term)
+			t.Logf("n1 is still leader")
+
+			// Replicate another write to make sure the Raft group still works.
+			_, pErr = kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+			require.NoError(t, pErr.GoError())
+			tc.WaitForValues(t, key, []int64{3, 3, 3})
+			t.Logf("n1 replicated write")
+
+			// Make sure the leader and term are still the same.
+			leaderStatus = repl1.RaftStatus()
+			logStatus(leaderStatus)
+			require.Equal(t, raftpb.StateLeader, leaderStatus.RaftState)
+			require.Equal(t, initialStatus.Term, leaderStatus.Term)
+			t.Logf("n1 is still leader")
+		})
+	})
+}
+
+// TestRaftCheckQuorum tests that Raft CheckQuorum works properly, i.e. that a
+// leader will step down if it hasn't heard from a quorum of followers in the
+// last election timeout interval.
+//
+//	               n1 (leader)
+//	              x  x
+//	             x    x
+//	(follower) n2 ---- n3 (follower)
+//
+// We test this by partitioning the leader away from two followers, using either
+// a symmetric or asymmetric partition. In the asymmetric case, the leader can
+// send heartbeats to followers, but won't receive responses. Eventually, it
+// should step down and the followers should elect a new leader.
+//
+// Only runs with leader leases.
+func TestRaftCheckQuorum(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test is timing-sensitive, so skip it under deadlock detector and
+	// race.
+	skip.UnderDeadlock(t)
+	skip.UnderRace(t)
+
+	testutils.RunTrueAndFalse(t, "symmetric", func(t *testing.T, symmetric bool) {
+		testutils.RunTrueAndFalse(t, "sleep", func(t *testing.T, sleep bool) {
+			ctx := context.Background()
+
+			// Turn on leader leases.
+			st := cluster.MakeTestingClusterSettings()
+			kvserver.RaftStoreLivenessQuiescenceEnabled.Override(ctx, &st.SV, sleep)
+			kvserver.OverrideDefaultLeaseType(ctx, &st.SV, roachpb.LeaseLeader)
+
+			tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+				ReplicationMode: base.ReplicationManual,
+				ServerArgs: base.TestServerArgs{
+					Settings: st,
+					RaftConfig: base.RaftConfig{
+						RaftEnableCheckQuorum: true,
+						RaftTickInterval:      200 * time.Millisecond, // speed up test
+					},
+				},
+			})
+			defer tc.Stopper().Stop(ctx)
+
+			logStatus := func(s *raft.Status) {
+				t.Helper()
+				require.NotNil(t, s)
+				t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
+			}
+
+			// Create a range, upreplicate it, and replicate a write.
+			sender := tc.GetFirstStoreFromServer(t, 0).TestSender()
+			key := tc.ScratchRange(t)
+			desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+
+			_, pErr := kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+			require.NoError(t, pErr.GoError())
+			tc.WaitForValues(t, key, []int64{1, 1, 1})
+
+			repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+			require.NoError(t, err)
+			repl2, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
+			require.NoError(t, err)
+			repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(desc.RangeID)
+			require.NoError(t, err)
+
+			// Set up dropping of inbound messages on n1 from n2,n3, but don't
+			// activate it yet.
+			var partitioned atomic.Bool
+			dropRaftMessagesFrom(t, tc.Servers[0], desc, []roachpb.ReplicaID{2, 3}, &partitioned)
+			if symmetric {
+				// Drop outbound messages from n1 to n2,n3 too.
+				dropRaftMessagesFrom(t, tc.Servers[1], desc, []roachpb.ReplicaID{1}, &partitioned)
+				dropRaftMessagesFrom(t, tc.Servers[2], desc, []roachpb.ReplicaID{1}, &partitioned)
+			}
+
+			// Make sure the lease is on n1 and that everyone has applied it.
+			tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(0))
+			tc.WaitForLeaseUpgrade(ctx, t, desc)
+			_, pErr = kv.SendWrapped(ctx, sender, incrementArgs(key, 1))
+			require.NoError(t, pErr.GoError())
+			tc.WaitForValues(t, key, []int64{2, 2, 2})
+			t.Logf("n1 has lease")
+
+			// Wait for the followers to fall asleep, if enabled.
+			if sleep {
+				require.Eventually(t, func() bool {
+					return repl2.IsAsleep() && repl3.IsAsleep()
+				}, 10*time.Second, 100*time.Millisecond)
+				// The leader shouldn't fall asleep.
+				require.False(t, repl1.IsAsleep())
+				t.Logf("n2 and n3 fell asleep")
+			} else {
+				require.False(t, repl1.IsAsleep() || repl2.IsAsleep() || repl3.IsAsleep())
+				t.Logf("n1, n2, and n3 not asleep")
+			}
+
+			// Partition n1.
+			partitioned.Store(true)
+			t.Logf("n1 partitioned")
+
+			// Fetch the leader's initial status.
+			initialStatus := repl1.RaftStatus()
+			require.Equal(t, raftpb.StateLeader, initialStatus.RaftState)
+			logStatus(initialStatus)
+
+			require.False(t, repl1.IsAsleep())
+			t.Logf("n1 not asleep")
+
+			// Wait for the followers to wake up.
+			if sleep {
+				testutils.SucceedsSoon(t, func() error {
+					if repl2.IsAsleep() || repl3.IsAsleep() {
+						return errors.Errorf("at least one follower still asleep")
+					}
+					return nil
+				})
+				t.Logf("n2 and n3 woke up")
+			} else {
+				require.False(t, repl1.IsAsleep() || repl2.IsAsleep() || repl3.IsAsleep())
+				t.Logf("n1, n2, and n3 not asleep")
+			}
+
+			// Wait for the leader to step down.
+			require.Eventually(t, func() bool {
+				status := repl1.RaftStatus()
+				logStatus(status)
+				return status.RaftState != raftpb.StateLeader
+			}, 10*time.Second, 500*time.Millisecond)
+			t.Logf("n1 stepped down as a leader")
+
+			// n2 or n3 should elect a new leader. At this point, the store liveness
+			// SupportWithdrawalGracePeriod may not have expired yet, so this step waits
+			// a little longer.
+			var leaderStatus *raft.Status
+			require.Eventually(t, func() bool {
+				for _, status := range []*raft.Status{repl2.RaftStatus(), repl3.RaftStatus()} {
+					logStatus(status)
+					if status.RaftState == raftpb.StateLeader {
+						leaderStatus = status
+						return true
+					}
+				}
+				return false
+			}, 20*time.Second, 500*time.Millisecond)
+			t.Logf("n%d became leader", leaderStatus.ID)
+
+			// n1 shouldn't become a leader.
+			require.Never(t, func() bool {
+				status := repl1.RaftStatus()
+				logStatus(status)
+				expState := status.RaftState != raftpb.StateLeader && status.Lead == raft.None
+				return !expState // require.Never
+			}, 3*time.Second, 500*time.Millisecond)
+			t.Logf("n1 remains not leader")
+
+			// The existing leader shouldn't have been affected by the possible n1's
+			// prevotes.
+			var finalStatus *raft.Status
+			for _, status := range []*raft.Status{repl2.RaftStatus(), repl3.RaftStatus()} {
+				logStatus(status)
+				if status.RaftState == raftpb.StateLeader {
+					finalStatus = status
+					break
+				}
+			}
+			require.NotNil(t, finalStatus)
+			require.Equal(t, leaderStatus.ID, finalStatus.ID)
+			require.Equal(t, leaderStatus.Term, finalStatus.Term)
+		})
+	})
+}
+
+// TestRaftLeaderRemovesItself tests that when a raft leader removes itself via
+// a conf change the leaseholder campaigns for leadership, ignoring
+// PreVote+CheckQuorum and transitioning directly to candidate.
+//
+// We set up three replicas:
+//
+// n1: Raft leader
+// n2: follower
+// n3: follower + leaseholder
+//
+// We disable leader following the leaseholder (which would otherwise transfer
+// leadership if we happened to tick during the conf change), and then remove n1
+// from the range. n3 should acquire leadership.
+//
+// We disable election timeouts, such that the only way n3 can become leader is
+// by campaigning explicitly.
+func TestRaftLeaderRemovesItself(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Timing-sensitive, so skip under deadlock detector and race.
+	skip.UnderDeadlock(t)
+	skip.UnderRace(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	testutils.RunValues(t, "leaseType", roachpb.TestingAllLeaseTypes(), func(t *testing.T, leaseType roachpb.LeaseType) {
+		settings := cluster.MakeTestingClusterSettings()
+		kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, leaseType)
+
+		raftCfg := base.RaftConfig{
+			RaftEnableCheckQuorum: true,
+			RaftTickInterval:      100 * time.Millisecond, // speed up test
+		}
+
+		if leaseType != roachpb.LeaseLeader {
+			// Set a large election timeout. We don't want replicas to call
+			// elections due to timeouts, instead, we want leadership to get
+			// transferred.
+			//
+			// We only need to do this if we're not running with leader leases. With
+			// leader leases, we won't have elections due to timeouts because of
+			// fortification. Unlike other lease types, which rely on per-range
+			// heartbeats which are affected by leader step-down, leader leases use
+			// per-store StoreLiveness heartbeats which are not affected by leader
+			// step-down.
+			//
+			// In fact, we can't use a high value of RaftElectionTimeoutTicks when
+			// using leader leases as the first attempt to establish raft leadership
+			// is guaranteed to fail because we won't have StoreLiveness support (so
+			// we won't campaign). The test will timeout if we set a high value for
+			// RaftElectionTimeoutTicks, as it'll take too long for us to come back
+			// a second time around to call an election.
+			raftCfg.RaftElectionTimeoutTicks = 300
+		}
+
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ReplicationMode: base.ReplicationManual,
+			ServerArgs: base.TestServerArgs{
+				RaftConfig: raftCfg,
+				Settings:   settings,
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						DisableLeaderFollowsLeaseholder: true, // the leader should stay put
+					},
+				},
+			},
+		})
+		defer tc.Stopper().Stop(ctx)
+
+		logStatus := func(s *raft.Status) {
+			t.Helper()
+			require.NotNil(t, s)
+			t.Logf("n%d %s at term=%d commit=%d", s.ID, s.RaftState, s.Term, s.Commit)
+		}
+
+		send1 := tc.GetFirstStoreFromServer(t, 0).TestSender()
+		send3 := tc.GetFirstStoreFromServer(t, 2).TestSender()
+
+		// Create a range, upreplicate it, and replicate a write.
+		key := tc.ScratchRange(t)
+		desc := tc.AddVotersOrFatal(t, key, tc.Targets(1, 2)...)
+		_, pErr := kv.SendWrapped(ctx, send1, incrementArgs(key, 1))
+		require.NoError(t, pErr.GoError())
+		tc.WaitForValues(t, key, []int64{1, 1, 1})
+
+		repl1, err := tc.GetFirstStoreFromServer(t, 0).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		repl2, err := tc.GetFirstStoreFromServer(t, 1).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+		repl3, err := tc.GetFirstStoreFromServer(t, 2).GetReplica(desc.RangeID)
+		require.NoError(t, err)
+
+		// Move the lease to n3, and make sure everyone has applied it.
+		tc.TransferRangeLeaseOrFatal(t, desc, tc.Target(2))
+		require.Eventually(t, func() bool {
+			lease, _ := repl3.GetLease()
+			return lease.Replica.ReplicaID == repl3.ReplicaID()
+		}, 10*time.Second, 500*time.Millisecond)
+		_, pErr = kv.SendWrapped(ctx, send3, incrementArgs(key, 1))
+		require.NoError(t, pErr.GoError())
+		tc.WaitForValues(t, key, []int64{2, 2, 2})
+		t.Logf("n3 has lease")
+
+		// Make sure n1 is still leader.
+		st := repl1.RaftStatus()
+		require.Equal(t, raftpb.StateLeader, st.RaftState)
+		logStatus(st)
+
+		// Remove n1 and wait for n3 to become leader.
+		tc.RemoveVotersOrFatal(t, key, tc.Target(0))
+		t.Logf("n1 removed from range")
+
+		// Make sure we didn't time out on the above.
+		require.NoError(t, ctx.Err())
+
+		require.Eventually(t, func() bool {
+			logStatus(repl2.RaftStatus())
+			logStatus(repl3.RaftStatus())
+			if repl3.RaftStatus().RaftState == raftpb.StateLeader {
+				t.Logf("n3 is leader")
+				return true
+			}
+			return false
+		}, 10*time.Second, 500*time.Millisecond)
+
+		require.NoError(t, ctx.Err())
+	})
+}
+
+// TestStoreMetricsOnIncomingOutgoingMsg verifies that HandleRaftRequest() and
+// HandleRaftRequestSent() correctly update metrics for incoming and outgoing
+// raft messages.
+func TestStoreMetricsOnIncomingOutgoingMsg(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(timeutil.Unix(0, 123)))
+	cfg := kvserver.TestStoreConfig(clock)
+	var stopper *stop.Stopper
+	stopper, _, _, cfg.StorePool, _, _ = storepool.CreateTestStorePool(ctx, cfg.Settings,
+		liveness.TestTimeUntilNodeDead, false, /* deterministic */
+		func() int { return 1 }, /* nodeCount */
+		livenesspb.NodeLivenessStatus_DEAD)
+	defer stopper.Stop(ctx)
+
+	// Create a noop store and request.
+	node := roachpb.NodeDescriptor{NodeID: roachpb.NodeID(1)}
+	eng := kvstorage.MakeEngines(storage.NewDefaultInMemForTesting())
+	stopper.AddCloser(&eng)
+	cfg.Transport = kvserver.NewDummyRaftTransport(cfg.AmbientCtx, cfg.Settings, cfg.Clock)
+	store := kvserver.NewStore(ctx, cfg, eng, &node)
+	store.Ident = &roachpb.StoreIdent{
+		ClusterID: uuid.Nil,
+		StoreID:   1,
+		NodeID:    1,
+	}
+	request := &kvserverpb.RaftMessageRequest{
+		RangeID:     1,
+		FromReplica: roachpb.ReplicaDescriptor{},
+		ToReplica:   roachpb.ReplicaDescriptor{},
+		Message: raftpb.Message{
+			From: 1,
+			To:   2,
+			Type: raftpb.MsgTimeoutNow,
+			Term: 1,
+		},
+	}
+
+	metricsNames := []string{
+		"raft.rcvd.bytes",
+		"raft.rcvd.cross_region.bytes",
+		"raft.rcvd.cross_zone.bytes",
+		"raft.sent.bytes",
+		"raft.sent.cross_region.bytes",
+		"raft.sent.cross_zone.bytes"}
+	stream := noopRaftMessageResponseStream{}
+	expectedSize := int64(request.Size())
+
+	t.Run("received raft message", func(t *testing.T) {
+		before, metricsErr := store.Metrics().GetStoreMetrics(metricsNames)
+		if metricsErr != nil {
+			t.Error(metricsErr)
+		}
+		if err := store.HandleRaftRequest(context.Background(), request, stream); err != nil {
+			t.Fatalf("HandleRaftRequest returned err %s", err)
+		}
+		after, metricsErr := store.Metrics().GetStoreMetrics(metricsNames)
+		if metricsErr != nil {
+			t.Error(metricsErr)
+		}
+		actual := getMapsDiff(before, after)
+		expected := map[string]int64{
+			"raft.rcvd.bytes":              expectedSize,
+			"raft.rcvd.cross_region.bytes": 0,
+			"raft.rcvd.cross_zone.bytes":   0,
+			"raft.sent.bytes":              0,
+			"raft.sent.cross_region.bytes": 0,
+			"raft.sent.cross_zone.bytes":   0,
+		}
+		require.Equal(t, expected, actual)
+	})
+
+	t.Run("sent raft message", func(t *testing.T) {
+		before, metricsErr := store.Metrics().GetStoreMetrics(metricsNames)
+		if metricsErr != nil {
+			t.Error(metricsErr)
+		}
+		store.HandleRaftRequestSent(context.Background(),
+			request.FromReplica.NodeID, request.ToReplica.NodeID, int64(request.Size()))
+		after, metricsErr := store.Metrics().GetStoreMetrics(metricsNames)
+		if metricsErr != nil {
+			t.Error(metricsErr)
+		}
+		actual := getMapsDiff(before, after)
+		expected := map[string]int64{
+			"raft.rcvd.bytes":              0,
+			"raft.rcvd.cross_region.bytes": 0,
+			"raft.rcvd.cross_zone.bytes":   0,
+			"raft.sent.bytes":              expectedSize,
+			"raft.sent.cross_region.bytes": 0,
+			"raft.sent.cross_zone.bytes":   0,
+		}
+		require.Equal(t, expected, actual)
+	})
+}
+
+// TestInvalidConfChangeRejection is a regression test for [1]. It proposes
+// an (intentionally) invalid configuration change and makes sure that raft
+// does not drop it.
+//
+// [1]: https://github.com/cockroachdb/cockroach/issues/105797
+func TestInvalidConfChangeRejection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This is a regression test against a stuck command, so set a timeout to get
+	// a shot at a graceful failure on regression.
+	ctx, cancel := context.WithTimeout(context.Background(), testutils.DefaultSucceedsSoonDuration)
+	defer cancel()
+
+	// When our configuration change shows up below raft, we need to apply it as a
+	// no-op, since the config change is intentionally invalid and assertions
+	// would fail if we were to try to actually apply it.
+	injErr := errors.New("injected error")
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+			TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
+				if args.Req != nil && args.Req.Txn != nil && args.Req.Txn.Name == "fake" {
+					return 0, kvpb.NewError(injErr)
+				}
+				return 0, nil
+			}}}},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	k := tc.ScratchRange(t)
+
+	repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(keys.MustAddr(k))
+
+	// Try to leave a joint config even though we're not in one. This is something
+	// that will lead raft to propose an empty entry instead of our conf change.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/105797
+	var ba kvpb.BatchRequest
+	now := tc.Server(0).Clock().Now()
+	txn := roachpb.MakeTransaction("fake", k, isolation.Serializable, roachpb.NormalUserPriority, now, 500*time.Millisecond.Nanoseconds(), 1, 0, false /* omitInRangefeeds */)
+	ba.Txn = &txn
+	ba.Timestamp = now
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key: k,
+		},
+		Commit: true,
+		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+			ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
+				Desc: repl.Desc(),
+			},
+		},
+	})
+
+	_, pErr := kvserver.ToSenderForTesting(repl).Send(ctx, &ba)
+	// Verify that we see the configuration change below raft, where we rejected it
+	// (since it would've otherwise blow up the Replica: after all, we intentionally
+	// proposed an invalid configuration change.
+	require.True(t, errors.Is(pErr.GoError(), injErr), "%+v", pErr.GoError())
 }

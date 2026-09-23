@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -16,7 +11,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -25,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -70,17 +66,27 @@ const (
 // aggType is a helper struct that allows tests to test both the ordered and
 // hash aggregators at the same time.
 type aggType struct {
-	new   func(*colexecagg.NewAggregatorArgs) colexecop.ResettableOperator
-	name  string
-	order ordering
+	new          func(context.Context, *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator
+	afterEachRun func() // if set, will be called at the end of each benchmark iteration
+	name         string
+	order        ordering
 }
 
 var aggTypesWithPartial = []aggType{
 	{
 		// This is a wrapper around NewHashAggregator so its signature is
 		// compatible with NewOrderedAggregator.
-		new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
-			return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, math.MaxInt64)
+		new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+			return NewHashAggregator(
+				ctx,
+				&colexecagg.NewHashAggregatorArgs{
+					NewAggregatorArgs:        args,
+					HashTableAllocator:       testAllocator,
+					OutputUnlimitedAllocator: testAllocator,
+					MaxOutputBatchMemSize:    math.MaxInt64,
+				},
+				nil, /* newSpillingQueueArgs */
+			)
 		},
 		name:  "hash",
 		order: unordered,
@@ -93,15 +99,24 @@ var aggTypesWithPartial = []aggType{
 	{
 		// This is a wrapper around NewHashAggregator so its signature is
 		// compatible with NewOrderedAggregator.
-		new: func(args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
-			return NewHashAggregator(args, nil /* newSpillingQueueArgs */, testAllocator, math.MaxInt64)
+		new: func(ctx context.Context, args *colexecagg.NewAggregatorArgs) colexecop.ResettableOperator {
+			return NewHashAggregator(
+				ctx,
+				&colexecagg.NewHashAggregatorArgs{
+					NewAggregatorArgs:        args,
+					HashTableAllocator:       testAllocator,
+					OutputUnlimitedAllocator: testAllocator,
+					MaxOutputBatchMemSize:    math.MaxInt64,
+				},
+				nil, /* newSpillingQueueArgs */
+			)
 		},
 		name:  "hash-partial-order",
 		order: partial,
 	},
 }
 
-var aggTypes = aggTypesWithPartial[:1]
+var aggTypes = aggTypesWithPartial[:2]
 
 func (tc *aggregatorTestCase) init() error {
 	if tc.convToDecimal {
@@ -432,7 +447,7 @@ var aggregatorsTestCases = []aggregatorTestCase{
 		},
 		expected: colexectestutils.Tuples{
 			{0, "1.5333333333333333333", 4.6},
-			{1, 4.32, 8.64},
+			{1, "4.3200000000000000000", 8.64},
 		},
 		convToDecimal: true,
 	},
@@ -610,10 +625,10 @@ var aggregatorsTestCases = []aggregatorTestCase{
 			execinfrapb.ConcatAgg,
 		},
 		expected: colexectestutils.Tuples{
-			{0, 2, 2.1, 2, 4.2, 5, 2, 3, false, true, "zero", "zerozero"},
-			{1, 2, 2.6, 2, 5.2, 1, 0, 1, false, false, "one", "oneone"},
-			{2, 1, 1.1, 1, 1.1, 1, 1, 1, true, true, "two", "two"},
-			{3, 2, 4.6, 2, 9.2, 0, 0, 0, false, true, "three", "threethree"},
+			{0, 2, "2.1000000000000000000", 2, 4.2, 5, 2, 3, false, true, "zero", "zerozero"},
+			{1, 2, "2.6000000000000000000", 2, 5.2, 1, 0, 1, false, false, "one", "oneone"},
+			{2, 1, "1.1000000000000000000", 1, 1.1, 1, 1, 1, true, true, "two", "two"},
+			{3, 2, "4.6000000000000000000", 2, 9.2, 0, 0, 0, false, true, "three", "threethree"},
 		},
 		convToDecimal: true,
 	},
@@ -644,8 +659,8 @@ var aggregatorsTestCases = []aggregatorTestCase{
 			execinfrapb.ConcatAgg,
 		},
 		expected: colexectestutils.Tuples{
-			{nil, 1, 1.1, 1, 1.1, 1.1, 4, 4, 4, true, true, "a"},
-			{0, 2, 3.1, 1, 3.1, 3.1, 5, 5, 5, nil, nil, "b"},
+			{nil, 1, 1.1, 1, 1.1, "1.1000000000000000000", 4, 4, 4, true, true, "a"},
+			{0, 2, 3.1, 1, 3.1, "3.1000000000000000000", 5, 5, 5, nil, nil, "b"},
 			{1, 2, nil, 0, nil, nil, nil, nil, nil, false, false, nil},
 		},
 		convToDecimal: true,
@@ -780,12 +795,13 @@ func TestAggregators(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
+	rng, _ := randutil.NewPseudoRand()
 	ctx := context.Background()
 	for _, tc := range aggregatorsTestCases {
 		constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-			&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+			ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 		)
 		require.NoError(t, err)
 		for _, agg := range aggTypes {
@@ -798,16 +814,15 @@ func TestAggregators(t *testing.T) {
 				// Filtering aggregation is only supported with hash aggregator.
 				continue
 			}
-			log.Infof(ctx, "%s/%s", tc.name, agg.name)
+			log.Dev.Infof(ctx, "%s/%s", tc.name, agg.name)
 			verifier := colexectestutils.OrderedVerifier
 			if tc.unorderedInput {
 				verifier = colexectestutils.UnorderedVerifier
 			}
 			colexectestutils.RunTestsWithTyps(t, testAllocator, []colexectestutils.Tuples{tc.input}, [][]*types.T{tc.typs}, tc.expected, verifier,
 				func(input []colexecop.Operator) (colexecop.Operator, error) {
-					return agg.new(&colexecagg.NewAggregatorArgs{
+					args := &colexecagg.NewAggregatorArgs{
 						Allocator:      testAllocator,
-						MemAccount:     testMemAcc,
 						Input:          input[0],
 						InputTypes:     tc.typs,
 						Spec:           tc.spec,
@@ -815,7 +830,9 @@ func TestAggregators(t *testing.T) {
 						Constructors:   constructors,
 						ConstArguments: constArguments,
 						OutputTypes:    outputTypes,
-					}), nil
+					}
+					args.TestingKnobs.HashTableNumBuckets = uint32(1 + rng.Intn(7))
+					return agg.new(ctx, args), nil
 				})
 		}
 	}
@@ -825,7 +842,7 @@ func TestAggregatorRandom(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 	// This test aggregates random inputs, keeping track of the expected results
 	// to make sure the aggregations are correct.
@@ -839,16 +856,16 @@ func TestAggregatorRandom(t *testing.T) {
 		for _, numInputBatches := range []int{1, 2, 64} {
 			for _, hasNulls := range []bool{true, false} {
 				for _, agg := range aggTypesWithPartial {
-					log.Infof(context.Background(), "%s/groupSize=%d/numInputBatches=%d/hasNulls=%t", agg.name, groupSize, numInputBatches, hasNulls)
+					log.Dev.Infof(context.Background(), "%s/groupSize=%d/numInputBatches=%d/hasNulls=%t", agg.name, groupSize, numInputBatches, hasNulls)
 					nTuples := coldata.BatchSize() * numInputBatches
 					typs := []*types.T{types.Int, types.Float}
-					cols := []coldata.Vec{
-						testAllocator.NewMemColumn(typs[0], nTuples),
-						testAllocator.NewMemColumn(typs[1], nTuples),
+					cols := []*coldata.Vec{
+						testAllocator.NewVec(typs[0], nTuples),
+						testAllocator.NewVec(typs[1], nTuples),
 					}
 					if agg.order == partial {
 						typs = append(typs, types.Int)
-						cols = append(cols, testAllocator.NewMemColumn(typs[2], nTuples))
+						cols = append(cols, testAllocator.NewVec(typs[2], nTuples))
 					}
 					groups, aggCol, aggColNulls := cols[0].Int64(), cols[1].Float64(), cols[1].Nulls()
 					expectedTuples := colexectestutils.Tuples{}
@@ -887,14 +904,14 @@ func TestAggregatorRandom(t *testing.T) {
 						// NULL values contribute to the row count, so we're updating
 						// the row counts outside of the if block.
 						expRowCounts[curGroup]++
-						if hasNulls && rng.Float64() < nullProbability {
+						if hasNulls && rng.Float64() < 0.1 {
 							aggColNulls.SetNull(i)
 						} else {
 							expNulls[curGroup] = false
 							expCounts[curGroup]++
 							expSums[curGroup] += aggCol[i]
-							expMins[curGroup] = min64(aggCol[i], expMins[curGroup])
-							expMaxs[curGroup] = max64(aggCol[i], expMaxs[curGroup])
+							expMins[curGroup] = min(aggCol[i], expMins[curGroup])
+							expMaxs[curGroup] = max(aggCol[i], expMaxs[curGroup])
 						}
 						groups[i] = int64(curGroup)
 					}
@@ -929,12 +946,11 @@ func TestAggregatorRandom(t *testing.T) {
 					}
 					require.NoError(t, tc.init())
 					constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-						&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+						context.Background(), &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 					)
 					require.NoError(t, err)
-					a := agg.new(&colexecagg.NewAggregatorArgs{
+					args := &colexecagg.NewAggregatorArgs{
 						Allocator:      testAllocator,
-						MemAccount:     testMemAcc,
 						Input:          source,
 						InputTypes:     tc.typs,
 						Spec:           tc.spec,
@@ -942,7 +958,9 @@ func TestAggregatorRandom(t *testing.T) {
 						Constructors:   constructors,
 						ConstArguments: constArguments,
 						OutputTypes:    outputTypes,
-					})
+					}
+					args.TestingKnobs.HashTableNumBuckets = uint32(1 + rng.Intn(31))
+					a := agg.new(context.Background(), args)
 					a.Init(context.Background())
 
 					testOutput := colexectestutils.NewOpTestOutput(a, expectedTuples)
@@ -964,12 +982,16 @@ func TestAggregatorRandom(t *testing.T) {
 	}
 }
 
-// benchmarkAggregateFunction runs aggregator microbenchmarks. numGroupCol is
-// the number of grouping columns. groupSize is the number of tuples to target
-// in each distinct aggregation group. chunkSize is the number of tuples to
-// target in each distinct partially ordered group column, and is intended for
-// use with partial order. Limit is the number of rows to retrieve from the
-// aggregation function before ending the microbenchmark.
+// benchmarkAggregateFunction runs aggregator micro benchmarks.
+// - numGroupCol is the number of grouping columns.
+// - groupSize is the number of tuples to target in each distinct aggregation
+// group.
+// - chunkSize is the number of tuples to target in each distinct partially
+// ordered group column, and is intended for use with partial order.
+// - limit is the number of rows to retrieve from the aggregation function
+// before ending the microbenchmark.
+// - numSameAggs, if positive, indicates the number of times that the provided
+// aggregate function should be evaluated.
 func benchmarkAggregateFunction(
 	b *testing.B,
 	agg aggType,
@@ -981,6 +1003,7 @@ func benchmarkAggregateFunction(
 	numInputRows int,
 	chunkSize int,
 	limit int,
+	numSameAggs int,
 ) {
 	defer log.Scope(b).Close(b)
 	if groupSize > numInputRows {
@@ -998,11 +1021,11 @@ func benchmarkAggregateFunction(
 			return
 		}
 	}
-	rng, _ := randutil.NewTestRand()
+	rng := randutil.NewTestRandWithSeed(17)
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
-	aggMemAcc := evalCtx.Mon.MakeBoundAccount()
+	aggMemAcc := evalCtx.TestingMon.MakeBoundAccount()
 	defer aggMemAcc.Close(ctx)
 	evalCtx.SingleDatumAggMemAccount = &aggMemAcc
 	const bytesFixedLength = 8
@@ -1013,9 +1036,9 @@ func benchmarkAggregateFunction(
 		groupCols = append(groupCols, uint32(g))
 	}
 	typs = append(typs, aggInputTypes...)
-	cols := make([]coldata.Vec, len(typs))
+	cols := make([]*coldata.Vec, len(typs))
 	for i := range typs {
-		cols[i] = testAllocator.NewMemColumn(typs[i], numInputRows)
+		cols[i] = testAllocator.NewVec(typs[i], numInputRows)
 	}
 	groups := cols[0].Int64()
 	if agg.order == ordered {
@@ -1072,9 +1095,14 @@ func benchmarkAggregateFunction(
 	tc := aggregatorTestCase{
 		typs:           typs,
 		groupCols:      groupCols,
-		aggCols:        [][]uint32{aggCols},
-		aggFns:         []execinfrapb.AggregatorSpec_Func{aggFn},
 		unorderedInput: agg.order == unordered,
+	}
+	if numSameAggs < 1 {
+		numSameAggs = 1
+	}
+	for i := 0; i < numSameAggs; i++ {
+		tc.aggCols = append(tc.aggCols, aggCols)
+		tc.aggFns = append(tc.aggFns, aggFn)
 	}
 	if distinctProb > 0 {
 		if !typs[0].Identical(types.Int) {
@@ -1092,7 +1120,7 @@ func benchmarkAggregateFunction(
 	}
 	require.NoError(b, tc.init())
 	constructors, constArguments, outputTypes, err := colexecagg.ProcessAggregations(
-		&evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
+		ctx, &evalCtx, nil /* semaCtx */, tc.spec.Aggregations, tc.typs,
 	)
 	require.NoError(b, err)
 	fName := execinfrapb.AggregatorSpec_Func_name[int32(aggFn)]
@@ -1124,37 +1152,53 @@ func benchmarkAggregateFunction(
 	if distinctProb > 0 {
 		distinctProbString = fmt.Sprintf("/distinctProb=%.2f", distinctProb)
 	}
+	numSameAggsSuffix := ""
+	if numSameAggs != 1 {
+		numSameAggsSuffix = fmt.Sprintf("/numSameAggs=%d", numSameAggs)
+	}
+	afterEachRunDefault := func(b *testing.B, op colexecop.Operator) {
+		if err = op.(colexecop.Closer).Close(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
 	b.Run(fmt.Sprintf(
-		"%s/%s/%s/groupSize=%d%s/numInputRows=%d",
-		fName, agg.name, inputTypesString, groupSize, distinctProbString, numInputRows),
+		"%s/%s/%s%s/groupSize=%d%s/numInputRows=%d",
+		fName, agg.name, inputTypesString, numSameAggsSuffix, groupSize, distinctProbString, numInputRows),
 		func(b *testing.B) {
+			afterEachRun := afterEachRunDefault
+			if agg.afterEachRun != nil {
+				afterEachRun = func(*testing.B, colexecop.Operator) {
+					agg.afterEachRun()
+				}
+			}
+			// Simulate the scenario when the optimizer has the perfect
+			// estimate.
+			estimatedRowCount := uint64(math.Ceil(float64(numInputRows) / float64(groupSize)))
 			b.SetBytes(int64(argumentsSize * numInputRows))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				a := agg.new(&colexecagg.NewAggregatorArgs{
-					Allocator:      testAllocator,
-					MemAccount:     testMemAcc,
-					Input:          source,
-					InputTypes:     tc.typs,
-					Spec:           tc.spec,
-					EvalCtx:        &evalCtx,
-					Constructors:   constructors,
-					ConstArguments: constArguments,
-					OutputTypes:    outputTypes,
+				a := agg.new(ctx, &colexecagg.NewAggregatorArgs{
+					Allocator:         testAllocator,
+					Input:             source,
+					InputTypes:        tc.typs,
+					Spec:              tc.spec,
+					EvalCtx:           &evalCtx,
+					Constructors:      constructors,
+					ConstArguments:    constArguments,
+					OutputTypes:       outputTypes,
+					EstimatedRowCount: estimatedRowCount,
 				})
 				a.Init(ctx)
 				// Exhaust aggregator until all batches have been read or limit, if
 				// non-zero, is reached.
 				tupleCount := 0
-				for b := a.Next(); b.Length() != 0; b = a.Next() {
+				for b := colexecop.NextNoMeta(a); b.Length() != 0; b = colexecop.NextNoMeta(a) {
 					tupleCount += b.Length()
 					if limit > 0 && tupleCount >= limit {
 						break
 					}
 				}
-				if err = a.(colexecop.Closer).Close(); err != nil {
-					b.Fatal(err)
-				}
+				afterEachRun(b, a)
 				source.Reset(ctx)
 			}
 		},
@@ -1166,20 +1210,26 @@ func benchmarkAggregateFunction(
 // benchmark is measuring the performance of the aggregators themselves
 // depending on the parameters of the input.
 func BenchmarkAggregator(b *testing.B) {
-	aggFn := execinfrapb.Min
 	numRows := []int{1, 32, coldata.BatchSize(), 32 * coldata.BatchSize(), 1024 * coldata.BatchSize()}
 	groupSizes := []int{1, 2, 32, 128, coldata.BatchSize()}
 	if testing.Short() {
 		numRows = []int{32, 32 * coldata.BatchSize()}
 		groupSizes = []int{1, coldata.BatchSize()}
 	}
+	// We choose any_not_null aggregate function because it is the simplest
+	// possible and, thus, its Compute function call will have the least impact
+	// when benchmarking the aggregator logic.
+	aggFn := execinfrapb.AnyNotNull
 	for _, agg := range aggTypes {
-		for _, numInputRows := range numRows {
-			for _, groupSize := range groupSizes {
-				benchmarkAggregateFunction(
-					b, agg, aggFn, []*types.T{types.Int}, 1, /* numGroupCol */
-					groupSize, 0 /* distinctProb */, numInputRows,
-					0 /* chunkSize */, 0 /* limit */)
+		for _, numSameAggs := range []int{1, 4} {
+			for _, numInputRows := range numRows {
+				for _, groupSize := range groupSizes {
+					benchmarkAggregateFunction(
+						b, agg, aggFn, []*types.T{types.Int}, 1, /* numGroupCol */
+						groupSize, 0 /* distinctProb */, numInputRows,
+						0 /* chunkSize */, 0 /* limit */, numSameAggs,
+					)
+				}
 			}
 		}
 	}
@@ -1216,7 +1266,8 @@ func BenchmarkAllOptimizedAggregateFunctions(b *testing.B) {
 				benchmarkAggregateFunction(b, agg, aggFn, aggInputTypes,
 					1 /* numGroupCol */, groupSize,
 					0 /* distinctProb */, numInputRows,
-					0 /* chunkSize */, 0 /* limit */)
+					0 /* chunkSize */, 0 /* limit */, 0, /* numSameAggs */
+				)
 			}
 		}
 	}
@@ -1240,23 +1291,10 @@ func BenchmarkDistinctAggregation(b *testing.B) {
 					benchmarkAggregateFunction(b, agg, aggFn, []*types.T{types.Int},
 						1 /* numGroupCol */, groupSize,
 						0 /* distinctProb */, numInputRows,
-						0 /* chunkSize */, 0 /* limit */)
+						0 /* chunkSize */, 0 /* limit */, 0, /* numSameAggs */
+					)
 				}
 			}
 		}
 	}
-}
-
-func min64(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max64(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
 }

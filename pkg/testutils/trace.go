@@ -1,29 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testutils
 
 import (
 	"regexp"
+	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
-
-// MakeAmbientCtx creates an AmbientContext with a Tracer in it.
-func MakeAmbientCtx() log.AmbientContext {
-	return log.AmbientContext{
-		Tracer: tracing.NewTracer(),
-	}
-}
 
 // MatchInOrder matches interprets the given slice of strings as a slice of
 // regular expressions and checks that they match, in order and without overlap,
@@ -36,7 +24,7 @@ func MatchInOrder(s string, res ...string) error {
 		reStr := "(?ms)" + res[i]
 		re, err := regexp.Compile(reStr)
 		if err != nil {
-			return errors.Errorf("regexp %d (%q) does not compile: %s", i, reStr, err)
+			return errors.Wrapf(err, "regexp %d (%q) does not compile", i, reStr)
 		}
 		loc := re.FindStringIndex(s[sPos:])
 		if loc == nil {
@@ -49,4 +37,21 @@ func MatchInOrder(s string, res ...string) error {
 		sPos += loc[1]
 	}
 	return nil
+}
+
+// SetVModule sets the logging vmodule. The vmodule will be reset by the given
+// testing.TB's Cleanup method.
+//
+// Not safe for concurrent use.
+func SetVModule(t testing.TB, vmodule string) {
+	t.Helper()
+	prevVModule := log.GetVModule()
+	if err := log.SetVModule(vmodule); err != nil {
+		t.Fatalf("failed to set vmodule: %s", err.Error())
+	}
+	t.Cleanup(func() {
+		if err := log.SetVModule(prevVModule); err != nil {
+			t.Fatalf("failed to set vmodule: %s", err.Error())
+		}
+	})
 }

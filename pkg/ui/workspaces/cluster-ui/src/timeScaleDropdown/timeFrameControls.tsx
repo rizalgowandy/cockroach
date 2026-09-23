@@ -1,20 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import classNames from "classnames/bind";
-import { Button, Tooltip } from "antd";
 import { CaretLeft, CaretRight } from "@cockroachlabs/icons";
-import { ArrowDirection } from "./timeScaleTypes";
+import { Button, Tooltip } from "antd";
+import classNames from "classnames/bind";
+import React from "react";
 
 import styles from "./timeFrameControls.module.scss";
+import { ArrowDirection } from "./timeScaleTypes";
 
 const cx = classNames.bind(styles);
 
@@ -36,8 +31,7 @@ export const TimeFrameControls = ({
     onArrowClick(direction);
 
   const left = disabledArrows.includes(ArrowDirection.LEFT);
-  const center = disabledArrows.includes(ArrowDirection.CENTER);
-  const right = disabledArrows.includes(ArrowDirection.RIGHT);
+  const canForward = !disabledArrows.includes(ArrowDirection.RIGHT);
   const delay = 0.3;
 
   return (
@@ -45,7 +39,7 @@ export const TimeFrameControls = ({
       <ButtonGroup>
         <Tooltip
           placement="bottom"
-          title="previous timeframe"
+          title="Previous time interval"
           mouseEnterDelay={delay}
           mouseLeaveDelay={delay}
         >
@@ -53,20 +47,23 @@ export const TimeFrameControls = ({
             onClick={handleChangeArrow(ArrowDirection.LEFT)}
             disabled={left}
             className={cx("_action", left ? "disabled" : "active")}
+            aria-label={"previous time interval"}
           >
             <CaretLeft className={cx("icon")} />
           </Button>
         </Tooltip>
         <Tooltip
           placement="bottom"
-          title="next timeframe"
+          title="Next time interval"
           mouseEnterDelay={delay}
           mouseLeaveDelay={delay}
         >
           <Button
-            onClick={handleChangeArrow(ArrowDirection.RIGHT)}
-            disabled={right}
-            className={cx("_action", right ? "disabled" : "active")}
+            onClick={handleChangeArrow(
+              canForward ? ArrowDirection.RIGHT : ArrowDirection.CENTER,
+            )}
+            className={cx("_action", "active")}
+            aria-label={"next time interval"}
           >
             <CaretRight className={cx("icon")} />
           </Button>
@@ -74,14 +71,13 @@ export const TimeFrameControls = ({
       </ButtonGroup>
       <Tooltip
         placement="bottom"
-        title="Now"
+        title="Most recent interval"
         mouseEnterDelay={delay}
         mouseLeaveDelay={delay}
       >
         <Button
           onClick={handleChangeArrow(ArrowDirection.CENTER)}
-          disabled={center}
-          className={cx("_action", center ? "disabled" : "active", "btn__now")}
+          className={cx("_action", "active", "btn__now")}
         >
           Now
         </Button>

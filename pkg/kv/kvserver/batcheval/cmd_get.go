@@ -1,108 +1,139 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package batcheval
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	RegisterReadOnlyCommand(roachpb.Get, DefaultDeclareIsolatedKeys, Get)
+	RegisterReadWriteCommand(kvpb.Get, DefaultDeclareIsolatedKeys, Get)
 }
 
 // Get returns the value for a specified key.
 func Get(
-	ctx context.Context, reader storage.Reader, cArgs CommandArgs, resp roachpb.Response,
+	ctx context.Context, readWriter storage.ReadWriter, cArgs CommandArgs, resp kvpb.Response,
 ) (result.Result, error) {
-	args := cArgs.Args.(*roachpb.GetRequest)
+	args := cArgs.Args.(*kvpb.GetRequest)
 	h := cArgs.Header
-	reply := resp.(*roachpb.GetResponse)
+	reply := resp.(*kvpb.GetResponse)
 
-	if h.MaxSpanRequestKeys < 0 || h.TargetBytes < 0 {
-		// Receipt of a GetRequest with negative MaxSpanRequestKeys or TargetBytes
-		// indicates that the request was part of a batch that has already exhausted
-		// its limit, which means that we should *not* serve the request and return
-		// a ResumeSpan for this GetRequest.
-		//
-		// This mirrors the logic in MVCCScan, though the logic in MVCCScan is
-		// slightly lower in the stack.
-		reply.ResumeSpan = &roachpb.Span{Key: args.Key}
-		if h.MaxSpanRequestKeys < 0 {
-			reply.ResumeReason = roachpb.RESUME_KEY_LIMIT
-		} else if h.TargetBytes < 0 {
-			reply.ResumeReason = roachpb.RESUME_BYTE_LIMIT
-		}
-		return result.Result{}, nil
-	}
-
-	var val *roachpb.Value
-	var intent *roachpb.Intent
-	var err error
-	val, intent, err = storage.MVCCGet(ctx, reader, args.Key, h.Timestamp, storage.MVCCGetOptions{
-		Inconsistent:     h.ReadConsistency != roachpb.CONSISTENT,
-		Txn:              h.Txn,
-		FailOnMoreRecent: args.KeyLocking != lock.None,
-		Uncertainty:      cArgs.Uncertainty,
-		MemoryAccount:    cArgs.EvalCtx.GetResponseMemoryAccount(),
-	})
-	if err != nil {
+	if err := args.Validate(h); err != nil {
 		return result.Result{}, err
 	}
-	if val != nil {
-		// NB: This calculation is different from Scan, since Scan responses include
-		// the key/value pair while Get only includes the value.
-		numBytes := int64(len(val.RawBytes))
-		if h.TargetBytes > 0 && h.TargetBytesAllowEmpty && numBytes > h.TargetBytes {
-			reply.ResumeSpan = &roachpb.Span{Key: args.Key}
-			reply.ResumeReason = roachpb.RESUME_BYTE_LIMIT
-			reply.ResumeNextBytes = numBytes
-			return result.Result{}, nil
-		}
-		reply.NumKeys = 1
-		reply.NumBytes = numBytes
-	}
-	var intents []roachpb.Intent
-	if intent != nil {
-		intents = append(intents, *intent)
+
+	var lockTableForSkipLocked storage.LockTableView
+	if h.WaitPolicy == lock.WaitPolicy_SkipLocked {
+		lockTableForSkipLocked = newRequestBoundLockTableView(
+			readWriter, cArgs.Concurrency, h.Txn, args.KeyLockingStrength,
+		)
+		defer lockTableForSkipLocked.Close()
 	}
 
-	reply.Value = val
-	if h.ReadConsistency == roachpb.READ_UNCOMMITTED {
+	readTimestamp := h.Timestamp
+	failOnMoreRecent := args.KeyLockingStrength != lock.None
+	expectExclusionSince := !args.ExpectExclusionSince.IsEmpty()
+
+	// If ExpectExclusionSince is set, use it as the read timestamp and set the
+	// MoreRecentPolicy to ExclusionViolationErrorOnMoreRecent to ensure that an
+	// exclusion violation error is returned if a write has occurred since the
+	// exclusion timestamp.
+	if expectExclusionSince {
+		readTimestamp = args.ExpectExclusionSince
+		failOnMoreRecent = true
+	}
+
+	getRes, err := storage.MVCCGet(ctx, readWriter, args.Key, readTimestamp, storage.MVCCGetOptions{
+		Inconsistent:          h.ReadConsistency != kvpb.CONSISTENT,
+		SkipLocked:            h.WaitPolicy == lock.WaitPolicy_SkipLocked,
+		Txn:                   h.Txn,
+		FailOnMoreRecent:      failOnMoreRecent,
+		ScanStats:             cArgs.ScanStats,
+		Uncertainty:           cArgs.Uncertainty,
+		MemoryAccount:         cArgs.EvalCtx.GetResponseMemoryAccount(),
+		LockTable:             lockTableForSkipLocked,
+		DontInterleaveIntents: cArgs.DontInterleaveIntents,
+		MaxKeys:               cArgs.Header.MaxSpanRequestKeys,
+		TargetBytes:           cArgs.Header.TargetBytes,
+		AllowEmpty:            cArgs.Header.AllowEmpty,
+		ReadCategory:          fs.BatchEvalReadCategory,
+		ReturnRawMVCCValues:   args.ReturnRawMVCCValues,
+		WorkloadID:            h.WorkloadID,
+	})
+	if err != nil {
+		// If the user has set ExpectExclusionSince, transform any WriteTooOld error
+		// into an ExclusionViolationError.
+		if expectExclusionSince {
+			if wtoErr := (*kvpb.WriteTooOldError)(nil); errors.As(err, &wtoErr) {
+				err = kvpb.NewExclusionViolationError(
+					readTimestamp,
+					wtoErr.ActualTimestamp.Prev(),
+					args.Key,
+				)
+			}
+		}
+		return result.Result{}, err
+	}
+	reply.ResumeSpan = getRes.ResumeSpan
+	reply.ResumeReason = getRes.ResumeReason
+	reply.ResumeNextBytes = getRes.ResumeNextBytes
+	reply.NumKeys = getRes.NumKeys
+	reply.NumBytes = getRes.NumBytes
+	if reply.ResumeSpan != nil {
+		return result.Result{}, nil
+	}
+	var intents []roachpb.Intent
+	if getRes.Intent != nil {
+		intents = append(intents, *getRes.Intent)
+	}
+
+	reply.Value = getRes.Value.ToPointer()
+	if h.ReadConsistency == kvpb.READ_UNCOMMITTED {
 		var intentVals []roachpb.KeyValue
 		// NOTE: MVCCGet uses a Prefix iterator, so we want to use one in
 		// CollectIntentRows as well so that we're guaranteed to use the same
 		// cached iterator and observe a consistent snapshot of the engine.
 		const usePrefixIter = true
-		intentVals, err = CollectIntentRows(ctx, reader, usePrefixIter, intents)
+		intentVals, err = CollectIntentRows(ctx, readWriter, usePrefixIter, intents)
 		if err == nil {
 			switch len(intentVals) {
 			case 0:
 			case 1:
 				reply.IntentValue = &intentVals[0].Value
 			default:
-				log.Fatalf(ctx, "more than 1 intent on single key: %v", intentVals)
+				log.KvExec.Fatalf(ctx, "more than 1 intent on single key: %v", intentVals)
 			}
 		}
 	}
 
+	shouldLockKey := getRes.Value.Exists() || args.LockNonExisting
 	var res result.Result
-	if args.KeyLocking != lock.None && h.Txn != nil && val != nil {
-		acq := roachpb.MakeLockAcquisition(h.Txn, args.Key, lock.Unreplicated)
-		res.Local.AcquiredLocks = []roachpb.LockAcquisition{acq}
+	if args.KeyLockingStrength != lock.None && shouldLockKey {
+		// ExpectExclusionSince is used by callers (namely, txnWriteBuffers) that
+		// are likely to be sending replicated, locking Get requests at sequence
+		// numbers corresponding to unreplicated locks taken earlier in the
+		// transaction. In this case, sequence number regression is not unexpected.
+		allowSequenceNumberRegression := args.ExpectExclusionSince.IsSet()
+		acq, err := acquireLockOnKey(ctx, readWriter, h.Txn, args.KeyLockingStrength,
+			args.KeyLockingDurability, args.Key, cArgs.Stats, cArgs.EvalCtx.ClusterSettings(), allowSequenceNumberRegression)
+		if err != nil {
+			return result.Result{}, err
+		}
+		if !acq.Empty() {
+			res.Local.AcquiredLocks = []roachpb.LockAcquisition{acq}
+		}
 	}
 	res.Local.EncounteredIntents = intents
 	return res, err

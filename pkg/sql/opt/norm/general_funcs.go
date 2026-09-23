@@ -1,17 +1,12 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
 import (
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
@@ -64,14 +59,31 @@ func (c *CustomFuncs) IsTimestampTZ(scalar opt.ScalarExpr) bool {
 	return scalar.DataType().Family() == types.TimestampTZFamily
 }
 
+// IsJSON returns true if the given scalar expression is of type
+// JSON.
+func (c *CustomFuncs) IsJSON(scalar opt.ScalarExpr) bool {
+	return scalar.DataType().Family() == types.JsonFamily
+}
+
+// IsInt returns true if the given scalar expression is of one of the
+// integer types.
+func (c *CustomFuncs) IsInt(scalar opt.ScalarExpr) bool {
+	return scalar.DataType().Family() == types.IntFamily
+}
+
+// IsTuple returns true if the given scalar expression is a tuple type.
+func (c *CustomFuncs) IsTuple(scalar opt.ScalarExpr) bool {
+	return scalar.DataType().Family() == types.TupleFamily
+}
+
 // BoolType returns the boolean SQL type.
 func (c *CustomFuncs) BoolType() *types.T {
 	return types.Bool
 }
 
-// AnyType returns the wildcard Any type.
+// AnyType returns the wildcard AnyElement type.
 func (c *CustomFuncs) AnyType() *types.T {
-	return types.Any
+	return types.AnyElement
 }
 
 // CanConstructBinary returns true if (op left right) has a valid binary op
@@ -98,6 +110,12 @@ func (c *CustomFuncs) BinaryType(op opt.Operator, left, right opt.ScalarExpr) *t
 // TypeOf returns the type of the expression.
 func (c *CustomFuncs) TypeOf(e opt.ScalarExpr) *types.T {
 	return e.DataType()
+}
+
+// IdenticalTypes returns true if the two types are identical. See
+// (*types.T).Identical.
+func (c *CustomFuncs) IdenticalTypes(left, right *types.T) bool {
+	return left.Identical(right)
 }
 
 // IsConstArray returns true if the expression is a constant array.
@@ -268,19 +286,48 @@ func (c *CustomFuncs) RedundantCols(input memo.RelExpr, cols opt.ColSet) opt.Col
 	return cols.Difference(reducedCols)
 }
 
+func (c *CustomFuncs) RemapScanColsInScalarExpr(
+	scalar opt.ScalarExpr, src, dst *memo.ScanPrivate,
+) opt.ScalarExpr {
+	md := c.mem.Metadata()
+	if md.Table(src.Table).ID() != md.Table(dst.Table).ID() {
+		panic(errors.AssertionFailedf("scans must have the same base table"))
+	}
+	if src.Cols.Len() != dst.Cols.Len() {
+		panic(errors.AssertionFailedf("scans must have the same number of columns"))
+	}
+	// Remap each column in src to a column in dst.
+	var colMap opt.ColMap
+	for srcCol, ok := src.Cols.Next(0); ok; srcCol, ok = src.Cols.Next(srcCol + 1) {
+		ord := src.Table.ColumnOrdinal(srcCol)
+		dstCol := dst.Table.ColumnID(ord)
+		colMap.Set(int(srcCol), int(dstCol))
+	}
+	return c.f.RemapCols(scalar, colMap)
+}
+
+// RemapScanColsInFilter returns a new FiltersExpr where columns in src's table
+// are replaced with columns of the same ordinal in dst's table. src and dst
+// must scan the same base table.
+func (c *CustomFuncs) RemapScanColsInFilter(
+	filters memo.FiltersExpr, src, dst *memo.ScanPrivate,
+) memo.FiltersExpr {
+	newFilters := c.RemapScanColsInScalarExpr(&filters, src, dst).(*memo.FiltersExpr)
+	return *newFilters
+}
+
 // DuplicateColumnIDs duplicates a table and set of columns IDs in the metadata.
 // It returns the new table's ID and the new set of columns IDs.
 func (c *CustomFuncs) DuplicateColumnIDs(
 	table opt.TableID, cols opt.ColSet,
 ) (opt.TableID, opt.ColSet) {
 	md := c.mem.Metadata()
-	tabMeta := md.TableMeta(table)
-	newTableID := md.DuplicateTable(table, c.RemapCols)
+	newTableID := md.DuplicateTable(table, c.f.RemapCols)
 
 	// Build a new set of column IDs from the new TableMeta.
 	var newColIDs opt.ColSet
 	for col, ok := cols.Next(0); ok; col, ok = cols.Next(col + 1) {
-		ord := tabMeta.MetaID.ColumnOrdinal(col)
+		ord := table.ColumnOrdinal(col)
 		newColID := newTableID.ColumnID(ord)
 		newColIDs.Add(newColID)
 	}
@@ -288,28 +335,40 @@ func (c *CustomFuncs) DuplicateColumnIDs(
 	return newTableID, newColIDs
 }
 
-// RemapCols remaps columns IDs in the input ScalarExpr by replacing occurrences
-// of the keys of colMap with the corresponding values. If column IDs are
-// encountered in the input ScalarExpr that are not keys in colMap, they are not
-// remapped.
-func (c *CustomFuncs) RemapCols(scalar opt.ScalarExpr, colMap opt.ColMap) opt.ScalarExpr {
-	// Recursively walk the scalar sub-tree looking for references to columns
-	// that need to be replaced and then replace them appropriately.
-	var replace ReplaceFunc
-	replace = func(e opt.Expr) opt.Expr {
-		switch t := e.(type) {
-		case *memo.VariableExpr:
-			dstCol, ok := colMap.Get(int(t.Col))
-			if !ok {
-				// The column ID is not in colMap so no replacement is required.
-				return e
-			}
-			return c.f.ConstructVariable(opt.ColumnID(dstCol))
-		}
-		return c.f.Replace(e, replace)
-	}
+// MakeBoolCol creates a new column of type Bool and returns its ID.
+func (c *CustomFuncs) MakeBoolCol() opt.ColumnID {
+	return c.mem.Metadata().AddColumn("", types.Bool)
+}
 
-	return replace(scalar).(opt.ScalarExpr)
+// CanRemapCols returns true if it's possible to remap every column in the
+// "from" set to a column in the "to" set using the given FDs.
+func (c *CustomFuncs) CanRemapCols(from, to opt.ColSet, fds *props.FuncDepSet) bool {
+	for fromCol, ok := from.Next(0); ok; fromCol, ok = from.Next(fromCol + 1) {
+		if _, ok := c.remapColWithIdenticalType(fromCol, to, fds); !ok {
+			// It is not possible to remap this column to one from the "to" set.
+			return false
+		}
+	}
+	return true
+}
+
+// remapColWithIdenticalType returns a column in the "to" set that is equivalent
+// to "fromCol" and has the identical type. It returns ok=false if no such
+// column exists.
+func (c *CustomFuncs) remapColWithIdenticalType(
+	fromCol opt.ColumnID, to opt.ColSet, fds *props.FuncDepSet,
+) (_ opt.ColumnID, ok bool) {
+	md := c.mem.Metadata()
+	fromColType := md.ColumnMeta(fromCol).Type
+	equivCols := fds.ComputeEquivGroup(fromCol)
+	equivCols.IntersectionWith(to)
+	for equivCol, ok := equivCols.Next(0); ok; equivCol, ok = equivCols.Next(equivCol + 1) {
+		equivColType := md.ColumnMeta(equivCol).Type
+		if fromColType.Identical(equivColType) {
+			return equivCol, true
+		}
+	}
+	return 0, false
 }
 
 // ----------------------------------------------------------------------
@@ -329,7 +388,7 @@ func (c *CustomFuncs) OuterCols(e opt.Expr) opt.ColSet {
 // column, or in other words, a reference to a variable that is not bound within
 // its own scope. For example:
 //
-//   SELECT * FROM a WHERE EXISTS(SELECT * FROM b WHERE b.x = a.x)
+//	SELECT * FROM a WHERE EXISTS(SELECT * FROM b WHERE b.x = a.x)
 //
 // The a.x variable in the EXISTS subquery references a column outside the scope
 // of the subquery. It is an "outer column" for the subquery (see the comment on
@@ -340,11 +399,12 @@ func (c *CustomFuncs) HasOuterCols(input opt.Expr) bool {
 
 // IsCorrelated returns true if any variable in the source expression references
 // a column from the given set of output columns. For example:
-//   (InnerJoin
-//     (Scan a)
-//     (Scan b)
-//     [ ... (FiltersItem $item:(Eq (Variable a.x) (Const 1))) ... ]
-//   )
+//
+//	(InnerJoin
+//	  (Scan a)
+//	  (Scan b)
+//	  [ ... (FiltersItem $item:(Eq (Variable a.x) (Const 1))) ... ]
+//	)
 //
 // The $item expression is correlated with the (Scan a) expression because it
 // references one of its columns. But the $item expression is not correlated
@@ -356,11 +416,11 @@ func (c *CustomFuncs) IsCorrelated(src memo.RelExpr, cols opt.ColSet) bool {
 // IsBoundBy returns true if all outer references in the source expression are
 // bound by the given columns. For example:
 //
-//   (InnerJoin
-//     (Scan a)
-//     (Scan b)
-//     [ ... $item:(FiltersItem (Eq (Variable a.x) (Const 1))) ... ]
-//   )
+//	(InnerJoin
+//	  (Scan a)
+//	  (Scan b)
+//	  [ ... $item:(FiltersItem (Eq (Variable a.x) (Const 1))) ... ]
+//	)
 //
 // The $item expression is fully bound by the output columns of the (Scan a)
 // expression because all of its outer references are satisfied by the columns
@@ -413,11 +473,11 @@ func (c *CustomFuncs) FilterOuterCols(filters memo.FiltersExpr) opt.ColSet {
 // FiltersBoundBy returns true if all outer references in any of the filter
 // conditions are bound by the given columns. For example:
 //
-//   (InnerJoin
-//     (Scan a)
-//     (Scan b)
-//     $filters:[ (FiltersItem (Eq (Variable a.x) (Const 1))) ]
-//   )
+//	(InnerJoin
+//	  (Scan a)
+//	  (Scan b)
+//	  $filters:[ (FiltersItem (Eq (Variable a.x) (Const 1))) ]
+//	)
 //
 // The $filters expression is fully bound by the output columns of the (Scan a)
 // expression because all of its outer references are satisfied by the columns
@@ -489,6 +549,23 @@ func (c *CustomFuncs) CanHaveZeroRows(input memo.RelExpr) bool {
 	return input.Relational().Cardinality.CanBeZero()
 }
 
+// HasBoundedCardinality returns true if the input expression returns a bounded
+// number of rows.
+func (c *CustomFuncs) HasBoundedCardinality(input memo.RelExpr) bool {
+	return !input.Relational().Cardinality.IsUnbounded()
+}
+
+// GetLimitFromCardinality returns a ConstExpr equal to the upper bound on the
+// input expression's cardinality. It panics if the expression is unbounded.
+func (c *CustomFuncs) GetLimitFromCardinality(input memo.RelExpr) opt.ScalarExpr {
+	if input.Relational().Cardinality.IsUnbounded() {
+		panic(errors.AssertionFailedf("called GetLimitFromCardinality on unbounded expression"))
+	}
+	return c.f.ConstructConstVal(
+		tree.NewDInt(tree.DInt(input.Relational().Cardinality.Max)), types.Int,
+	)
+}
+
 // ----------------------------------------------------------------------
 //
 // Key functions
@@ -520,10 +597,93 @@ func (c *CustomFuncs) ColsAreStrictKey(cols opt.ColSet, input memo.RelExpr) bool
 	return input.Relational().FuncDeps.ColsAreStrictKey(cols)
 }
 
+// ColsAreLaxKey returns true if the given columns form a lax key for the given
+// input expression. A lax key considers NULL values as distinct from one
+// another, so it is allowed for two rows to have the same set of values if some
+// of the values are NULL.
+func (c *CustomFuncs) ColsAreLaxKey(cols opt.ColSet, input memo.RelExpr) bool {
+	return input.Relational().FuncDeps.ColsAreLaxKey(cols)
+}
+
 // PrimaryKeyCols returns the key columns of the primary key of the table.
 func (c *CustomFuncs) PrimaryKeyCols(table opt.TableID) opt.ColSet {
 	tabMeta := c.mem.Metadata().TableMeta(table)
 	return tabMeta.IndexKeyColumns(cat.PrimaryIndex)
+}
+
+// KeyCols returns a column set consisting of the columns that make up the
+// candidate key for the input expression (a key must be present).
+func (c *CustomFuncs) KeyCols(in memo.RelExpr) opt.ColSet {
+	keyCols, ok := c.CandidateKey(in)
+	if !ok {
+		panic(errors.AssertionFailedf("expected expression to have key"))
+	}
+	return keyCols
+}
+
+// NonKeyCols returns a column set consisting of the output columns of the given
+// input, minus the columns that make up its candidate key (which it must have).
+func (c *CustomFuncs) NonKeyCols(in memo.RelExpr) opt.ColSet {
+	keyCols, ok := c.CandidateKey(in)
+	if !ok {
+		panic(errors.AssertionFailedf("expected expression to have key"))
+	}
+	return c.OutputCols(in).Difference(keyCols)
+}
+
+// EnsureKey finds the shortest strong key for the input expression. If no
+// strong key exists and the input expression is a Scan or a Scan wrapped in a
+// Select, EnsureKey returns a new Scan (possibly wrapped in a Select) with the
+// preexisting primary key for the table. If the input is not a Scan or
+// Select(Scan), EnsureKey wraps the input in an Ordinality operator, which
+// provides a key column by uniquely numbering the rows. EnsureKey returns the
+// input expression (perhaps augmented with a key column(s) or wrapped by
+// Ordinality).
+func (c *CustomFuncs) EnsureKey(in memo.RelExpr) memo.RelExpr {
+	// Try to add the preexisting primary key if the input is a Scan or Scan
+	// wrapped in a Select.
+	if res, ok := c.tryFindExistingKey(in); ok {
+		return res
+	}
+
+	// Otherwise, wrap the input in an Ordinality operator.
+	colID := c.f.Metadata().AddColumn("rownum", types.Int)
+	private := memo.OrdinalityPrivate{ColID: colID, ForDuplicateRemoval: true}
+	return c.f.ConstructOrdinality(in, &private)
+}
+
+// tryFindExistingKey attempts to find an existing key for the input expression.
+// It may modify the expression in order to project the key column.
+func (c *CustomFuncs) tryFindExistingKey(in memo.RelExpr) (_ memo.RelExpr, ok bool) {
+	_, hasKey := c.CandidateKey(in)
+	if hasKey {
+		return in, true
+	}
+	switch t := in.(type) {
+	case *memo.ProjectExpr:
+		input, foundKey := c.tryFindExistingKey(t.Input)
+		if foundKey {
+			return c.f.ConstructProject(input, t.Projections, input.Relational().OutputCols), true
+		}
+
+	case *memo.ScanExpr:
+		private := t.ScanPrivate
+		tableID := private.Table
+		table := c.f.Metadata().Table(tableID)
+		if !table.IsVirtualTable() {
+			keyCols := c.PrimaryKeyCols(tableID)
+			private.Cols = private.Cols.Union(keyCols)
+			return c.f.ConstructScan(&private), true
+		}
+
+	case *memo.SelectExpr:
+		input, foundKey := c.tryFindExistingKey(t.Input)
+		if foundKey {
+			return c.f.ConstructSelect(input, t.Filters), true
+		}
+	}
+
+	return nil, false
 }
 
 // ----------------------------------------------------------------------
@@ -540,6 +700,13 @@ func (c *CustomFuncs) ExprIsNeverNull(e opt.ScalarExpr, notNullCols opt.ColSet) 
 	return memo.ExprIsNeverNull(e, notNullCols)
 }
 
+// EitherExprIsNeverNull returns true if either of the two provided scalar
+// expressions is guaranteed to be non-NULL, given the set of outer columns that
+// are known to be not null.
+func (c *CustomFuncs) EitherExprIsNeverNull(a, b opt.ScalarExpr, notNullCols opt.ColSet) bool {
+	return memo.ExprIsNeverNull(a, notNullCols) || memo.ExprIsNeverNull(b, notNullCols)
+}
+
 // sharedProps returns the shared logical properties for the given expression.
 // Only relational expressions and certain scalar list items (e.g. FiltersItem,
 // ProjectionsItem, AggregationsItem) have shared properties.
@@ -554,6 +721,51 @@ func (c *CustomFuncs) sharedProps(e opt.Expr) *props.Shared {
 		memo.BuildSharedProps(e, &p, c.f.evalCtx)
 		return &p
 	}
+}
+
+// FuncDeps retrieves the FuncDepSet for the given expression.
+func (c *CustomFuncs) FuncDeps(expr memo.RelExpr) *props.FuncDepSet {
+	return &expr.Relational().FuncDeps
+}
+
+// IsLeakproof returns true if the given expression is leakproof.
+func (c *CustomFuncs) IsLeakproof(expr memo.RelExpr) bool {
+	return expr.Relational().VolatilitySet.IsLeakproof()
+}
+
+// ----------------------------------------------------------------------
+//
+// ScalarListExpr functions
+//   General functions related to ScalarListExpr.
+//
+// ----------------------------------------------------------------------
+
+// LenGT returns true if the given scalar expression list has length greater
+// than x.
+func (c *CustomFuncs) LenGT(list memo.ScalarListExpr, x int) bool {
+	return len(list) > x
+}
+
+// ScalarExprAt returns the ScalarExpr in the i-th position in the given list.
+// Returns ok=false if i is out of bounds.
+func (c *CustomFuncs) ScalarExprAt(list memo.ScalarListExpr, i int) (_ opt.ScalarExpr, ok bool) {
+	if i >= 0 && i < len(list) {
+		return list[i], true
+	}
+	return nil, false
+}
+
+// ScalarPair returns the two expressions in the given list. Returns ok=false if
+// the length of the list is not two.
+func (c *CustomFuncs) ScalarPair(list memo.ScalarListExpr) (_, _ opt.ScalarExpr, ok bool) {
+	if len(list) != 2 {
+		return nil, nil, false
+	}
+	return list[0], list[1], true
+}
+
+func (c *CustomFuncs) DropLast(list memo.ScalarListExpr) memo.ScalarListExpr {
+	return list[:len(list)-1]
 }
 
 // ----------------------------------------------------------------------
@@ -690,6 +902,17 @@ func (c *CustomFuncs) RemoveFiltersItem(
 	return filters.RemoveFiltersItem(search)
 }
 
+// AppendFiltersItem returns a new list that is a copy of the given list, except
+// that the given item has been appended to the end of the list.
+func (c *CustomFuncs) AppendFiltersItem(
+	filters memo.FiltersExpr, toAppend opt.ScalarExpr,
+) memo.FiltersExpr {
+	newFilters := make(memo.FiltersExpr, len(filters)+1)
+	copy(newFilters, filters)
+	newFilters[len(filters)] = c.f.ConstructFiltersItem(toAppend)
+	return newFilters
+}
+
 // ReplaceFiltersItem returns a new list that is a copy of the given list,
 // except that the given search item has been replaced by the given replace
 // item. If the list contains the search item multiple times, then only the
@@ -714,14 +937,14 @@ func (c *CustomFuncs) ReplaceFiltersItem(
 // from the given list that are fully bound by the given columns (i.e. all
 // outer references are to one of these columns). For example:
 //
-//   (InnerJoin
-//     (Scan a)
-//     (Scan b)
-//     (Filters [
-//       (Eq (Variable a.x) (Variable b.x))
-//       (Gt (Variable a.x) (Const 1))
-//     ])
-//   )
+//	(InnerJoin
+//	  (Scan a)
+//	  (Scan b)
+//	  (Filters [
+//	    (Eq (Variable a.x) (Variable b.x))
+//	    (Gt (Variable a.x) (Const 1))
+//	  ])
+//	)
 //
 // Calling ExtractBoundConditions with the filter conditions list and the output
 // columns of (Scan a) would extract the (Gt) expression, since its outer
@@ -752,6 +975,386 @@ func (c *CustomFuncs) ExtractUnboundConditions(
 		}
 	}
 	return newFilters
+}
+
+// ComputedColFilters generates all filters that can be derived from the list of
+// computed column expressions from the given table. A computed column can be
+// used as a filter when it has a constant value. That is true when:
+//
+//  1. All other columns it references are constant, because other filters in
+//     the query constrain them to be so.
+//  2. All functions in the computed column expression can be folded into
+//     constants (i.e. they do not have problematic side effects).
+//
+// Note that computed columns can depend on other computed columns; in general
+// the dependencies form an acyclic directed graph. ComputedColFilters will
+// return filters for all constant computed columns, regardless of the order of
+// their dependencies.
+//
+// As with checkConstraintFilters, ComputedColFilters do not really filter any
+// rows, they are rather facts or guarantees about the data. Treating them as
+// filters may allow some indexes to be constrained and used. Consider the
+// following example:
+//
+//	CREATE TABLE t (
+//	  k INT NOT NULL,
+//	  hash INT AS (k % 4) STORED,
+//	  PRIMARY KEY (hash, k)
+//	)
+//
+//	SELECT * FROM t WHERE k = 5
+//
+// Notice that the filter provided explicitly wouldn't allow the optimizer to
+// seek using the primary index (it would have to fall back to a table scan).
+// However, column "hash" can be proven to have the constant value of 1, since
+// it's dependent on column "k", which has the constant value of 5. This enables
+// usage of the primary index:
+//
+//	scan t
+//	 ├── columns: k:1(int!null) hash:2(int!null)
+//	 ├── constraint: /2/1: [/1/5 - /1/5]
+//	 ├── key: (2)
+//	 └── fd: ()-->(1)
+//
+// The values of both columns in that index are known, enabling a single value
+// constraint to be generated.
+func (c *CustomFuncs) ComputedColFilters(
+	scanPrivate *memo.ScanPrivate, requiredFilters, optionalFilters memo.FiltersExpr,
+) memo.FiltersExpr {
+	tabMeta := c.mem.Metadata().TableMeta(scanPrivate.Table)
+	if len(tabMeta.ComputedCols) == 0 {
+		return nil
+	}
+
+	// Start with set of constant columns, as derived from the list of filter
+	// conditions.
+	constCols := make(constColsMap)
+	c.findConstantFilterCols(constCols, scanPrivate, requiredFilters)
+	c.findConstantFilterCols(constCols, scanPrivate, optionalFilters)
+	if len(constCols) == 0 {
+		// No constant values could be derived from filters, so assume that there
+		// are also no constant computed columns.
+		return nil
+	}
+
+	// Construct a new filter condition for each computed column that is
+	// constant (i.e. all of its variables are in the constCols set).
+	var computedColFilters memo.FiltersExpr
+	for colID := range tabMeta.ComputedCols {
+		if c.tryFoldComputedCol(tabMeta.ComputedCols, colID, constCols) {
+			constVal := constCols[colID]
+			// Note: Eq is not correct here because of NULLs.
+			eqOp := c.f.ConstructIs(c.f.ConstructVariable(colID), constVal)
+			computedColFilters = append(computedColFilters, c.f.ConstructFiltersItem(eqOp))
+		}
+	}
+	return computedColFilters
+}
+
+// constColsMap maps columns to constant values that we can infer from query
+// filters.
+//
+// Note that for composite types, the constant value is not interchangeable with
+// the column in all contexts. Composite types are types which can have
+// logically equal but not identical values, like the decimals 1.0 and 1.00.
+//
+// For example:
+//
+//	CREATE TABLE t (
+//	  d DECIMAL,
+//	  c DECIMAL AS (d*10) STORED
+//	);
+//	INSERT INTO t VALUES (1.0), (1.00), (1.000);
+//	SELECT c::STRING FROM t WHERE d=1;
+//	----
+//	  10.0
+//	  10.00
+//	  10.000
+//
+// We can infer that c has a constant value of 1 but we can't replace it with 1
+// in any expression.
+type constColsMap map[opt.ColumnID]opt.ScalarExpr
+
+// findConstantFilterCols adds to constFilterCols mappings from table column ID
+// to the constant value of that column. It does this by iterating over the
+// given lists of filters and finding expressions that constrain columns to a
+// single constant value. For example:
+//
+//	x = 5 AND y = 'foo'
+//
+// This would add a mapping from x => 5 and y => 'foo', which constants can
+// then be used to prove that dependent computed columns are also constant.
+func (c *CustomFuncs) findConstantFilterCols(
+	constFilterCols constColsMap, scanPrivate *memo.ScanPrivate, filters memo.FiltersExpr,
+) {
+	tab := c.mem.Metadata().Table(scanPrivate.Table)
+	for i := range filters {
+		// If filter constraints are not tight, then no way to derive constant
+		// values.
+		props := filters[i].ScalarProps()
+		if !props.TightConstraints {
+			continue
+		}
+
+		// Iterate over constraint conjuncts with a single column and single
+		// span having a single key.
+		for i, n := 0, props.Constraints.Length(); i < n; i++ {
+			cons := props.Constraints.Constraint(i)
+			if cons.Columns.Count() != 1 || cons.Spans.Count() != 1 {
+				continue
+			}
+
+			// Skip columns that aren't in the scanned table.
+			colID := cons.Columns.Get(0).ID()
+			if !scanPrivate.Cols.Contains(colID) {
+				continue
+			}
+
+			colTyp := tab.Column(scanPrivate.Table.ColumnOrdinal(colID)).DatumType()
+
+			span := cons.Spans.Get(0)
+			if !span.HasSingleKey(c.f.ctx, c.f.evalCtx) {
+				continue
+			}
+
+			datum := span.StartKey().Value(0)
+			constFilterCols[colID] = c.f.ConstructConstVal(datum, colTyp)
+		}
+	}
+}
+
+// tryFoldComputedCol tries to reduce the computed column with the given column
+// ID into a constant value, by evaluating it with respect to a set of other
+// columns that are constant. If the computed column is constant, enter it into
+// the constCols map and return true. Otherwise, return false.
+func (c *CustomFuncs) tryFoldComputedCol(
+	ComputedCols map[opt.ColumnID]opt.ScalarExpr, computedColID opt.ColumnID, constCols constColsMap,
+) bool {
+	// Check whether computed column has already been folded.
+	if _, ok := constCols[computedColID]; ok {
+		return true
+	}
+
+	var replace func(e opt.Expr) opt.Expr
+	replace = func(e opt.Expr) opt.Expr {
+		if variable, ok := e.(*memo.VariableExpr); ok {
+			// Can variable be folded?
+			if constVal, ok := constCols[variable.Col]; ok {
+				// Yes, so replace it with its constant value.
+				return constVal
+			}
+
+			// No, but that may be because the variable refers to a dependent
+			// computed column. In that case, try to recursively fold that
+			// computed column. There are no infinite loops possible because the
+			// dependency graph is guaranteed to be acyclic.
+			if _, ok := ComputedCols[variable.Col]; ok {
+				if c.tryFoldComputedCol(ComputedCols, variable.Col, constCols) {
+					return constCols[variable.Col]
+				}
+			}
+
+			return e
+		}
+		return c.f.Replace(e, replace)
+	}
+
+	computedCol := ComputedCols[computedColID]
+	if memo.CanBeCompositeSensitive(computedCol) {
+		// The computed column expression can return different values for logically
+		// equal outer columns (e.g. d::STRING where d is a DECIMAL).
+		return false
+	}
+	replaced := replace(computedCol).(opt.ScalarExpr)
+
+	// If the computed column is constant, enter it into the constCols map.
+	if opt.IsConstValueOp(replaced) {
+		constCols[computedColID] = replaced
+		return true
+	}
+	return false
+}
+
+// CombineComputedColFilters is a generalized version of ComputedColFilters,
+// which seeks to fold computed column expressions using values from single-key
+// constraint spans in order to build new predicates on those computed columns
+// and AND them with predicates built from the constraint span key used to
+// compute the computed column value. If successful, it returns a list of
+// expressions representing disjunctions, with a length equal to the number of
+// spans in the constraint. If unsuccessful, nil is returned.
+//
+// New derived keys cannot be saved for the filters as a whole, for later
+// processing, because a given combination of span key values is only applicable
+// with the scope of that predicate. For example:
+//
+// Example:
+//
+//	CREATE TABLE t1 (
+//	a INT,
+//	b INT,
+//	c INT AS (a+b) VIRTUAL,
+//	INDEX idx1 (c ASC, b ASC, a ASC));
+//
+// SELECT * FROM t1 WHERE (a,b) IN ((3,4), (5,6));
+//
+// Here we derive:
+//
+//	(a IS 3 AND b IS 4 AND c IS 7) OR
+//	(a IS 5 AND b IS 6 AND c IS 11)
+//
+// The `c IS 7` term is only applicable when a is 3 and b is 4, so those two
+// terms must be combined with the `c IS 7` term in the same conjunction for the
+// result to be semantically equivalent to the original query.
+// Here is the plan built in this case:
+//
+//	scan t1@idx1
+//	├── columns: a:1!null b:2!null c:3!null
+//	├── constraint: /3/2/1
+//	│    ├── [/7/4/3 - /7/4/3]
+//	│    └── [/11/6/5 - /11/6/5]
+//	├── cardinality: [0 - 2]
+//	├── key: (1,2)
+//	└── fd: (1,2)-->(3)
+//
+// Note that new predicates are derived from constraint spans, not predicates,
+// so a predicate such as (a,b) IN ((null,4), (5,6)) will not derive anything
+// because the null is not placed in a span, and also IN predicates with nulls
+// are not marked as tight, and this function does not process non-tight
+// constraints.
+//
+// Note that `ComputedColFilters` can't be replaced because it can handle cases
+// which `combineComputedColFilters` doesn't, for example a computed column
+// which is built from constants found in separate `FiltersItem`s.
+//
+// Also note that `CombineComputedColFilters` must only be called on a tight
+// constraint. It is up to the caller to test whether the constraint is tight
+// before calling this function.
+func CombineComputedColFilters(
+	computedCols map[opt.ColumnID]opt.ScalarExpr,
+	indexKeyCols opt.ColSet,
+	colsInComputedColsExpressions opt.ColSet,
+	cons *constraint.Constraint,
+	f *Factory,
+) (disjunctions []opt.ScalarExpr) {
+	if len(computedCols) == 0 {
+		return nil
+	}
+	if !f.evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation {
+		return nil
+	}
+	if !cons.Columns.ColSet().Intersects(colsInComputedColsExpressions) {
+		// If this constraint doesn't involve any columns used to construct a
+		// computed column value, no need to process it further.
+		return nil
+	}
+	for k := 0; k < cons.Spans.Count(); k++ {
+		span := cons.Spans.Get(k)
+		if !span.HasSingleKey(f.ctx, f.evalCtx) {
+			// If we don't have a single value, or combination of single values
+			// to use in folding the computed column expression, don't use this
+			// constraint.
+			return nil
+		}
+		// Build the initial conjunction and constColsMap from the constraint.
+		initialConjunction, constFilterCols, ok :=
+			buildConjunctionAndConstColsMapFromConstraint(cons, span, f)
+		if !ok {
+			return nil
+		}
+		// Build a new ANDed predicate involving the computed column and columns
+		// in the computed column expression.
+		conjunct, ok := buildConjunctionOfEqualityPredsOnComputedAndNonComputedCols(
+			initialConjunction, computedCols, constFilterCols, indexKeyCols, f,
+		)
+		if !ok {
+			// If we failed to build any of the disjuncts, we must give up.
+			return nil
+		}
+		if disjunctions == nil {
+			// Lazily allocate the slice of disjunctions.
+			disjunctions = make([]opt.ScalarExpr, 0, cons.Spans.Count())
+		}
+		disjunctions = append(disjunctions, conjunct)
+	}
+	return disjunctions
+}
+
+// buildConstColsMapFromConstraint converts a constraint on one or more columns
+// into a scalar expression predicate in the form:
+// (constraint_col1 IS span1) AND (constraint_col2 IS span2) AND ...
+func buildConjunctionAndConstColsMapFromConstraint(
+	cons *constraint.Constraint, span *constraint.Span, f *Factory,
+) (conjunction opt.ScalarExpr, constFilterCols constColsMap, ok bool) {
+	for i := 0; i < cons.Columns.Count(); i++ {
+		colID := cons.Columns.Get(i).ID()
+		datum := span.StartKey().Value(i)
+		colTyp := datum.ResolvedType()
+		originalConstVal := f.ConstructConstVal(datum, colTyp)
+		// Mark the value in the map for use by `tryFoldComputedCol`.
+		if constFilterCols == nil {
+			constFilterCols = make(constColsMap)
+		}
+		constFilterCols[colID] = originalConstVal
+		// Note: Nulls could be handled here, but they are explicitly disallowed for
+		// now.
+		if _, isNullExpr := originalConstVal.(*memo.NullExpr); isNullExpr {
+			ok = false
+			break
+		}
+		// Use IS NOT DISTINCT FROM to handle nulls.
+		originalEqOp := f.ConstructIs(f.ConstructVariable(colID), originalConstVal)
+		if conjunction == nil {
+			conjunction = originalEqOp
+		} else {
+			// Build a conjunction representing this span.
+			conjunction = f.ConstructAnd(conjunction, originalEqOp)
+		}
+		ok = true
+	}
+	if !ok {
+		if len(constFilterCols) != 0 {
+			// Help the garbage collector.
+			for k := range constFilterCols {
+				delete(constFilterCols, k)
+			}
+		}
+		return nil, nil, false
+	}
+	return conjunction, constFilterCols, true
+}
+
+// buildConjunctionOfEqualityPredsOnComputedAndNonComputedCols takes an
+// initialConjunction of IS equality predicates on non-computed columns and
+// attempts to build a new conjunction of IS equality predicates on computed
+// columns which are part of the index key by folding the computed column
+// expressions using the constant values stored in the constFilterCols map. If
+// successful, ok=true is returned along with initialConjunction ANDed with the
+// predicates on computed columns.
+func buildConjunctionOfEqualityPredsOnComputedAndNonComputedCols(
+	initialConjunction opt.ScalarExpr,
+	computedCols map[opt.ColumnID]opt.ScalarExpr,
+	constFilterCols constColsMap,
+	indexKeyCols opt.ColSet,
+	f *Factory,
+) (computedColPlusOriginalColEqualityConjunction opt.ScalarExpr, ok bool) {
+	computedColPlusOriginalColEqualityConjunction = initialConjunction
+	for computedColID := range computedCols {
+		if !indexKeyCols.Contains(computedColID) {
+			continue
+		}
+		if f.CustomFuncs().tryFoldComputedCol(computedCols, computedColID, constFilterCols) {
+			constVal := constFilterCols[computedColID]
+			// Use IS NOT DISTINCT FROM to handle nulls.
+			eqOp := f.ConstructIs(f.ConstructVariable(computedColID), constVal)
+			computedColPlusOriginalColEqualityConjunction =
+				f.ConstructAnd(computedColPlusOriginalColEqualityConjunction, eqOp)
+			ok = true
+		}
+	}
+	if !ok {
+		return nil, false
+	}
+	return computedColPlusOriginalColEqualityConjunction, true
 }
 
 // ----------------------------------------------------------------------
@@ -908,11 +1511,10 @@ func (c *CustomFuncs) AppendAggCols(
 // function of the given operator type for each of column in the given set. For
 // example, for ConstAggOp and columns (1,2), this expression is returned:
 //
-//   (Aggregations
-//     [(ConstAgg (Variable 1)) (ConstAgg (Variable 2))]
-//     [1,2]
-//   )
-//
+//	(Aggregations
+//	  [(ConstAgg (Variable 1)) (ConstAgg (Variable 2))]
+//	  [1,2]
+//	)
 func (c *CustomFuncs) MakeAggCols(aggOp opt.Operator, cols opt.ColSet) memo.AggregationsExpr {
 	colsLen := cols.Len()
 	aggs := make(memo.AggregationsExpr, colsLen)
@@ -958,6 +1560,12 @@ func (c *CustomFuncs) JoinPreservesRightRows(join memo.RelExpr) bool {
 	return mult.JoinPreservesRightRows(join.Op())
 }
 
+// IndexJoinPreservesRows returns true if the index join is guaranteed to
+// produce the same number of rows as its input.
+func (c *CustomFuncs) IndexJoinPreservesRows(p *memo.IndexJoinPrivate) bool {
+	return p.Locking.WaitPolicy != tree.LockWaitSkipLocked
+}
+
 // NoJoinHints returns true if no hints were specified for this join.
 func (c *CustomFuncs) NoJoinHints(p *memo.JoinPrivate) bool {
 	return p.Flags.Empty()
@@ -969,6 +1577,17 @@ func (c *CustomFuncs) NoJoinHints(p *memo.JoinPrivate) bool {
 //   General functions related to constant values and datums.
 //
 // ----------------------------------------------------------------------
+
+// If returns the given boolean value. This function is useful in matching
+// expressions that have a boolean field.
+func (c *CustomFuncs) If(val bool) bool {
+	return val
+}
+
+// EqualsBool returns true if the given boolean values are equal.
+func (c *CustomFuncs) EqualsBool(left, right bool) bool {
+	return left == right
+}
 
 // IsPositiveInt is true if the given Datum value is greater than zero.
 func (c *CustomFuncs) IsPositiveInt(datum tree.Datum) bool {
@@ -982,8 +1601,7 @@ func (c *CustomFuncs) IsPositiveInt(datum tree.Datum) bool {
 // For example, NormalizeCmpTimeZoneFunction uses this function implicitly to
 // match a specific function, like so:
 //
-//   (Function $args:* (FunctionPrivate "timezone"))
-//
+//	(Function $args:* (FunctionPrivate "timezone"))
 func (c *CustomFuncs) EqualsString(left string, right string) bool {
 	return left == right
 }
@@ -1032,20 +1650,57 @@ func (c *CustomFuncs) CanAddConstInts(first tree.Datum, second tree.Datum) bool 
 	return ok
 }
 
+// DInt returns a new *tree.DInt with the given integer value.
+func (c *CustomFuncs) DInt(i tree.DInt) *tree.DInt {
+	return tree.NewDInt(i)
+}
+
 // IntConst constructs a Const holding a DInt.
 func (c *CustomFuncs) IntConst(d *tree.DInt) opt.ScalarExpr {
 	return c.f.ConstructConst(d, types.Int)
 }
 
+// StringFromConst extracts a string from a Const expression. It returns the
+// string and a boolean indicating whether the extraction was successful.
+func (c *CustomFuncs) StringFromConst(expr opt.ScalarExpr) (string, bool) {
+	if constExpr, ok := expr.(*memo.ConstExpr); ok {
+		datum := tree.UnwrapDOidWrapper(constExpr.Value)
+		switch d := datum.(type) {
+		case *tree.DString:
+			return string(*d), true
+		case *tree.DCollatedString:
+			return d.Contents, true
+		}
+	}
+	return "", false
+}
+
+// ConstStringEquals returns true if e is a constant string expression and is
+// equal to other.
+func (c *CustomFuncs) ConstStringEquals(e opt.ScalarExpr, other string) bool {
+	if eStr, ok := c.StringFromConst(e); ok {
+		return eStr == other
+	}
+	return false
+}
+
 // IsGreaterThan returns true if the first datum compares as greater than the
 // second.
 func (c *CustomFuncs) IsGreaterThan(first, second tree.Datum) bool {
-	return first.Compare(c.f.evalCtx, second) == 1
+	cmp, err := first.Compare(c.f.ctx, c.f.evalCtx, second)
+	if err != nil {
+		panic(err)
+	}
+	return cmp == 1
 }
 
 // DatumsEqual returns true if the first datum compares as equal to the second.
 func (c *CustomFuncs) DatumsEqual(first, second tree.Datum) bool {
-	return first.Compare(c.f.evalCtx, second) == 0
+	cmp, err := first.Compare(c.f.ctx, c.f.evalCtx, second)
+	if err != nil {
+		panic(err)
+	}
+	return cmp == 0
 }
 
 // ----------------------------------------------------------------------
@@ -1068,4 +1723,57 @@ func (c *CustomFuncs) DuplicateScanPrivate(sp *memo.ScanPrivate) *memo.ScanPriva
 		Flags:   sp.Flags,
 		Locking: sp.Locking,
 	}
+}
+
+// DuplicateJoinPrivate copies a JoinPrivate, preserving the Flags and
+// SkipReorderJoins field values.
+func (c *CustomFuncs) DuplicateJoinPrivate(jp *memo.JoinPrivate) *memo.JoinPrivate {
+	return &memo.JoinPrivate{
+		Flags:            jp.Flags,
+		SkipReorderJoins: jp.SkipReorderJoins,
+	}
+}
+
+// SplitLeakproofFilters separates a list of filters into two groups: those that
+// are leakproof and those that are not. Leakproof filters are expressions that
+// do not reveal information about underlying data through their evaluation
+// behavior.
+//
+// This function is typically used to determine which filters can be safely
+// reordered or pushed past a Barrier marked as LeakproofPermeable. It returns
+// the leakproof filters, the remaining filters, and a boolean indicating
+// whether any leakproof filters were found.
+func (c *CustomFuncs) SplitLeakproofFilters(
+	filters memo.FiltersExpr,
+) (leakproofFilters, remainingFilters memo.FiltersExpr, hasLeakproofFilters bool) {
+	numLeakproof := 0
+	for i := range filters {
+		if filters[i].ScalarProps().VolatilitySet.IsLeakproof() {
+			numLeakproof++
+		}
+	}
+	if numLeakproof == 0 {
+		// Return early if there are no leakproof filters.
+		return nil, nil, false
+	}
+	leakproofFilters = make(memo.FiltersExpr, 0, numLeakproof)
+	remainingFilters = make(memo.FiltersExpr, 0, len(filters)-numLeakproof)
+	for i := range filters {
+		if filters[i].ScalarProps().VolatilitySet.IsLeakproof() {
+			leakproofFilters = append(leakproofFilters, filters[i])
+		} else {
+			remainingFilters = append(remainingFilters, filters[i])
+		}
+	}
+	return leakproofFilters, remainingFilters, true
+}
+
+// HasAllLeakProofFilters returns true if every filter given is leakproof.
+func (c *CustomFuncs) HasAllLeakProofFilters(filters memo.FiltersExpr) bool {
+	for i := range filters {
+		if !filters[i].ScalarProps().VolatilitySet.IsLeakproof() {
+			return false
+		}
+	}
+	return true
 }

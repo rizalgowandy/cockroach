@@ -2,9 +2,10 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "acceptance",
+    testonly = 1,
     srcs = [
         "flags.go",
-        "test_acceptance.go",  # keep
+        "test_acceptance.go",
         "util_cluster.go",
         "util_docker.go",
     ],
@@ -14,14 +15,17 @@ go_library(
         "//pkg/acceptance/cluster",
         "//pkg/base",
         "//pkg/build/bazel",
-        "//pkg/security",
-        "//pkg/security/securitytest",  #keep
-        "//pkg/server",  # keep
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
+        "//pkg/security/username",
+        "//pkg/server",
         "//pkg/testutils",
-        "//pkg/testutils/serverutils",  # keep
-        "//pkg/testutils/testcluster",  # keep
+        "//pkg/testutils/serverutils",
+        "//pkg/testutils/skip",
+        "//pkg/testutils/testcluster",
+        "//pkg/util/envutil",
         "//pkg/util/log",
-        "//pkg/util/randutil",  # keep
+        "//pkg/util/randutil",
         "//pkg/util/stop",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_containerd_containerd//platforms",
@@ -38,27 +42,24 @@ go_test(
         "cli_test.go",
         "compose_test.go",
         "debug_remote_test.go",
-        "main_test.go",
-    ],
-    args = [
-        "-e",
-        "/cockroach/cockroach",
-        "-b",
-        "../../../../../../cmd/cockroach/cockroach_/cockroach",
+        "generated_cli_test.go",
     ],
     data = glob([
         "testdata/**",
         "compose/**",
     ]) + [
         "//pkg/cli:interactive_tests",
-        "//pkg/cmd/cockroach:cockroach",
     ],
     embed = [":acceptance"],
-    gotags = ["acceptance"],
+    shard_count = 16,
+    tags = [
+        "integration",
+        "no-remote-exec",
+    ],
     deps = [
         "//pkg/acceptance/cluster",
         "//pkg/build/bazel",
-        "//pkg/security",
+        "//pkg/security/username",
         "//pkg/testutils/skip",
         "//pkg/util/log",
     ],

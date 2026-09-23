@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -33,7 +29,7 @@ func BoolOrUnknownToSelOp(
 		// can simply plan a zero operator.
 		return NewZeroOp(input), nil
 	default:
-		return nil, errors.Errorf("unexpectedly %s is neither bool nor unknown", typs[vecIdx])
+		return nil, errors.AssertionFailedf("unexpectedly %s is neither bool nor unknown", typs[vecIdx].SQLStringForError())
 	}
 }
 
@@ -55,14 +51,17 @@ type BoolVecToSelOp struct {
 var _ colexecop.ResettableOperator = &BoolVecToSelOp{}
 
 // Next implements the colexecop.Operator interface.
-func (p *BoolVecToSelOp) Next() coldata.Batch {
+func (p *BoolVecToSelOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	// Loop until we have non-zero amount of output to return, or our input's been
 	// exhausted.
 	for {
-		batch := p.Input.Next()
+		batch, meta := p.Input.Next()
+		if meta != nil {
+			return nil, meta
+		}
 		n := batch.Length()
 		if n == 0 {
-			return batch
+			return batch, nil
 		}
 		outputCol := p.OutputCol
 
@@ -101,7 +100,7 @@ func (p *BoolVecToSelOp) Next() coldata.Batch {
 
 		if idx > 0 || p.ProcessOnlyOneBatch {
 			batch.SetLength(idx)
-			return batch
+			return batch, nil
 		}
 	}
 }
@@ -138,11 +137,14 @@ type selBoolOp struct {
 	colIdx         int
 }
 
-func (d *selBoolOp) Next() coldata.Batch {
-	batch := d.Input.Next()
+func (d *selBoolOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batch, meta := d.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	n := batch.Length()
 	if n == 0 {
-		return batch
+		return batch, nil
 	}
 	inputCol := batch.ColVec(d.colIdx)
 	d.boolVecToSelOp.OutputCol = inputCol.Bool()
@@ -173,5 +175,5 @@ func (d *selBoolOp) Next() coldata.Batch {
 			}
 		}
 	}
-	return batch
+	return batch, nil
 }

@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
 import (
 	"container/heap"
 	"container/list"
+	"fmt"
 	"sort"
 	"time"
 
@@ -55,6 +51,11 @@ func (m *ManualTime) Since(t time.Time) time.Duration {
 	return m.Now().Sub(t)
 }
 
+// Until implements TimeSource interface
+func (m *ManualTime) Until(t time.Time) time.Duration {
+	return t.Sub(m.Now())
+}
+
 // NewTimer constructs a new timer.
 func (m *ManualTime) NewTimer() TimerI {
 	return &manualTimer{m: m}
@@ -84,11 +85,55 @@ func (m *ManualTime) Advance(duration time.Duration) {
 	m.AdvanceTo(m.Now().Add(duration))
 }
 
+// AdvanceInOneTick forwards the current time by the given duration. If
+// tick(s) are needed, only one will be sent out. This simulates a ticker
+// dropping ticks, as can happen if receivers are slow:
+// https://pkg.go.dev/time#NewTicker
+func (m *ManualTime) AdvanceInOneTick(duration time.Duration) {
+	m.AdvanceToInOneTick(m.Now().Add(duration))
+}
+
+// Backwards moves the clock back by duration. Duration is expected to be
+// positive, and it will be subtracted from the current time.
+func (m *ManualTime) Backwards(duration time.Duration) {
+	if duration < 0 {
+		panic("invalid negative duration")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// No timers fire when the clock goes backwards.
+	m.mu.now = m.mu.now.Add(-duration)
+}
+
 // AdvanceTo advances the current time to t. If t is earlier than the current
 // time then AdvanceTo is a no-op.
 func (m *ManualTime) AdvanceTo(now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.advanceToLocked(now, false /* skipIntermediateTicks */)
+}
+
+// AdvanceToInOneTick advances the current time to t. If t is earlier than the current
+// time then AdvanceTo is a no-op. If tick(s) are needed, only one will be sent out.
+// This simulates a ticker dropping ticks, as can happen if receivers are slow:
+// https://pkg.go.dev/time#NewTicker
+func (m *ManualTime) AdvanceToInOneTick(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.advanceToLocked(now, true /* skipIntermediateTicks */)
+}
+
+// MustAdvanceTo is like AdvanceTo, except it panics if now is below m's current time.
+func (m *ManualTime) MustAdvanceTo(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now.Before(m.mu.now) {
+		panic(fmt.Sprintf("attempting to move ManualTime backwards from %s to %s", m.mu.now, now))
+	}
+	m.advanceToLocked(now, false /* skipIntermediateTicks */)
+}
+
+func (m *ManualTime) advanceToLocked(now time.Time, skipIntermediateTicks bool) {
 	if !now.After(m.mu.now) {
 		return
 	}
@@ -107,13 +152,27 @@ func (m *ManualTime) AdvanceTo(now time.Time) {
 	// Fire off any tickers.
 	for e := m.mu.tickers.Front(); e != nil; e = e.Next() {
 		t := e.Value.(*manualTicker)
-		for !t.nextTick.After(now) {
-			select {
-			case t.ch <- t.nextTick:
-			default:
-				panic("ticker channel full")
+		// This simulates a ticker dropping ticks, as can happen if receivers are slow:
+		// https://pkg.go.dev/time#NewTicker. We are not trying to copy the exact
+		// behavior of time.Ticker here, which is not documented.
+		if skipIntermediateTicks {
+			if !t.nextTick.After(now) {
+				select {
+				case t.ch <- now:
+				default:
+					panic("ticker channel full")
+				}
+				t.nextTick = now.Add(t.duration)
 			}
-			t.nextTick = t.nextTick.Add(t.duration)
+		} else {
+			for !t.nextTick.After(now) {
+				select {
+				case t.ch <- t.nextTick:
+				default:
+					panic("ticker channel full")
+				}
+				t.nextTick = t.nextTick.Add(t.duration)
+			}
 		}
 	}
 }
@@ -223,8 +282,6 @@ func (m *manualTimer) Stop() bool {
 func (m *manualTimer) Ch() <-chan time.Time {
 	return m.ch
 }
-
-func (m *manualTimer) MarkRead() {}
 
 type manualTicker struct {
 	m       *ManualTime

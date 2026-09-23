@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -16,9 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/prometheus"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	gomock "github.com/golang/mock/gomock"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
@@ -518,8 +514,8 @@ func TestTPCCChaosEventProcessor(t *testing.T) {
 				allowZeroSuccessDuringUptime: tc.allowZeroSuccessDuringUptime,
 				maxErrorsDuringUptime:        tc.maxErrorsDuringUptime,
 
-				promClient: func(ctrl *gomock.Controller) PromClient {
-					c := NewMockPromClient(ctrl)
+				promClient: func(ctrl *gomock.Controller) prometheus.Client {
+					c := NewMockClient(ctrl)
 					e := c.EXPECT()
 					for _, m := range tc.mockPromQueries {
 						e.Query(ctx, m.q, m.t).Return(
@@ -535,7 +531,8 @@ func TestTPCCChaosEventProcessor(t *testing.T) {
 			l, err := (&logger.Config{}).NewLogger("")
 			require.NoError(t, err)
 
-			ep.listen(ctx, l)
+			tasker := task.NewManager(ctx, l)
+			ep.listen(ctx, tasker, l)
 			for _, chaosEvent := range tc.chaosEvents {
 				ch <- chaosEvent
 			}

@@ -1,16 +1,10 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for span_encoder.eg.go. It's formatted in a
@@ -26,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -36,7 +30,7 @@ import (
 // Workaround for bazel auto-generated code. goimports does not automatically
 // pick up the right packages when run within the bazel sandbox.
 var (
-	_ = rowenc.EncodeTableKey
+	_ = keyside.Encode
 	_ tree.Datum
 )
 
@@ -56,12 +50,12 @@ func _ASSIGN_SPAN_ENCODING(_, _ string) {
 
 // */}}
 
-// newSpanEncoder creates a new utility operator that, given input batches,
+// NewSpanEncoder creates a new utility operator that, given input batches,
 // generates the encoding for the given key column. It is used by SpanAssembler
 // operators to generate spans for index joins and lookup joins.
-func newSpanEncoder(
+func NewSpanEncoder(
 	allocator *colmem.Allocator, typ *types.T, asc bool, encodeColIdx int,
-) spanEncoder {
+) SpanEncoder {
 	base := spanEncoderBase{
 		allocator:    allocator,
 		encodeColIdx: encodeColIdx,
@@ -86,21 +80,27 @@ func newSpanEncoder(
 	return nil
 }
 
-type spanEncoder interface {
-	// next generates the encoding for the current key column for each row from
+// SpanEncoder generates the encoding for a key column for each row from a
+// batch.
+type SpanEncoder interface {
+	// Next generates the encoding for the current key column for each row from
 	// the given batch in the range [startIdx, endIdx), then returns each row's
 	// encoding as a value in a Bytes column. The returned Bytes column is owned
-	// by the spanEncoder operator and should not be modified. Calling next
-	// invalidates previous calls to next. next assumes that startIdx and endIdx
+	// by the SpanEncoder operator and should not be modified. Calling Next
+	// invalidates previous calls to Next. Next assumes that startIdx and endIdx
 	// constitute a valid range of the given batch.
-	next(batch coldata.Batch, startIdx, endIdx int) *coldata.Bytes
+	//
+	// NB: Next performs the deselection step (meaning that all output encodings
+	// are contiguous in the output Bytes vector).
+	// TODO(yuzefovich): consider switching to value receiver.
+	Next(batch coldata.Batch, startIdx, endIdx int) *coldata.Bytes
 
-	close()
+	// Close releases any resources held by the encoder.
+	Close()
 }
 
 type spanEncoderBase struct {
-	allocator    *colmem.Allocator
-	encodeColIdx int
+	allocator *colmem.Allocator
 
 	// outputBytes contains the encoding for each row of the key column. It is
 	// reused between calls to next().
@@ -109,6 +109,8 @@ type spanEncoderBase struct {
 	// A scratch bytes slice used to hold each encoding before it is appended to
 	// the output column. It is reused to avoid allocating for every row.
 	scratch []byte
+
+	encodeColIdx int
 }
 
 // {{range .}}
@@ -119,15 +121,21 @@ type _OP_STRING struct {
 	spanEncoderBase
 }
 
-var _ spanEncoder = &_OP_STRING{}
+var _ SpanEncoder = &_OP_STRING{}
 
-// next implements the spanEncoder interface.
-func (op *_OP_STRING) next(batch coldata.Batch, startIdx, endIdx int) *coldata.Bytes {
+// Next implements the SpanEncoder interface.
+func (op *_OP_STRING) Next(batch coldata.Batch, startIdx, endIdx int) *coldata.Bytes {
 	oldBytesSize := op.outputBytes.Size()
-	if op.outputBytes == nil {
+	if op.outputBytes == nil || op.outputBytes.Len() < endIdx-startIdx {
 		op.outputBytes = coldata.NewBytes(endIdx - startIdx)
+	} else {
+		// {{/*
+		//     Note that it is ok that op.outputBytes.Len() might be larger than
+		//     endIdx-startIdx - only the first elements will be set by the
+		//     spanEncoder and used by the ColSpanAssembler.
+		// */}}
+		op.outputBytes.Reset()
 	}
-	op.outputBytes.ResetForAppend()
 
 	vec := batch.ColVec(op.encodeColIdx)
 	col := vec.TemplateType()
@@ -137,11 +145,11 @@ func (op *_OP_STRING) next(batch coldata.Batch, startIdx, endIdx int) *coldata.B
 		sel = sel[startIdx:endIdx]
 		if vec.Nulls().MaybeHasNulls() {
 			nulls := vec.Nulls()
-			for _, i := range sel {
+			for outIdx, i := range sel {
 				encodeSpan(true, true)
 			}
 		} else {
-			for _, i := range sel {
+			for outIdx, i := range sel {
 				encodeSpan(true, false)
 			}
 		}
@@ -150,16 +158,18 @@ func (op *_OP_STRING) next(batch coldata.Batch, startIdx, endIdx int) *coldata.B
 		if vec.Nulls().MaybeHasNulls() {
 			nulls := vec.Nulls()
 			for i := startIdx; i < endIdx; i++ {
+				outIdx := i - startIdx
 				encodeSpan(false, true)
 			}
 		} else {
 			for i := startIdx; i < endIdx; i++ {
+				outIdx := i - startIdx
 				encodeSpan(false, false)
 			}
 		}
 	}
 
-	op.allocator.AdjustMemoryUsage(op.outputBytes.Size() - oldBytesSize)
+	op.allocator.AdjustMemoryUsageAfterAllocation(op.outputBytes.Size() - oldBytesSize)
 	return op.outputBytes
 }
 
@@ -167,8 +177,8 @@ func (op *_OP_STRING) next(batch coldata.Batch, startIdx, endIdx int) *coldata.B
 // {{end}}
 // {{end}}
 
-// close implements the spanEncoder interface.
-func (b *spanEncoderBase) close() {
+// Close implements the SpanEncoder interface.
+func (b *spanEncoderBase) Close() {
 	*b = spanEncoderBase{}
 }
 
@@ -179,9 +189,9 @@ func encodeSpan(hasSel bool, hasNulls bool) {
 	if hasNulls {
 		if nulls.NullAt(i) {
 			// {{if .Asc}}
-			op.outputBytes.AppendVal(encoding.EncodeNullAscending(op.scratch))
+			op.outputBytes.Set(outIdx, encoding.EncodeNullAscending(op.scratch))
 			// {{else}}
-			op.outputBytes.AppendVal(encoding.EncodeNullDescending(op.scratch))
+			op.outputBytes.Set(outIdx, encoding.EncodeNullDescending(op.scratch))
 			// {{end}}
 			continue
 		}
@@ -193,5 +203,5 @@ func encodeSpan(hasSel bool, hasNulls bool) {
 	}
 	val := col.Get(i)
 	_ASSIGN_SPAN_ENCODING(op.scratch, val)
-	op.outputBytes.AppendVal(op.scratch)
+	op.outputBytes.Set(outIdx, op.scratch)
 }

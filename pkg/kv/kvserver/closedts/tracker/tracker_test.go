@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracker
 
@@ -79,19 +74,6 @@ func testTracker(ctx context.Context, t *testing.T, tr Tracker) {
 	}
 	tr.Untrack(ctx, tok30)
 	require.True(t, tr.LowerBound(ctx).IsEmpty())
-
-	// Check that synthetic timestamps are tracked as such.
-	synthTS := hlc.Timestamp{
-		WallTime:  10,
-		Synthetic: true,
-	}
-	tok := tr.Track(ctx, synthTS)
-	require.Equal(t, synthTS, tr.LowerBound(ctx))
-	// Check that after the Tracker is emptied, lowerbounds are not synthetic any
-	// more.
-	tr.Untrack(ctx, tok)
-	tr.Track(ctx, ts(10))
-	require.Equal(t, ts(10), tr.LowerBound(ctx))
 }
 
 // Test the tracker by throwing random requests at it. We verify that, at all
@@ -185,7 +167,7 @@ func TestLockfreeTrackerRandomStress(t *testing.T) {
 	// hours of stressrace on GCE worker (and it failed once on CI stress too).
 	// Figure out why.
 	maxToleratedErrorMillis := 3 * c.maxEvaluationTime.Milliseconds()
-	log.Infof(ctx, "maximum lower bound error: %dms. maximum request evaluation time: %s",
+	log.KvExec.Infof(ctx, "maximum lower bound error: %dms. maximum request evaluation time: %s",
 		maxOvershotMillis, c.maxEvaluationTime)
 	require.Lessf(t, maxOvershotMillis, maxToleratedErrorMillis,
 		"maximum tracker lowerbound error was %dms, above maximum tolerated %dms",
@@ -464,7 +446,7 @@ func (c *trackerChecker) run(ctx context.Context) error {
 		if c.maxOvershotNanos < overshotNanos {
 			c.maxOvershotNanos = overshotNanos
 		}
-		log.VInfof(ctx, 1, "lower bound error: %dms", overshotNanos/1000000)
+		log.KvExec.VInfof(ctx, 1, "lower bound error: %dms", overshotNanos/1000000)
 	}
 }
 
@@ -535,7 +517,7 @@ func benchmarkTracker(ctx context.Context, b *testing.B, t Tracker) {
 				toks[i] = toks[i][:0]
 			}
 			mu.Unlock()
-			log.VInfof(ctx, 1, "cleared %d reqs", n)
+			log.KvExec.VInfof(ctx, 1, "cleared %d reqs", n)
 		}
 	}()
 

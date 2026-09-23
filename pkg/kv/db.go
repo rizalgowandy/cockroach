@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kv
 
@@ -16,9 +11,15 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/obs/workloadid"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -124,13 +125,13 @@ type Result struct {
 	// Err contains any error encountered when performing the operation.
 	Err error
 	// Rows contains the key/value pairs for the operation. The number of rows
-	// returned varies by operation. For Get, Put, CPut, Inc and Del the number
+	// returned varies by operation. For Get, Put, CPut, and Inc the number
 	// of rows returned is the number of keys operated on. For Scan the number of
-	// rows returned is the number or rows matching the scan capped by the
-	// maxRows parameter and other options. For DelRange Rows is nil.
+	// rows returned is the number of rows matching the scan capped by the
+	// maxRows parameter and other options. For Del and DelRange Rows is nil.
 	Rows []KeyValue
 
-	// Keys is set by some operations instead of returning the rows themselves.
+	// Keys is set by Del and DelRange instead of returning the rows themselves.
 	Keys []roachpb.Key
 
 	// ResumeSpan is the span to be used on the next operation in a
@@ -142,7 +143,7 @@ type Result struct {
 	ResumeSpan *roachpb.Span
 	// When ResumeSpan is populated, this specifies the reason why the operation
 	// wasn't completed and needs to be resumed.
-	ResumeReason roachpb.ResumeReason
+	ResumeReason kvpb.ResumeReason
 	// ResumeNextBytes is the size of the next result when ResumeSpan is populated.
 	ResumeNextBytes int64
 }
@@ -179,19 +180,22 @@ type DBContext struct {
 	// NodeID provides the node ID for setting the gateway node and avoiding
 	// clock uncertainty for root transactions started at the gateway.
 	NodeID *base.SQLIDContainer
+	// Settings is the collection of cluster settings. The field is optional and
+	// can be set to nil in tests.
+	Settings *cluster.Settings
 	// Stopper is used for async tasks.
 	Stopper *stop.Stopper
 }
 
 // DefaultDBContext returns (a copy of) the default options for
 // NewDBWithContext.
-func DefaultDBContext(stopper *stop.Stopper) DBContext {
-	var c base.NodeIDContainer
+func DefaultDBContext(settings *cluster.Settings, stopper *stop.Stopper) DBContext {
 	return DBContext{
 		UserPriority: roachpb.NormalUserPriority,
 		// TODO(tbg): this is ugly. Force callers to pass in an SQLIDContainer.
-		NodeID:  base.NewSQLIDContainer(0, &c),
-		Stopper: stopper,
+		NodeID:   &base.SQLIDContainer{},
+		Settings: settings,
+		Stopper:  stopper,
 	}
 }
 
@@ -212,16 +216,32 @@ var _ Sender = &CrossRangeTxnWrapperSender{}
 
 // Send implements the Sender interface.
 func (s *CrossRangeTxnWrapperSender) Send(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	if ba.Txn != nil {
-		log.Fatalf(ctx, "CrossRangeTxnWrapperSender can't handle transactional requests")
+		log.KvExec.Fatalf(ctx, "CrossRangeTxnWrapperSender can't handle transactional requests")
+	}
+
+	if ba.Header.WorkloadID == 0 {
+		if wid, wtype := WorkloadInfoFromContext(ctx); wid != 0 {
+			ba.Header.WorkloadID = wid
+			ba.Header.WorkloadType = wtype.ToUint32()
+		}
 	}
 
 	br, pErr := s.wrapped.Send(ctx, ba)
-	if _, ok := pErr.GetDetail().(*roachpb.OpRequiresTxnError); !ok {
+	if _, ok := pErr.GetDetail().(*kvpb.OpRequiresTxnError); !ok {
 		return br, pErr
 	}
+
+	// Before retrying the batch in a transaction, strip the header's timestamp.
+	// It may have been set to try a follower read, but it's not allowed in a txn
+	// (see comment near Header.Timestamp). Currently, this non-transactional API
+	// is used for follower reads only by KVNemesis.
+	//
+	// We can end up here if the batch contains transactional requests and spans
+	// multiple ranges.
+	ba.Header.Timestamp = hlc.Timestamp{}
 
 	err := s.db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
 		txn.SetDebugName("auto-wrap")
@@ -236,7 +256,7 @@ func (s *CrossRangeTxnWrapperSender) Send(
 		return err
 	})
 	if err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 	br.Txn = nil // hide the evidence
 	return br, nil
@@ -261,8 +281,45 @@ type DB struct {
 	// SQLKVResponseAdmissionQ is for use by SQL clients of the DB, and is
 	// placed here simply for plumbing convenience, as there is a diversity of
 	// SQL code that all uses kv.DB.
-	// TODO(sumeer): find a home for this in the SQL layer.
+	//
+	// TODO(sumeer,irfansharif): Find a home for these in the SQL layer.
+	// Especially SettingsValue.
 	SQLKVResponseAdmissionQ *admission.WorkQueue
+	AdmissionPacerFactory   admission.PacerFactory
+
+	SQLCPUProvider admission.SQLCPUProvider
+}
+
+// workloadInfoCtxKey is the context key for workload info propagation.
+type workloadInfoCtxKey struct{}
+
+// workloadInfo bundles the workload ID and type for context
+// propagation.
+type workloadInfo struct {
+	id           uint64
+	workloadType workloadid.WorkloadType
+}
+
+// ContextWithWorkloadInfo returns a new context that carries the given
+// workload ID and type. Transaction creation methods (NewTxn, Txn,
+// TxnWithAdmissionControl, TxnWithSteppingEnabled) automatically
+// extract these values and call SetWorkloadInfo on the new
+// transaction, enabling ASH workload attribution.
+func ContextWithWorkloadInfo(
+	ctx context.Context, id uint64, wType workloadid.WorkloadType,
+) context.Context {
+	return context.WithValue(ctx, workloadInfoCtxKey{}, workloadInfo{
+		id:           id,
+		workloadType: wType,
+	})
+}
+
+// WorkloadInfoFromContext extracts the workload ID and type
+// previously set by ContextWithWorkloadInfo. Returns (0, 0) if no
+// workload info is present.
+func WorkloadInfoFromContext(ctx context.Context) (uint64, workloadid.WorkloadType) {
+	v, _ := ctx.Value(workloadInfoCtxKey{}).(workloadInfo)
+	return v.id, v.workloadType
 }
 
 // NonTransactionalSender returns a Sender that can be used for sending
@@ -285,11 +342,29 @@ func (db *DB) Clock() *hlc.Clock {
 	return db.clock
 }
 
+// Context returns the DB's DBContext.
+func (db *DB) Context() DBContext {
+	return db.ctx
+}
+
+// SettingsValues returns the DB's settings.Values, if configured.
+func (db *DB) SettingsValues() *settings.Values {
+	if db.ctx.Settings == nil {
+		return nil
+	}
+	return &db.ctx.Settings.SV
+}
+
+// NewBatch creates a new empty batch.
+func (db *DB) NewBatch() *Batch {
+	return &Batch{}
+}
+
 // NewDB returns a new DB.
 func NewDB(
 	actx log.AmbientContext, factory TxnSenderFactory, clock *hlc.Clock, stopper *stop.Stopper,
 ) *DB {
-	return NewDBWithContext(actx, factory, clock, DefaultDBContext(stopper))
+	return NewDBWithContext(actx, factory, clock, DefaultDBContext(nil /* settings */, stopper))
 }
 
 // NewDBWithContext returns a new DB with the given parameters.
@@ -315,8 +390,8 @@ func NewDBWithContext(
 // Get retrieves the value for a key, returning the retrieved key/value or an
 // error. It is not considered an error for the key not to exist.
 //
-//   r, err := db.Get("a")
-//   // string(r.Key) == "a"
+//	r, err := db.Get("a")
+//	// string(r.Key) == "a"
 //
 // key can be either a byte slice or a string.
 func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
@@ -326,16 +401,35 @@ func (db *DB) Get(ctx context.Context, key interface{}) (KeyValue, error) {
 }
 
 // GetForUpdate retrieves the value for a key, returning the retrieved key/value
-// or an error. An unreplicated, exclusive lock is acquired on the key, if it
-// exists. It is not considered an error for the key not to exist.
+// or an error. An Exclusive lock with the supplied durability is acquired on
+// the key, if it exists. It is not considered an error for the key not to
+// exist.
 //
-//   r, err := db.GetForUpdate("a")
-//   // string(r.Key) == "a"
+//	r, err := db.GetForUpdate("a")
+//	// string(r.Key) == "a"
 //
 // key can be either a byte slice or a string.
-func (db *DB) GetForUpdate(ctx context.Context, key interface{}) (KeyValue, error) {
+func (db *DB) GetForUpdate(
+	ctx context.Context, key interface{}, dur kvpb.KeyLockingDurabilityType,
+) (KeyValue, error) {
 	b := &Batch{}
-	b.GetForUpdate(key)
+	b.GetForUpdate(key, dur)
+	return getOneRow(db.Run(ctx, b), b)
+}
+
+// GetForShare retrieves the value for a key. A shared lock with the supplied
+// durability is acquired on the key, if it exists. A new result will be
+// appended to the batch which will contain a single row.
+//
+//	r, err := db.GetForShare("a")
+//	// string(r.Key) == "a"
+//
+// key can be either a byte slice or a string.
+func (db *DB) GetForShare(
+	ctx context.Context, key interface{}, dur kvpb.KeyLockingDurabilityType,
+) (KeyValue, error) {
+	b := &Batch{}
+	b.GetForShare(key, dur)
 	return getOneRow(db.Run(ctx, b), b)
 }
 
@@ -431,20 +525,6 @@ func (db *DB) CPutInline(ctx context.Context, key, value interface{}, expValue [
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// InitPut sets the first value for a key to value. A ConditionFailedError is
-// reported if a value already exists for the key and it's not equal to the
-// value passed in. If failOnTombstones is set to true, tombstones count as
-// mismatched values and will cause a ConditionFailedError.
-//
-// key can be either a byte slice or a string. value can be any key type, a
-// protoutil.Message or any Go primitive type (bool, int, etc). It is illegal to
-// set value to nil.
-func (db *DB) InitPut(ctx context.Context, key, value interface{}, failOnTombstones bool) error {
-	b := &Batch{}
-	b.InitPut(key, value, failOnTombstones)
-	return getOneErr(db.Run(ctx, b), b)
-}
-
 // Inc increments the integer value at key. If the key does not exist it will
 // be created with an initial value of 0 which will then be incremented. If the
 // key exists but was set using Put or CPut an error will be returned.
@@ -461,15 +541,17 @@ func (db *DB) scan(
 	begin, end interface{},
 	maxRows int64,
 	isReverse bool,
-	forUpdate bool,
-	readConsistency roachpb.ReadConsistencyType,
+	str kvpb.KeyLockingStrengthType,
+	readConsistency kvpb.ReadConsistencyType,
+	dur kvpb.KeyLockingDurabilityType,
 ) ([]KeyValue, error) {
 	b := &Batch{}
 	b.Header.ReadConsistency = readConsistency
 	if maxRows > 0 {
 		b.Header.MaxSpanRequestKeys = maxRows
 	}
-	b.scan(begin, end, isReverse, forUpdate)
+	b.Header.IsReverse = isReverse
+	b.scan(begin, end, isReverse, str, dur)
 	r, err := getOneResult(db.Run(ctx, b), b)
 	return r.Rows, err
 }
@@ -481,20 +563,37 @@ func (db *DB) scan(
 //
 // key can be either a byte slice or a string.
 func (db *DB) Scan(ctx context.Context, begin, end interface{}, maxRows int64) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, false /* forUpdate */, roachpb.CONSISTENT)
+	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, kvpb.NonLocking, kvpb.CONSISTENT, kvpb.Invalid)
 }
 
 // ScanForUpdate retrieves the rows between begin (inclusive) and end
-// (exclusive) in ascending order. Unreplicated, exclusive locks are
-// acquired on each of the returned keys.
+// (exclusive) in ascending order. Exclusive locks with the supplied durability
+// are acquired on each of the returned keys.
 //
 // The returned []KeyValue will contain up to maxRows elements.
 //
 // key can be either a byte slice or a string.
 func (db *DB) ScanForUpdate(
-	ctx context.Context, begin, end interface{}, maxRows int64,
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
 ) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, false /* isReverse */, true /* forUpdate */, roachpb.CONSISTENT)
+	return db.scan(
+		ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForUpdate, kvpb.CONSISTENT, dur,
+	)
+}
+
+// ScanForShare retrieves the rows between begin (inclusive) and end (exclusive)
+// in ascending order. Shared locks with the supplied durability are acquired on
+// each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements.
+//
+// key can be either a byte slice or a string.
+func (db *DB) ScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
+) ([]KeyValue, error) {
+	return db.scan(
+		ctx, begin, end, maxRows, false /* isReverse */, kvpb.ForShare, kvpb.CONSISTENT, dur,
+	)
 }
 
 // ReverseScan retrieves the rows between begin (inclusive) and end (exclusive)
@@ -506,29 +605,49 @@ func (db *DB) ScanForUpdate(
 func (db *DB) ReverseScan(
 	ctx context.Context, begin, end interface{}, maxRows int64,
 ) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, false /* forUpdate */, roachpb.CONSISTENT)
+	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, kvpb.NonLocking, kvpb.CONSISTENT, kvpb.Invalid)
 }
 
 // ReverseScanForUpdate retrieves the rows between begin (inclusive) and end
-// (exclusive) in descending order. Unreplicated, exclusive locks are acquired
-// on each of the returned keys.
+// (exclusive) in descending order. Exclusive locks with the supplied durability
+// are acquired on each of the returned keys.
 //
 // The returned []KeyValue will contain up to maxRows elements.
 //
 // key can be either a byte slice or a string.
 func (db *DB) ReverseScanForUpdate(
-	ctx context.Context, begin, end interface{}, maxRows int64,
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
 ) ([]KeyValue, error) {
-	return db.scan(ctx, begin, end, maxRows, true /* isReverse */, true /* forUpdate */, roachpb.CONSISTENT)
+	return db.scan(
+		ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForUpdate, kvpb.CONSISTENT, dur,
+	)
+}
+
+// ReverseScanForShare retrieves the rows between begin (inclusive) and end
+// (exclusive) in descending order. Shared locks with the supplied durability
+// are acquired on each of the returned keys.
+//
+// The returned []KeyValue will contain up to maxRows elements.
+//
+// key can be either a byte slice or a string.
+func (db *DB) ReverseScanForShare(
+	ctx context.Context, begin, end interface{}, maxRows int64, dur kvpb.KeyLockingDurabilityType,
+) ([]KeyValue, error) {
+	return db.scan(
+		ctx, begin, end, maxRows, true /* isReverse */, kvpb.ForShare, kvpb.CONSISTENT, dur,
+	)
 }
 
 // Del deletes one or more keys.
 //
+// The returned []roachpb.Key will contain the keys that were actually deleted.
+//
 // key can be either a byte slice or a string.
-func (db *DB) Del(ctx context.Context, keys ...interface{}) error {
+func (db *DB) Del(ctx context.Context, keys ...interface{}) ([]roachpb.Key, error) {
 	b := &Batch{}
 	b.Del(keys...)
-	return getOneErr(db.Run(ctx, b), b)
+	r, err := getOneResult(db.Run(ctx, b), b)
+	return r.Keys, err
 }
 
 // DelRange deletes the rows between begin (inclusive) and end (exclusive).
@@ -544,6 +663,15 @@ func (db *DB) DelRange(
 	b.DelRange(begin, end, returnKeys)
 	r, err := getOneResult(db.Run(ctx, b), b)
 	return r.Keys, err
+}
+
+// DelRangeUsingTombstone deletes the rows between begin (inclusive) and end
+// (exclusive) using an MVCC range tombstone.
+func (db *DB) DelRangeUsingTombstone(ctx context.Context, begin, end interface{}) error {
+	b := &Batch{}
+	b.DelRangeUsingTombstone(begin, end)
+	_, err := getOneResult(db.Run(ctx, b), b)
+	return err
 }
 
 // AdminMerge merges the range containing key and the subsequent range. After
@@ -572,28 +700,52 @@ func (db *DB) AdminMerge(ctx context.Context, key interface{}) error {
 //
 // The keys can be either byte slices or a strings.
 func (db *DB) AdminSplit(
-	ctx context.Context, splitKey interface{}, expirationTime hlc.Timestamp,
+	ctx context.Context,
+	splitKey interface{},
+	expirationTime hlc.Timestamp,
+	predicateKeys ...roachpb.Key,
 ) error {
 	b := &Batch{}
-	b.adminSplit(splitKey, expirationTime)
+	b.adminSplit(splitKey, expirationTime, predicateKeys)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// SplitAndScatter is a helper that wraps AdminSplit + AdminScatter.
-func (db *DB) SplitAndScatter(
-	ctx context.Context, key roachpb.Key, expirationTime hlc.Timestamp,
-) error {
-	if err := db.AdminSplit(ctx, key, expirationTime); err != nil {
-		return err
-	}
-	scatterReq := &roachpb.AdminScatterRequest{
-		RequestHeader:   roachpb.RequestHeaderFromSpan(roachpb.Span{Key: key, EndKey: key.Next()}),
+// AdminScatter scatters the range containing the specified key.
+//
+// maxSize greater than non-zero specified a maximum size of the range above
+// which it should reject the scatter request, allowing callers to send request
+// to scatter that is conditional on it not resulting in excessive data movement
+// if the range is large.
+func (db *DB) AdminScatter(
+	ctx context.Context, key roachpb.Key, maxSize int64,
+) (*kvpb.AdminScatterResponse, error) {
+	return db.sendAdminScatterRequest(ctx, roachpb.Span{Key: key, EndKey: key.Next()}, maxSize)
+}
+
+func (db *DB) sendAdminScatterRequest(
+	ctx context.Context, span roachpb.Span, maxSize int64,
+) (*kvpb.AdminScatterResponse, error) {
+	scatterReq := &kvpb.AdminScatterRequest{
+		RequestHeader:   kvpb.RequestHeaderFromSpan(span),
 		RandomizeLeases: true,
+		MaxSize:         maxSize,
 	}
-	if _, pErr := SendWrapped(ctx, db.NonTransactionalSender(), scatterReq); pErr != nil {
-		return pErr.GoError()
+	raw, pErr := SendWrapped(ctx, db.NonTransactionalSender(), scatterReq)
+	if pErr != nil {
+		return nil, pErr.GoError()
 	}
-	return nil
+	resp, ok := raw.(*kvpb.AdminScatterResponse)
+	if !ok {
+		return nil, errors.Errorf("unexpected response of type %T for AdminScatter", raw)
+	}
+	return resp, nil
+}
+
+// AdminScatterSpan scatters the ranges that overlap the specified span.
+func (db *DB) AdminScatterSpan(
+	ctx context.Context, span roachpb.Span,
+) (*kvpb.AdminScatterResponse, error) {
+	return db.sendAdminScatterRequest(ctx, span, 0 /* maxSize */)
 }
 
 // AdminUnsplit removes the sticky bit of the range specified by splitKey.
@@ -623,7 +775,18 @@ func (db *DB) AdminTransferLease(
 	ctx context.Context, key interface{}, target roachpb.StoreID,
 ) error {
 	b := &Batch{}
-	b.adminTransferLease(key, target)
+	b.adminTransferLease(key, target, false /* bypassSafetyChecks */)
+	return getOneErr(db.Run(ctx, b), b)
+}
+
+// AdminTransferLeaseBypassingSafetyChecks is like AdminTransferLease, but
+// configures the lease transfer to bypass safety checks. See the comment on
+// AdminTransferLeaseRequest.BypassSafetyChecks for details.
+func (db *DB) AdminTransferLeaseBypassingSafetyChecks(
+	ctx context.Context, key interface{}, target roachpb.StoreID,
+) error {
+	b := &Batch{}
+	b.adminTransferLease(key, target, true /* bypassSafetyChecks */)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
@@ -632,7 +795,7 @@ func (db *DB) AdminChangeReplicas(
 	ctx context.Context,
 	key interface{},
 	expDesc roachpb.RangeDescriptor,
-	chgs []roachpb.ReplicationChange,
+	chgs []kvpb.ReplicationChange,
 ) (*roachpb.RangeDescriptor, error) {
 	b := &Batch{}
 	b.adminChangeReplicas(key, expDesc, chgs)
@@ -643,7 +806,7 @@ func (db *DB) AdminChangeReplicas(
 	if len(responses) == 0 {
 		return nil, errors.Errorf("unexpected empty responses for AdminChangeReplicas")
 	}
-	resp, ok := responses[0].GetInner().(*roachpb.AdminChangeReplicasResponse)
+	resp, ok := responses[0].GetInner().(*kvpb.AdminChangeReplicasResponse)
 	if !ok {
 		return nil, errors.Errorf("unexpected response of type %T for AdminChangeReplicas",
 			responses[0].GetInner())
@@ -655,34 +818,99 @@ func (db *DB) AdminChangeReplicas(
 // AdminRelocateRange relocates the replicas for a range onto the specified
 // list of stores.
 func (db *DB) AdminRelocateRange(
-	ctx context.Context, key interface{}, voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
+	ctx context.Context,
+	key interface{},
+	voterTargets, nonVoterTargets []roachpb.ReplicationTarget,
+	transferLeaseToFirstVoter bool,
 ) error {
 	b := &Batch{}
-	b.adminRelocateRange(key, voterTargets, nonVoterTargets)
+	b.adminRelocateRange(key, voterTargets, nonVoterTargets, transferLeaseToFirstVoter)
 	return getOneErr(db.Run(ctx, b), b)
 }
 
-// AddSSTable links a file into the RocksDB log-structured merge-tree. Existing
-// data in the range is cleared.
-//
-// The disallowConflicts, disallowShadowingBelow, and writeAtBatchTs parameters
-// require the MVCCAddSSTable version gate, as they are new in 22.1.
+// AddSSTable links a file into the Pebble log-structured merge-tree.
 func (db *DB) AddSSTable(
 	ctx context.Context,
 	begin, end interface{},
 	data []byte,
 	disallowConflicts bool,
-	disallowShadowing bool,
 	disallowShadowingBelow hlc.Timestamp,
 	stats *enginepb.MVCCStats,
 	ingestAsWrites bool,
 	batchTs hlc.Timestamp,
-	writeAtBatchTs bool,
+) (roachpb.Span, int64, error) {
+	b := &Batch{Header: kvpb.Header{Timestamp: batchTs}}
+	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowingBelow,
+		stats, ingestAsWrites, hlc.Timestamp{} /* sstTimestampToRequestTimestamp */)
+	err := getOneErr(db.Run(ctx, b), b)
+	if err != nil {
+		return roachpb.Span{}, 0, err
+	}
+	if l := len(b.response.Responses); l != 1 {
+		return roachpb.Span{}, 0, errors.AssertionFailedf("expected single response, got %d", l)
+	}
+	resp := b.response.Responses[0].GetAddSstable()
+	return resp.RangeSpan, resp.AvailableBytes, nil
+}
+
+// LinkExternalSSTable links an external sst into the Pebble log-structured merge-tree.
+func (db *DB) LinkExternalSSTable(
+	ctx context.Context,
+	span roachpb.Span,
+	file kvpb.LinkExternalSSTableRequest_ExternalFile,
+	batchTimestamp hlc.Timestamp,
 ) error {
-	b := &Batch{Header: roachpb.Header{Timestamp: batchTs}}
-	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowing, disallowShadowingBelow,
-		stats, ingestAsWrites, writeAtBatchTs)
-	return getOneErr(db.Run(ctx, b), b)
+	b := &Batch{Header: kvpb.Header{Timestamp: batchTimestamp}}
+	b.linkExternalSSTable(span, file)
+	err := getOneErr(db.Run(ctx, b), b)
+	if err != nil {
+		if m := (*kvpb.RangeKeyMismatchError)(nil); errors.As(err, &m) {
+			r, err := m.MismatchedRange()
+			if err != nil {
+				return err
+			}
+			// TODO(dt): iterate over all of all of m.Ranges, not just first, but
+			// ensure we cover all of `span` when we do.
+			lhs := roachpb.Span{Key: span.Key, EndKey: r.Desc.EndKey.AsRawKey()}
+			rhs := roachpb.Span{Key: lhs.EndKey, EndKey: span.EndKey}
+			if err := db.LinkExternalSSTable(ctx, lhs, file, batchTimestamp); err != nil {
+				return err
+			}
+			return db.LinkExternalSSTable(ctx, rhs, file, batchTimestamp)
+		}
+		return err
+	}
+	if l := len(b.response.Responses); l != 1 {
+		return errors.AssertionFailedf("expected single response, got %d", l)
+	}
+	return nil
+}
+
+// AddSSTableAtBatchTimestamp links a file into the Pebble log-structured
+// merge-tree. All keys in the SST must have batchTs as their timestamp, but the
+// batch timestamp at which the sst is actually ingested -- and that those keys
+// end up with after it is ingested -- may be updated if the request is pushed.
+func (db *DB) AddSSTableAtBatchTimestamp(
+	ctx context.Context,
+	begin, end interface{},
+	data []byte,
+	disallowConflicts bool,
+	disallowShadowingBelow hlc.Timestamp,
+	stats *enginepb.MVCCStats,
+	ingestAsWrites bool,
+	batchTs hlc.Timestamp,
+) (hlc.Timestamp, roachpb.Span, int64, error) {
+	b := &Batch{Header: kvpb.Header{Timestamp: batchTs}}
+	b.addSSTable(begin, end, data, disallowConflicts, disallowShadowingBelow, stats, ingestAsWrites, batchTs)
+	err := getOneErr(db.Run(ctx, b), b)
+	if err != nil {
+		return hlc.Timestamp{}, roachpb.Span{}, 0, err
+	}
+	if l := len(b.response.Responses); l != 1 {
+		return hlc.Timestamp{}, roachpb.Span{}, 0, errors.AssertionFailedf("expected single response, got %d", l)
+	}
+	resp := b.response.Responses[0].GetAddSstable()
+	return b.response.Timestamp, resp.RangeSpan, resp.AvailableBytes, nil
 }
 
 // Migrate is used instruct all ranges overlapping with the provided keyspace to
@@ -708,7 +936,7 @@ func (db *DB) QueryResolvedTimestamp(
 	b := &Batch{}
 	b.queryResolvedTimestamp(begin, end)
 	if nearest {
-		b.Header.RoutingPolicy = roachpb.RoutingPolicy_NEAREST
+		b.Header.RoutingPolicy = kvpb.RoutingPolicy_NEAREST
 	}
 	if err := getOneErr(db.Run(ctx, b), b); err != nil {
 		return hlc.Timestamp{}, err
@@ -717,49 +945,66 @@ func (db *DB) QueryResolvedTimestamp(
 	return r.ResolvedTS, nil
 }
 
-// ScanInterleavedIntents is a command that returns all interleaved intents
-// encountered in the request span. A resume span is returned if the entirety
-// of the request span was not scanned.
-func (db *DB) ScanInterleavedIntents(
-	ctx context.Context, begin, end interface{}, ts hlc.Timestamp,
-) ([]roachpb.Intent, *roachpb.Span, error) {
-	b := &Batch{Header: roachpb.Header{Timestamp: ts}}
-	b.scanInterleavedIntents(begin, end)
-	result, err := getOneResult(db.Run(ctx, b), b)
-	if err != nil {
-		return nil, nil, err
-	}
-	responses := b.response.Responses
-	if len(responses) == 0 {
-		return nil, nil, errors.Errorf("unexpected empty response for ScanInterleavedIntents")
-	}
-	resp, ok := responses[0].GetInner().(*roachpb.ScanInterleavedIntentsResponse)
-	if !ok {
-		return nil, nil, errors.Errorf("unexpected response of type %T for ScanInterleavedIntents",
-			responses[0].GetInner())
-	}
-	return resp.Intents, result.ResumeSpan, nil
-}
-
 // Barrier is a command that waits for conflicting operations such as earlier
 // writes on the specified key range to finish.
 func (db *DB) Barrier(ctx context.Context, begin, end interface{}) (hlc.Timestamp, error) {
 	b := &Batch{}
-	b.barrier(begin, end)
-	err := getOneErr(db.Run(ctx, b), b)
-	if err != nil {
+	b.barrier(begin, end, false /* withLAI */)
+	if err := getOneErr(db.Run(ctx, b), b); err != nil {
 		return hlc.Timestamp{}, err
 	}
-	responses := b.response.Responses
-	if len(responses) == 0 {
-		return hlc.Timestamp{}, errors.Errorf("unexpected empty response for Barrier")
+	if l := len(b.response.Responses); l != 1 {
+		return hlc.Timestamp{}, errors.Errorf("got %d responses for Barrier", l)
 	}
-	resp, ok := responses[0].GetInner().(*roachpb.BarrierResponse)
-	if !ok {
-		return hlc.Timestamp{}, errors.Errorf("unexpected response of type %T for Barrier",
-			responses[0].GetInner())
+	resp := b.response.Responses[0].GetBarrier()
+	if resp == nil {
+		return hlc.Timestamp{}, errors.Errorf("unexpected response %T for Barrier",
+			b.response.Responses[0].GetInner())
 	}
 	return resp.Timestamp, nil
+}
+
+func (db *DB) FlushLockTable(ctx context.Context, begin, end interface{}) error {
+	b := &Batch{}
+	b.flushLockTable(begin, end)
+	if err := getOneErr(db.Run(ctx, b), b); err != nil {
+		return err
+	}
+	if l := len(b.response.Responses); l != 1 {
+		return errors.Errorf("got %d responses for FlushLockTable", l)
+	}
+	resp := b.response.Responses[0].GetFlushLockTable()
+	if resp == nil {
+		return errors.Errorf("unexpected response %T for FlushLockTable",
+			b.response.Responses[0].GetInner())
+	}
+	return nil
+}
+
+// BarrierWithLAI is like Barrier, but also returns the lease applied index and
+// range descriptor at which the barrier was applied. In this case, the barrier
+// can't span multiple ranges, otherwise a RangeKeyMismatchError is returned.
+//
+// NB: the protocol support for this was added in a patch release, and is not
+// guaranteed to be present with nodes prior to 24.1. In this case, the request
+// will return an empty result.
+func (db *DB) BarrierWithLAI(
+	ctx context.Context, begin, end interface{},
+) (kvpb.LeaseAppliedIndex, roachpb.RangeDescriptor, error) {
+	b := &Batch{}
+	b.barrier(begin, end, true /* withLAI */)
+	if err := getOneErr(db.Run(ctx, b), b); err != nil {
+		return 0, roachpb.RangeDescriptor{}, err
+	}
+	if l := len(b.response.Responses); l != 1 {
+		return 0, roachpb.RangeDescriptor{}, errors.Errorf("got %d responses for Barrier", l)
+	}
+	resp := b.response.Responses[0].GetBarrier()
+	if resp == nil {
+		return 0, roachpb.RangeDescriptor{}, errors.Errorf("unexpected response %T for Barrier",
+			b.response.Responses[0].GetInner())
+	}
+	return resp.LeaseAppliedIndex, resp.RangeDesc, nil
 }
 
 // sendAndFill is a helper which sends the given batch and fills its results,
@@ -771,14 +1016,14 @@ func sendAndFill(ctx context.Context, send SenderFunc, b *Batch) error {
 	// fails. But send() also returns its own errors, so there's some dancing
 	// here to do because we want to run fillResults() so that the individual
 	// result gets initialized with an error from the corresponding call.
-	var ba roachpb.BatchRequest
+	ba := &kvpb.BatchRequest{}
 	ba.Requests = b.reqs
 	ba.Header = b.Header
 	ba.AdmissionHeader = b.AdmissionHeader
 	b.response, b.pErr = send(ctx, ba)
 	b.fillResults(ctx)
 	if b.pErr == nil {
-		b.pErr = roachpb.NewError(b.resultErr())
+		b.pErr = kvpb.NewError(b.resultErr())
 	}
 	return b.pErr.GoError()
 }
@@ -802,6 +1047,11 @@ func (db *DB) Run(ctx context.Context, b *Batch) error {
 }
 
 // NewTxn creates a new RootTxn.
+//
+// Note: this is a low-level constructor for users who intend to manage
+// the lifecycle of the transaction manually (read: the sql layer). For
+// ad-hoc transactions against the KV layer, prefer db.Txn() or
+// db.TxnWithAdmissionControl().
 func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 	// Observed timestamps don't work with multi-tenancy. See:
 	//
@@ -809,6 +1059,9 @@ func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
 	txn := NewTxn(ctx, db, nodeID)
 	txn.SetDebugName(debugName)
+	if wid, wtype := WorkloadInfoFromContext(ctx); wid != 0 {
+		txn.SetWorkloadInfo(wid, 0 /* appNameID */, wtype)
+	}
 	return txn
 }
 
@@ -817,7 +1070,45 @@ func (db *DB) NewTxn(ctx context.Context, debugName string) *Txn {
 // from recoverable internal errors, and is automatically committed
 // otherwise. The retryable function should have no side effects which could
 // cause problems in the event it must be run more than once.
+//
+// This transaction will not be subject to admission control. To enable this,
+// use TxnWithAdmissionControl.
+//
+// For example:
+//
+//	err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+//			if kv, err := txn.Get(ctx, key); err != nil {
+//				return err
+//			}
+//			// ...
+//			return nil
+//		})
+//
+// Note that once the transaction encounters a retryable error, the txn object
+// is marked as poisoned and all future ops fail fast until the retry. The
+// callback may return either nil or the retryable error. Txn is responsible for
+// resetting the transaction and retrying the callback.
+//
+// TODO(irfansharif): Audit uses of this since API since it bypasses AC for the
+// system tenant. Make the other variant (TxnWithAdmissionControl) the default,
+// or maybe rename this to be more explicit (TxnWithoutAdmissionControl) so new
+// callers have to be conscious about what they want.
 func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) error) error {
+	return db.TxnWithAdmissionControl(
+		ctx, kvpb.AdmissionHeader_OTHER, admissionpb.NormalPri,
+		SteppingDisabled, retryable,
+	)
+}
+
+// TxnWithAdmissionControl is like Txn, but uses a configurable admission
+// control source and priority.
+func (db *DB) TxnWithAdmissionControl(
+	ctx context.Context,
+	source kvpb.AdmissionHeader_Source,
+	priority admissionpb.WorkPriority,
+	steppingMode SteppingMode,
+	retryable func(context.Context, *Txn) error,
+) error {
 	// TODO(radu): we should open a tracing Span here (we need to figure out how
 	// to use the correct tracer).
 
@@ -825,8 +1116,34 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 	//
 	// https://github.com/cockroachdb/cockroach/issues/48008
 	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
-	txn := NewTxn(ctx, db, nodeID)
+	txn := NewTxnWithAdmissionControl(ctx, db, nodeID, source, priority)
 	txn.SetDebugName("unnamed")
+	txn.ConfigureStepping(ctx, steppingMode)
+	if wid, wtype := WorkloadInfoFromContext(ctx); wid != 0 {
+		txn.SetWorkloadInfo(wid, 0 /* appNameID */, wtype)
+	}
+	return runTxn(ctx, txn, retryable)
+}
+
+// TxnWithSteppingEnabled is the same Txn, but represents a request originating
+// from SQL and has stepping enabled and quality of service set.
+func (db *DB) TxnWithSteppingEnabled(
+	ctx context.Context,
+	qualityOfService sessiondatapb.QoSLevel,
+	retryable func(context.Context, *Txn) error,
+) error {
+	// TODO(radu): we should open a tracing Span here (we need to figure out how
+	// to use the correct tracer).
+
+	// Observed timestamps don't work with multi-tenancy. See:
+	//
+	// https://github.com/cockroachdb/cockroach/issues/48008
+	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
+	txn := NewTxnWithSteppingEnabled(ctx, db, nodeID, qualityOfService)
+	txn.SetDebugName("unnamed")
+	if wid, wtype := WorkloadInfoFromContext(ctx); wid != 0 {
+		txn.SetWorkloadInfo(wid, 0 /* appNameID */, wtype)
+	}
 	return runTxn(ctx, txn, retryable)
 }
 
@@ -845,38 +1162,82 @@ func (db *DB) TxnRootKV(ctx context.Context, retryable func(context.Context, *Tx
 
 // runTxn runs the given retryable transaction function using the given *Txn.
 func runTxn(ctx context.Context, txn *Txn, retryable func(context.Context, *Txn) error) error {
-	err := txn.exec(ctx, func(ctx context.Context, txn *Txn) error {
-		return retryable(ctx, txn)
-	})
+	err := txn.exec(ctx, retryable)
 	if err != nil {
-		txn.CleanupOnError(ctx, err)
+		if rollbackErr := txn.Rollback(ctx); rollbackErr != nil {
+			log.Eventf(ctx, "failure aborting transaction: %s; abort caused by: %s", rollbackErr, err)
+		}
 	}
 	// Terminate TransactionRetryWithProtoRefreshError here, so it doesn't cause a higher-level
 	// txn to be retried. We don't do this in any of the other functions in DB; I
 	// guess we should.
-	if errors.HasType(err, (*roachpb.TransactionRetryWithProtoRefreshError)(nil)) {
+	if errors.HasType(err, (*kvpb.TransactionRetryWithProtoRefreshError)(nil)) {
 		return errors.Wrapf(err, "terminated retryable error")
 	}
 	return err
 }
 
+// CommitPrepared commits the prepared transaction.
+func (db *DB) CommitPrepared(ctx context.Context, txn *roachpb.Transaction) error {
+	return db.endPrepared(ctx, txn, true /* commit */)
+}
+
+// RollbackPrepared rolls back the prepared transaction.
+func (db *DB) RollbackPrepared(ctx context.Context, txn *roachpb.Transaction) error {
+	return db.endPrepared(ctx, txn, false /* commit */)
+}
+
+func (db *DB) endPrepared(ctx context.Context, txn *roachpb.Transaction, commit bool) error {
+	if txn.Status != roachpb.PREPARED {
+		return errors.WithContextTags(errors.AssertionFailedf("transaction %v is not in a prepared state", txn), ctx)
+	}
+	if txn.Key == nil {
+		// If the transaction key is nil, the transaction was read-only and never
+		// wrote a transaction record when preparing. Committing or rolling back
+		// such a transaction is a no-op.
+		return nil
+	}
+
+	// NOTE: an EndTxn sent to a prepared transaction does not need a deadline,
+	// because the commit deadline was already checked when the transaction was
+	// prepared and the transaction can not have been pushed to a later commit
+	// timestamp when prepared.
+	et := endTxnReq(commit, hlc.Timestamp{} /* deadline */)
+	et.req.Key = txn.Key
+	// TODO(nvanbenschoten): it's unfortunate that we have to set the txn's
+	// LockSpans here. cmd_end_transaction.go should be able to read them from the
+	// transaction record. Unfortunately, it currently doesn't. Address this
+	// before merging this commit.
+	et.req.LockSpans = txn.LockSpans
+	ba := &kvpb.BatchRequest{Requests: et.unionArr[:]}
+	ba.Txn = txn
+	// NOTE: bypass the CrossRangeTxnWrapperSender, which does not support
+	// transactional requests. Use the underlying sender directly.
+	_, pErr := db.sendUsingSender(ctx, ba, db.factory.NonTransactionalSender())
+	return pErr.GoError()
+}
+
 // send runs the specified calls synchronously in a single batch and returns
 // any errors. Returns (nil, nil) for an empty batch.
-func (db *DB) send(
-	ctx context.Context, ba roachpb.BatchRequest,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+func (db *DB) send(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
+	if ba.Header.WorkloadID == 0 {
+		if wid, wtype := WorkloadInfoFromContext(ctx); wid != 0 {
+			ba.Header.WorkloadID = wid
+			ba.Header.WorkloadType = wtype.ToUint32()
+		}
+	}
 	return db.sendUsingSender(ctx, ba, db.NonTransactionalSender())
 }
 
 // sendUsingSender uses the specified sender to send the batch request.
 func (db *DB) sendUsingSender(
-	ctx context.Context, ba roachpb.BatchRequest, sender Sender,
-) (*roachpb.BatchResponse, *roachpb.Error) {
+	ctx context.Context, ba *kvpb.BatchRequest, sender Sender,
+) (*kvpb.BatchResponse, *kvpb.Error) {
 	if len(ba.Requests) == 0 {
 		return nil, nil
 	}
 	if err := ba.ReadConsistency.SupportsBatch(ba); err != nil {
-		return nil, roachpb.NewError(err)
+		return nil, kvpb.NewError(err)
 	}
 	if ba.UserPriority == 0 && db.ctx.UserPriority != 1 {
 		ba.UserPriority = db.ctx.UserPriority
@@ -885,7 +1246,7 @@ func (db *DB) sendUsingSender(
 	br, pErr := sender.Send(ctx, ba)
 	if pErr != nil {
 		if log.V(1) {
-			log.Infof(ctx, "failed batch: %s", pErr)
+			log.KvExec.Infof(ctx, "failed batch: %s", pErr)
 		}
 		return nil, pErr
 	}
@@ -935,10 +1296,12 @@ func getOneRow(runErr error, b *Batch) (KeyValue, error) {
 func IncrementValRetryable(ctx context.Context, db *DB, key roachpb.Key, inc int64) (int64, error) {
 	var err error
 	var res KeyValue
-	for r := retry.Start(base.DefaultRetryOptions()); r.Next(); {
+	retryOpts := base.DefaultRetryOptions()
+	retryOpts.Closer = db.Context().Stopper.ShouldQuiesce()
+	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		res, err = db.Inc(ctx, key, inc)
-		if errors.HasType(err, (*roachpb.UnhandledRetryableError)(nil)) ||
-			errors.HasType(err, (*roachpb.AmbiguousResultError)(nil)) {
+		if errors.HasType(err, (*kvpb.UnhandledRetryableError)(nil)) ||
+			errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)) {
 			continue
 		}
 		break

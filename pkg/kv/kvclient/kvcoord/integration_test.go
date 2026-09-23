@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord_test
 
@@ -18,15 +13,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 // This file contains contains integration tests that don't fit anywhere else.
@@ -56,8 +52,6 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 
 	// The txn id whose commit we're going to reject. A uuid.UUID.
 	var txnID atomic.Value
-	// The EndTxn proposal that we want to reject. A string.
-	var commitCmdID atomic.Value
 	readerBlocked := make(chan struct{}, 2)
 	// txnUpdate is signaled once the txn wait queue is updated for our
 	// transaction. Normally it only needs a buffer length of 1, but bugs that
@@ -71,48 +65,38 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue: true,
 				DisableSplitQueue: true,
-				TestingProposalFilter: func(args kvserverbase.ProposalFilterArgs) *roachpb.Error {
-					// We'll recognize the attempt to commit our transaction and store the
-					// respective command id.
-					ba := args.Req
-					etReq, ok := ba.GetArg(roachpb.EndTxn)
-					if !ok {
-						return nil
+				TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
+					// Match on the transaction ID rather than the command ID,
+					// because reproposals get new command IDs.
+					if args.Req == nil {
+						return 0, nil
 					}
-					if !etReq.(*roachpb.EndTxnRequest).Commit {
-						return nil
+					etReq, ok := args.Req.GetArg(kvpb.EndTxn)
+					if !ok {
+						return 0, nil
+					}
+					if !etReq.(*kvpb.EndTxnRequest).Commit {
+						return 0, nil
 					}
 					v := txnID.Load()
 					if v == nil {
-						return nil
-					}
-					if !ba.Txn.ID.Equal(v.(uuid.UUID)) {
-						return nil
-					}
-					commitCmdID.Store(args.CmdID)
-					return nil
-				},
-				TestingApplyFilter: func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
-					// We'll trap the processing of the commit command and return an error
-					// for it.
-					v := commitCmdID.Load()
-					if v == nil {
 						return 0, nil
 					}
-					cmdID := v.(kvserverbase.CmdIDKey)
-					if args.CmdID == cmdID {
-						if illegalLeaseIndex {
-							illegalLeaseIndex = false
-							// NB: 1 is proposalIllegalLeaseIndex.
-							return 1, roachpb.NewErrorf("test injected err (illegal lease index)")
-						}
-						// NB: 0 is proposalNoReevaluation.
-						return 0, roachpb.NewErrorf("test injected err")
+					if !args.Req.Txn.ID.Equal(v.(uuid.UUID)) {
+						return 0, nil
 					}
-					return 0, nil
+					if illegalLeaseIndex {
+						illegalLeaseIndex = false
+						t.Logf("injecting illegal lease index for %v", args.CmdID)
+						// NB: 1 is ProposalRejectionIllegalLeaseIndex.
+						return 1, kvpb.NewErrorf("test injected err (illegal lease index)")
+					}
+					t.Logf("injecting permanent rejection for %v", args.CmdID)
+					// NB: 0 is ProposalRejectionPermanent.
+					return 0, kvpb.NewErrorf("test injected err")
 				},
 				TxnWaitKnobs: txnwait.TestingKnobs{
-					OnPusherBlocked: func(ctx context.Context, push *roachpb.PushTxnRequest) {
+					OnPusherBlocked: func(ctx context.Context, push *kvpb.PushTxnRequest) {
 						// We'll trap a reader entering the wait queue for our txn.
 						v := txnID.Load()
 						if v == nil {
@@ -156,6 +140,7 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	t.Logf("txn ID: %v", txn.ID())
 	txnID.Store(txn.ID())
 
 	readerDone := make(chan error, 2)
@@ -177,9 +162,8 @@ func TestWaiterOnRejectedCommit(t *testing.T) {
 	<-readerBlocked
 	<-readerBlocked
 
-	if err := txn.CommitOrCleanup(ctx); !testutils.IsError(err, "test injected err") {
-		t.Fatalf("expected injected err, got: %v", err)
-	}
+	require.ErrorContains(t, txn.Commit(ctx), "test injected err", "expected injected error")
+	require.NoError(t, txn.Rollback(ctx))
 	// Wait for the txn wait queue to be pinged and check the status.
 	if status := <-txnUpdate; status != roachpb.ABORTED {
 		t.Fatalf("expected the wait queue to be updated with an Aborted txn, instead got: %s", status)

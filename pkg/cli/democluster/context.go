@@ -1,18 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package democluster
 
 import (
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clicfg"
 	"github.com/cockroachdb/cockroach/pkg/workload"
 )
@@ -35,20 +31,22 @@ type Context struct {
 	// CacheSize is the size of the storage cache for each KV server.
 	CacheSize int64
 
-	// DisableTelemetry requests that telemetry be disabled.
-	DisableTelemetry bool
-
-	// DisableLicenseAcquisition requests that no evaluation license be
-	// automatically acquired to enable enterprise features.
-	DisableLicenseAcquisition bool
-
-	// NoExampleDatabase prevents the auto-creation of a demo database
+	// UseEmptyDatabase prevents the auto-creation of a demo database
 	// from a workload.
-	NoExampleDatabase bool
+	UseEmptyDatabase bool
 
 	// RunWorkload indicates whether to run a workload in the background
 	// after the demo cluster has been initialized.
 	RunWorkload bool
+
+	// ExpandSchema indicates whether to expand the schema of the
+	// workload. The expansion stops when this number of extra
+	// descriptors has been reached.
+	ExpandSchema int
+
+	// NameGenOptions configures the name generation options to use
+	// during schema expansion.
+	NameGenOptions string
 
 	// WorkloadGenerator is the desired workload generator.
 	WorkloadGenerator workload.Generator
@@ -100,6 +98,25 @@ type Context struct {
 	// Multitenant is true if we're starting the demo cluster in
 	// multi-tenant mode.
 	Multitenant bool
+
+	// DefaultEnableRangefeeds is true if rangefeeds should start
+	// out enabled.
+	DefaultEnableRangefeeds bool
+
+	// DisableServerController is true if we want to avoid the server
+	// controller to instantiate tenant secondary servers.
+	DisableServerController bool
+
+	// UseDRPC indicates whether to use DRPC instead of gRPC for
+	// inter-node RPC communication in the demo cluster.
+	UseDRPC bool
+}
+
+func (demoCtx *Context) defaultDRPCOption() base.DefaultTestDRPCOption {
+	if demoCtx.UseDRPC {
+		return base.TestDRPCEnabled
+	}
+	return base.TestDRPCDisabled
 }
 
 // IsInteractive returns true if the demo cluster configuration

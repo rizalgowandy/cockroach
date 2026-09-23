@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -16,6 +11,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 )
 
@@ -32,6 +29,8 @@ type CancelChecker struct {
 	// Number of times check() has been called since last context cancellation
 	// check.
 	callsSinceLastCheck uint32
+
+	cpuHandle *admission.GoroutineCPUHandle
 }
 
 var _ colexecop.Operator = &CancelChecker{}
@@ -51,10 +50,14 @@ func (c *CancelChecker) Init(ctx context.Context) {
 		// Check*() methods, and the input remains nil then.
 		c.Input.Init(c.Ctx)
 	}
+	cpuHandle := admission.SQLCPUHandleFromContext(ctx)
+	if cpuHandle != nil {
+		c.cpuHandle = cpuHandle.RegisterGoroutine()
+	}
 }
 
 // Next is part of colexecop.Operator interface.
-func (c *CancelChecker) Next() coldata.Batch {
+func (c *CancelChecker) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	c.CheckEveryCall()
 	return c.Input.Next()
 }
@@ -85,5 +88,11 @@ func (c *CancelChecker) CheckEveryCall() {
 	case <-c.Ctx.Done():
 		colexecerror.ExpectedError(cancelchecker.QueryCanceledError)
 	default:
+	}
+	if c.cpuHandle != nil {
+		err := c.cpuHandle.MeasureAndAdmit(c.Ctx)
+		if err != nil {
+			colexecerror.ExpectedError(cancelchecker.QueryCanceledError)
+		}
 	}
 }

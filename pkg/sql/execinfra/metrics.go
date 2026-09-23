@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfra
 
@@ -14,27 +9,31 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 )
 
 // DistSQLMetrics contains pointers to the metrics for monitoring DistSQL
 // processing.
 type DistSQLMetrics struct {
-	QueriesActive         *metric.Gauge
-	QueriesTotal          *metric.Counter
-	ContendedQueriesCount *metric.Counter
-	FlowsActive           *metric.Gauge
-	FlowsTotal            *metric.Counter
-	FlowsQueued           *metric.Gauge
-	FlowsScheduled        *metric.Counter
-	QueueWaitHist         *metric.Histogram
-	MaxBytesHist          *metric.Histogram
-	CurBytesCount         *metric.Gauge
-	VecOpenFDs            *metric.Gauge
-	CurDiskBytesCount     *metric.Gauge
-	MaxDiskBytesHist      *metric.Histogram
-	QueriesSpilled        *metric.Counter
-	SpilledBytesWritten   *metric.Counter
-	SpilledBytesRead      *metric.Counter
+	QueriesActive               *metric.Gauge
+	QueriesTotal                *metric.Counter
+	DistributedCount            *metric.Counter
+	ContendedQueriesCount       *aggmetric.SQLCounter
+	CumulativeContentionNanos   *aggmetric.SQLCounter
+	FlowsActive                 *metric.Gauge
+	FlowsTotal                  *metric.Counter
+	RunnerReqParallelCount      *metric.Counter
+	RunnerReqSequentialCount    *metric.Counter
+	MaxBytesHist                metric.IHistogram
+	CurBytesCount               *metric.Gauge
+	VecOpenFDs                  *metric.Gauge
+	CurDiskBytesCount           *metric.Gauge
+	MaxDiskBytesHist            metric.IHistogram
+	QueriesSpilled              *metric.Counter
+	SpilledBytesWritten         *metric.Counter
+	SpilledBytesRead            *metric.Counter
+	DistErrorLocalRetryAttempts *metric.Counter
+	DistErrorLocalRetryFailures *metric.Counter
 }
 
 // MetricStruct implements the metrics.Struct interface.
@@ -45,14 +44,20 @@ var _ metric.Struct = DistSQLMetrics{}
 var (
 	metaQueriesActive = metric.Metadata{
 		Name:        "sql.distsql.queries.active",
-		Help:        "Number of SQL queries currently active",
-		Measurement: "Queries",
+		Help:        "Number of invocations of the execution engine currently active (multiple of which may occur for a single SQL statement)",
+		Measurement: "DistSQL runs",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaQueriesTotal = metric.Metadata{
 		Name:        "sql.distsql.queries.total",
-		Help:        "Number of SQL queries executed",
-		Measurement: "Queries",
+		Help:        "Number of invocations of the execution engine executed (multiple of which may occur for a single SQL statement)",
+		Measurement: "DistSQL runs",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistributedCount = metric.Metadata{
+		Name:        "sql.distsql.distributed_exec.count",
+		Help:        "Number of invocations of the execution engine executed with full or partial distribution (multiple of which may occur for a single SQL statement)",
+		Measurement: "DistSQL runs",
 		Unit:        metric.Unit_COUNT,
 	}
 	metaContendedQueriesCount = metric.Metadata{
@@ -60,6 +65,15 @@ var (
 		Help:        "Number of SQL queries that experienced contention",
 		Measurement: "Queries",
 		Unit:        metric.Unit_COUNT,
+		Visibility:  metric.Metadata_ESSENTIAL,
+		Category:    metric.Metadata_SQL,
+		HowToUse:    `This metric is incremented whenever there is a non-trivial amount of contention experienced by a statement whether read-write or write-write conflicts. Monitor this metric to correlate possible workload performance issues to contention conflicts.`,
+	}
+	metaCumulativeContentionNanos = metric.Metadata{
+		Name:        "sql.distsql.cumulative_contention_nanos",
+		Help:        "Cumulative contention across all queries (in nanoseconds)",
+		Measurement: "Nanoseconds",
+		Unit:        metric.Unit_NANOSECONDS,
 	}
 	metaFlowsActive = metric.Metadata{
 		Name:        "sql.distsql.flows.active",
@@ -73,23 +87,17 @@ var (
 		Measurement: "Flows",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaFlowsQueued = metric.Metadata{
-		Name:        "sql.distsql.flows.queued",
-		Help:        "Number of distributed SQL flows currently queued",
-		Measurement: "Flows",
+	metaRunnerReqParallelCount = metric.Metadata{
+		Name:        "sql.distsql.parallel_runner.count",
+		Help:        "Number of SetupFlowRequest RPCs executed concurrently via DistSQL runners",
+		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
 	}
-	metaFlowsScheduled = metric.Metadata{
-		Name:        "sql.distsql.flows.scheduled",
-		Help:        "Number of distributed SQL flows scheduled",
-		Measurement: "Flows",
+	metaRunnerReqSequentialCount = metric.Metadata{
+		Name:        "sql.distsql.sequential_runner.count",
+		Help:        "Number of SetupFlowRequest RPCs executed sequentially via the main gateway goroutine",
+		Measurement: "Requests",
 		Unit:        metric.Unit_COUNT,
-	}
-	metaQueueWaitHist = metric.Metadata{
-		Name:        "sql.distsql.flows.queue_wait",
-		Help:        "Duration of time flows spend waiting in the queue",
-		Measurement: "Nanoseconds",
-		Unit:        metric.Unit_NANOSECONDS,
 	}
 	metaMemMaxBytes = metric.Metadata{
 		Name:        "sql.mem.distsql.max",
@@ -139,6 +147,18 @@ var (
 		Measurement: "Disk",
 		Unit:        metric.Unit_BYTES,
 	}
+	metaDistErrorLocalRetryAttempts = metric.Metadata{
+		Name:        "sql.distsql.dist_query_rerun_locally.count",
+		Help:        "Total number of cases when distributed query error resulted in a local rerun",
+		Measurement: "Queries",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaDistErrorLocalRetryFailures = metric.Metadata{
+		Name:        "sql.distsql.dist_query_rerun_locally.failure_count",
+		Help:        "Total number of cases when the local rerun of a distributed query resulted in an error",
+		Measurement: "Queries",
+		Unit:        metric.Unit_COUNT,
+	}
 )
 
 // See pkg/sql/mem_metrics.go
@@ -148,33 +168,50 @@ const log10int64times1000 = 19 * 1000
 // MakeDistSQLMetrics instantiates the metrics holder for DistSQL monitoring.
 func MakeDistSQLMetrics(histogramWindow time.Duration) DistSQLMetrics {
 	return DistSQLMetrics{
-		QueriesActive:         metric.NewGauge(metaQueriesActive),
-		QueriesTotal:          metric.NewCounter(metaQueriesTotal),
-		ContendedQueriesCount: metric.NewCounter(metaContendedQueriesCount),
-		FlowsActive:           metric.NewGauge(metaFlowsActive),
-		FlowsTotal:            metric.NewCounter(metaFlowsTotal),
-		FlowsQueued:           metric.NewGauge(metaFlowsQueued),
-		FlowsScheduled:        metric.NewCounter(metaFlowsScheduled),
-		QueueWaitHist:         metric.NewLatency(metaQueueWaitHist, histogramWindow),
-		MaxBytesHist:          metric.NewHistogram(metaMemMaxBytes, histogramWindow, log10int64times1000, 3),
-		CurBytesCount:         metric.NewGauge(metaMemCurBytes),
-		VecOpenFDs:            metric.NewGauge(metaVecOpenFDs),
-		CurDiskBytesCount:     metric.NewGauge(metaDiskCurBytes),
-		MaxDiskBytesHist:      metric.NewHistogram(metaDiskMaxBytes, histogramWindow, log10int64times1000, 3),
-		QueriesSpilled:        metric.NewCounter(metaQueriesSpilled),
-		SpilledBytesWritten:   metric.NewCounter(metaSpilledBytesWritten),
-		SpilledBytesRead:      metric.NewCounter(metaSpilledBytesRead),
+		QueriesActive:             metric.NewGauge(metaQueriesActive),
+		QueriesTotal:              metric.NewCounter(metaQueriesTotal),
+		DistributedCount:          metric.NewCounter(metaDistributedCount),
+		ContendedQueriesCount:     aggmetric.NewSQLCounter(metaContendedQueriesCount),
+		CumulativeContentionNanos: aggmetric.NewSQLCounter(metaCumulativeContentionNanos),
+		FlowsActive:               metric.NewGauge(metaFlowsActive),
+		FlowsTotal:                metric.NewCounter(metaFlowsTotal),
+		RunnerReqParallelCount:    metric.NewCounter(metaRunnerReqParallelCount),
+		RunnerReqSequentialCount:  metric.NewCounter(metaRunnerReqSequentialCount),
+		MaxBytesHist: metric.NewHistogram(metric.HistogramOptions{
+			Metadata:     metaMemMaxBytes,
+			Duration:     histogramWindow,
+			MaxVal:       log10int64times1000,
+			SigFigs:      3,
+			BucketConfig: metric.MemoryUsage64MBBuckets,
+		}),
+		CurBytesCount:     metric.NewGauge(metaMemCurBytes),
+		VecOpenFDs:        metric.NewGauge(metaVecOpenFDs),
+		CurDiskBytesCount: metric.NewGauge(metaDiskCurBytes),
+		MaxDiskBytesHist: metric.NewHistogram(metric.HistogramOptions{
+			Metadata:     metaDiskMaxBytes,
+			Duration:     histogramWindow,
+			MaxVal:       log10int64times1000,
+			SigFigs:      3,
+			BucketConfig: metric.MemoryUsage64MBBuckets}),
+		QueriesSpilled:              metric.NewCounter(metaQueriesSpilled),
+		SpilledBytesWritten:         metric.NewCounter(metaSpilledBytesWritten),
+		SpilledBytesRead:            metric.NewCounter(metaSpilledBytesRead),
+		DistErrorLocalRetryAttempts: metric.NewCounter(metaDistErrorLocalRetryAttempts),
+		DistErrorLocalRetryFailures: metric.NewCounter(metaDistErrorLocalRetryFailures),
 	}
 }
 
-// QueryStart registers the start of a new DistSQL query.
-func (m *DistSQLMetrics) QueryStart() {
+// RunStart registers the start of an invocation of the DistSQL engine.
+func (m *DistSQLMetrics) RunStart(distributed bool) {
 	m.QueriesActive.Inc(1)
 	m.QueriesTotal.Inc(1)
+	if distributed {
+		m.DistributedCount.Inc(1)
+	}
 }
 
-// QueryStop registers the end of a DistSQL query.
-func (m *DistSQLMetrics) QueryStop() {
+// RunStop registers the end of an invocation of the DistSQL engine.
+func (m *DistSQLMetrics) RunStop() {
 	m.QueriesActive.Dec(1)
 }
 

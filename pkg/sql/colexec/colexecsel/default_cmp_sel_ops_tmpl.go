@@ -1,16 +1,10 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for default_cmp_sel_ops.eg.go. It's
@@ -27,7 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexeccmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -46,14 +41,17 @@ type defaultCmp_KINDSelOp struct {
 }
 
 var _ colexecop.Operator = &defaultCmp_KINDSelOp{}
-var _ execinfra.Releasable = &defaultCmp_KINDSelOp{}
+var _ execreleasable.Releasable = &defaultCmp_KINDSelOp{}
 
-func (d *defaultCmp_KINDSelOp) Next() coldata.Batch {
+func (d *defaultCmp_KINDSelOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	for {
-		batch := d.Input.Next()
+		batch, meta := d.Input.Next()
+		if meta != nil {
+			return nil, meta
+		}
 		n := batch.Length()
 		if n == 0 {
-			return coldata.ZeroBatch
+			return coldata.ZeroBatch, nil
 		}
 		d.toDatumConverter.ConvertBatchAndDeselect(batch)
 		// {{if .HasConst}}
@@ -75,10 +73,10 @@ func (d *defaultCmp_KINDSelOp) Next() coldata.Batch {
 			// is no need to check whether hasSel is true.
 			// {{if .HasConst}}
 			//gcassert:bce
-			res, err := d.adapter.Eval(leftColumn[i], d.constArg)
+			res, err := d.adapter.Eval(d.Ctx, leftColumn[i], d.constArg)
 			// {{else}}
 			//gcassert:bce
-			res, err := d.adapter.Eval(leftColumn[i], rightColumn[i])
+			res, err := d.adapter.Eval(d.Ctx, leftColumn[i], rightColumn[i])
 			// {{end}}
 			if err != nil {
 				colexecerror.ExpectedError(err)
@@ -95,7 +93,7 @@ func (d *defaultCmp_KINDSelOp) Next() coldata.Batch {
 		}
 		if idx > 0 {
 			batch.SetLength(idx)
-			return batch
+			return batch, nil
 		}
 	}
 }

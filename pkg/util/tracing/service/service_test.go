@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package service
 
@@ -29,17 +24,17 @@ func TestTracingServiceGetSpanRecordings(t *testing.T) {
 	tracer1 := tracing.NewTracer()
 	setupTraces := func() (tracingpb.TraceID, func()) {
 		// Start a root span.
-		root1 := tracer1.StartSpan("root1", tracing.WithRecording(tracing.RecordingVerbose))
+		root1 := tracer1.StartSpan("root1", tracing.WithRecording(tracingpb.RecordingVerbose))
 		child1 := tracer1.StartSpan("root1.child", tracing.WithParent(root1))
 		child2 := tracer1.StartSpan("root1.child.detached", tracing.WithParent(child1), tracing.WithDetachedRecording())
 		// Create a span that will be added to the tracers' active span map, but
 		// will share the same traceID as root.
-		child3 := tracer1.StartSpan("root1.remote_child", tracing.WithRemoteParent(child2.Meta()))
+		child3 := tracer1.StartSpan("root1.remote_child", tracing.WithRemoteParentFromSpanMeta(child2.Meta()))
 
 		time.Sleep(10 * time.Millisecond)
 
 		// Start span with different trace ID.
-		root2 := tracer1.StartSpan("root2", tracing.WithRecording(tracing.RecordingVerbose))
+		root2 := tracer1.StartSpan("root2", tracing.WithRecording(tracingpb.RecordingVerbose))
 		root2.Record("root2")
 
 		return root1.TraceID(), func() {

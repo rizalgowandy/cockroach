@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -18,12 +13,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/gogo/protobuf/proto"
+	"github.com/stretchr/testify/require"
 )
 
 // TestSplitQueueShouldQueue verifies shouldSplitRange method correctly
@@ -31,10 +29,13 @@ import (
 func TestSplitQueueShouldQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	ctx := context.Background()
 	tc := testContext{}
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
-	tc.Start(t, stopper)
+	defer stopper.Stop(ctx)
+	sc := TestStoreConfig(nil)
+	sc.TestingKnobs.DisableCanAckBeforeApplication = true
+	tc.StartWithStoreConfig(ctx, t, stopper, sc)
 
 	// Set zone configs.
 	config.TestingSetZoneConfig(2000, zonepb.ZoneConfig{RangeMaxBytes: proto.Int64(32 << 20)})
@@ -48,7 +49,7 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		priority   float64
 	}{
 		// No intersection, no bytes, no load.
-		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 0, 64 << 20, false, 0},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), 0, 64 << 20, false, 0},
 		// Intersection in zone, no bytes, no load.
 		{roachpb.RKey(keys.SystemSQLCodec.TablePrefix(2001)), roachpb.RKeyMax, 0, 64 << 20, true, 1},
 		// Already split at largest ID, no load.
@@ -56,24 +57,47 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		// Multiple intersections, no bytes, no load.
 		{roachpb.RKeyMin, roachpb.RKeyMax, 0, 64 << 20, true, 1},
 		// No intersection, max bytes, no load.
-		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 20, 64 << 20, false, 0},
+		//{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 20, 64 << 20, false, 0},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), 64 << 20, 64 << 20, false, 0},
 		// No intersection, max bytes+1, no load.
-		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64<<20 + 1, 64 << 20, true, 1},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), 64<<20 + 1, 64 << 20, true, 1},
 		// No intersection, max bytes * 2 + 2, no load, should backpressure.
-		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64<<21 + 2, 64 << 20, true, 52},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), 64<<21 + 2, 64 << 20, true, 52},
 		// No intersection, max bytes * 4, no load, should not backpressure.
-		{roachpb.RKeyMin, roachpb.RKey(keys.MetaMax), 64 << 22, 64 << 20, true, 4},
+		{roachpb.RKeyMin, roachpb.RKey(keys.Meta1KeyMax), 64 << 22, 64 << 20, true, 4},
+		// Meta2 range, Intersection, no bytes, no load.
+		{roachpb.RKey(keys.Meta2Prefix), roachpb.RKey(keys.Meta2KeyMax), 0, 64 << 20, false, 0},
+		// Meta2 range, Intersection, max bytes, no load.
+		{roachpb.RKey(keys.Meta2Prefix), roachpb.RKey(keys.Meta2KeyMax), 0, 64 << 20, false, 0},
+		// Meta2 range, Intersection, max bytes, no load.
+		{roachpb.RKey(keys.Meta2Prefix), roachpb.RKey(keys.Meta2KeyMax), 64 << 20, 64 << 20, false, 0},
+		// Meta2 range, Intersection, max bytes +1, no load.
+		{roachpb.RKey(keys.Meta2Prefix), roachpb.RKey(keys.Meta2KeyMax), 64<<20 + 1, 64 << 20, true, 1},
+		// Meta2 range, Intersection, max bytes *2, no load.
+		{roachpb.RKey(keys.Meta2Prefix), roachpb.RKey(keys.Meta2KeyMax), 64 << 21, 64 << 20, true, 2},
+		// Meta2 range, Intersection, max bytes *2 +2, no load, should backpressure.
+		{roachpb.RKey(keys.Meta2Prefix), roachpb.RKey(keys.Meta2KeyMax), 64<<21 + 2, 64 << 20, true, 52},
 		// Intersection, max bytes +1, no load.
 		{roachpb.RKey(keys.SystemSQLCodec.TablePrefix(2000)), roachpb.RKeyMax, 32<<20 + 1, 32 << 20, true, 2},
 		// Split needed at table boundary, but no zone config, no load.
 		{roachpb.RKey(keys.SystemSQLCodec.TablePrefix(2001)), roachpb.RKeyMax, 32<<20 + 1, 64 << 20, true, 1},
 	}
 
-	cfg := tc.gossip.GetSystemConfig()
-	if cfg == nil {
-		t.Fatal("config not set")
+	cfg, err := tc.store.GetConfReader(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	ctx := context.Background()
+
+	{
+		// This test plays fast and loose and if there are raft commands ongoing then
+		// we'll hit internal assertions in the tests below. Sending a write through
+		// before mucking with internals and waiting for it to show up in the state
+		// machine appears to be good enough.
+		put := putArgs(tc.repl.Desc().EndKey.AsRawKey().Prevish(5), []byte("foo"))
+		_, pErr := kv.SendWrapped(ctx, tc.Sender(), &put)
+		require.NoError(t, pErr.GoError())
+	}
+
 	for i, test := range testCases {
 		// Create a replica for testing that is not hooked up to the store. This
 		// ensures that the store won't be mucking with our replica concurrently
@@ -81,13 +105,16 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		cpy := *tc.repl.Desc()
 		cpy.StartKey = test.start
 		cpy.EndKey = test.end
-		repl, err := newReplica(ctx, &cpy, tc.store, cpy.Replicas().VoterDescriptors()[0].ReplicaID)
+		replicaID := cpy.Replicas().VoterDescriptors()[0].ReplicaID
+		require.NoError(t,
+			kvstorage.MakeStateLoader(cpy.RangeID).SetRaftReplicaID(ctx, tc.store.StateEngine(), replicaID))
+		repl, err := loadInitializedReplicaForTesting(ctx, tc.store, &cpy, replicaID)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		repl.mu.Lock()
-		repl.mu.state.Stats = &enginepb.MVCCStats{KeyBytes: test.bytes}
+		repl.shMu.state.Stats = &enginepb.MVCCStats{KeyBytes: test.bytes}
 		repl.mu.Unlock()
 		conf := roachpb.TestingDefaultSpanConfig()
 		conf.RangeMaxBytes = test.maxBytes
@@ -97,7 +124,7 @@ func TestSplitQueueShouldQueue(t *testing.T) {
 		// This tests the merge queue behavior too as a result. For splitFinder tests,
 		// see split/split_test.go.
 		shouldQ, priority := shouldSplitRange(ctx, repl.Desc(), repl.GetMVCCStats(),
-			repl.GetMaxBytes(), repl.ShouldBackpressureWrites(), cfg)
+			repl.GetMaxBytes(ctx), repl.ShouldBackpressureWrites(ctx), cfg)
 		if shouldQ != test.shouldQ {
 			t.Errorf("%d: should queue expected %t; got %t", i, test.shouldQ, shouldQ)
 		}

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -21,26 +16,34 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilitiespb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStatementReuses(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
-	s, db, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
 
 	initStmts := []string{
+		`SET create_table_with_schema_locked=false`,
 		`CREATE DATABASE d`,
 		`USE d`,
 		`CREATE TABLE a(b INT)`,
@@ -81,7 +84,6 @@ func TestStatementReuses(t *testing.T) {
 		`ALTER TABLE a SCATTER`,
 
 		`ALTER INDEX a@woo RENAME TO waa`,
-		`ALTER INDEX a@woo CONFIGURE ZONE USING DEFAULT`,
 		`ALTER INDEX a@woo SPLIT AT VALUES(1)`,
 		`ALTER INDEX a@woo SCATTER`,
 
@@ -229,10 +231,9 @@ func TestPrepareExplain(t *testing.T) {
 		"EXPLAIN SELECT * FROM abc WHERE c=1",
 		"EXPLAIN (VERBOSE) SELECT * FROM abc WHERE c=1",
 		"EXPLAIN (TYPES) SELECT * FROM abc WHERE c=1",
-		"EXPLAIN ANALYZE SELECT * FROM abc WHERE c=1",
-		"EXPLAIN ANALYZE (VERBOSE) SELECT * FROM abc WHERE c=1",
 		"EXPLAIN (DISTSQL) SELECT * FROM abc WHERE c=1",
 		"EXPLAIN (VEC) SELECT * FROM abc WHERE c=1",
+		"EXPLAIN ANALYZE SELECT * FROM abc WHERE c=1",
 	}
 
 	for _, sql := range statements {
@@ -321,47 +322,119 @@ func TestExplainStatsCollected(t *testing.T) {
 	}
 }
 
-// TestExplainMVCCSteps makes sure that the MVCC stats are properly collected
-// during explain analyze. This can't be a normal logic test because the MVCC
-// stats are marked as nondeterministic (they change depending on number of
-// nodes in the query).
-func TestExplainMVCCSteps(t *testing.T) {
+// TestExplainKVInfo makes sure that miscellaneous KV-level stats are properly
+// collected during EXPLAIN ANALYZE. This can't be a normal logic test because
+// KV-level stats are marked as non-deterministic.
+func TestExplainKVInfo(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderMetamorphic(t,
-		"this test expects a precise number of scan requests, which is not upheld "+
-			"in the metamorphic configuration that edits the kv batch size.")
-
 	ctx := context.Background()
-	srv, godb, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	srv, godb, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			Insecure: true,
+			Knobs: base.TestingKnobs{
+				SQLEvalContext: &eval.TestingKnobs{
+					ForceProductionValues: true,
+				},
+			},
+		},
+	)
 	defer srv.Stopper().Stop(ctx)
 	r := sqlutils.MakeSQLRunner(godb)
 	r.Exec(t, "CREATE TABLE ab (a PRIMARY KEY, b) AS SELECT g, g FROM generate_series(1,1000) g(g)")
+	r.Exec(t, "CREATE TABLE bc (b PRIMARY KEY, c) AS SELECT g, g FROM generate_series(1,1000) g(g)")
 
-	expectedSteps, expectedSeeks := 1000, 2
-	foundSteps, foundSeeks := getMVCCStats(t, r)
+	for _, vectorize := range []bool{true, false} {
+		if vectorize {
+			r.Exec(t, "SET vectorize = on")
+		} else {
+			r.Exec(t, "SET vectorize = off")
+		}
+		for _, streamer := range []bool{true, false} {
+			if streamer {
+				r.Exec(t, "SET streamer_enabled = true")
+			} else {
+				r.Exec(t, "SET streamer_enabled = false")
+			}
 
-	assert.Equal(t, expectedSteps, foundSteps)
-	assert.Equal(t, expectedSeeks, foundSeeks)
-	assert.Equal(t, expectedSteps, foundSteps)
-	assert.Equal(t, expectedSeeks, foundSeeks)
+			scanQuery := "SELECT count(*) FROM ab"
+			info, fullOutput := getKVInfo(t, r, scanQuery)
 
-	// Update all rows.
-	r.Exec(t, "UPDATE ab SET b=b+1 WHERE true")
+			assert.Equal(t, 1, info.counters[kvNodes])
+			assert.Equal(t, 1000, info.counters[rowsRead])
+			assert.Equal(t, 1000, info.counters[pairsRead])
+			assert.LessOrEqual(t, 31 /* KiB */, info.counters[bytesRead])
+			assert.Equal(t, 1, info.counters[gRPCCalls])
+			assert.Equal(t, 1000, info.counters[stepCount])
+			assert.Equal(t, 1, info.counters[seekCount])
+			// Additionally assert that correct distribution is shown.
+			assert.Truef(
+				t, strings.Contains(fullOutput, "distribution: local"),
+				"expected local distribution, found\n\n%s", fullOutput,
+			)
 
-	expectedSteps, expectedSeeks = 2000, 2
-	foundSteps, foundSeeks = getMVCCStats(t, r)
+			lookupJoinQuery := "SELECT count(*) FROM ab INNER LOOKUP JOIN bc ON ab.b = bc.b"
+			info, fullOutput = getKVInfo(t, r, lookupJoinQuery)
 
-	assert.Equal(t, expectedSteps, foundSteps)
-	assert.Equal(t, expectedSeeks, foundSeeks)
+			assert.Equal(t, 1, info.counters[kvNodes])
+			assert.Equal(t, 1000, info.counters[rowsRead])
+			assert.Equal(t, 1000, info.counters[pairsRead])
+			assert.LessOrEqual(t, 13 /* KiB */, info.counters[bytesRead])
+			assert.Equal(t, 1, info.counters[gRPCCalls])
+			assert.Equal(t, 0, info.counters[stepCount])
+			assert.Equal(t, 1000, info.counters[seekCount])
+			assert.Truef(
+				t, strings.Contains(fullOutput, "distribution: local"),
+				"expected local distribution\n\n%s", fullOutput,
+			)
+		}
+	}
 }
 
-func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner) (foundSteps, foundSeeks int) {
-	rows := r.Query(t, "EXPLAIN ANALYZE(VERBOSE) SELECT count(*) FROM ab")
+const (
+	// Note that kvNodes is not really a counter, but since we're using a single
+	// node cluster, only a single node ID is expected.
+	kvNodes = iota
+	rowsRead
+	pairsRead
+	bytesRead
+	gRPCCalls
+	stepCount
+	seekCount
+	numKVCounters
+)
+
+type kvInfo struct {
+	counters [numKVCounters]int
+}
+
+var patterns [numKVCounters]*regexp.Regexp
+
+func init() {
+	patterns[kvNodes] = regexp.MustCompile(`kv nodes: n(\d)`)
+	patterns[rowsRead] = regexp.MustCompile(`KV rows decoded: (\d+)`)
+	patterns[pairsRead] = regexp.MustCompile(`KV pairs read: (\d+)`)
+	patterns[bytesRead] = regexp.MustCompile(`KV bytes read: (\d+) \w+`)
+	patterns[gRPCCalls] = regexp.MustCompile(`KV gRPC calls: (\d+)`)
+	patterns[stepCount] = regexp.MustCompile(`MVCC step count \(ext/int\): (\d+)/[\d+]`)
+	patterns[seekCount] = regexp.MustCompile(`MVCC seek count \(ext/int\): (\d+)/[\d+]`)
+}
+
+// getKVInfo returns miscellaneous KV-level stats found in the EXPLAIN ANALYZE
+// of the given query from the top-most operator in the plan (i.e. if there are
+// multiple operators exposing the scan stats, then the first info that appears
+// in the EXPLAIN output is used).
+//
+// It additionally returns the full output of EXPLAIN ANALYZE of the given
+// query.
+func getKVInfo(t *testing.T, r *sqlutils.SQLRunner, query string) (_ kvInfo, fullOutput string) {
+	rows := r.Query(t, "EXPLAIN ANALYZE (VERBOSE) "+query)
 	var output strings.Builder
 	var str string
 	var err error
+	var info kvInfo
+	var counterSet [numKVCounters]bool
 	for rows.Next() {
 		if err := rows.Scan(&str); err != nil {
 			t.Fatal(err)
@@ -371,17 +444,17 @@ func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner) (foundSteps, foundSeeks i
 		str = strings.TrimSpace(str)
 		// Numbers are printed with commas to indicate 1000s places, remove them.
 		str = strings.ReplaceAll(str, ",", "")
-		stepRe := regexp.MustCompile(`MVCC step count \(ext/int\): (\d+)/(\d+)`)
-		stepMatches := stepRe.FindStringSubmatch(str)
-		if len(stepMatches) == 3 {
-			foundSteps, err = strconv.Atoi(stepMatches[1])
-			assert.NoError(t, err)
-		}
-		seekRe := regexp.MustCompile(`MVCC seek count \(ext/int\): (\d+)/(\d+)`)
-		seekMatches := seekRe.FindStringSubmatch(str)
-		if len(seekMatches) == 3 {
-			foundSeeks, err = strconv.Atoi(seekMatches[1])
-			assert.NoError(t, err)
+		for i := 0; i < numKVCounters; i++ {
+			if counterSet[i] {
+				continue
+			}
+			matches := patterns[i].FindStringSubmatch(str)
+			if len(matches) == 2 {
+				info.counters[i], err = strconv.Atoi(matches[1])
+				assert.NoError(t, err)
+				counterSet[i] = true
+				break
+			}
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -391,5 +464,294 @@ func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner) (foundSteps, foundSeeks i
 		fmt.Println("Explain output:")
 		fmt.Println(output.String())
 	}
-	return foundSteps, foundSeeks
+	return info, output.String()
+}
+
+// TestExplainAnalyzeWarnings verifies that warnings are printed whenever the
+// estimated number of rows to be scanned differs significantly from the actual
+// row count.
+func TestExplainAnalyzeWarnings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, godb, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	defer srv.Stopper().Stop(ctx)
+	r := sqlutils.MakeSQLRunner(godb)
+
+	// Disable auto stats collection so that it doesn't interfere.
+	r.Exec(t, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false")
+	r.Exec(t, "CREATE TABLE warnings (k INT PRIMARY KEY)")
+	// Insert 1000 rows into the table - this will be the actual row count. The
+	// "acceptable" range for the estimates when the warning is not added is
+	// [450, 2100].
+	r.Exec(t, "INSERT INTO warnings SELECT generate_series(1, 1000)")
+
+	for i, tc := range []struct {
+		estimatedRowCount int
+		expectWarning     bool
+	}{
+		{estimatedRowCount: 0, expectWarning: true},
+		{estimatedRowCount: 100, expectWarning: true},
+		{estimatedRowCount: 449, expectWarning: true},
+		{estimatedRowCount: 450, expectWarning: false},
+		{estimatedRowCount: 1000, expectWarning: false},
+		{estimatedRowCount: 2000, expectWarning: false},
+		{estimatedRowCount: 2100, expectWarning: false},
+		{estimatedRowCount: 2101, expectWarning: true},
+		{estimatedRowCount: 10000, expectWarning: true},
+	} {
+		// Inject fake stats.
+		r.Exec(t, fmt.Sprintf(
+			`ALTER TABLE warnings INJECT STATISTICS '[{
+                            "columns": ["k"],
+                            "created_at": "2022-08-23 00:00:0%[2]d.000000",
+                            "distinct_count": %[1]d,
+                            "name": "__auto__",
+                            "null_count": 0,
+                            "row_count": %[1]d
+			}]'`, tc.estimatedRowCount, i,
+		))
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE SELECT * FROM warnings")
+		var warningFound bool
+		for _, row := range rows {
+			if len(row) > 1 {
+				t.Fatalf("unexpectedly more than a single string is returned in %v", row)
+			}
+			if strings.HasPrefix(row[0], "WARNING") {
+				warningFound = true
+			}
+		}
+		assert.Equal(t, tc.expectWarning, warningFound, fmt.Sprintf("failed for estimated row count %d", tc.estimatedRowCount))
+	}
+}
+
+// TestExplainRedact tests that variants of EXPLAIN (REDACT) do not leak PII.
+func TestExplainRedact(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderDeadlock(t, "the test is too slow")
+	skip.UnderRace(t, "the test is too slow")
+
+	const numStatements = 10
+
+	ctx := context.Background()
+	rng, seed := randutil.NewTestRand()
+	t.Log("seed:", seed)
+
+	srv, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// To check for PII leaks, we inject a single unlikely string into some of the
+	// query constants produced by SQLSmith, and then search the redacted EXPLAIN
+	// output for this string.
+	pii := "pterodactyl"
+	containsPII := func(explain, output string) error {
+		lowerOutput := strings.ToLower(output)
+		if strings.Contains(lowerOutput, pii) {
+			return errors.Newf(
+				"EXPLAIN output contained PII (%q):\n%s\noutput:\n%s\n", pii, explain, output,
+			)
+		}
+		return nil
+	}
+
+	// Set up smither to generate random DML statements.
+	setup := sqlsmith.Setups["seed"](rng)
+	setup = append(setup, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = off;")
+	setup = append(setup, "ANALYZE seed;")
+	setup = append(setup, "SET statement_timeout = '5s';")
+	for _, stmt := range setup {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(stmt + ";")
+	}
+
+	smith, err := sqlsmith.NewSmither(sqlDB, rng,
+		sqlsmith.PrefixStringConsts(pii),
+		sqlsmith.DisableDDLs(),
+		sqlsmith.SimpleNames(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer smith.Close()
+
+	tests.GenerateAndCheckRedactedExplainsForPII(t, smith, numStatements, conn, containsPII)
+}
+
+// TestExplainAnalyzeSQLNodes verifies the 'sql nodes' attribute of EXPLAIN
+// ANALYZE output.
+func TestExplainAnalyzeSQLNodes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	skip.UnderDuress(t)
+
+	c := testcluster.StartTestCluster(t, 3 /* nodes */, base.TestClusterArgs{})
+	defer c.Stopper().Stop(context.Background())
+
+	if c.DefaultTenantDeploymentMode().IsExternal() {
+		c.GrantTenantCapabilities(context.Background(), t, serverutils.TestTenantID(),
+			map[tenantcapabilitiespb.ID]string{tenantcapabilitiespb.CanAdminRelocateRange: "true"})
+	}
+
+	r := sqlutils.MakeSQLRunner(c.ApplicationLayer(0).SQLConn(t))
+	r.Exec(t, `CREATE TABLE kv (k INT PRIMARY KEY, v INT);`)
+	r.Exec(t, `INSERT INTO kv SELECT i, i FROM generate_series (1, 300) AS g(i);`)
+	r.Exec(t, `ANALYZE kv;`)
+	r.Exec(t, `ALTER TABLE kv SPLIT AT VALUES (100), (200);`)
+	r.ExecSucceedsSoon(t, `ALTER TABLE kv EXPERIMENTAL_RELOCATE VALUES (ARRAY[1], 1), (ARRAY[2], 101), (ARRAY[3], 201);`)
+
+	for _, tc := range []struct {
+		setup    string
+		query    string
+		op       string
+		sqlNodes string
+	}{
+		{
+			setup:    `SET distribute_sort_row_count_threshold = 1`,
+			query:    `SELECT v FROM kv ORDER BY v LIMIT 10`,
+			op:       `top-k`,
+			sqlNodes: `n1, n2, n3`,
+		},
+		{
+			setup:    `SET distribute_group_by_row_count_threshold = 1`,
+			query:    `SELECT min(v) FROM kv`,
+			op:       `group`,
+			sqlNodes: `n1, n2, n3`,
+		},
+	} {
+		t.Run(tc.op, func(t *testing.T) {
+			if tc.setup != "" {
+				r.Exec(t, tc.setup)
+			}
+			rows := r.QueryStr(t, "EXPLAIN ANALYZE "+tc.query)
+			for i := range rows {
+				// Find the first row that corresponds to the target operator.
+				if strings.Contains(rows[i][0], tc.op) {
+					// Now find the 'sql nodes' attribute of the operator.
+					for j := i + 1; j < len(rows); j++ {
+						if strings.Contains(rows[j][0], `sql nodes`) {
+							if !strings.Contains(rows[j][0], tc.sqlNodes) {
+								t.Fatalf(
+									"expected 'sql nodes' to be %s for %q, found %s\n%s",
+									tc.sqlNodes, tc.op, rows[j][0], rows,
+								)
+							}
+							return
+						} else if strings.Contains(rows[j][0], "•") {
+							// We already reached the next operator.
+							t.Fatalf("didn't find 'sql nodes' for %q\n%s", tc.op, rows)
+						}
+					}
+				}
+			}
+			t.Fatalf("didn't find 'sql nodes' for %q\n%s", tc.op, rows)
+		})
+	}
+}
+
+// TestExplainAnalyzeBufferedWrites verifies that write buffering info is
+// printed only when applicable.
+func TestExplainAnalyzeBufferedWrites(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, godb, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+
+	conn, err := godb.Conn(ctx)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, `CREATE TABLE t (v INT);`)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		setup       []string
+		cleanup     string
+		query       string
+		infoPrinted bool
+	}{
+		{ // disabled
+			setup:       []string{`SET kv_transaction_buffered_writes_enabled = false;`},
+			query:       `INSERT INTO t VALUES (1)`,
+			infoPrinted: false,
+		},
+		{ // enabled
+			setup: []string{
+				`SET kv_transaction_buffered_writes_enabled = true;`,
+				`SET buffered_writes_implicit_txns_enabled = true;`,
+			},
+			query:       `INSERT INTO t VALUES (1), (2)`,
+			infoPrinted: true,
+		},
+		// In this case we won't actually buffer any writes, so the write
+		// buffering effectively gets disabled during the stmt execution, but we
+		// still include the info.
+		// TODO(yuzefovich): consider differentiating this case if it becomes
+		// frequent. For now it seems ok since we'll have a message in the trace
+		// about this switch.
+		{
+			setup: []string{
+				`SET kv_transaction_buffered_writes_enabled = true;`,
+				`SET buffered_writes_implicit_txns_enabled = true;`,
+				`SET CLUSTER SETTING kv.transaction.write_buffering.max_buffer_size = '1B';`,
+			},
+			cleanup:     `RESET CLUSTER SETTING kv.transaction.write_buffering.max_buffer_size;`,
+			query:       `INSERT INTO t VALUES (1), (2), (3)`,
+			infoPrinted: true,
+		},
+		{ // read-only implicit
+			setup: []string{
+				`SET kv_transaction_buffered_writes_enabled = true;`,
+				`SET buffered_writes_implicit_txns_enabled = true;`,
+			},
+			query:       `SELECT * FROM t`,
+			infoPrinted: false,
+		},
+		{ // read-only explicit
+			setup: []string{
+				`SET kv_transaction_buffered_writes_enabled = true;`,
+				`BEGIN;`,
+			},
+			cleanup:     `COMMIT;`,
+			query:       `SELECT * FROM t`,
+			infoPrinted: true,
+		},
+	} {
+		for _, stmt := range tc.setup {
+			_, err = conn.ExecContext(ctx, stmt)
+			require.NoError(t, err)
+		}
+		result, err := conn.QueryContext(ctx, "EXPLAIN ANALYZE (VERBOSE) "+tc.query)
+		require.NoError(t, err)
+		rows, err := sqlutils.RowsToStrMatrix(result)
+		require.NoError(t, err)
+		var printed bool
+		for _, row := range rows {
+			if len(row) > 1 {
+				t.Fatalf("unexpectedly more than a single string is returned in %v", row)
+			}
+			if strings.Contains(row[0], "buffered writes enabled") {
+				printed = true
+			}
+		}
+		if printed != tc.infoPrinted {
+			var negate string
+			if !tc.infoPrinted {
+				negate = "not "
+			}
+			t.Fatalf("expected 'buffered writes enabled' to %sbe printed", negate)
+		}
+		_, err = conn.ExecContext(ctx, tc.cleanup)
+		require.NoError(t, err)
+	}
 }

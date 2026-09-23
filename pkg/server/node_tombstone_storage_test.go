@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -16,7 +11,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -28,20 +23,19 @@ import (
 func TestNodeTombstoneStorage(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	eng1 := storage.NewDefaultInMemForTesting()
+	eng1 := kvstorage.MakeEngines(storage.NewDefaultInMemForTesting())
 	defer eng1.Close()
-	eng2 := storage.NewDefaultInMemForTesting()
+	eng2 := kvstorage.MakeEngines(storage.NewDefaultInMemForTesting())
 	defer eng2.Close()
 
-	engs := []storage.Engine{eng1, eng2}
+	engs := []kvstorage.Engines{eng1, eng2}
 
 	// The tombstone storage only writes to initialized engines.
 	// We'll test uninited engines at the end of the test.
-	id, err := uuid.NewV4()
-	require.NoError(t, err)
+	id := uuid.NewV4()
 	for i := range engs {
-		require.NoError(t, kvserver.WriteClusterVersion(ctx, engs[i], clusterversion.TestingClusterVersion))
-		require.NoError(t, kvserver.InitEngine(ctx, engs[i], roachpb.StoreIdent{
+		require.NoError(t, engs[i].SetMinVersion(clusterversion.TestingClusterVersion))
+		require.NoError(t, kvstorage.InitEngine(ctx, engs[i], roachpb.StoreIdent{
 			ClusterID: id,
 			NodeID:    1,
 			StoreID:   roachpb.StoreID(1 + i),
@@ -54,7 +48,7 @@ func TestNodeTombstoneStorage(t *testing.T) {
 		return ts
 	}
 
-	s := &nodeTombstoneStorage{engs: []storage.Engine{eng1, eng2}}
+	s := &nodeTombstoneStorage{engs: engs}
 	// Empty storage has nobody decommissioned.
 	require.Equal(t, time.Time{}, mustTime(s.IsDecommissioned(ctx, 1)))
 
@@ -98,18 +92,19 @@ func TestNodeTombstoneStorage(t *testing.T) {
 	require.Equal(t, time.Time{}, mustTime(s.IsDecommissioned(ctx, 3)))
 
 	// Throw an uninitialized engine in the mix. It should be skipped over.
-	eng3 := storage.NewDefaultInMemForTesting()
+	eng3 := kvstorage.MakeEngines(storage.NewDefaultInMemForTesting())
 	defer eng3.Close()
-	s = &nodeTombstoneStorage{engs: []storage.Engine{eng1, eng2, eng3}}
+	engs = append(engs, eng3)
+	s = &nodeTombstoneStorage{engs: engs}
 	// Decommission n100.
 	ts3 := timeutil.Unix(15, 30).UTC()
 	require.NoError(t, s.SetDecommissioned(ctx, 100, ts3))
 	require.Equal(t, ts3, mustTime(s.IsDecommissioned(ctx, 100)))
 	// Rehydrate.
-	s = &nodeTombstoneStorage{engs: []storage.Engine{eng1, eng2, eng3}}
+	s = &nodeTombstoneStorage{engs: engs}
 	require.Equal(t, ts3, mustTime(s.IsDecommissioned(ctx, 100)))
 	// Rehydrate, but only from eng3. Now the entry is gone, meaning it
 	// wasn't written to n3.
-	s = &nodeTombstoneStorage{engs: []storage.Engine{eng3}}
+	s = &nodeTombstoneStorage{engs: []kvstorage.Engines{eng3}}
 	require.Equal(t, time.Time{}, mustTime(s.IsDecommissioned(ctx, 100)))
 }

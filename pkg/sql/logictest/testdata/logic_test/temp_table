@@ -1,3 +1,5 @@
+# knob-opt: sync-event-log
+
 statement ok
 SET CLUSTER SETTING sql.cross_db_views.enabled = TRUE
 
@@ -16,6 +18,15 @@ query TT rowsort
 SELECT table_name, type FROM [SHOW TABLES]
 ----
 tbl  table
+
+# Verify that temp schema is visible in pg_namespace index.
+let $tempSchemaOID
+SELECT oid FROM pg_namespace where nspname LIKE 'pg_temp%'
+
+query B
+SELECT nspname LIKE 'pg_temp%' FROM pg_namespace where oid = $tempSchemaOID
+----
+true
 
 statement ok
 DROP TABLE tbl
@@ -139,10 +150,17 @@ SELECT * from pg_temp.view_on_temp
 2
 
 # A "permanent" view on a temporary table gets upgraded to temporary.
+# Weak isolation levels emit extra notices, so skip them.
+skipif config weak-iso-level-configs
 query T noticetrace
 CREATE VIEW upgrade_temp_view AS SELECT a FROM temp_table
 ----
 NOTICE: view "upgrade_temp_view" will be a temporary view
+
+onlyif config weak-iso-level-configs
+statement ok
+CREATE VIEW upgrade_temp_view AS SELECT a FROM temp_table
+
 
 query I
 SELECT * from pg_temp.upgrade_temp_view
@@ -207,7 +225,13 @@ statement ok
 DROP TABLE perm_table; DROP TABLE ref_temp_table
 
 statement ok
-DROP SEQUENCE pg_temp.temp_seq; DROP SEQUENCE pg_temp.ref_temp_table_a_seq; DROP TABLE a
+DROP SEQUENCE pg_temp.temp_seq; DROP TABLE a
+
+query ITT
+SELECT table_id, name, state
+FROM crdb_internal.tables WHERE name
+LIKE 'ref_temp_table%' AND state = 'PUBLIC'
+----
 
 statement ok
 SET serial_normalization='rowid'
@@ -228,7 +252,10 @@ SELECT * FROM regression_47030
 1
 
 statement ok
-TRUNCATE regression_47030; INSERT INTO regression_47030 VALUES (2)
+TRUNCATE regression_47030
+
+statement ok
+INSERT INTO regression_47030 VALUES (2)
 
 query I
 SELECT * FROM regression_47030
@@ -247,7 +274,7 @@ ALTER TABLE regression_48233 RENAME TO reg_48233
 query IITI rowsort
 SELECT * FROM system.namespace WHERE name LIKE '%48233'
 ----
-50  69  reg_48233  82
+100  117  reg_48233  130
 
 statement error pq: cannot change schema of table with RENAME
 ALTER TABLE reg_48233 RENAME TO public.reg_48233
@@ -301,6 +328,8 @@ user testuser
 statement ok
 USE to_drop;
 SET experimental_enable_temp_tables=true;
+
+statement ok
 CREATE TABLE not_temp (i INT PRIMARY KEY);
 CREATE TEMPORARY TABLE testuser_tmp (i INT PRIMARY KEY);
 CREATE TEMPORARY VIEW tempuser_view AS SELECT i FROM testuser_tmp;
@@ -310,6 +339,8 @@ user root
 
 statement ok
 USE to_drop;
+
+statement ok
 CREATE TEMPORARY TABLE root_temp (i INT PRIMARY KEY);
 
 let $before_drop
@@ -317,6 +348,8 @@ SELECT now()
 
 statement ok
 USE test;
+
+statement ok
 DROP DATABASE to_drop CASCADE
 
 query T
@@ -336,4 +369,439 @@ to_drop.pg_temp.testuser_tmp
 to_drop.pg_temp.tempuser_view
 to_drop.pg_temp.root_temp
 
+subtest create_after_discard_and_drop_database
+
+statement ok
+ALTER ROLE testuser WITH CREATEDB;
+
 user testuser
+
+statement ok
+CREATE DATABASE to_drop
+
+statement ok
+USE to_drop
+
+statement ok
+CREATE TEMPORARY TABLE t (i INT PRIMARY KEY);
+
+statement ok
+SELECT * FROM pg_temp.t
+
+statement ok
+DISCARD TEMP
+
+statement error pgcode 42P01 relation "pg_temp.t" does not exist
+SELECT * FROM pg_temp.t
+
+statement ok
+USE defaultdb;
+
+statement ok
+DROP DATABASE to_drop CASCADE;
+
+statement ok
+CREATE DATABASE to_drop
+
+statement ok
+CREATE TEMPORARY TABLE t (i INT PRIMARY KEY);
+
+statement ok
+SELECT * FROM pg_temp.t
+
+statement ok
+USE defaultdb;
+
+statement ok
+DROP DATABASE to_drop CASCADE;
+
+subtest end
+
+subtest temp_table_in_other_session
+
+user testuser
+
+statement ok
+USE defaultdb;
+
+statement ok
+CREATE TEMPORARY TABLE from_other_session(i INT PRIMARY KEY)
+
+user root
+
+statement ok
+USE defaultdb
+
+query TT
+SELECT c.relname, a.attname FROM pg_attribute a
+INNER LOOKUP JOIN pg_class c ON c.oid = a.attrelid
+WHERE c.relname = 'from_other_session'
+----
+from_other_session  i
+
+subtest end
+
+# The descriptor for a temp view should not persist after the session creating
+# the temp view ends.
+subtest regression_108751
+
+user root nodeidx=0
+
+statement ok
+CREATE DATABASE database_108751
+
+statement ok
+USE database_108751
+
+statement ok
+SET experimental_enable_temp_tables TO on
+
+statement ok
+CREATE TABLE t_108751 (x int)
+
+statement ok
+CREATE TEMP VIEW t_108751_view (x) AS SELECT x FROM t_108751
+
+let $t_108751_view_id
+SELECT id FROM system.namespace WHERE name = 't_108751_view'
+
+user root nodeidx=0 newsession
+
+statement ok
+USE database_108751
+
+# There should be no descriptor returned here since the session that
+# created the temp view has ended.
+# We retry because dropping a descriptor is not instantaneous.
+query T retry
+SELECT descriptor FROM system.descriptor WHERE id = $t_108751_view_id
+----
+
+statement ok
+DROP DATABASE database_108751 CASCADE
+
+subtest end
+
+# Verify that a good error message is returned for temporary types.
+subtest pg_temp_type
+
+statement ok
+CREATE DATABASE database_142780
+
+statement ok
+USE database_142780
+
+statement ok
+SET experimental_enable_temp_tables = on
+
+statement error cannot create type "temp_type" in temporary schema
+CREATE TYPE pg_temp.temp_type AS (a int, b int);
+
+# Verify that the error message is also good if we create a temporary table first.
+statement ok
+CREATE TEMP TABLE temp_table_142780 (a int primary key, b int);
+
+statement error cannot create type "temp_type" in temporary schema
+CREATE TYPE pg_temp.temp_type AS (a int, b int);
+
+statement ok
+RESET database
+
+statement ok
+DROP DATABASE database_142780
+
+subtest end
+
+# Test that views can be created in the temporary schema directly.
+subtest pg_temp_view
+
+statement ok
+CREATE DATABASE database_145438
+
+statement ok
+USE database_145438
+
+statement ok
+SET experimental_enable_temp_tables = on
+
+statement ok
+CREATE VIEW pg_temp.temp_view AS SELECT 1;
+
+query I
+SELECT * FROM pg_temp.temp_view
+----
+1
+
+statement error cannot create temporary relation in non-temporary schema
+CREATE TEMP VIEW public.bad_temp_view AS SELECT 1;
+
+statement ok
+RESET database
+
+statement ok
+DROP DATABASE database_145438
+
+subtest end
+
+# Test that sequences can be created in the temporary schema directly.
+subtest pg_temp_sequence
+
+statement ok
+CREATE DATABASE database_145438
+
+statement ok
+USE database_145438
+
+statement ok
+SET experimental_enable_temp_tables = on
+
+statement ok
+CREATE SEQUENCE pg_temp.temp_seq;
+
+query I
+SELECT nextval('pg_temp.temp_seq');
+----
+1
+
+statement error cannot create temporary relation in non-temporary schema
+CREATE TEMP SEQUENCE public.bad_temp_seq;
+
+statement ok
+RESET database
+
+statement ok
+DROP DATABASE database_145438
+
+subtest end
+
+# Test that UDFs cannot be created in the temporary schema directly.
+subtest pg_temp_udf
+
+statement ok
+CREATE DATABASE database_142783
+
+statement ok
+USE database_142783
+
+statement ok
+SET experimental_enable_temp_tables = on
+
+statement error cannot create user-defined functions under a temporary schema
+CREATE FUNCTION pg_temp.temp_func() RETURNS int AS $$SELECT 1$$ LANGUAGE SQL;
+
+# Verify the error message after creating a temporary table.
+statement ok
+CREATE TEMP TABLE temp_table_142783 (a int primary key);
+
+statement error cannot create user-defined functions under a temporary schema
+CREATE FUNCTION pg_temp.temp_func() RETURNS int AS $$SELECT 1$$ LANGUAGE SQL;
+
+statement ok
+RESET database
+
+statement ok
+DROP DATABASE database_142783
+
+subtest end
+
+# Test ALTER TYPE when a temp table exists.
+subtest alter_type
+
+statement ok
+USE defaultdb;
+
+statement ok
+create type my_enum as enum ('value1', 'value2');
+
+statement ok
+create temporary table tmp_table (id int primary key);
+
+statement ok
+insert into tmp_table values (1), (2), (3);
+
+statement ok
+ALTER TYPE my_enum ADD VALUE 'value3';
+
+statement ok
+DROP TYPE my_enum;
+
+statement ok
+DROP TABLE tmp_table;
+
+subtest end
+
+# Test that TEMPORARY privilege controls temp table creation, and that
+# CREATE on public schema is not required for temp tables.
+subtest temp_table_privileges
+
+user root
+
+statement ok
+CREATE DATABASE temp_priv_db
+
+statement ok
+CREATE USER temp_test_user
+
+statement ok
+GRANT temp_test_user TO testuser
+
+statement ok
+GRANT CONNECT ON DATABASE temp_priv_db TO temp_test_user
+
+statement ok
+GRANT TEMPORARY ON DATABASE temp_priv_db TO temp_test_user
+
+# Revoke CREATE from public schema so that temp_test_user does NOT have CREATE
+# on the public schema.
+statement ok
+REVOKE CREATE ON SCHEMA temp_priv_db.public FROM public
+
+user testuser
+
+statement ok
+SET ROLE temp_test_user
+
+statement ok
+USE temp_priv_db
+
+# temp_test_user has TEMPORARY but no CREATE on public schema.
+# After V26_2, creating a temp table should succeed because only TEMPORARY is
+# needed, not CREATE on the schema.
+skipif config local-mixed-25.4 local-mixed-26.1
+statement ok
+CREATE TEMP TABLE temp_priv_t (a INT PRIMARY KEY)
+
+skipif config local-mixed-25.4 local-mixed-26.1
+statement ok
+CREATE TEMP VIEW temp_priv_v AS SELECT 1
+
+# On mixed-version configs, temp table creation still requires CREATE on the
+# public schema, so it should fail.
+onlyif config local-mixed-25.4 local-mixed-26.1
+statement error user temp_test_user does not have CREATE privilege on schema public
+CREATE TEMP TABLE temp_priv_t (a INT PRIMARY KEY)
+
+onlyif config local-mixed-25.4 local-mixed-26.1
+statement error user temp_test_user does not have CREATE privilege on schema public
+CREATE TEMP VIEW temp_priv_v AS SELECT 1
+
+# Regular table creation should fail because CREATE on schema is required.
+statement error user temp_test_user does not have CREATE privilege on schema public
+CREATE TABLE regular_t (a INT PRIMARY KEY)
+
+skipif config local-mixed-25.4 local-mixed-26.1
+statement ok
+DROP VIEW temp_priv_v
+
+skipif config local-mixed-25.4 local-mixed-26.1
+statement ok
+DROP TABLE temp_priv_t
+
+# Revoke TEMPORARY from both the user and public to verify temp table
+# creation is disallowed.
+user root
+
+statement ok
+REVOKE TEMPORARY ON DATABASE temp_priv_db FROM temp_test_user, public
+
+user testuser
+
+statement ok
+SET ROLE temp_test_user
+
+statement ok
+USE temp_priv_db
+
+# After V26_2, creating a temp table should fail with a TEMPORARY privilege
+# error. On mixed-version configs, it fails with a CREATE privilege error
+# since TEMPORARY is not yet checked.
+skipif config local-mixed-25.4 local-mixed-26.1
+statement error user temp_test_user does not have TEMPORARY privilege on database temp_priv_db
+CREATE TEMP TABLE temp_priv_t2 (a INT PRIMARY KEY)
+
+onlyif config local-mixed-25.4 local-mixed-26.1
+statement error user temp_test_user does not have CREATE privilege on schema public
+CREATE TEMP TABLE temp_priv_t2 (a INT PRIMARY KEY)
+
+# Re-grant TEMPORARY and verify it works again.
+user root
+
+statement ok
+GRANT TEMPORARY ON DATABASE temp_priv_db TO temp_test_user
+
+user testuser
+
+statement ok
+SET ROLE temp_test_user
+
+statement ok
+USE temp_priv_db
+
+skipif config local-mixed-25.4 local-mixed-26.1
+statement ok
+CREATE TEMP TABLE temp_priv_t2 (a INT PRIMARY KEY)
+
+# On mixed-version configs, temp table creation still requires CREATE on the
+# public schema.
+onlyif config local-mixed-25.4 local-mixed-26.1
+statement error user temp_test_user does not have CREATE privilege on schema public
+CREATE TEMP TABLE temp_priv_t2 (a INT PRIMARY KEY)
+
+skipif config local-mixed-25.4 local-mixed-26.1
+statement ok
+DROP TABLE temp_priv_t2
+
+user root
+
+statement ok
+SET ROLE root
+
+statement ok
+USE defaultdb
+
+statement ok
+DROP DATABASE temp_priv_db CASCADE
+
+subtest end
+
+# Tests that UDFs referencing temp tables in a differnt schema will leave the
+# schema accessible to the user (see #166495).
+subtest temp_schema_udf_regression
+
+user root
+
+statement ok
+CREATE DATABASE tmpdb
+
+user testuser
+
+statement ok
+USE tmpdb
+
+statement ok
+CREATE TEMP TABLE users (userid INT PRIMARY KEY)
+
+skipif config local-legacy-schema-changer
+statement ok
+CREATE OR REPLACE FUNCTION tmpdb.public.get_users() RETURNS SETOF users AS
+$$ SELECT * FROM users ORDER BY userid; $$
+LANGUAGE SQL STABLE
+
+user root
+
+statement ok
+USE tmpdb
+
+statement ok
+SELECT * FROM [SHOW TABLES]
+
+statement ok
+DROP DATABASE tmpdb CASCADE
+
+subtest end
+
+statement ok
+DROP USER temp_test_user
+
+statement ok
+USE test;

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sqlstatsutil
 
@@ -16,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,18 +31,16 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	t.Run("statement_statistics", func(t *testing.T) {
-		data := genRandomData()
-		input := roachpb.CollectedStatementStatistics{}
+		data := GenRandomData()
+		input := appstatspb.CollectedStatementStatistics{}
 
 		expectedMetadataStrTemplate := `
 {
-  "stmtTyp":      "{{.String}}",
+  "stmtType":     "{{.String}}",
   "query":        "{{.String}}",
   "querySummary": "{{.String}}",
   "db":           "{{.String}}",
   "distsql": {{.Bool}},
-  "failed":  {{.Bool}},
-  "implicitTxn": {{.Bool}},
   "vec":         {{.Bool}},
   "fullScan":    {{.Bool}}
 }
@@ -58,9 +51,16 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
        "statistics": {
          "cnt": {{.Int64}},
          "firstAttemptCnt": {{.Int64}},
+         "failureCount":    {{.Int64}},
+         "genericCount":    {{.Int64}},
+         "stmtHintsCount":  {{.Int64}},
          "maxRetries":      {{.Int64}},
          "lastExecAt":      "{{stringifyTime .Time}}",
          "numRows": {
+           "mean": {{.Float}},
+           "sqDiff": {{.Float}}
+         },
+         "idleLat": {
            "mean": {{.Float}},
            "sqDiff": {{.Float}}
          },
@@ -96,7 +96,44 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
            "mean": {{.Float}},
            "sqDiff": {{.Float}}
          },
-         "nodes": [{{joinInts .IntArray}}]
+         "kvCPUTimeNanos": {
+           "mean": {{.Float}},
+           "sqDiff": {{.Float}}
+         },
+         "nodes": [{{joinInts .IntArray}}],
+         "kvNodeIds": [{{joinInt32s .Int32Array}}],
+         "regions": [{{joinStrings .StringArray}}],
+         "usedFollowerRead": {{.Bool}},
+         "planGists": [{{joinStrings .StringArray}}],
+         "indexes": [{{joinStrings .StringArray}}],
+         "latencyInfo": {
+           "min": {{.Float}},
+           "max": {{.Float}}
+         },
+         "lastErrorCode": "{{.String}}",
+				 "sqlType": "{{.String}}",
+				 "canaryStats": {
+				   "count": {{.Int64}},
+				   "runLat": {
+				     "mean": {{.Float}},
+				     "sqDiff": {{.Float}}
+				   },
+				   "planLat": {
+				     "mean": {{.Float}},
+				     "sqDiff": {{.Float}}
+				   }
+				 },
+				 "stableStats": {
+				   "count": {{.Int64}},
+				   "runLat": {
+				     "mean": {{.Float}},
+				     "sqDiff": {{.Float}}
+				   },
+				   "planLat": {
+				     "mean": {{.Float}},
+				     "sqDiff": {{.Float}}
+				   }
+				 }
        },
        "execution_statistics": {
          "cnt": {{.Int64}},
@@ -119,14 +156,77 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
          "maxDiskUsage": {
            "mean": {{.Float}},
            "sqDiff": {{.Float}}
-         }
-       }
+         },
+         "cpuSQLNanos": {
+           "mean": {{.Float}},
+           "sqDiff": {{.Float}}
+         },
+         "admissionWaitTime": {
+           "mean": {{.Float}},
+           "sqDiff": {{.Float}}
+         },
+         "mvccIteratorStats": {
+           "stepCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "stepCountInternal": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "seekCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "seekCountInternal": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "blockBytes": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "blockBytesInCache": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "keyBytes": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "valueBytes": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "pointCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "pointsCoveredByRangeTombstones": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "rangeKeyCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "rangeKeyContainedPoints": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "rangeKeySkippedPoints": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           }
+			   }
+       },
+       "index_recommendations": [{{joinStrings .StringArray}}]
      }
 		 `
 
 		expectedMetadataStr := fillTemplate(t, expectedMetadataStrTemplate, data)
 		expectedStatisticsStr := fillTemplate(t, expectedStatisticsStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&input), &data)
+		FillObject(t, reflect.ValueOf(&input), &data)
 
 		actualMetadataJSON, err := BuildStmtMetadataJSON(&input)
 		require.NoError(t, err)
@@ -137,32 +237,110 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		jsonTestHelper(t, expectedStatisticsStr, actualStatisticsJSON)
 
 		// Ensure that we get the same protobuf after we decode the JSON.
-		var actualJSONUnmarshalled roachpb.CollectedStatementStatistics
+		var actualJSONUnmarshalled appstatspb.CollectedStatementStatistics
 
 		err = DecodeStmtStatsMetadataJSON(actualMetadataJSON, &actualJSONUnmarshalled)
 		require.NoError(t, err)
+		// Strip the monononic part of timestamps, as it doesn't roundtrip. UTC()
+		// has that stripping side-effect.
+		input.Stats.LastExecTimestamp = input.Stats.LastExecTimestamp.UTC()
+		// We are no longer setting the latency percentiles.
+		input.Stats.LatencyInfo.P50 = 0
+		input.Stats.LatencyInfo.P90 = 0
+		input.Stats.LatencyInfo.P99 = 0
 
 		err = DecodeStmtStatsStatisticsJSON(actualStatisticsJSON, &actualJSONUnmarshalled.Stats)
 		require.NoError(t, err)
 		require.Equal(t, input, actualJSONUnmarshalled)
 	})
 
+	// Verify that when CanaryCount and StableCount are zero, the canary/stable
+	// fields are omitted from the JSON encoding to save storage, and that
+	// decoding such JSON back produces the correct zero-valued fields.
+	t.Run("statement_statistics zero canary and stable roundtrip", func(t *testing.T) {
+		input := appstatspb.StatementStatistics{
+			Count:             5,
+			FirstAttemptCount: 3,
+			// CanaryCount and StableCount are zero — fields should be omitted.
+		}
+
+		statsJSON, err := BuildStmtStatisticsJSON(&input)
+		require.NoError(t, err)
+
+		// Verify canary and stable fields are absent from the encoded JSON.
+		statsField, err := statsJSON.FetchValKey("statistics")
+		require.NoError(t, err)
+		canaryStats, err := statsField.FetchValKey("canaryStats")
+		require.NoError(t, err)
+		require.Nil(t, canaryStats, "canaryStats should be omitted when zero")
+		stableStats, err := statsField.FetchValKey("stableStats")
+		require.NoError(t, err)
+		require.Nil(t, stableStats, "stableStats should be omitted when zero")
+
+		// Decode and verify roundtrip produces zero values.
+		var decoded appstatspb.StatementStatistics
+		err = DecodeStmtStatsStatisticsJSON(statsJSON, &decoded)
+		require.NoError(t, err)
+		require.Equal(t, appstatspb.ExperimentStatsInfo{}, decoded.CanaryStats)
+		require.Equal(t, appstatspb.ExperimentStatsInfo{}, decoded.StableStats)
+	})
+
+	// Verify that when CanaryStats and StableStats have non-zero counts, the
+	// fields are present in the encoded JSON and survive a roundtrip.
+	t.Run("statement_statistics non-zero canary and stable roundtrip", func(t *testing.T) {
+		input := appstatspb.StatementStatistics{
+			Count:             10,
+			FirstAttemptCount: 8,
+			CanaryStats: appstatspb.ExperimentStatsInfo{
+				Count:   3,
+				RunLat:  appstatspb.NumericStat{Mean: 0.05, SquaredDiffs: 0.001},
+				PlanLat: appstatspb.NumericStat{Mean: 0.02, SquaredDiffs: 0.0005},
+			},
+			StableStats: appstatspb.ExperimentStatsInfo{
+				Count:   7,
+				RunLat:  appstatspb.NumericStat{Mean: 0.08, SquaredDiffs: 0.003},
+				PlanLat: appstatspb.NumericStat{Mean: 0.03, SquaredDiffs: 0.001},
+			},
+		}
+
+		statsJSON, err := BuildStmtStatisticsJSON(&input)
+		require.NoError(t, err)
+
+		// Verify canary and stable fields are present in the encoded JSON.
+		statsField, err := statsJSON.FetchValKey("statistics")
+		require.NoError(t, err)
+		canaryStats, err := statsField.FetchValKey("canaryStats")
+		require.NoError(t, err)
+		require.NotNil(t, canaryStats, "canaryStats should be present when non-zero")
+		stableStats, err := statsField.FetchValKey("stableStats")
+		require.NoError(t, err)
+		require.NotNil(t, stableStats, "stableStats should be present when non-zero")
+
+		// Decode and verify roundtrip.
+		var decoded appstatspb.StatementStatistics
+		err = DecodeStmtStatsStatisticsJSON(statsJSON, &decoded)
+		require.NoError(t, err)
+		require.Equal(t, input.CanaryStats.Count, decoded.CanaryStats.Count)
+		require.Equal(t, input.StableStats.Count, decoded.StableStats.Count)
+		require.InEpsilon(t, input.CanaryStats.RunLat.Mean, decoded.CanaryStats.RunLat.Mean, 0.0000001)
+		require.InEpsilon(t, input.StableStats.RunLat.Mean, decoded.StableStats.RunLat.Mean, 0.0000001)
+	})
+
 	// When a new statistic is added to a statement payload, older versions won't have the
 	// new parameter, so this test is to confirm that all other parameters will be set and
 	// the new one will be empty, without breaking the decoding process.
 	t.Run("statement_statistics with new parameter", func(t *testing.T) {
-		data := genRandomData()
-		expectedStatistics := roachpb.CollectedStatementStatistics{}
+		data := GenRandomData()
+		expectedStatistics := appstatspb.CollectedStatementStatistics{}
 
 		expectedMetadataStrTemplate := `
 			{
-				"stmtTyp":      "{{.String}}",
+				"stmtType":     "{{.String}}",
 				"query":        "{{.String}}",
 				"querySummary": "{{.String}}",
 				"db":           "{{.String}}",
 				"distsql": {{.Bool}},
 				"failed":  {{.Bool}},
-				"implicitTxn": {{.Bool}},
 				"vec":         {{.Bool}},
 				"fullScan":    {{.Bool}}
 			}
@@ -210,7 +388,15 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
            "mean": {{.Float}},
            "sqDiff": {{.Float}}
          },
-         "nodes": [{{joinInts .IntArray}}]
+         "nodes": [{{joinInts .IntArray}}],
+         "kvNodeIds": [{{joinInt32s .Int32Array}}],
+         "usedFollowerRead": {{.Bool}},
+         "planGists": [{{joinStrings .StringArray}}],
+         "latencyInfo": {
+           "min": {{.Float}},
+           "max": {{.Float}}
+         },
+         "errorCode": "{{.String}}"
        },
        "execution_statistics": {
          "cnt": {{.Int64}},
@@ -233,21 +419,84 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
          "maxDiskUsage": {
            "mean": {{.Float}},
            "sqDiff": {{.Float}}
-         }
-       }
+         },
+         "cpuSQLNanos": {
+           "mean": {{.Float}},
+           "sqDiff": {{.Float}}
+         },
+         "admissionWaitTime": {
+           "mean": {{.Float}},
+           "sqDiff": {{.Float}}
+         },
+         "mvccIteratorStats": {
+           "stepCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "stepCountInternal": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "seekCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "seekCountInternal": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "blockBytes": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "blockBytesInCache": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "keyBytes": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "valueBytes": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "pointCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "pointsCoveredByRangeTombstones": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "rangeKeyCount": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "rangeKeyContainedPoints": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           },
+           "rangeKeySkippedPoints": {
+             "mean": {{.Float}},
+             "sqDiff": {{.Float}}
+           }
+			   }
+       },
+       "index_recommendations": [{{joinStrings .StringArray}}]
      }
 		 `
 
 		fillTemplate(t, expectedMetadataStrTemplate, data)
 		fillTemplate(t, expectedStatisticsStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&expectedStatistics), &data)
+		FillObject(t, reflect.ValueOf(&expectedStatistics), &data)
 
 		actualMetadataJSON, err := BuildStmtMetadataJSON(&expectedStatistics)
 		require.NoError(t, err)
 		actualStatisticsJSON, err := BuildStmtStatisticsJSON(&expectedStatistics.Stats)
 		require.NoError(t, err)
 
-		var actualJSONUnmarshalled roachpb.CollectedStatementStatistics
+		var actualJSONUnmarshalled appstatspb.CollectedStatementStatistics
 
 		err = DecodeStmtStatsMetadataJSON(actualMetadataJSON, &actualJSONUnmarshalled)
 		require.NoError(t, err)
@@ -256,7 +505,14 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		// the final actualJSONUnmarshalled.Stats.
 		actualStatisticsJSON, _, _ = actualStatisticsJSON.RemovePath([]string{"statistics", "numRows"})
 		// Initialize the field again to remove the existing value.
-		expectedStatistics.Stats.NumRows = roachpb.NumericStat{}
+		expectedStatistics.Stats.NumRows = appstatspb.NumericStat{}
+		// Strip the monononic part of timestamps, as it doesn't roundtrip. UTC()
+		// has that stripping side-effect.
+		expectedStatistics.Stats.LastExecTimestamp = expectedStatistics.Stats.LastExecTimestamp.UTC()
+		// We no longer set the percentile latencies.
+		expectedStatistics.Stats.LatencyInfo.P50 = 0
+		expectedStatistics.Stats.LatencyInfo.P90 = 0
+		expectedStatistics.Stats.LatencyInfo.P99 = 0
 
 		err = DecodeStmtStatsStatisticsJSON(actualStatisticsJSON, &actualJSONUnmarshalled.Stats)
 		require.NoError(t, err)
@@ -264,10 +520,10 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 	})
 
 	t.Run("transaction_statistics", func(t *testing.T) {
-		data := genRandomData()
+		data := GenRandomData()
 
-		input := roachpb.CollectedTransactionStatistics{
-			StatementFingerprintIDs: []roachpb.StmtFingerprintID{
+		input := appstatspb.CollectedTransactionStatistics{
+			StatementFingerprintIDs: []appstatspb.StmtFingerprintID{
 				1, 100, 1000, 5467890,
 			},
 		}
@@ -303,6 +559,10 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
       "mean": {{.Float}},
       "sqDiff": {{.Float}}
     },
+    "idleLat": {
+      "mean": {{.Float}},
+      "sqDiff": {{.Float}}
+    },
     "bytesRead": {
       "mean": {{.Float}},
       "sqDiff": {{.Float}}
@@ -312,6 +572,10 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
       "sqDiff": {{.Float}}
     },
     "rowsWritten": {
+      "mean": {{.Float}},
+      "sqDiff": {{.Float}}
+    },
+    "kvCPUTimeNanos": {
       "mean": {{.Float}},
       "sqDiff": {{.Float}}
     }
@@ -337,12 +601,74 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
     "maxDiskUsage": {
       "mean": {{.Float}},
       "sqDiff": {{.Float}}
+    },
+    "cpuSQLNanos": {
+      "mean": {{.Float}},
+      "sqDiff": {{.Float}}
+    },
+    "admissionWaitTime": {
+      "mean": {{.Float}},
+      "sqDiff": {{.Float}}
+    },
+    "mvccIteratorStats": {
+      "stepCount": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "stepCountInternal": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "seekCount": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "seekCountInternal": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "blockBytes": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "blockBytesInCache": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "keyBytes": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "valueBytes": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "pointCount": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "pointsCoveredByRangeTombstones": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "rangeKeyCount": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "rangeKeyContainedPoints": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      },
+      "rangeKeySkippedPoints": {
+        "mean": {{.Float}},
+        "sqDiff": {{.Float}}
+      }
     }
   }
 }
 		 `
 		expectedStatisticsStr := fillTemplate(t, expectedStatisticsStrTemplate, data)
-		fillObject(t, reflect.ValueOf(&input), &data)
+		FillObject(t, reflect.ValueOf(&input), &data)
 
 		actualMetadataJSON, err := BuildTxnMetadataJSON(&input)
 		require.NoError(t, err)
@@ -353,7 +679,7 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		jsonTestHelper(t, expectedStatisticsStr, actualStatisticsJSON)
 
 		// Ensure that we get the same protobuf after we decode the JSON.
-		var actualJSONUnmarshalled roachpb.CollectedTransactionStatistics
+		var actualJSONUnmarshalled appstatspb.CollectedTransactionStatistics
 
 		err = DecodeTxnStatsMetadataJSON(actualMetadataJSON, &actualJSONUnmarshalled)
 		require.NoError(t, err)
@@ -362,12 +688,55 @@ func TestSQLStatsJsonEncoding(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, input, actualJSONUnmarshalled)
 	})
+
+	t.Run("statement aggregated metadata", func(t *testing.T) {
+		data := GenRandomData()
+
+		input := appstatspb.AggregatedStatementMetadata{}
+
+		expectedAggregatedMetadataStrTemplate := `
+{
+  "stmtType": "{{.String}}",
+  "query": "{{.String}}",
+  "formattedQuery": "{{.String}}",
+  "querySummary": "{{.String}}",
+  "distSQLCount": {{.Int64}},
+  "vecCount": {{.Int64}},
+  "fullScanCount": {{.Int64}},
+  "totalCount": {{.Int64}},
+  "db": [{{joinStrings .StringArray}}],
+  "appNames": [{{joinStrings .StringArray}}],
+  "fingerprintID": "{{.String}}"
+}
+		 `
+		expectedAggregatedMetadataStr := fillTemplate(t, expectedAggregatedMetadataStrTemplate, data)
+		FillObject(t, reflect.ValueOf(&input), &data)
+
+		actualMetadataJSON, err := BuildStmtDetailsMetadataJSON(&input)
+		require.NoError(t, err)
+		jsonTestHelper(t, expectedAggregatedMetadataStr, actualMetadataJSON)
+
+		// Ensure that we get the same protobuf after we decode the JSON.
+		var actualJSONUnmarshalled appstatspb.AggregatedStatementMetadata
+		err = DecodeAggregatedMetadataJSON(actualMetadataJSON, &actualJSONUnmarshalled)
+		require.NoError(t, err)
+		require.Equal(t, input, actualJSONUnmarshalled)
+	})
+
+	t.Run("random metadata JSON structure and values", func(t *testing.T) {
+		input := `{"HcEN0pht": null, "bar": [false, "foobar", true], "c": {"8r8qmK": 1.4687388461922657, "vbF3TH0I": null, "yNNmkGr6": 2.0887609844362762}, "db": {"KKDmambo": 0.10124464952424544}, "foobar": {"LM8G": {"zniUw24Z": 0.14422951431111297}, "bar": "lp7jfTq2"}, "r0O": false}`
+		value, err := json.ParseJSON(input)
+		require.NoError(t, err)
+		var actualJSONUnmarshalled appstatspb.AggregatedStatementMetadata
+		err = DecodeAggregatedMetadataJSON(value, &actualJSONUnmarshalled)
+		require.NoError(t, err)
+	})
 }
 
 func BenchmarkSQLStatsJson(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	b.Run("statement_stats", func(b *testing.B) {
-		inputStmtStats := roachpb.CollectedStatementStatistics{}
+		inputStmtStats := appstatspb.CollectedStatementStatistics{}
 		b.Run("encoding", func(b *testing.B) {
 			b.SetBytes(int64(inputStmtStats.Size()))
 
@@ -385,7 +754,7 @@ func BenchmarkSQLStatsJson(b *testing.B) {
 
 		inputStmtStatsMetaJSON, _ := BuildStmtMetadataJSON(&inputStmtStats)
 		inputStmtStatsJSON, _ := BuildStmtStatisticsJSON(&inputStmtStats.Stats)
-		result := roachpb.CollectedStatementStatistics{}
+		result := appstatspb.CollectedStatementStatistics{}
 
 		b.Run("decoding", func(b *testing.B) {
 			b.SetBytes(int64(inputStmtStatsJSON.Size() + inputStmtStatsMetaJSON.Size()))
@@ -404,7 +773,7 @@ func BenchmarkSQLStatsJson(b *testing.B) {
 	})
 
 	b.Run("transaction_stats", func(b *testing.B) {
-		inputTxnStats := roachpb.CollectedTransactionStatistics{}
+		inputTxnStats := appstatspb.CollectedTransactionStatistics{}
 		b.Run("encoding", func(b *testing.B) {
 			b.SetBytes(int64(inputTxnStats.Size()))
 
@@ -426,7 +795,7 @@ func BenchmarkSQLStatsJson(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		result := roachpb.CollectedTransactionStatistics{}
+		result := appstatspb.CollectedTransactionStatistics{}
 
 		b.Run("decoding", func(b *testing.B) {
 			b.SetBytes(int64(inputTxnStatsJSON.Size() + inputTxnStatsMetaJSON.Size()))
@@ -443,6 +812,35 @@ func BenchmarkSQLStatsJson(b *testing.B) {
 			}
 		})
 	})
+
+	b.Run("statement_metadata", func(b *testing.B) {
+		inputStmtStats := appstatspb.CollectedStatementStatistics{}
+		inputStmtMetadata := appstatspb.AggregatedStatementMetadata{}
+		b.Run("encoding", func(b *testing.B) {
+			b.SetBytes(int64(inputStmtStats.Size()))
+
+			for i := 0; i < b.N; i++ {
+				_, err := BuildStmtDetailsMetadataJSON(&inputStmtMetadata)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+
+		inputStmtStatsAggregatedMetaJSON, _ := BuildStmtMetadataJSON(&inputStmtStats)
+		result := appstatspb.AggregatedStatementMetadata{}
+
+		b.Run("decoding", func(b *testing.B) {
+			b.SetBytes(int64(inputStmtStatsAggregatedMetaJSON.Size()))
+
+			for i := 0; i < b.N; i++ {
+				err := DecodeAggregatedMetadataJSON(inputStmtStatsAggregatedMetaJSON, &result)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	})
 }
 
 // TestExplainTreePlanNodeToJSON tests whether the ExplainTreePlanNode function
@@ -451,32 +849,32 @@ func TestExplainTreePlanNodeToJSON(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	testDataArr := []struct {
-		explainTree roachpb.ExplainTreePlanNode
+		explainTree appstatspb.ExplainTreePlanNode
 		expected    string
 	}{
 		// Test data using a node with multiple inner children.
 		{
-			roachpb.ExplainTreePlanNode{
+			appstatspb.ExplainTreePlanNode{
 				Name: "root",
-				Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+				Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 					{
 						Key:   "rootKey",
 						Value: "rootValue",
 					},
 				},
-				Children: []*roachpb.ExplainTreePlanNode{
+				Children: []*appstatspb.ExplainTreePlanNode{
 					{
 						Name: "child",
-						Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+						Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 							{
 								Key:   "childKey",
 								Value: "childValue",
 							},
 						},
-						Children: []*roachpb.ExplainTreePlanNode{
+						Children: []*appstatspb.ExplainTreePlanNode{
 							{
 								Name: "innerChild",
-								Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+								Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 									{
 										Key:   "innerChildKey",
 										Value: "innerChildValue",
@@ -491,9 +889,9 @@ func TestExplainTreePlanNodeToJSON(t *testing.T) {
 		},
 		// Test using a node with multiple attributes.
 		{
-			roachpb.ExplainTreePlanNode{
+			appstatspb.ExplainTreePlanNode{
 				Name: "root",
-				Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+				Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 					{
 						Key:   "rootFirstKey",
 						Value: "rootFirstValue",
@@ -503,10 +901,10 @@ func TestExplainTreePlanNodeToJSON(t *testing.T) {
 						Value: "rootSecondValue",
 					},
 				},
-				Children: []*roachpb.ExplainTreePlanNode{
+				Children: []*appstatspb.ExplainTreePlanNode{
 					{
 						Name: "child",
-						Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+						Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 							{
 								Key:   "childKey",
 								Value: "childValue",
@@ -519,27 +917,27 @@ func TestExplainTreePlanNodeToJSON(t *testing.T) {
 		},
 		// Test using a node with multiple children and multiple inner children.
 		{
-			roachpb.ExplainTreePlanNode{
+			appstatspb.ExplainTreePlanNode{
 				Name: "root",
-				Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+				Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 					{
 						Key:   "rootKey",
 						Value: "rootValue",
 					},
 				},
-				Children: []*roachpb.ExplainTreePlanNode{
+				Children: []*appstatspb.ExplainTreePlanNode{
 					{
 						Name: "firstChild",
-						Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+						Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 							{
 								Key:   "firstChildKey",
 								Value: "firstChildValue",
 							},
 						},
-						Children: []*roachpb.ExplainTreePlanNode{
+						Children: []*appstatspb.ExplainTreePlanNode{
 							{
 								Name: "innerChild",
-								Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+								Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 									{
 										Key:   "innerChildKey",
 										Value: "innerChildValue",
@@ -550,7 +948,7 @@ func TestExplainTreePlanNodeToJSON(t *testing.T) {
 					},
 					{
 						Name: "secondChild",
-						Attrs: []*roachpb.ExplainTreePlanNode_Attr{
+						Attrs: []*appstatspb.ExplainTreePlanNode_Attr{
 							{
 								Key:   "secondChildKey",
 								Value: "secondChildValue",
@@ -573,7 +971,7 @@ func TestExplainTreePlanNodeToJSON(t *testing.T) {
 	}
 }
 
-type nodeAttrList []*roachpb.ExplainTreePlanNode_Attr
+type nodeAttrList []*appstatspb.ExplainTreePlanNode_Attr
 
 var _ sort.Interface = nodeAttrList{}
 
@@ -591,7 +989,7 @@ func (n nodeAttrList) Swap(i, j int) {
 	n[j] = tmp
 }
 
-type nodeList []*roachpb.ExplainTreePlanNode
+type nodeList []*appstatspb.ExplainTreePlanNode
 
 var _ sort.Interface = nodeList{}
 
@@ -609,7 +1007,7 @@ func (n nodeList) Swap(i, j int) {
 	n[j] = tmp
 }
 
-func compareExplainTree(t *testing.T, expected, actual *roachpb.ExplainTreePlanNode) {
+func compareExplainTree(t *testing.T, expected, actual *appstatspb.ExplainTreePlanNode) {
 	require.Equal(t, strings.ToLower(expected.Name), strings.ToLower(actual.Name))
 	require.Equal(t, len(expected.Attrs), len(actual.Attrs))
 

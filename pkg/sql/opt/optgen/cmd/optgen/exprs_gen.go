@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -87,13 +82,12 @@ func (g *exprsGen) genExprDef(define *lang.DefineExpr) {
 // genExprGroupDef generates the group struct definition for a relational
 // expression, plus its methods:
 //
-//   type selectGroup struct {
-//     mem   *Memo
-//     rel   props.Relational
-//     first SelectExpr
-//     best  bestProps
-//   }
-//
+//	type selectGroup struct {
+//	  mem   *Memo
+//	  rel   props.Relational
+//	  first SelectExpr
+//	  best  bestProps
+//	}
 func (g *exprsGen) genExprGroupDef(define *lang.DefineExpr) {
 	if !define.Tags.Contains("Relational") {
 		return
@@ -104,17 +98,11 @@ func (g *exprsGen) genExprGroupDef(define *lang.DefineExpr) {
 
 	// Generate the type definition.
 	fmt.Fprintf(g.w, "type %s struct {\n", groupStructType)
-	fmt.Fprintf(g.w, "  mem *Memo\n")
 	fmt.Fprintf(g.w, "  rel props.Relational\n")
 	fmt.Fprintf(g.w, "  first %s\n", structType)
 	fmt.Fprintf(g.w, "  best bestProps\n")
 	fmt.Fprintf(g.w, "}\n\n")
 	fmt.Fprintf(g.w, "var _ exprGroup = &%s{}\n\n", groupStructType)
-
-	// Generate the memo method.
-	fmt.Fprintf(g.w, "func (g *%s) memo() *Memo {\n", groupStructType)
-	fmt.Fprintf(g.w, "  return g.mem\n")
-	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the relational method.
 	fmt.Fprintf(g.w, "func (g *%s) relational() *props.Relational {\n", groupStructType)
@@ -134,13 +122,12 @@ func (g *exprsGen) genExprGroupDef(define *lang.DefineExpr) {
 
 // genPrivateStruct generates the struct for a define tagged as Private:
 //
-//   type FunctionPrivate struct {
-//     Name       string
-//     Typ        *types.T
-//     Properties *tree.FunctionProperties
-//     Overload   *tree.Overload
-//   }
-//
+//	type FunctionPrivate struct {
+//	  Name       string
+//	  Typ        *types.T
+//	  Properties *tree.FunctionProperties
+//	  Overload   *tree.Overload
+//	}
 func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 	privTyp := g.md.typeOf(define)
 
@@ -166,14 +153,13 @@ func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 
 // genExprStruct generates the struct type definition for an expression:
 //
-//   type SelectExpr struct {
-//     Input   RelExpr
-//     Filters FiltersExpr
+//	type SelectExpr struct {
+//	  Input   RelExpr
+//	  Filters FiltersExpr
 //
-//     grp  exprGroup
-//     next RelExpr
-//   }
-//
+//	  grp  exprGroup
+//	  next RelExpr
+//	}
 func (g *exprsGen) genExprStruct(define *lang.DefineExpr) {
 	opTyp := g.md.typeOf(define)
 
@@ -232,7 +218,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 	if define.Tags.Contains("Scalar") {
 		fmt.Fprintf(g.w, "var _ opt.ScalarExpr = &%s{}\n\n", opTyp.name)
 
-		// Generate the ID method.
+		// Generate the Rank method.
 		fmt.Fprintf(g.w, "func (e *%s) Rank() opt.ScalarRank {\n", opTyp.name)
 		if define.Tags.Contains("ListItem") {
 			fmt.Fprintf(g.w, "  panic(errors.AssertionFailedf(\"list items have no rank\"))")
@@ -288,17 +274,6 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 	}
 	fmt.Fprintf(g.w, "}\n\n")
 
-	// Generate the String method.
-	fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
-	if define.Tags.Contains("Scalar") {
-		fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)\n")
-	} else {
-		fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, e.Memo(), nil)\n")
-	}
-	fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
-	fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
-	fmt.Fprintf(g.w, "}\n\n")
-
 	// Generate the SetChild method.
 	fmt.Fprintf(g.w, "func (e *%s) SetChild(nth int, child opt.Expr) {\n", opTyp.name)
 	if len(childFields) > 0 {
@@ -323,6 +298,13 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "}\n\n")
 
 	if define.Tags.Contains("Scalar") {
+		// Generate the String method.
+		fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
+		fmt.Fprintf(g.w, "  f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)\n")
+		fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
+		fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
+		fmt.Fprintf(g.w, "}\n\n")
+
 		// Generate the DataType method.
 		fmt.Fprintf(g.w, "func (e *%s) DataType() *types.T {\n", opTyp.name)
 		if dataType, ok := g.constDataType(define); ok {
@@ -344,11 +326,6 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 			fmt.Fprintf(g.w, "}\n\n")
 		}
 	} else {
-		// Generate the Memo method.
-		fmt.Fprintf(g.w, "func (e *%s) Memo() *Memo {\n", opTyp.name)
-		fmt.Fprintf(g.w, "  return e.grp.memo()\n")
-		fmt.Fprintf(g.w, "}\n\n")
-
 		// Generate the Relational method.
 		fmt.Fprintf(g.w, "func (e *%s) Relational() *props.Relational {\n", opTyp.name)
 		fmt.Fprintf(g.w, "  return e.grp.relational()\n")
@@ -371,7 +348,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 
 		// Generate the ProvidedPhysical method.
 		fmt.Fprintf(g.w, "func (e *%s) ProvidedPhysical() *physical.Provided {\n", opTyp.name)
-		fmt.Fprintf(g.w, "  return &e.grp.bestProps().provided\n")
+		fmt.Fprintf(g.w, "  return e.grp.bestProps().provided\n")
 		fmt.Fprintf(g.w, "}\n\n")
 
 		// Generate the Cost method.
@@ -392,7 +369,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		// Generate the setNext method.
 		fmt.Fprintf(g.w, "func (e *%s) setNext(member RelExpr) {\n", opTyp.name)
 		fmt.Fprintf(g.w, "  if e.next != nil {\n")
-		fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"expression already has its next defined: %%s\", e))\n")
+		fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"expression already has its next defined: %%s\", errors.Safe(e.Op())))\n")
 		fmt.Fprintf(g.w, "  }\n")
 		fmt.Fprintf(g.w, "  e.next = member\n")
 		fmt.Fprintf(g.w, "}\n\n")
@@ -400,7 +377,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 		// Generate the setGroup method.
 		fmt.Fprintf(g.w, "func (e *%s) setGroup(member RelExpr) {\n", opTyp.name)
 		fmt.Fprintf(g.w, "  if e.grp != nil {\n")
-		fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"expression is already in a group: %%s\", e))\n")
+		fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"expression is already in a group: %%s\", errors.Safe(e.Op())))\n")
 		fmt.Fprintf(g.w, "  }\n")
 		fmt.Fprintf(g.w, "  e.grp = member.group()\n")
 		fmt.Fprintf(g.w, "  LastGroupMember(member).setNext(e)\n")
@@ -436,13 +413,6 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "  return nil\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
-	// Generate the String method.
-	fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, e.Memo(), nil)\n")
-	fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
-	fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
-	fmt.Fprintf(g.w, "}\n\n")
-
 	// Generate the SetChild method.
 	fmt.Fprintf(g.w, "func (e *%s) SetChild(nth int, child opt.Expr) {\n", opTyp.name)
 	fmt.Fprintf(g.w, "  if nth == 0 {\n")
@@ -450,11 +420,6 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 	fmt.Fprintf(g.w, "    return\n")
 	fmt.Fprintf(g.w, "  }\n")
 	fmt.Fprintf(g.w, "  panic(errors.AssertionFailedf(\"child index out of range\"))\n")
-	fmt.Fprintf(g.w, "}\n\n")
-
-	// Generate the Memo method.
-	fmt.Fprintf(g.w, "func (e *%s) Memo() *Memo {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  return e.Input.Memo()\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Relational method.
@@ -479,7 +444,7 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 
 	// Generate the ProvidedPhysical method.
 	fmt.Fprintf(g.w, "func (e *%s) ProvidedPhysical() *physical.Provided {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  return &e.best.provided\n")
+	fmt.Fprintf(g.w, "  return e.best.provided\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
 	// Generate the Cost method.
@@ -518,7 +483,7 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 	opTyp := g.md.typeOf(define)
 	fmt.Fprintf(g.w, "var _ opt.ScalarExpr = &%s{}\n\n", opTyp.name)
 
-	// Generate the ID method.
+	// Generate the Rank method.
 	fmt.Fprintf(g.w, "func (e *%s) Rank() opt.ScalarRank {\n", opTyp.name)
 	fmt.Fprintf(g.w, "  panic(errors.AssertionFailedf(\"lists have no rank\"))")
 	fmt.Fprintf(g.w, "}\n\n")
@@ -547,7 +512,7 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 
 	// Generate the String method.
 	fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)\n")
+	fmt.Fprintf(g.w, "  f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)\n")
 	fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
 	fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
 	fmt.Fprintf(g.w, "}\n\n")
@@ -563,7 +528,7 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 
 	// Generate the DataType method.
 	fmt.Fprintf(g.w, "func (e *%s) DataType() *types.T {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  return types.Any\n")
+	fmt.Fprintf(g.w, "  return types.AnyElement\n")
 	fmt.Fprintf(g.w, "}\n\n")
 }
 
@@ -606,7 +571,7 @@ func (g *exprsGen) genMemoizeFuncs() {
 		} else {
 			groupName := fmt.Sprintf("%sGroup", unTitle(string(define.Name)))
 			fmt.Fprintf(g.w, "  const size = int64(unsafe.Sizeof(%s{}))\n", groupName)
-			fmt.Fprintf(g.w, "  grp := &%s{mem: m, first: %s{\n", groupName, opTyp.name)
+			fmt.Fprintf(g.w, "  grp := &%s{first: %s{\n", groupName, opTyp.name)
 		}
 
 		for _, field := range fields {
@@ -724,7 +689,7 @@ func (g *exprsGen) genInternFuncs() {
 		fmt.Fprintf(g.w, "    return in.Intern%s(t)\n", define.Name)
 	}
 	fmt.Fprintf(g.w, "  default:\n")
-	fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"unhandled op: %%s\", e.Op()))\n")
+	fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"unhandled op: %%s\", errors.Safe(e.Op())))\n")
 	fmt.Fprintf(g.w, "  }\n")
 	fmt.Fprintf(g.w, "}\n\n")
 
@@ -822,7 +787,7 @@ func (g *exprsGen) genBuildPropsFunc() {
 		fmt.Fprintf(g.w, "    b.build%sProps(t, rel)\n", define.Name)
 	}
 	fmt.Fprintf(g.w, "  default:\n")
-	fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"unhandled type: %%s\", t.Op()))\n")
+	fmt.Fprintf(g.w, "    panic(errors.AssertionFailedf(\"unhandled type: %%s\", errors.Safe(e.Op())))\n")
 
 	fmt.Fprintf(g.w, "  }\n")
 	fmt.Fprintf(g.w, "}\n\n")

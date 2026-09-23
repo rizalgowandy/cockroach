@@ -1,16 +1,12 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import React, { ErrorInfo } from "react";
 import Helmet from "react-helmet";
-import "./errorMessage.styl";
+
+import "./errorMessage.scss";
 import SleepyMoonImg from "assets/sleepy-moon.svg";
 
 interface ErrorBoundaryProps {
@@ -40,8 +36,13 @@ export default class ErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    // Console.error for developer visibility.
-    console.error(error);
+    // Console.error for developer visibility as well as production logging.
+    // eslint-disable-next-line no-console
+    console.error("[ErrorBoundary::componentDidCatch] error = ", error);
+    // eslint-disable-next-line no-console
+    console.error("[ErrorBoundary::componentDidCatch] errorInfo = ", errorInfo);
+    // eslint-disable-next-line no-console
+    console.log("children = ", this.props.children);
     this.props.onCatch && this.props.onCatch(error, errorInfo);
   }
 

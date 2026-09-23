@@ -1,21 +1,19 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React, { useState, useRef } from "react";
 import { Button, Dropdown } from "antd";
-import moment, { Moment } from "moment";
-import { DateRangeMenu } from "src/dateRange";
-import { CaretDown } from "src/icon/caretDown";
 import classNames from "classnames/bind";
+import moment, { Moment } from "moment-timezone";
+import React, { useState, useRef } from "react";
+
+import { DateRangeMenu } from "src/dateRangeMenu";
+import { CaretDown } from "src/icon/caretDown";
+import { Timezone } from "src/timestamp";
 
 import styles from "./rangeSelector.module.scss";
+import { TimeWindow } from "./timeScaleTypes";
 
 const cx = classNames.bind(styles);
 
@@ -30,15 +28,15 @@ export type Selected = {
   dateEnd?: string;
   timeStart?: string;
   timeEnd?: string;
-  title?: string;
-  timeLabel?: string;
+  key: "Custom" | string;
+  timeLabel: string;
+  timeWindow: TimeWindow;
 };
 
 interface RangeSelectProps {
   options: RangeOption[];
-  onChange: (arg0: RangeOption) => void;
-  changeDate: (dateRange: [moment.Moment, moment.Moment]) => void;
-  onClosed?: () => void;
+  onPresetOptionSelect: (arg0: RangeOption) => void;
+  onCustomSelect: (dateRange: [moment.Moment, moment.Moment]) => void;
   selected: Selected;
 }
 
@@ -72,7 +70,7 @@ const OptionButton = ({ option, onClick, isSelected }: OptionButtonProps) => {
         {!isSelected && option.value === "Custom" ? "--" : option.timeLabel}
       </TimeLabel>
       <span className={cx("__option-label")}>
-        {option.value === "Custom" ? "Custom date range" : option.value}
+        {option.value === "Custom" ? "Custom time interval" : option.value}
       </span>
     </Button>
   );
@@ -80,87 +78,140 @@ const OptionButton = ({ option, onClick, isSelected }: OptionButtonProps) => {
 
 const RangeSelect = ({
   options,
-  onChange,
-  changeDate,
-  onClosed,
+  onPresetOptionSelect,
+  onCustomSelect,
   selected,
 }: RangeSelectProps): React.ReactElement => {
   const [isVisible, setIsVisible] = useState<boolean>(false);
-  const [custom, setCustom] = useState<boolean>(false);
+  /**
+   * customDropdownOptionWasJustSelected holds whether the user had just clicked the "Custom time interval" option in
+   * the dropdown menu.
+   * It is NOT whether the user had just selected a custom time by clicking "Apply".
+   */
+  const [
+    customDropdownOptionWasJustSelected,
+    setCustomDropdownOptionWasJustSelected,
+  ] = useState<boolean>(false);
+
+  /**
+   * customBackWasJustSelected holds whether the "Back", as in back to preset options, button in the custom menu was
+   * just selected.
+   */
+  const [customBackWasJustSelected, setReturnToPresetOptionsWasJustSelected] =
+    useState<boolean>(false);
 
   const rangeContainer = useRef<HTMLDivElement>();
 
-  const onChangeDate = (start: Moment, end: Moment) => {
-    closeDropdown();
-    changeDate([start, end]);
-  };
-
-  const closeDropdown = () => {
-    setCustom(false);
-    setIsVisible(false);
-    if (onClosed) {
-      onClosed();
-    }
-  };
-
-  const handleOptionButtonOnClick = (option: RangeOption): void => {
-    if (option.value === "Custom") {
-      setCustom(true);
-      return;
-    }
-    closeDropdown();
-    onChange(option);
+  const handleEvent = (
+    eventIsSelectingCustomDropdownOption: boolean,
+    eventIsReturnToPresetOptions: boolean,
+  ) => {
+    setCustomDropdownOptionWasJustSelected(
+      eventIsSelectingCustomDropdownOption,
+    );
+    setReturnToPresetOptionsWasJustSelected(eventIsReturnToPresetOptions);
   };
 
   const onVisibleChange = (visible: boolean): void => {
+    handleEvent(false, false);
     setIsVisible(visible);
   };
 
+  const closeDropdown = () => {
+    onVisibleChange(false);
+  };
+
+  const onDropdownOptionClick = (option: RangeOption): void => {
+    if (option.value === "Custom") {
+      // Switch to showing the DateRangeMenu, for users to select a custom time. The dropdown remains open.
+      handleEvent(true, false);
+      return;
+    }
+    onPresetOptionSelect(option);
+    closeDropdown();
+  };
+
+  const onCustomSelectWrapper = (start: Moment, end: Moment) => {
+    onCustomSelect([start, end]);
+    closeDropdown();
+  };
+
+  const onReturnToPresetOptionsClick = () => {
+    handleEvent(false, true);
+  };
+
+  const selectedIsCustom = selected.key === "Custom";
+  const shouldShowCustom =
+    customDropdownOptionWasJustSelected ||
+    (selectedIsCustom && !customBackWasJustSelected);
+
   const menu = (
-    <div
-      className={cx("range-selector", `${custom ? "__custom" : "__options"}`)}
-    >
-      {custom ? (
-        <div className={cx("custom-menu")}>
-          <DateRangeMenu
-            startInit={moment.utc().subtract(10, "minutes")}
-            endInit={moment.utc()}
-            onSubmit={onChangeDate}
-            onCancel={() => setCustom(false)}
-          />
-        </div>
-      ) : (
-        <div className={cx("_quick-view")}>
-          {options.map(option => (
-            <OptionButton
-              key={option.label}
-              isSelected={selected.title === option.value}
-              option={option}
-              onClick={handleOptionButtonOnClick}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+    <>
+      {
+        /**
+         * isVisible is used here to trigger a remount of DateRangeMenu and re-initialize the time in the custom menu. See
+         *  comments on DateRangeMenu.
+         * It is needed because passing isVisible to <Dropdown> merely causes a css change in visibility, and does not
+         *  re-mount the component.
+         * The coupling of setting isVisible to true with the need to re-initialize the time relies on the implicit
+         *  assumption that the dropdown is always in a closed state after a user-induced time change.
+         */
+        isVisible && (
+          <div
+            className={cx(
+              "range-selector",
+              `${shouldShowCustom ? "__custom" : "__options"}`,
+            )}
+          >
+            {shouldShowCustom ? (
+              <div className={cx("custom-menu")}>
+                <DateRangeMenu
+                  startInit={selected.timeWindow.start}
+                  endInit={selected.timeWindow.end}
+                  onSubmit={onCustomSelectWrapper}
+                  onCancel={closeDropdown}
+                  onReturnToPresetOptionsClick={onReturnToPresetOptionsClick}
+                />
+              </div>
+            ) : (
+              <div className={cx("_quick-view")}>
+                {options.map(option => (
+                  <OptionButton
+                    key={option.label}
+                    isSelected={selected.key === option.value}
+                    option={option}
+                    onClick={onDropdownOptionClick}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      }
+    </>
   );
 
   return (
     <div ref={rangeContainer} className={cx("Range")}>
       <div className={cx("trigger-wrapper")}>
         <Dropdown
-          visible={isVisible}
-          onVisibleChange={onVisibleChange}
+          open={isVisible}
+          onOpenChange={onVisibleChange}
           placement="bottomLeft"
           trigger={["click"]}
           overlay={menu}
+          destroyPopupOnHide
         >
-          <Button className={cx("trigger-button")}>
+          <Button
+            className={cx("trigger-button")}
+            data-testid="dropdown-button"
+          >
             <div className={cx("trigger", "Select")}>
               <div>
                 <TimeLabel>{selected.timeLabel}</TimeLabel>
                 <span className={cx("Select-value-label", "title")}>
-                  {selected.title !== "Custom" ? (
-                    selected.title
+                  {!selectedIsCustom ? (
+                    selected.key
                   ) : (
                     <>
                       {selected.dateStart}{" "}
@@ -172,7 +223,7 @@ const RangeSelect = ({
                         {selected.timeEnd}
                       </span>{" "}
                       <span className={cx("Select-value-label__sufix")}>
-                        (UTC)
+                        <Timezone />
                       </span>
                     </>
                   )}

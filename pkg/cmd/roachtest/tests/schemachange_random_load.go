@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -14,38 +9,40 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand/v2"
 	"path/filepath"
-	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/workload/schemachange"
 )
 
-type randomLoadBenchSpec struct {
-	Nodes       int
-	Ops         int
-	Concurrency int
-}
+const (
+	txnLogFile = "transactions.ndjson"
+)
 
 func registerSchemaChangeRandomLoad(r registry.Registry) {
-	geoZones := []string{"us-east1-b", "us-west1-b", "europe-west2-b"}
-	if r.MakeClusterSpec(1).Cloud == spec.AWS {
-		geoZones = []string{"us-east-2b", "us-west-1a", "eu-west-1a"}
-	}
-	geoZonesStr := strings.Join(geoZones, ",")
 	r.Add(registry.TestSpec{
-		Name:  "schemachange/random-load",
-		Owner: registry.OwnerSQLSchema,
+		Name:      "schemachange/random-load",
+		Owner:     registry.OwnerSQLFoundations,
+		Benchmark: true,
 		Cluster: r.MakeClusterSpec(
 			3,
 			spec.Geo(),
-			spec.Zones(geoZonesStr),
+			spec.GCEZones("us-east1-b,us-west1-c,europe-west2-b"),
+			spec.AWSZones("us-east-2b,us-west-1a,eu-west-1a"),
 		),
-		// This is set while development is still happening on the workload and we
-		// fix (or bypass) minor schema change bugs that are discovered.
-		NonReleaseBlocker: true,
+		// TODO(radu): enable this test on AWS.
+		CompatibleClouds:           registry.AllExceptAWS,
+		Suites:                     registry.Suites(registry.Nightly),
+		Leases:                     registry.MetamorphicLeases,
+		NativeLibs:                 registry.LibGEOS,
+		RequiresDeprecatedWorkload: true, // uses schemachange
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			maxOps := 5000
 			concurrency := 20
@@ -56,106 +53,66 @@ func registerSchemaChangeRandomLoad(r registry.Registry) {
 			runSchemaChangeRandomLoad(ctx, t, c, maxOps, concurrency)
 		},
 	})
-
-	// Run a few representative scbench specs in CI.
-	registerRandomLoadBenchSpec(r, randomLoadBenchSpec{
-		Nodes:       3,
-		Ops:         2000,
-		Concurrency: 1,
-	})
-
-	registerRandomLoadBenchSpec(r, randomLoadBenchSpec{
-		Nodes:       3,
-		Ops:         10000,
-		Concurrency: 20,
-	})
-}
-
-func registerRandomLoadBenchSpec(r registry.Registry, b randomLoadBenchSpec) {
-	nameParts := []string{
-		"scbench",
-		"randomload",
-		fmt.Sprintf("nodes=%d", b.Nodes),
-		fmt.Sprintf("ops=%d", b.Ops),
-		fmt.Sprintf("conc=%d", b.Concurrency),
-	}
-	name := strings.Join(nameParts, "/")
-
-	r.Add(registry.TestSpec{
-		Name:    name,
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: r.MakeClusterSpec(b.Nodes),
-		// This is set while development is still happening on the workload and we
-		// fix (or bypass) minor schema change bugs that are discovered.
-		NonReleaseBlocker: true,
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runSchemaChangeRandomLoad(ctx, t, c, b.Ops, b.Concurrency)
-		},
-	})
 }
 
 func runSchemaChangeRandomLoad(
 	ctx context.Context, t test.Test, c cluster.Cluster, maxOps, concurrency int,
 ) {
 	validate := func(db *gosql.DB) {
-		var (
-			id           int
-			databaseName string
-			schemaName   string
-			objName      string
-			objError     string
-		)
-		numInvalidObjects := 0
-		rows, err := db.QueryContext(ctx, `SELECT id, database_name, schema_name, obj_name, error FROM crdb_internal.invalid_objects`)
+		invalidObjects, err := schemachange.ValidateInvalidObjects(ctx, db)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for rows.Next() {
-			numInvalidObjects++
-			if err := rows.Scan(&id, &databaseName, &schemaName, &objName, &objError); err != nil {
-				t.Fatal(err)
-			}
+		for _, obj := range invalidObjects {
 			t.L().Errorf(
-				"invalid object found: id: %d, database_name: %s, schema_name: %s, obj_name: %s, error: %s",
-				id, databaseName, schemaName, objName, objError,
+				"invalid object found: id: %d, database_name: %s, schema_name: %s, obj_name: %s, error: %v",
+				obj.ID, obj.DatabaseName, obj.SchemaName, obj.ObjName, obj.Error,
 			)
 		}
-		if err := rows.Err(); err != nil {
-			t.Fatal(err)
-		}
-		if numInvalidObjects > 0 {
-			t.Fatalf("found %d invalid objects", numInvalidObjects)
+		if len(invalidObjects) > 0 {
+			t.Fatalf("found %d invalid objects", len(invalidObjects))
 		}
 	}
-
 	loadNode := c.Node(1)
 	roachNodes := c.Range(1, c.Spec().NodeCount)
 	t.Status("copying binaries")
-	c.Put(ctx, t.Cockroach(), "./cockroach", roachNodes)
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", loadNode)
 
 	t.Status("starting cockroach nodes")
-	c.Start(ctx, roachNodes)
-	c.Run(ctx, loadNode, "./workload init schemachange")
 
-	storeDirectory, err := c.RunWithBuffer(ctx, t.L(), c.Node(1), "echo", "-n", "{store-dir}")
+	settings := install.MakeClusterSettings(install.ClusterSettingsOption{
+		"sql.log.all_statements.enabled": "true",
+	})
+
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, roachNodes)
+
+	c.Run(ctx, option.WithNodes(loadNode), "./workload init schemachange {pgurl:1}")
+
+	result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.Node(1)), "echo", "-n", "{store-dir}")
 	if err != nil {
 		t.L().Printf("Failed to retrieve store directory from node 1: %v\n", err.Error())
 	}
+	storeDirectory := result.Stdout
 
 	runCmd := []string{
 		"./workload run schemachange --verbose=1",
 		"--tolerate-errors=false",
-		// Save the histograms so that they can be reported to https://roachperf.crdb.dev/.
-		" --histograms=" + t.PerfArtifactsDir() + "/stats.json",
 		fmt.Sprintf("--max-ops %d", maxOps),
 		fmt.Sprintf("--concurrency %d", concurrency),
-		fmt.Sprintf("--txn-log %s", filepath.Join(string(storeDirectory), "transactions.json")),
+		fmt.Sprintf("--txn-log %s", filepath.Join(storeDirectory, txnLogFile)),
+		fmt.Sprintf("{pgurl%s}", loadNode),
 	}
+
+	extraLabels := map[string]string{
+		"concurrency": fmt.Sprintf("%d", concurrency),
+		"max-ops":     fmt.Sprintf("%d", maxOps),
+	}
+
+	runCmd = append(runCmd, roachtestutil.GetWorkloadHistogramArgs(t, c, extraLabels))
 	t.Status("running schemachange workload")
-	err = c.RunE(ctx, loadNode, runCmd...)
+	err = c.RunE(ctx, option.WithNodes(loadNode), runCmd...)
 	if err != nil {
-		saveArtifacts(ctx, t, c, string(storeDirectory))
+		saveArtifacts(ctx, t, c, storeDirectory)
 		t.Fatal(err)
 	}
 
@@ -167,13 +124,21 @@ func runSchemaChangeRandomLoad(
 	// the workload itself (if we even still want it, considering that the
 	// workload itself would be running DROP DATABASE CASCADE).
 
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 
 	t.Status("performing validation after workload")
 	validate(db)
-	t.Status("dropping database")
-	_, err = db.ExecContext(ctx, `USE defaultdb; DROP DATABASE schemachange CASCADE;`)
+	schemaChangerSetting := "on"
+	if rand.Float32() < 0.5 {
+		schemaChangerSetting = "off"
+	}
+	t.Status(fmt.Sprintf("dropping database with use_declarative_schema_changer = %s", schemaChangerSetting))
+	_, err = db.ExecContext(ctx, "SET use_declarative_schema_changer = $1", schemaChangerSetting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, "DROP DATABASE schemachange CASCADE")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,19 +148,25 @@ func runSchemaChangeRandomLoad(
 
 // saveArtifacts saves important test artifacts in the artifacts directory.
 func saveArtifacts(ctx context.Context, t test.Test, c cluster.Cluster, storeDirectory string) {
-	db := c.Conn(ctx, 1)
+	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
 
 	// Save a backup file called schemachange to the store directory.
-	_, err := db.Exec("BACKUP DATABASE schemachange to 'nodelocal://1/schemachange'")
+	_, err := db.Exec("BACKUP DATABASE schemachange INTO 'nodelocal://1/schemachange'")
 	if err != nil {
 		t.L().Printf("Failed execute backup command on node 1: %v\n", err.Error())
 	}
-
-	remoteBackupFilePath := filepath.Join(storeDirectory, "extern", "schemachange")
+	if _, err := db.Exec("SET use_backups_with_ids = true"); err != nil {
+		t.L().Printf("Failed to set use_backups_with_ids on node 1: %v\n", err.Error())
+	}
+	var backupPath string
+	if err := db.QueryRow("SELECT path FROM [SHOW BACKUPS IN 'nodelocal://1/schemachange' WITH DEBUG]").Scan(&backupPath); err != nil {
+		t.L().Printf("Failed to get backup path from node 1: %v\n", err.Error())
+	}
+	remoteBackupFilePath := filepath.Join(storeDirectory, "extern", "schemachange", backupPath)
 	localBackupFilePath := filepath.Join(t.ArtifactsDir(), "backup")
-	remoteTransactionsFilePath := filepath.Join(storeDirectory, "transactions.ndjson")
-	localTransactionsFilePath := filepath.Join(t.ArtifactsDir(), "transactions.ndjson")
+	remoteTransactionsFilePath := filepath.Join(storeDirectory, txnLogFile)
+	localTransactionsFilePath := filepath.Join(t.ArtifactsDir(), txnLogFile)
 
 	// Copy the backup from the store directory to the artifacts directory.
 	err = c.Get(ctx, t.L(), remoteBackupFilePath, localBackupFilePath, c.Node(1))

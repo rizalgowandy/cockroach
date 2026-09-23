@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -31,16 +26,21 @@ type replicaQueue interface {
 	// Start launches a goroutine to process the contents of the queue.
 	// The provided stopper is used to signal that the goroutine should exit.
 	Start(*stop.Stopper)
-	// MaybeAdd adds the replica to the queue if the replica meets
+	// MaybeAddAsync adds the replica to the queue if the replica meets
 	// the queue's inclusion criteria and the queue is not already
 	// too full, etc.
 	MaybeAddAsync(context.Context, replicaInQueue, hlc.ClockTimestamp)
+	// AddAsync adds the replica to the queue without checking whether the replica
+	// meets the queue's inclusion criteria.
+	AddAsync(context.Context, replicaInQueue, float64)
 	// MaybeRemove removes the replica from the queue if it is present.
 	MaybeRemove(roachpb.RangeID)
 	// Name returns the name of the queue.
 	Name() string
 	// NeedsLease returns whether the queue requires a replica to be leaseholder.
 	NeedsLease() bool
+	// SetDisabled turns queue processing off or on as directed.
+	SetDisabled(disabled bool)
 }
 
 // A replicaSet provides access to a sequence of replicas to consider
@@ -213,21 +213,20 @@ func (rs *replicaScanner) waitAndProcess(ctx context.Context, start time.Time, r
 	waitInterval := rs.paceInterval(start, timeutil.Now())
 	rs.waitTimer.Reset(waitInterval)
 	if log.V(6) {
-		log.Infof(ctx, "wait timer interval set to %s", waitInterval)
+		log.KvDistribution.Infof(ctx, "wait timer interval set to %s", waitInterval)
 	}
 	for {
 		select {
 		case <-rs.waitTimer.C:
 			if log.V(6) {
-				log.Infof(ctx, "wait timer fired")
+				log.KvDistribution.Infof(ctx, "wait timer fired")
 			}
-			rs.waitTimer.Read = true
 			if repl == nil {
 				return false
 			}
 
 			if log.V(2) {
-				log.Infof(ctx, "replica scanner processing %s", repl)
+				log.KvDistribution.Infof(ctx, "replica scanner processing %s", repl)
 			}
 			for _, q := range rs.queues {
 				q.MaybeAddAsync(ctx, repl, rs.clock.NowAsClockTimestamp())
@@ -252,7 +251,7 @@ func (rs *replicaScanner) removeReplica(repl *Replica) {
 	}
 	if log.V(6) {
 		ctx := rs.AnnotateCtx(context.TODO())
-		log.Infof(ctx, "removed replica %s", repl)
+		log.KvDistribution.Infof(ctx, "removed replica %s", repl)
 	}
 }
 
@@ -300,7 +299,7 @@ func (rs *replicaScanner) scanLoop() {
 				rs.mu.total += timeutil.Since(start)
 			}()
 			if log.V(6) {
-				log.Infof(ctx, "reset replica scan iteration")
+				log.KvDistribution.Infof(ctx, "reset replica scan iteration")
 			}
 
 			// Reset iteration and start time.

@@ -1,18 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
+	"context"
+	"fmt"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/readsummary/rspb"
@@ -21,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -35,9 +32,9 @@ func TestReadSummaryApplyForR1(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
 	baseTS := hlc.Timestamp{WallTime: 123}
-	manual := hlc.NewManualClock(baseTS.WallTime)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(baseTS.GoTime()))
 	tc := tscache.New(clock)
 
 	r1desc := roachpb.RangeDescriptor{
@@ -50,20 +47,20 @@ func TestReadSummaryApplyForR1(t *testing.T) {
 		Local:  rspb.Segment{LowWater: ts1},
 		Global: rspb.Segment{LowWater: ts1},
 	}
-	applyReadSummaryToTimestampCache(tc, &r1desc, summary)
-	tc.GetMax(keys.LocalPrefix, nil)
+	applyReadSummaryToTimestampCache(ctx, tc, &r1desc, summary)
+	tc.GetMax(ctx, keys.LocalPrefix, nil)
 
 	// Make sure that updating the tscache did something, so the test is not
 	// fooling itself.
-	ts, _ := tc.GetMax(roachpb.Key("a"), nil)
+	ts, _ := tc.GetMax(ctx, roachpb.Key("a"), nil)
 	require.Equal(t, ts1, ts)
 
 	// Check that the local keyspace was not affected.
-	ts, _ = tc.GetMax(keys.LocalPrefix, nil)
+	ts, _ = tc.GetMax(ctx, keys.LocalPrefix, nil)
 	require.Equal(t, baseTS, ts)
 
 	// Check that the range-local keyspace for the range in question was affected.
-	ts, _ = tc.GetMax(keys.MakeRangeKeyPrefix(r1desc.StartKey), nil)
+	ts, _ = tc.GetMax(ctx, keys.MakeRangeKeyPrefix(r1desc.StartKey), nil)
 	require.Equal(t, ts1, ts)
 }
 
@@ -74,9 +71,9 @@ func TestReadSummaryCollectForR1(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	ctx := context.Background()
 	baseTS := hlc.Timestamp{WallTime: 123}
-	manual := hlc.NewManualClock(baseTS.WallTime)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(baseTS.GoTime()))
 	tc := tscache.New(clock)
 
 	r1desc := roachpb.RangeDescriptor{
@@ -90,11 +87,64 @@ func TestReadSummaryCollectForR1(t *testing.T) {
 		EndKey:   roachpb.RKeyMax,
 	}
 	// Populate the timestamp cache for a range-local key for r2.
-	tc.Add(keys.MakeRangeKeyPrefix(r2desc.StartKey), nil, hlc.Timestamp{WallTime: 1000}, uuid.Nil)
+	tc.Add(ctx, keys.MakeRangeKeyPrefix(r2desc.StartKey), nil, hlc.Timestamp{WallTime: 1000}, uuid.Nil)
 
 	// Assert that r1's summary was not influenced by the r2 range-local key we
 	// set above.
-	summary := collectReadSummaryFromTimestampCache(tc, &r1desc)
+	summary, _, _ := collectReadSummaryFromTimestampCache(ctx, tc, &r1desc, 0, 0)
 	require.Equal(t, baseTS, summary.Global.LowWater)
 	require.Equal(t, baseTS, summary.Local.LowWater)
+}
+
+// TestReadSummaryCompression ensures we correctly return whether the local
+// and/or global segments were compressed when collecting the read summary.
+func TestReadSummaryCompression(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	baseTS := hlc.Timestamp{WallTime: 123}
+	clock := hlc.NewClockForTesting(timeutil.NewManualTime(baseTS.GoTime()))
+	tc := tscache.New(clock)
+
+	// Populate the local segment of the timestamp cache.
+	localKeyPrefix := keys.MakeRangeKeyPrefix(roachpb.RKey("a"))
+	for i := 0; i < 100; i++ {
+		key := append(localKeyPrefix.Clone(), byte(i))
+		ts := hlc.Timestamp{WallTime: int64(1000 + i)}
+		tc.Add(ctx, key, nil, ts, uuid.Nil)
+	}
+
+	// Populate the global segment of the timestamp cache.
+	for i := 0; i < 100; i++ {
+		key := roachpb.Key(fmt.Sprintf("a%d", i))
+		ts := hlc.Timestamp{WallTime: int64(2000 + i)}
+		tc.Add(ctx, key, nil, ts, uuid.Nil)
+	}
+
+	desc := &roachpb.RangeDescriptor{
+		RangeID:  1,
+		StartKey: roachpb.RKey("a"),
+		EndKey:   roachpb.RKey("z"),
+	}
+
+	budgetSizes := []struct {
+		budget            int64
+		expectCompression bool
+	}{
+		{0, true},        // zero budget
+		{100, true},      // small budget
+		{1 << 20, false}, // large budget
+	}
+
+	for _, localBudget := range budgetSizes {
+		for _, globalBudget := range budgetSizes {
+			_, localCompressed, globalCompressed := collectReadSummaryFromTimestampCache(
+				ctx, tc, desc, localBudget.budget, globalBudget.budget,
+			)
+
+			require.Equal(t, localBudget.expectCompression, localCompressed)
+			require.Equal(t, globalBudget.expectCompression, globalCompressed)
+		}
+	}
 }

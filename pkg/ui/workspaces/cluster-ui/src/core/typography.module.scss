@@ -1,3 +1,8 @@
+// Copyright 2021 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
 @mixin font-face($name) {
   @font-face {
     font-family: $name;
@@ -11,7 +16,6 @@
 @include font-face("SourceSansPro-Bold");
 @include font-face("SourceSansPro-Regular");
 @include font-face("SourceSansPro-SemiBold");
-@include font-face("SFMono-Semibold");
 @include font-face("RobotoMono-Medium");
 @include font-face("RobotoMono-Regular");
 @include font-face("Lato-Regular");
@@ -21,7 +25,6 @@ $font-family--bold: SourceSansPro-Bold;
 $font-family--semi-bold: SourceSansPro-SemiBold;
 $font-family--monospace: RobotoMono-Medium;
 $font-family--mono-regular: RobotoMono-Regular;
-$font-family--sf-mono: SFMono-Semibold;
 $font-family--lato-regular: Lato-Regular;
 
 $font-weight--extra-bold: 900;
@@ -113,11 +116,18 @@ $spacing-xx-large: 48px;
   font-weight: $font-weight--light;
 }
 
-@mixin text--body-strong {
+@mixin text--caption {
   font-family: $font-family--base;
+  font-size: $font-size--small;
+  line-height: $line-height--small;
+  font-weight: $font-weight--light;
+  letter-spacing: $letter-spacing--medium;
+}
+
+@mixin text--body-strong {
+  font-family: $font-family--semi-bold;
   font-size: $font-size--medium;
   line-height: $line-height--medium;
-  font-weight: $font-weight--bold;
 }
 
 @mixin text--code {

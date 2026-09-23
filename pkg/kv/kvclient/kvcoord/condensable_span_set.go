@@ -1,18 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvcoord
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -27,6 +23,13 @@ import (
 // "footprint" of the set to grow, so the set should be thought of as on
 // overestimate.
 type condensableSpanSet struct {
+	// TODO(nvanbenschoten): It feels like there is a lot that we could do with
+	// this data structure to 1) reduce the per span overhead, and 2) avoid the
+	// retention of many small keys for the duration of a transaction. For
+	// instance, we could allocate a single large block of memory and copy keys
+	// into it. We could also store key lengths inline to minimize the per-span
+	// overhead. Recognizing that many spans are actually point keys would also
+	// help.
 	s     []roachpb.Span
 	bytes int64
 
@@ -36,11 +39,17 @@ type condensableSpanSet struct {
 	// memory without losing fidelity, in which case this flag would not be set
 	// (e.g. merging overlapping or adjacent spans).
 	condensed bool
+
+	// Avoid heap allocations for transactions with a small number of spans.
+	sAlloc [2]roachpb.Span
 }
 
 // insert adds new spans to the condensable span set. No attempt to condense the
 // set or deduplicate the new span with existing spans is made.
 func (s *condensableSpanSet) insert(spans ...roachpb.Span) {
+	if cap(s.s) == 0 {
+		s.s = s.sAlloc[:0]
+	}
 	s.s = append(s.s, spans...)
 	for _, sp := range spans {
 		s.bytes += spanSize(sp)
@@ -54,7 +63,7 @@ func (s *condensableSpanSet) insert(spans ...roachpb.Span) {
 // The method has the side effect of sorting the set.
 func (s *condensableSpanSet) mergeAndSort() {
 	oldLen := len(s.s)
-	s.s, _ = roachpb.MergeSpans(&s.s)
+	s.s, _ = roachpb.MergeSpans(s.s)
 	// Recompute the size if anything has changed.
 	if oldLen != len(s.s) {
 		s.bytes = 0
@@ -113,7 +122,7 @@ func (s *condensableSpanSet) maybeCondense(
 		ri.Seek(ctx, roachpb.RKey(sp.Key), Ascending)
 		if !ri.Valid() {
 			// We haven't modified s.s yet, so it is safe to return.
-			log.Warningf(ctx, "failed to condense lock spans: %v", ri.Error())
+			log.Dev.Warningf(ctx, "failed to condense lock spans: %v", ri.Error())
 			return false
 		}
 		rangeID := ri.Desc().RangeID
@@ -129,7 +138,7 @@ func (s *condensableSpanSet) maybeCondense(
 
 	// Sort the buckets by size and collapse from largest to smallest
 	// until total size of uncondensed spans no longer exceeds threshold.
-	sort.Slice(buckets, func(i, j int) bool { return buckets[i].bytes > buckets[j].bytes })
+	slices.SortFunc(buckets, func(a, b spanBucket) int { return -cmp.Compare(a.bytes, b.bytes) })
 	s.s = localSpans // reset to hold just the local spans; will add newly condensed and remainder
 	for _, bucket := range buckets {
 		// Condense until we get to half the threshold.
@@ -149,7 +158,7 @@ func (s *condensableSpanSet) maybeCondense(
 				// If we didn't fatal here then we would need to ensure that the
 				// spans were restored or a transaction could lose part of its
 				// lock footprint.
-				log.Fatalf(ctx, "failed to condense lock spans: "+
+				log.Dev.Fatalf(ctx, "failed to condense lock spans: "+
 					"combining span %s yielded invalid result", s)
 			}
 		}
@@ -213,7 +222,7 @@ func (s *condensableSpanSet) estimateSize(spans []roachpb.Span, mergeThresholdBy
 	// Try harder - merge (a copy of) the existing spans with the new spans.
 	spans = append(spans, s.s...)
 	lenBeforeMerge := len(spans)
-	spans, _ = roachpb.MergeSpans(&spans)
+	spans, _ = roachpb.MergeSpans(spans)
 	if len(spans) == lenBeforeMerge {
 		// Nothing changed -i.e. we failed to merge any spans.
 		return estimate
@@ -232,9 +241,7 @@ func (s *condensableSpanSet) bytesSize() int64 {
 }
 
 func spanSize(sp roachpb.Span) int64 {
-	return int64(len(sp.Key) + len(sp.EndKey))
-}
-
-func keySize(k roachpb.Key) int64 {
-	return int64(len(k))
+	// Since the span is included into a []roachpb.Span, we also need to account
+	// for the overhead of storing it in that slice.
+	return roachpb.SpanOverhead + int64(cap(sp.Key)+cap(sp.EndKey))
 }

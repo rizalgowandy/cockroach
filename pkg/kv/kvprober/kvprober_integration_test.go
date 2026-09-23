@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvprober_test
 
@@ -14,14 +9,20 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
+	"regexp"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvprober"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	slpb "github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness/storelivenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -29,11 +30,32 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
+
+// Implements the interceptor interface to intercept log entries.
+type kvproberLogSpy struct {
+	t *testing.T
+
+	entries syncutil.Map[uuid.UUID, logpb.Entry]
+}
+
+func (l *kvproberLogSpy) Intercept(entry []byte) {
+	var rawLog logpb.Entry
+
+	if err := json.Unmarshal(entry, &rawLog); err != nil {
+		l.t.Errorf("failed unmarshalling entry %s: %v", entry, err)
+		return
+	}
+	l.entries.Store(uuid.MakeV4(), &rawLog)
+}
+
+var _ log.Interceptor = &kvproberLogSpy{}
 
 func TestProberDoesReadsAndWrites(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -43,13 +65,18 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("disabled by default", func(t *testing.T) {
-		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{})
+	t.Run("disabled", func(t *testing.T) {
+		s, _, p, cleanup := initTestServer(t, base.TestingKnobs{})
 		defer cleanup()
 
+		kvprober.ReadEnabled.Override(ctx, &s.ClusterSettings().SV, false)
 		kvprober.ReadInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
-		require.NoError(t, p.Start(ctx, s.Stopper()))
+		kvprober.WriteEnabled.Override(ctx, &s.ClusterSettings().SV, false)
+		kvprober.WriteInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
+
+		kvprober.QuarantineEnabled.Override(ctx, &s.ClusterSettings().SV, false)
+		kvprober.QuarantineInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
 		time.Sleep(100 * time.Millisecond)
 
@@ -59,7 +86,14 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 	})
 
 	t.Run("happy path", func(t *testing.T) {
-		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{})
+		logSpy := &kvproberLogSpy{
+			t: t,
+		}
+
+		spyCleanup := log.InterceptWith(ctx, logSpy)
+		defer spyCleanup()
+
+		s, _, p, cleanup := initTestServer(t, base.TestingKnobs{})
 		defer cleanup()
 
 		kvprober.ReadEnabled.Override(ctx, &s.ClusterSettings().SV, true)
@@ -68,7 +102,10 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 		kvprober.WriteEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 		kvprober.WriteInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
-		require.NoError(t, p.Start(ctx, s.Stopper()))
+		kvprober.QuarantineEnabled.Override(ctx, &s.ClusterSettings().SV, true)
+		kvprober.QuarantineInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
+
+		kvprober.TracingEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 
 		testutils.SucceedsSoon(t, func() error {
 			if p.Metrics().ReadProbeAttempts.Count() < int64(50) {
@@ -79,19 +116,23 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 			}
 			return nil
 		})
+
 		require.Zero(t, p.Metrics().ReadProbeFailures.Count())
 		require.Zero(t, p.Metrics().WriteProbeFailures.Count())
 		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
+		// Check if the logs contain the expected log line.
+		expectedPattern := `r=.+ having likely leaseholder=.+ returned success`
+		require.True(t, containsPattern(&logSpy.entries, expectedPattern))
 	})
 
 	t.Run("a single range is unavailable for all KV ops", func(t *testing.T) {
-		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{
+		s, _, p, cleanup := initTestServer(t, base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(i context.Context, ba roachpb.BatchRequest) *roachpb.Error {
+				TestingRequestFilter: func(i context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 					for _, ru := range ba.Requests {
 						key := ru.GetInner().Header().Key
 						if bytes.HasPrefix(key, keys.TimeseriesPrefix) {
-							return roachpb.NewError(fmt.Errorf("boom"))
+							return kvpb.NewError(fmt.Errorf("boom"))
 						}
 					}
 					return nil
@@ -106,7 +147,8 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 		kvprober.WriteEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 		kvprober.WriteInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
-		require.NoError(t, p.Start(ctx, s.Stopper()))
+		kvprober.QuarantineEnabled.Override(ctx, &s.ClusterSettings().SV, true)
+		kvprober.QuarantineInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
 		// Expect >=2 failures eventually due to unavailable time-series range.
 		// TODO(josh): Once structured logging is in, can check that failures
@@ -124,16 +166,16 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 	})
 
 	t.Run("all ranges are unavailable for Gets only", func(t *testing.T) {
-		var dbIsAvailable syncutil.AtomicBool
-		dbIsAvailable.Set(true)
+		var dbIsAvailable atomic.Bool
+		dbIsAvailable.Store(true)
 
-		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{
+		s, _, p, cleanup := initTestServer(t, base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(i context.Context, ba roachpb.BatchRequest) *roachpb.Error {
-					if !dbIsAvailable.Get() {
+				TestingRequestFilter: func(i context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+					if !dbIsAvailable.Load() {
 						for _, ru := range ba.Requests {
 							if ru.GetGet() != nil {
-								return roachpb.NewError(fmt.Errorf("boom"))
+								return kvpb.NewError(fmt.Errorf("boom"))
 							}
 						}
 						return nil
@@ -145,7 +187,7 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 		defer cleanup()
 
 		// Want server to startup successfully then become unavailable.
-		dbIsAvailable.Set(false)
+		dbIsAvailable.Store(false)
 
 		kvprober.ReadEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 		kvprober.ReadInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
@@ -153,32 +195,34 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 		kvprober.WriteEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 		kvprober.WriteInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
+		kvprober.QuarantineEnabled.Override(ctx, &s.ClusterSettings().SV, true)
+		kvprober.QuarantineInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
+
 		// Probe exactly ten times so we can make assertions below.
 		for i := 0; i < 10; i++ {
 			p.ReadProbe(ctx, s.DB())
 			p.WriteProbe(ctx, s.DB())
 		}
 
-		// Expect all read probes to fail but write probes & planning to succeed.
-		require.Equal(t, int64(10), p.Metrics().ReadProbeAttempts.Count())
-		require.Equal(t, int64(10), p.Metrics().ReadProbeFailures.Count())
+		// kvprober is running in background, so more than ten probes may be run.
+		require.GreaterOrEqual(t, p.Metrics().ReadProbeFailures.Count(), int64(10))
 
-		require.Equal(t, int64(10), p.Metrics().WriteProbeAttempts.Count())
+		require.GreaterOrEqual(t, p.Metrics().WriteProbeAttempts.Count(), int64(10))
 		require.Zero(t, p.Metrics().WriteProbeFailures.Count())
 
 		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
 	})
 	t.Run("all ranges are unavailable for Puts only", func(t *testing.T) {
-		var dbIsAvailable syncutil.AtomicBool
-		dbIsAvailable.Set(true)
+		var dbIsAvailable atomic.Bool
+		dbIsAvailable.Store(true)
 
-		s, _, p, cleanup := initTestProber(t, base.TestingKnobs{
+		s, _, p, cleanup := initTestServer(t, base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
-				TestingRequestFilter: func(i context.Context, ba roachpb.BatchRequest) *roachpb.Error {
-					if !dbIsAvailable.Get() {
+				TestingRequestFilter: func(i context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
+					if !dbIsAvailable.Load() {
 						for _, ru := range ba.Requests {
 							if ru.GetPut() != nil {
-								return roachpb.NewError(fmt.Errorf("boom"))
+								return kvpb.NewError(fmt.Errorf("boom"))
 							}
 						}
 						return nil
@@ -190,7 +234,7 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 		defer cleanup()
 
 		// Want server to startup successfully then become unavailable.
-		dbIsAvailable.Set(false)
+		dbIsAvailable.Store(false)
 
 		kvprober.ReadEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 		kvprober.ReadInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
@@ -198,17 +242,19 @@ func TestProberDoesReadsAndWrites(t *testing.T) {
 		kvprober.WriteEnabled.Override(ctx, &s.ClusterSettings().SV, true)
 		kvprober.WriteInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
 
+		kvprober.QuarantineEnabled.Override(ctx, &s.ClusterSettings().SV, true)
+		kvprober.QuarantineInterval.Override(ctx, &s.ClusterSettings().SV, 5*time.Millisecond)
+
 		// Probe exactly ten times so we can make assertions below.
 		for i := 0; i < 10; i++ {
 			p.ReadProbe(ctx, s.DB())
 			p.WriteProbe(ctx, s.DB())
 		}
 
-		// Expect all write probes to fail but read probes & planning to succeed.
-		require.Equal(t, int64(10), p.Metrics().WriteProbeAttempts.Count())
-		require.Equal(t, int64(10), p.Metrics().WriteProbeFailures.Count())
+		// kvprober is running in background, so more than ten probes may be run.
+		require.GreaterOrEqual(t, p.Metrics().WriteProbeFailures.Count(), int64(10))
 
-		require.Equal(t, int64(10), p.Metrics().ReadProbeAttempts.Count())
+		require.GreaterOrEqual(t, p.Metrics().ReadProbeAttempts.Count(), int64(10))
 		require.Zero(t, p.Metrics().ReadProbeFailures.Count())
 
 		require.Zero(t, p.Metrics().ProbePlanFailures.Count())
@@ -223,7 +269,7 @@ func TestWriteProbeDoesNotLeaveLiveData(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, p, cleanup := initTestProber(t, base.TestingKnobs{})
+	s, _, p, cleanup := initTestServer(t, base.TestingKnobs{})
 	defer cleanup()
 
 	kvprober.WriteEnabled.Override(ctx, &s.ClusterSettings().SV, true)
@@ -231,7 +277,8 @@ func TestWriteProbeDoesNotLeaveLiveData(t *testing.T) {
 	lastStep := p.WriteProbeReturnLastStep(ctx, s.DB())
 
 	// Expect write probe to succeed.
-	require.Equal(t, int64(1), p.Metrics().WriteProbeAttempts.Count())
+	// kvprober is running in background, so more than one probe may be run.
+	require.Greater(t, p.Metrics().WriteProbeAttempts.Count(), int64(0))
 	require.Zero(t, p.Metrics().WriteProbeFailures.Count())
 	require.Zero(t, p.Metrics().ProbePlanFailures.Count())
 
@@ -256,8 +303,22 @@ func TestPlannerMakesPlansCoveringAllRanges(t *testing.T) {
 	skip.UnderShort(t)
 
 	ctx := context.Background()
-	_, sqlDB, p, cleanup := initTestProber(t, base.TestingKnobs{})
+	// Disable split and merge queue just in case.
+	s, sqlDB, _, cleanup := initTestServer(t, base.TestingKnobs{
+		Store: &kvserver.StoreTestingKnobs{DisableSplitQueue: true, DisableMergeQueue: true},
+	})
 	defer cleanup()
+
+	// Create a kvprober and don't call Start, so that we can manually
+	// call the planner from this test, without any planning happening in the
+	// background.
+	p := kvprober.NewProber(kvprober.Opts{
+		Tracer:                  s.TracerI().(*tracing.Tracer),
+		DB:                      s.DB(),
+		HistogramWindowInterval: time.Minute, // actual value not important to test
+		Settings:                s.ClusterSettings(),
+	})
+	p.SetPlanningRateLimits(0)
 
 	rangeIDToTimesWouldBeProbed := make(map[int64]int)
 
@@ -267,7 +328,7 @@ func TestPlannerMakesPlansCoveringAllRanges(t *testing.T) {
 			"SELECT count(*) FROM crdb_internal.ranges").Scan(&numRanges); err != nil {
 			require.True(t, false)
 		}
-		log.Infof(ctx, "want numRanges %v", numRanges)
+		log.Dev.Infof(ctx, "want numRanges %v", numRanges)
 
 		require.Eventually(t, func() bool {
 			step, err := p.ReadPlannerNext(ctx)
@@ -275,9 +336,15 @@ func TestPlannerMakesPlansCoveringAllRanges(t *testing.T) {
 
 			rangeIDToTimesWouldBeProbed[int64(step.RangeID)]++
 
-			log.Infof(ctx, "current rangeID to times would be probed map: %v", rangeIDToTimesWouldBeProbed)
+			log.Dev.Infof(ctx, "current rangeID to times would be probed map: %v", rangeIDToTimesWouldBeProbed)
 
 			for i := int64(1); i <= numRanges; i++ {
+				// Range 1 (meta1 range) is not probed by the kvprober planner, as it
+				// only scans meta2 records, and range 1's descriptor isn't stored in
+				// meta2.
+				if i == 1 {
+					continue
+				}
 				// Expect all ranges to eventually be returned by Next n or n+1 times.
 				// Can't expect all ranges to be returned by Next exactly n times,
 				// as the order in which the lowest ordinal ranges are returned by
@@ -290,30 +357,96 @@ func TestPlannerMakesPlansCoveringAllRanges(t *testing.T) {
 				}
 			}
 			return true
-		}, time.Second, time.Millisecond)
+		}, testutils.DefaultSucceedsSoonDuration, 20*time.Millisecond)
 	}
 	for i := 0; i < 20; i++ {
 		test(i)
 	}
 }
 
-func initTestProber(
+func TestProberOpsValidatesProbeKey(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, _, _, cleanup := initTestServer(t, base.TestingKnobs{})
+	defer cleanup()
+
+	var ops kvprober.ProberOps
+	probeOps := []struct {
+		name string
+		op   func(roachpb.Key) func(context.Context, *kv.Txn) error
+	}{
+		{"Read", ops.Read},
+		{"Write", ops.Write},
+	}
+
+	probeKeys := []struct {
+		key   roachpb.Key
+		valid bool
+	}{
+		// Global key.
+		{roachpb.Key("a"), false},
+		// Incorrect range local key.
+		{keys.RangeDescriptorKey(roachpb.RKey("a")), false},
+		// Incorrect range-ID local key.
+		{keys.RangeLeaseKey(1), false},
+		// Correct range local probe key.
+		{keys.RangeProbeKey(roachpb.RKey("a")), true},
+	}
+
+	for _, op := range probeOps {
+		t.Run(op.name, func(t *testing.T) {
+			for _, key := range probeKeys {
+				t.Run(key.key.String(), func(t *testing.T) {
+					err := s.DB().Txn(ctx, op.op(key.key))
+					if key.valid {
+						require.NoError(t, err)
+					} else {
+						require.Error(t, err)
+						require.True(t, errors.IsAssertionFailure(err))
+					}
+				})
+			}
+		})
+	}
+}
+
+func initTestServer(
 	t *testing.T, knobs base.TestingKnobs,
 ) (serverutils.TestServerInterface, *gosql.DB, *kvprober.Prober, func()) {
-
-	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
-		Settings: cluster.MakeClusterSettings(),
-		Knobs:    knobs,
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		// KV probes always go to the storage layer.
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+		Settings:          cluster.MakeClusterSettings(),
+		Knobs:             knobs,
+		RaftConfig: base.RaftConfig{
+			// Speed up tests.
+			RaftTickInterval:           100 * time.Millisecond,
+			RaftElectionTimeoutTicks:   2,
+			RaftHeartbeatIntervalTicks: 1,
+		},
 	})
-	p := kvprober.NewProber(kvprober.Opts{
-		Tracer:                  tracing.NewTracer(),
-		DB:                      kvDB,
-		HistogramWindowInterval: time.Minute, // actual value not important to test
-		Settings:                s.ClusterSettings(),
+
+	// With leader leases, wait for store liveness support to be established. This
+	// is useful as the leader will only be elected once it has quorum support
+	// in store liveness. Without this, we could see some deadline exceeded errors
+	// until the store liveness support is established and the leader is elected.
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
+	require.NoError(t, err)
+	testutils.SucceedsSoon(t, func() error {
+		ident := slpb.StoreIdent{NodeID: store.NodeID(), StoreID: store.StoreID()}
+		epoch, _ := store.TestingStoreLivenessSupportManager().SupportFrom(ident)
+		if epoch == 0 {
+			return errors.New("support not established")
+		}
+		return nil
 	})
 
 	// Given small test cluster, this better exercises the planning logic.
 	kvprober.NumStepsToPlanAtOnce.Override(context.Background(), &s.ClusterSettings().SV, 10)
+
+	p := s.KvProber()
 	// Want these tests to run as fast as possible; see planner_test.go for a
 	// unit test of the rate limiting.
 	p.SetPlanningRateLimits(0)
@@ -321,4 +454,19 @@ func initTestProber(
 	return s, sqlDB, p, func() {
 		s.Stopper().Stop(context.Background())
 	}
+}
+
+// containsPattern returns true if any of the log entries contain the given pattern.
+func containsPattern(entries *syncutil.Map[uuid.UUID, logpb.Entry], pattern string) bool {
+	expectedPattern := regexp.MustCompile(pattern)
+	found := false
+
+	entries.Range(func(key uuid.UUID, value *logpb.Entry) bool {
+		if expectedPattern.MatchString(value.Message) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }

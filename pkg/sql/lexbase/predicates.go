@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lexbase
 
@@ -37,6 +32,26 @@ func IsHexDigit(ch int) bool {
 		(ch >= 'A' && ch <= 'F')
 }
 
+var lookaheadKeywords = []string{
+	"between",
+	"ilike",
+	"in",
+	"like",
+	"of",
+	"ordinality",
+	"similar",
+	"time",
+	"generated",
+	"reset",
+	"role",
+	"user",
+	"on",
+	"tenant",
+	"set",
+	"for",
+	"execute",
+}
+
 // reservedOrLookaheadKeywords are the reserved keywords plus those keywords for
 // which we need one token of lookahead extra to determine their token type.
 var reservedOrLookaheadKeywords = make(map[string]struct{})
@@ -45,21 +60,7 @@ func init() {
 	for s := range reservedKeywords {
 		reservedOrLookaheadKeywords[s] = struct{}{}
 	}
-	for _, s := range []string{
-		"between",
-		"ilike",
-		"in",
-		"like",
-		"of",
-		"ordinality",
-		"similar",
-		"time",
-		"generated",
-		"reset",
-		"role",
-		"user",
-		"on",
-	} {
+	for _, s := range lookaheadKeywords {
 		reservedOrLookaheadKeywords[s] = struct{}{}
 	}
 }

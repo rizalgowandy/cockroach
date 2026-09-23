@@ -1,12 +1,9 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import * as d3 from "d3";
+import { arc } from "d3-shape";
 
 import * as vector from "src/util/vector";
 
@@ -19,8 +16,7 @@ export function createArcPath(
   endAngle: number,
   cornerRadius: number,
 ) {
-  return d3.svg
-    .arc()
+  return arc()
     .innerRadius(innerR)
     .outerRadius(outerR)
     .cornerRadius(cornerRadius)

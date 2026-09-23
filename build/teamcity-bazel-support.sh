@@ -1,115 +1,102 @@
+# Copyright 2021 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+if [ -z "${root:-}" ]
+then
+    echo '$root is not set; please source teamcity-support.sh'
+    exit 1
+fi
+
 # FYI: You can run `./dev builder` to run this Docker image. :)
-# `dev` depends on this variable! Don't change the name or format unless you
-# also update `dev` accordingly.
-BAZEL_IMAGE=cockroachdb/bazel:20211124-095044
+BAZEL_IMAGE=$(cat $root/build/.bazelbuilderversion)
+
+# Capture all "COCKROACH_*" environment variables, generating a string
+# in the format:
+#
+# -e COCKROACH_VAR1 -e COCKROACH_VAR2 ...
+#
+# This can be passed to the `docker` call in run_bazel, allowing
+# engineers to set COCKROACH_* variables via TeamCity and have those
+# set in the environment where `cockroach` runs.
+#
+# NB: `|| true` stops the command from returning 1 if there are no
+# COCKROACH_* variables; that would cause builds that use `pipefail`
+# to fail.
+DOCKER_EXPORT_COCKROACH_VARS=$(env | grep '^COCKROACH_' | cut -d= -f1 | sed -e 's/\(.*\)/-e \1/' | tr '\n' ' ') || true
 
 # Call `run_bazel $NAME_OF_SCRIPT` to start an appropriately-configured Docker
-# container with the `cockroachdb/bazel` image running the given script.
+# container with the `us-east1-docker.pkg.dev/crl-ci-images/cockroach/bazel`
+# image running the given script.
 # BAZEL_SUPPORT_EXTRA_DOCKER_ARGS will be passed on to `docker run` unchanged.
 run_bazel() {
-    if [ -z "${root:-}" ]
-    then
-        echo '$root is not set; please source teamcity-support.sh'
-        exit 1
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+        run_bazel_github "$@"
+        return
     fi
-
     # Set up volumes.
     # TeamCity uses git alternates, so make sure we mount the path to the real
     # git objects.
     teamcity_alternates="/home/agent/system/git"
     vols="--volume ${teamcity_alternates}:${teamcity_alternates}:ro"
+    vols="${vols} --volume ${TEAMCITY_BUILD_PROPERTIES_FILE}:${TEAMCITY_BUILD_PROPERTIES_FILE}:ro"
     artifacts_dir=$root/artifacts
     mkdir -p "$artifacts_dir"
     vols="${vols} --volume ${artifacts_dir}:/artifacts"
-    cache=/home/agent/.bzlhome
+    cache=/home/agent/.bzlhome24
     mkdir -p $cache
     vols="${vols} --volume ${root}:/go/src/github.com/cockroachdb/cockroach"
     vols="${vols} --volume ${cache}:/home/roach"
 
+    exit_status=0
     docker run -i ${tty-} --rm --init \
         -u "$(id -u):$(id -g)" \
         --workdir="/go/src/github.com/cockroachdb/cockroach" \
+	${DOCKER_EXPORT_COCKROACH_VARS} \
 	${BAZEL_SUPPORT_EXTRA_DOCKER_ARGS:+$BAZEL_SUPPORT_EXTRA_DOCKER_ARGS} \
         ${vols} \
-        $BAZEL_IMAGE "$@"
+        $BAZEL_IMAGE "$@" || exit_status=$?
+    rm -rf _bazel
+    return $exit_status
+}
+
+# GitHub Actions sibling of run_bazel. Kept separate so the TC body of
+# run_bazel above stays identical to its pre-GHA-migration form, which
+# lets TC-side fixes backport cleanly to release branches that don't
+# carry the GHA migration.
+run_bazel_github() {
+    artifacts_dir=$root/artifacts
+    mkdir -p "$artifacts_dir"
+    vols="--volume ${artifacts_dir}:/artifacts"
+    vols="${vols} --volume ${root}:/go/src/github.com/cockroachdb/cockroach"
+    cache="${RUNNER_TEMP:-/tmp}/.bzlhome"
+    mkdir -p "$cache"
+    vols="${vols} --volume ${cache}:/home/roach"
+    if [[ -n "${GOOGLE_GHA_CREDS_PATH:-}" && -f "${GOOGLE_GHA_CREDS_PATH}" ]]; then
+        vols="${vols} --volume ${GOOGLE_GHA_CREDS_PATH}:${GOOGLE_GHA_CREDS_PATH}:ro"
+        BAZEL_SUPPORT_EXTRA_DOCKER_ARGS="${BAZEL_SUPPORT_EXTRA_DOCKER_ARGS:-} -e CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=${GOOGLE_GHA_CREDS_PATH} -e GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_GHA_CREDS_PATH}"
+    fi
+
+    exit_status=0
+    docker run -i ${tty-} --rm --init \
+        -u "$(id -u):$(id -g)" \
+        --workdir="/go/src/github.com/cockroachdb/cockroach" \
+	${DOCKER_EXPORT_COCKROACH_VARS} \
+	${BAZEL_SUPPORT_EXTRA_DOCKER_ARGS:+$BAZEL_SUPPORT_EXTRA_DOCKER_ARGS} \
+        ${vols} \
+        $BAZEL_IMAGE "$@" || exit_status=$?
+    rm -rf _bazel
+    return $exit_status
+}
+
+# local copy of _tc_build_branch from teamcity-support.sh to avoid imports.
+_tc_build_branch() {
+    echo "${TC_BUILD_BRANCH#refs/heads/}"
 }
 
 # local copy of tc_release_branch from teamcity-support.sh to avoid imports.
 _tc_release_branch() {
-  [[ "$TC_BUILD_BRANCH" == master || "$TC_BUILD_BRANCH" == release-* || "$TC_BUILD_BRANCH" == provisional_* ]]
+  branch=$(_tc_build_branch)
+  [[ "$branch" == master || "$branch" == release-* || "$branch" == provisional_* ]]
 }
-
-# process_test_json processes logs and submits failures to GitHub
-# Requires GITHUB_API_TOKEN set for the release branches.
-# Accepts 5 arguments:
-# testfilter: path to the `testfilter` executable, usually
-#   `$BAZEL_BIN/pkg/cmd/testfilter/testfilter_/testfilter`
-# github_post: path to the `github-post` executable, usually
-#   `$BAZEL_BIN/pkg/cmd/github-post/github-post_/github-post`
-# artifacts_dir: usually `/artifacts`
-# test_json: path to test's JSON output, usually generated by `rules_go`'s and
-#   `GO_TEST_JSON_OUTPUT_FILE`. The file is removed after processing.
-# create_tarball: whether to create a tarball with full logs. If the test's
-#   exit code is passed, the tarball is generated on failures.
-process_test_json() {
-  local testfilter=$1
-  local github_post=$2
-  local artifacts_dir=$3
-  local test_json=$4
-  local create_tarball=$5
-
-  # move test.json.txt to the artifacts directory in order to simplify tarball creation
-  if [ ! -e $artifacts_dir/test.json.txt ]; then
-    mv -f $test_json $artifacts_dir/test.json.txt
-    test_json=$artifacts_dir/test.json.txt
-  fi
-
-  $testfilter -mode=strip < "$test_json" | $testfilter -mode=omit | $testfilter -mode=convert > "$artifacts_dir"/failures.txt
-  failures_size=$(stat --format=%s "$artifacts_dir"/failures.txt)
-  if [ $failures_size = 0 ]; then
-    rm -f "$artifacts_dir"/failures.txt
-  fi
-
-  if _tc_release_branch; then
-    if [ -z "${GITHUB_API_TOKEN-}" ]; then
-      # GITHUB_API_TOKEN must be in the env or github-post will barf if it's
-      # ever asked to post, so enforce that on all runs.
-      # The way this env var is made available here is quite tricky. The build
-      # calling this method is usually a build that is invoked from PRs, so it
-      # can't have secrets available to it (for the PR could modify
-      # build/teamcity-* to leak the secret). Instead, we provide the secrets
-      # to a higher-level job (Publish Bleeding Edge) and use TeamCity magic to
-      # pass that env var through when it's there. This means we won't have the
-      # env var on PR builds, but we'll have it for builds that are triggered
-      # from the release branches.
-      echo "GITHUB_API_TOKEN must be set"
-      exit 1
-    else
-      tc_start_block "post issues"
-      $github_post < "$test_json"
-      tc_end_block "post issues"
-    fi
-  fi
-
-  if [ "$create_tarball" -ne 0 ]; then
-    # Keep the debug file around for failed builds. Compress it to avoid
-    # clogging the agents with stuff we'll hopefully rarely ever need to
-    # look at.
-    # If the process failed, also save the full human-readable output. This is
-    # helpful in cases in which tests timed out, where it's difficult to blame
-    # the failure on any particular test. It's also a good alternative to poking
-    # around in test.json.txt itself when anything else we don't handle well happens,
-    # whatever that may be.
-    $testfilter -mode=convert < "$test_json" > "$artifacts_dir"/full_output.txt
-    (cd "$artifacts_dir" && tar --strip-components 1 -czf full_output.tgz full_output.txt $(basename $test_json))
-    rm -rf "$artifacts_dir"/full_output.txt
-  fi
-
-  rm -f "$test_json"
-
-  # Some unit tests test automatic ballast creation. These ballasts can be
-  # larger than the maximum artifact size. Remove any artifacts with the
-  # EMERGENCY_BALLAST filename.
-  find "$artifacts_dir" -name "EMERGENCY_BALLAST" -delete
-}
-

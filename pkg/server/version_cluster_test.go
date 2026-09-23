@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server_test
 
@@ -16,21 +11,21 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/migration"
-	"github.com/cockroachdb/cockroach/pkg/migration/migrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -116,7 +111,7 @@ func setupMixedCluster(
 	})
 
 	// We simulate crashes using this cluster, and having this enabled (which is
-	// a default migration) causes leaktest to complain.
+	// a default upgrade) causes leaktest to complain.
 	if _, err := tc.ServerConn(0).Exec("SET CLUSTER SETTING diagnostics.reporting.enabled = 'false'"); err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +134,20 @@ func prev(version roachpb.Version) roachpb.Version {
 		if version.Minor > 1 {
 			return roachpb.Version{Major: version.Major, Minor: version.Minor - 1}
 		}
-		// Here we assume that there's going to only be 2 releases per year.
-		// Otherwise we'd need to keep some history of what releases we've had.
+
+		// version is the first release of that year, e.g. MM.1
+
+		v25_1 := roachpb.Version{Major: 25, Minor: 1}
+		if v25_1.Equal(version) {
+			// For 2024, we had 3 releases that year.
+			return roachpb.Version{Major: 24, Minor: 3}
+		}
+		if v25_1.Less(version) {
+			// 2025 onwards, we had 4 releases per year.
+			return roachpb.Version{Major: version.Major - 1, Minor: 4}
+		}
+
+		// Prior to 2024, we had 2 releases per year.
 		return roachpb.Version{Major: version.Major - 1, Minor: 2}
 	}
 
@@ -151,7 +158,7 @@ func prev(version roachpb.Version) roachpb.Version {
 	// Logic for versions below 19.1.
 
 	if version.Major > 2 {
-		log.Fatalf(context.Background(), "can't compute previous version for %s", version)
+		log.Dev.Fatalf(context.Background(), "can't compute previous version for %s", version)
 	}
 
 	if version.Minor != 0 {
@@ -162,11 +169,55 @@ func prev(version roachpb.Version) roachpb.Version {
 	}
 }
 
+func TestPrev(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tests := []struct {
+		this, prev roachpb.Version
+	}{
+		// releases 2025+: 4 releases per year.
+		{
+			this: roachpb.Version{Major: 28, Minor: 4},
+			prev: roachpb.Version{Major: 28, Minor: 3},
+		},
+		{
+			this: roachpb.Version{Major: 28, Minor: 1},
+			prev: roachpb.Version{Major: 27, Minor: 4},
+		},
+		{
+			this: roachpb.Version{Major: 26, Minor: 1},
+			prev: roachpb.Version{Major: 25, Minor: 4},
+		},
+		// releases 2024: 3 releases per year.
+		{
+			this: roachpb.Version{Major: 25, Minor: 1},
+			prev: roachpb.Version{Major: 24, Minor: 3},
+		},
+		// releases 2019-2023: Calendar versioning, with 2 releases per year
+		{
+			this: roachpb.Version{Major: 24, Minor: 1},
+			prev: roachpb.Version{Major: 23, Minor: 2},
+		},
+		{
+			this: roachpb.Version{Major: 21, Minor: 1},
+			prev: roachpb.Version{Major: 20, Minor: 2},
+		},
+	}
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			if p := prev(test.this); p != test.prev {
+				t.Errorf("expected %s, got %s", test.prev, p)
+			}
+		})
+	}
+}
+
 func TestClusterVersionPersistedOnJoin(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	var newVersion = clusterversion.TestingBinaryVersion
+	var newVersion = clusterversion.Latest.Version()
 	var oldVersion = prev(newVersion)
 
 	// Starts 3 nodes that have cluster versions set to be oldVersion and
@@ -182,7 +233,7 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 
 	knobs := base.TestingKnobs{
 		Server: &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: 1,
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
 		},
 	}
 
@@ -193,14 +244,9 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 	defer tc.TestCluster.Stopper().Stop(ctx)
 
 	for i := 0; i < len(tc.TestCluster.Servers); i++ {
-		for _, engine := range tc.TestCluster.Servers[i].Engines() {
-			cv, err := kvserver.ReadClusterVersion(ctx, engine)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cv.Version != newVersion {
-				t.Fatalf("n%d: expected version %v, got %v", i+1, newVersion, cv)
-			}
+		for _, e := range tc.TestCluster.Servers[i].Engines() {
+			require.Equalf(t, newVersion, e.StateEngine().MinVersion(), "n%d", i+1)
+			require.Equalf(t, newVersion, e.LogEngine().MinVersion(), "n%d", i+1)
 		}
 	}
 }
@@ -208,22 +254,26 @@ func TestClusterVersionPersistedOnJoin(t *testing.T) {
 func TestClusterVersionUpgrade(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderShort(t, "test takes minutes")
+	skip.UnderRace(t, "takes >5mn under race")
+	skip.UnderStress(t, "takes >3mn under stress")
+
 	ctx := context.Background()
 
-	var newVersion = clusterversion.TestingBinaryVersion
+	var newVersion = clusterversion.Latest.Version()
 	var oldVersion = prev(newVersion)
 
-	knobs := base.TestingKnobs{
-		Server: &server.TestingKnobs{
-			BinaryVersionOverride:          oldVersion,
-			DisableAutomaticVersionUpgrade: 1,
-		},
-	}
-
+	disableUpgradeCh := make(chan struct{})
 	rawTC := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // speeds up test
 		ServerArgs: base.TestServerArgs{
-			Knobs: knobs,
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					ClusterVersionOverride:         oldVersion,
+					DisableAutomaticVersionUpgrade: disableUpgradeCh,
+				},
+			},
 		},
 	})
 	defer rawTC.Stopper().Stop(ctx)
@@ -244,33 +294,26 @@ func TestClusterVersionUpgrade(t *testing.T) {
 	}
 
 	// Set CLUSTER SETTING cluster.preserve_downgrade_option to oldVersion to prevent upgrade.
-	if err := tc.setDowngrade(0, oldVersion.String()); err != nil {
-		t.Fatalf("error setting CLUSTER SETTING cluster.preserve_downgrade_option: %s", err)
-	}
-	atomic.StoreInt32(&knobs.Server.(*server.TestingKnobs).DisableAutomaticVersionUpgrade, 0)
+	require.NoError(t, tc.setDowngrade(0, oldVersion.String()))
+	close(disableUpgradeCh)
 
 	// Check the cluster version is still oldVersion.
-	curVersion := tc.getVersionFromSelect(0)
-	if curVersion != oldVersion.String() {
-		t.Fatalf("cluster version should still be %s, but get %s", oldVersion, curVersion)
-	}
+	require.Equal(t, oldVersion.String(), tc.getVersionFromSelect(0))
 
 	// Reset cluster.preserve_downgrade_option to enable auto upgrade.
-	if err := tc.resetDowngrade(0); err != nil {
-		t.Fatalf("error resetting CLUSTER SETTING cluster.preserve_downgrade_option: %s", err)
-	}
+	require.NoError(t, tc.resetDowngrade(0))
 
 	// Check the cluster version is bumped to newVersion.
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		if version := tc.getVersionFromSelect(0); version != newVersion.String() {
-			return errors.Errorf("cluster version is still %s, should be %s", oldVersion, newVersion)
+			return errors.Errorf("cluster version is still %s, should be %s", version, newVersion)
 		}
 		return nil
-	})
-	curVersion = tc.getVersionFromSelect(0)
+	}, 3*time.Minute)
+	curVersion := tc.getVersionFromSelect(0)
 	isNoopUpdate := curVersion == newVersion.String()
 
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		for i := 0; i < tc.NumServers(); i++ {
 			st := tc.Servers[i].ClusterSettings()
 			v := st.Version.ActiveVersion(ctx)
@@ -278,20 +321,19 @@ func TestClusterVersionUpgrade(t *testing.T) {
 			if isActive := v.IsActiveVersion(newVersion); isActive != wantActive {
 				return errors.Errorf("%d: v%s active=%t (wanted %t)", i, newVersion, isActive, wantActive)
 			}
-
 			if tableV, curV := tc.getVersionFromSelect(i), v.String(); tableV != curV {
 				return errors.Errorf("%d: read v%s from table, v%s from setting", i, tableV, curV)
 			}
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 
 	exp := newVersion.String()
 
 	// Read the versions from the table from each node. Note that under the
 	// hood, everything goes to the lease holder and so it's pretty much
 	// guaranteed that they all read the same, but it doesn't hurt to check.
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		for i := 0; i < tc.NumServers(); i++ {
 			if version := tc.getVersionFromSelect(i); version != exp {
 				return errors.Errorf("%d: incorrect version %q (wanted %s)", i, version, exp)
@@ -301,13 +343,13 @@ func TestClusterVersionUpgrade(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 
 	// Now check the Settings.Version variable. That is the tricky one for which
 	// we "hold back" a gossip update until we've written to the engines. We may
 	// have to wait a bit until we see the new version here, even though it's
 	// already in the table.
-	testutils.SucceedsSoon(t, func() error {
+	testutils.SucceedsWithin(t, func() error {
 		for i := 0; i < tc.NumServers(); i++ {
 			vers := tc.Servers[i].ClusterSettings().Version.ActiveVersion(ctx)
 			if v := vers.String(); v == curVersion {
@@ -320,22 +362,15 @@ func TestClusterVersionUpgrade(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}, 3*time.Minute)
 
 	// Since the wrapped version setting exposes the new versions, it must
 	// definitely be present on all stores on the first try.
-	if err := tc.Servers[1].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
-		cv, err := kvserver.ReadClusterVersion(ctx, s.Engine())
-		if err != nil {
-			return err
-		}
-		if act := cv.Version.String(); act != exp {
-			t.Fatalf("%s: %s persisted, but should be %s", s, act, exp)
-		}
+	require.NoError(t, tc.Servers[1].GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
+		require.Equal(t, exp, s.StateEngine().MinVersion().String())
+		require.Equal(t, exp, s.LogEngine().MinVersion().String())
 		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	}))
 }
 
 // Test that, after cluster bootstrap, the different ways of getting the cluster
@@ -352,7 +387,7 @@ func TestAllVersionsAgree(t *testing.T) {
 		TestCluster: tcRaw,
 	}
 
-	exp := clusterversion.TestingBinaryVersion.String()
+	exp := clusterversion.Latest.String()
 
 	// The node bootstrapping the cluster starts at TestingBinaryVersion, the
 	// others start at TestingMinimumSupportedVersion and it takes them a gossip
@@ -374,20 +409,6 @@ func TestAllVersionsAgree(t *testing.T) {
 	})
 }
 
-// Returns two versions v0 and v1 which correspond to adjacent releases. v1 will
-// equal the TestingBinaryMinSupportedVersion to avoid rot in tests using this
-// (as we retire old versions).
-func v0v1() (roachpb.Version, roachpb.Version) {
-	v1 := clusterversion.TestingBinaryMinSupportedVersion
-	v0 := clusterversion.TestingBinaryMinSupportedVersion
-	if v0.Minor > 0 {
-		v0.Minor--
-	} else {
-		v0.Major--
-	}
-	return v0, v1
-}
-
 // TestClusterVersionMixedVersionTooOld verifies that we're unable to bump a
 // cluster version in a mixed node cluster where one of the nodes is running a
 // binary that cannot support the targeted cluster version.
@@ -400,7 +421,8 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 	// GOTRACEBACK=all, as it is on CI.
 	defer log.DisableTracebacks()()
 
-	v0, v1 := v0v1()
+	v0 := clusterversion.MinSupported.Version()
+	v1 := clusterversion.Latest.Version()
 	v0s := v0.String()
 	v1s := v1.String()
 
@@ -415,28 +437,27 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 	// Start by running v0.
 	knobs := base.TestingKnobs{
 		Server: &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: 1,
-			BinaryVersionOverride:          v0,
+			DisableAutomaticVersionUpgrade: make(chan struct{}),
+			ClusterVersionOverride:         v0,
 		},
-		// Inject a migration which would run to upgrade the cluster.
-		// We'll validate that we never create a job for this migration.
-		MigrationManager: &migration.TestingKnobs{
-			ListBetweenOverride: func(from, to clusterversion.ClusterVersion) []clusterversion.ClusterVersion {
-				return []clusterversion.ClusterVersion{to}
+		// Inject an upgrade which would run to upgrade the cluster.
+		// We'll validate that we never create a job for this upgrade.
+		UpgradeManager: &upgradebase.TestingKnobs{
+			ListBetweenOverride: func(from, to roachpb.Version) []roachpb.Version {
+				return []roachpb.Version{to}
 			},
-			RegistryOverride: func(cv clusterversion.ClusterVersion) (migration.Migration, bool) {
-				if !cv.Version.Equal(v1) {
+			RegistryOverride: func(cv roachpb.Version) (upgradebase.Upgrade, bool) {
+				if !cv.Equal(v1) {
 					return nil, false
 				}
-				return migration.NewTenantMigration("testing", clusterversion.ClusterVersion{
-					Version: v1,
-				},
-					migrations.NoPrecondition,
-					func(
-						ctx context.Context, version clusterversion.ClusterVersion, deps migration.TenantDeps, _ *jobs.Job,
-					) error {
+				return upgrade.NewTenantUpgrade("testing",
+					v1,
+					upgrade.NoPrecondition,
+					func(ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps) error {
 						return nil
-					}), true
+					},
+					upgrade.RestoreActionNotRequired("test"),
+				), true
 			},
 		},
 	}
@@ -471,10 +492,10 @@ func TestClusterVersionMixedVersionTooOld(t *testing.T) {
 		})
 	}
 
-	// Ensure that no migration jobs got created.
+	// Ensure that no upgrade jobs got created.
 	{
 		sqlutils.MakeSQLRunner(tc.ServerConn(0)).CheckQueryResults(
-			t, "SELECT * FROM crdb_internal.jobs WHERE job_type = 'MIGRATION'", [][]string{})
+			t, "SELECT * FROM crdb_internal.jobs WHERE job_type = 'upgrade'", [][]string{})
 	}
 
 	// Check that we can still talk to the first three nodes.

@@ -1,18 +1,14 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
@@ -22,6 +18,42 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
+
+// getTargetByPolicyRLocked returns a range's closed timestamp policy and target
+// timestamp.
+func (r *Replica) getTargetByPolicyRLocked(
+	targetByPolicy map[ctpb.RangeClosedTimestampPolicy]hlc.Timestamp,
+) (ctpb.RangeClosedTimestampPolicy, hlc.Timestamp) {
+	policy := closedTimestampPolicy(r.descRLocked(), *r.cachedClosedTimestampPolicy.Load())
+	target, ok := targetByPolicy[policy]
+	if ok {
+		return policy, target
+	}
+	// If the range's policy is not found in targetByPolicy, fall back to
+	// LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO.
+	//
+	// This fallback handles race conditions between the policy refresher and side
+	// transport during cluster version upgrades. The race can occur in this
+	// sequence:
+	// 1. Side transport prepares a policy map before cluster upgrade is
+	// complete.
+	// 2. Cluster upgrade completes.
+	// 3. Policy refresher sees the upgrade and quickly updates replica policies
+	// to use latency-based policies.
+	// 4. Replica tries to use a latency-based policy but the policy map from step
+	// 1 doesn't include it yet.
+	//
+	// In this case, we temporarily fall back to the no-latency policy until the
+	// side transport catches up with the new cluster version.
+	// TODO(wenyihu6): remove this fallback once version compatibility with v25.1
+	// is no longer a concern
+	if policy >= ctpb.LEAD_FOR_GLOBAL_READS_LATENCY_LESS_THAN_20MS &&
+		policy <= ctpb.LEAD_FOR_GLOBAL_READS_LATENCY_EQUAL_OR_GREATER_THAN_300MS {
+		return ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO,
+			targetByPolicy[ctpb.LEAD_FOR_GLOBAL_READS_WITH_NO_LATENCY_INFO]
+	}
+	panic("unexpected: policy not found in targetByPolicy")
+}
 
 // BumpSideTransportClosed advances the range's closed timestamp if it can. If
 // the closed timestamp is advanced, the function synchronizes with incoming
@@ -37,7 +69,7 @@ import (
 func (r *Replica) BumpSideTransportClosed(
 	ctx context.Context,
 	now hlc.ClockTimestamp,
-	targetByPolicy [roachpb.MAX_CLOSED_TIMESTAMP_POLICY]hlc.Timestamp,
+	targetByPolicy map[ctpb.RangeClosedTimestampPolicy]hlc.Timestamp,
 ) sidetransport.BumpSideTransportClosedResult {
 	var res sidetransport.BumpSideTransportClosedResult
 	r.mu.Lock()
@@ -54,10 +86,10 @@ func (r *Replica) BumpSideTransportClosed(
 		return res
 	}
 
-	lai := ctpb.LAI(r.mu.state.LeaseAppliedIndex)
-	policy := r.closedTimestampPolicyRLocked()
-	target := targetByPolicy[policy]
-	st := r.leaseStatusForRequestRLocked(ctx, now, hlc.Timestamp{} /* reqTS */)
+	lai := r.shMu.state.LeaseAppliedIndex
+	policy, target := r.getTargetByPolicyRLocked(targetByPolicy)
+	st := r.leaseStatusForRequest(ctx, now, hlc.Timestamp{} /* reqTS */, r.mu.minLeaseProposedTS,
+		r.mu.minValidObservedTimestamp, r.shMu.state.Lease, r.raftBasicStatusRLocked())
 	// We need to own the lease but note that stasis (LeaseState_UNUSABLE) doesn't
 	// matter.
 	valid := st.IsValid() || st.State == kvserverpb.LeaseState_UNUSABLE
@@ -123,14 +155,15 @@ func (r *Replica) closedTimestampTargetRLocked() hlc.Timestamp {
 		closedts.TargetDuration.Get(&r.ClusterSettings().SV),
 		closedts.LeadForGlobalReadsOverride.Get(&r.ClusterSettings().SV),
 		closedts.SideTransportCloseInterval.Get(&r.ClusterSettings().SV),
-		r.closedTimestampPolicyRLocked(),
+		closedts.SideTransportPacingRefreshInterval.Get(&r.ClusterSettings().SV),
+		closedTimestampPolicy(r.descRLocked(), *r.cachedClosedTimestampPolicy.Load()),
 	)
 }
 
 // ForwardSideTransportClosedTimestamp forwards the side-transport closed
 // timestamp. It is called by the closed timestamp side-transport receiver.
 func (r *Replica) ForwardSideTransportClosedTimestamp(
-	ctx context.Context, closed hlc.Timestamp, lai ctpb.LAI,
+	ctx context.Context, closed hlc.Timestamp, lai kvpb.LeaseAppliedIndex,
 ) {
 	// We pass knownApplied = false because we don't know whether this lease
 	// applied index has been applied locally yet.
@@ -177,7 +210,7 @@ type sidetransportAccess struct {
 type sidetransportReceiver interface {
 	GetClosedTimestamp(
 		ctx context.Context, rangeID roachpb.RangeID, leaseholderNode roachpb.NodeID,
-	) (hlc.Timestamp, ctpb.LAI)
+	) (hlc.Timestamp, kvpb.LeaseAppliedIndex)
 	HTML() string
 }
 
@@ -186,7 +219,7 @@ type sidetransportReceiver interface {
 // lease applied index has been locally applied.
 type closedTimestamp struct {
 	ts  hlc.Timestamp
-	lai ctpb.LAI
+	lai kvpb.LeaseAppliedIndex
 }
 
 // regression returns whether the combination of the two closed timestamps
@@ -226,7 +259,7 @@ func (st *sidetransportAccess) init(receiver sidetransportReceiver, rangeID roac
 //
 // The method returns the current applied closed timestamp.
 func (st *sidetransportAccess) forward(
-	ctx context.Context, closed hlc.Timestamp, lai ctpb.LAI, knownApplied bool,
+	ctx context.Context, closed hlc.Timestamp, lai kvpb.LeaseAppliedIndex, knownApplied bool,
 ) closedTimestamp {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -260,7 +293,7 @@ func (st *sidetransportAccess) forward(
 
 func (st *sidetransportAccess) assertNoRegression(ctx context.Context, cur, up closedTimestamp) {
 	if cur.regression(up) {
-		log.Fatalf(ctx, "side-transport update saw closed timestamp regression on r%d: "+
+		log.KvExec.Fatalf(ctx, "side-transport update saw closed timestamp regression on r%d: "+
 			"(lai=%d, ts=%s) -> (lai=%d, ts=%s)", st.rangeID, cur.lai, cur.ts, up.lai, up.ts)
 	}
 }
@@ -280,7 +313,10 @@ func (st *sidetransportAccess) assertNoRegression(ctx context.Context, cur, up c
 // previous caller passed in. This means that get can be called without holding
 // the replica.mu.
 func (st *sidetransportAccess) get(
-	ctx context.Context, leaseholder roachpb.NodeID, appliedLAI ctpb.LAI, sufficient hlc.Timestamp,
+	ctx context.Context,
+	leaseholder roachpb.NodeID,
+	appliedLAI kvpb.LeaseAppliedIndex,
+	sufficient hlc.Timestamp,
 ) hlc.Timestamp {
 	st.mu.RLock()
 	cur, next := st.mu.cur, st.mu.next

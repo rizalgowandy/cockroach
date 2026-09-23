@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -15,19 +10,21 @@ import (
 	"context"
 	gosql "database/sql"
 	"errors"
+	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -69,7 +66,7 @@ func hasManuallySplitRangesInSpan(
 		if err := r.ValueProto(&desc); err != nil {
 			t.Fatal(err)
 		}
-		if !desc.GetStickyBit().IsEmpty() {
+		if !desc.StickyBit.IsEmpty() {
 			return true
 		}
 	}
@@ -79,7 +76,12 @@ func hasManuallySplitRangesInSpan(
 // hasManuallySplitRangesOnIndex checks whether there is any range of an index
 // has stick bit.
 func hasManuallySplitRangesOnIndex(
-	ctx context.Context, t *testing.T, kvDB *kv.DB, tableSpan roachpb.Span, indexID descpb.IndexID,
+	ctx context.Context,
+	t *testing.T,
+	codec keys.SQLCodec,
+	kvDB *kv.DB,
+	tableSpan roachpb.Span,
+	indexID descpb.IndexID,
 ) bool {
 	ranges, err := kvclient.ScanMetaKVs(ctx, kvDB.NewTxn(ctx, "drop index unsplit test"), tableSpan)
 	if err != nil {
@@ -91,11 +93,11 @@ func hasManuallySplitRangesOnIndex(
 		if err := ranges[i].ValueProto(&desc); err != nil {
 			t.Fatal(err)
 		}
-		_, _, foundIndexID, err := keys.SystemSQLCodec.DecodeIndexPrefix(roachpb.Key(desc.StartKey))
+		_, _, foundIndexID, err := codec.DecodeIndexPrefix(roachpb.Key(desc.StartKey))
 		if err != nil {
 			continue
 		}
-		if indexID == descpb.IndexID(foundIndexID) && !desc.GetStickyBit().IsEmpty() {
+		if indexID == descpb.IndexID(foundIndexID) && !desc.StickyBit.IsEmpty() {
 			return true
 		}
 	}
@@ -103,9 +105,9 @@ func hasManuallySplitRangesOnIndex(
 	return false
 }
 
-// splitLastRangeInSpan split the last range into two ranges,
+// splitFirstRangeInSpan split the first range into two ranges,
 // and check the new range has sticky bit set.
-func splitLastRangeInSpan(
+func splitFirstRangeInSpan(
 	ctx context.Context, t *testing.T, kvDB *kv.DB, tableSpan roachpb.Span,
 ) roachpb.Key {
 	metaStartKey := keys.RangeMetaKey(keys.MustAddr(tableSpan.Key))
@@ -114,12 +116,18 @@ func splitLastRangeInSpan(
 	if err != nil {
 		t.Fatal(err)
 	}
-	lastRange := ranges[len(ranges)-1]
-	var lastRangeDesc roachpb.RangeDescriptor
-	if err := lastRange.ValueProto(&lastRangeDesc); err != nil {
-		t.Fatal(err)
+	var firstRangeDesc roachpb.RangeDescriptor
+	for _, r := range ranges {
+		var rDesc roachpb.RangeDescriptor
+		if err := r.ValueProto(&rDesc); err != nil {
+			t.Fatal(err)
+		}
+		// Find the first range that's within the table span.
+		if bytes.Compare(rDesc.StartKey, tableSpan.Key) <= 0 {
+			firstRangeDesc = rDesc
+		}
 	}
-	splitKey := getMidKeyInSpan(t, kvDB, lastRangeDesc.StartKey, lastRangeDesc.EndKey)
+	splitKey := getMidKeyInSpan(t, kvDB, firstRangeDesc.StartKey, firstRangeDesc.EndKey)
 	splitKey, err = keys.EnsureSafeSplitKey(splitKey)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +156,7 @@ func rangeIsManuallySplit(
 		if err := r.ValueProto(&desc); err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Equal(desc.StartKey.AsRawKey(), startKey) && !desc.GetStickyBit().IsEmpty() {
+		if bytes.Equal(desc.StartKey.AsRawKey(), startKey) && !desc.StickyBit.IsEmpty() {
 			return true
 		}
 	}
@@ -156,12 +164,7 @@ func rangeIsManuallySplit(
 }
 
 // Test that manually split ranges get unsplit when dropping a
-// table/database/index or truncating a table. It verifies that the logic is
-// working on both the old (before version `UnsplitRangesInAsyncGCJobs`) and new
-// (from versiom `UnsplitRangesInAsyncGCJobs`) pathes.
-// TODO(Chengxiong): remove test for test cases with binary version
-// "clusterversion.UnsplitRangesInAsyncGCJobs - 1" and update this comment in
-// 22.2.
+// table/database/index or truncating a table.
 func TestUnsplitRanges(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -174,9 +177,7 @@ func TestUnsplitRanges(t *testing.T) {
 	//
 	// For each testcase we execute a statement represented by the testcase's
 	// query string to either drop the table/database/index or truncate the table.
-	// The Unsplit logic is then triggered through either the new or old code
-	// path, determined by the "binaryVersion" assigned. For the new code path,
-	// ranges are not unsplit until the gc job is kicked off. So we wait until it
+	// Ranges are not unsplit until the gc job is kicked off. So we wait until it
 	// succeeds.
 	//
 	// In the end, expected results are verified based on the testcase's settings.
@@ -184,9 +185,8 @@ func TestUnsplitRanges(t *testing.T) {
 	// Then we checked if there are still split ranges start with key "splitKey"
 	// and on the table in overall.
 	type testCase struct {
-		name          string
-		query         string
-		binaryVersion clusterversion.Key
+		name  string
+		query string
 		// allKeyCntAfterGC is the expected keys count of the whole table.
 		// For example, we expect it to be 0 when dropping a table because all data
 		// should be gone, while 2*numRows is expected if only index "foo" is being
@@ -206,22 +206,23 @@ func TestUnsplitRanges(t *testing.T) {
 		hasSplitOnKeyAfterGC bool
 		// gcSucceedFunc is called within testutils.SucceedsSoon() to make sure gc
 		// worked. Different statements need has different success condition.
-		gcSucceedFunc func(kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error
+		gcSucceedFunc func(codec keys.SQLCodec, kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error
 	}
 
-	const numRows = 2*row.TableTruncateChunkSize + 1
+	const deprecatedTableTruncateChunkSize = 600
+	const numRows = 2*deprecatedTableTruncateChunkSize + 1
 	const numKeys = 3 * numRows
 	const tableName string = "test1"
 
-	tableDropSucceed := func(kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error {
+	tableDropSucceed := func(codec keys.SQLCodec, kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error {
 		if err := descExists(sqlDB, false, tableDesc.GetID()); err != nil {
 			return err
 		}
 		return zoneExists(sqlDB, nil, tableDesc.GetID())
 	}
 
-	tableTruncateSucceed := func(kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error {
-		tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
+	tableTruncateSucceed := func(codec keys.SQLCodec, kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error {
+		tableSpan := tableDesc.TableSpan(codec)
 		if kvs, err := kvDB.Scan(context.Background(), tableSpan.Key, tableSpan.EndKey, 0); err != nil {
 			return err
 		} else if len(kvs) != 0 {
@@ -230,7 +231,7 @@ func TestUnsplitRanges(t *testing.T) {
 		return nil
 	}
 
-	indexDropSucceed := func(kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error {
+	indexDropSucceed := func(codec keys.SQLCodec, kvDB *kv.DB, sqlDB *gosql.DB, tableDesc catalog.TableDescriptor, indexSpan roachpb.Span) error {
 		if kvs, err := kvDB.Scan(context.Background(), indexSpan.Key, indexSpan.EndKey, 0); err != nil {
 			return err
 		} else if len(kvs) != 0 {
@@ -241,27 +242,8 @@ func TestUnsplitRanges(t *testing.T) {
 
 	testCases := []testCase{
 		{
-			name:                   "drop-table-unsplit-sync",
-			query:                  "DROP TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
-			allKeyCntAfterGC:       0,
-			hasSplitOnTableAfterGC: false,
-			hasSplitOnKeyAfterGC:   false,
-			gcSucceedFunc:          tableDropSucceed,
-		},
-		{
 			name:                   "drop-table-unsplit-async",
 			query:                  "DROP TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
-			allKeyCntAfterGC:       0,
-			hasSplitOnTableAfterGC: false,
-			hasSplitOnKeyAfterGC:   false,
-			gcSucceedFunc:          tableDropSucceed,
-		},
-		{
-			name:                   "drop-database-unsplit-sync",
-			query:                  "DROP DATABASE t",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
 			allKeyCntAfterGC:       0,
 			hasSplitOnTableAfterGC: false,
 			hasSplitOnKeyAfterGC:   false,
@@ -270,43 +252,22 @@ func TestUnsplitRanges(t *testing.T) {
 		{
 			name:                   "drop-database-unsplit-async",
 			query:                  "DROP DATABASE t",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
 			allKeyCntAfterGC:       0,
 			hasSplitOnTableAfterGC: false,
 			hasSplitOnKeyAfterGC:   false,
 			gcSucceedFunc:          tableDropSucceed,
 		},
 		{
-			name:                   "truncate-table-unsplit-sync",
-			query:                  "TRUNCATE TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
-			allKeyCntAfterGC:       0,
-			hasSplitOnTableAfterGC: true, // It's true since we copy split points.
-			hasSplitOnKeyAfterGC:   false,
-			gcSucceedFunc:          tableTruncateSucceed,
-		},
-		{
 			name:                   "truncate-table-unsplit-async",
 			query:                  "TRUNCATE TABLE t.test1",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
 			allKeyCntAfterGC:       0,
 			hasSplitOnTableAfterGC: true, // It's true since we copy split points.
 			hasSplitOnKeyAfterGC:   false,
 			gcSucceedFunc:          tableTruncateSucceed,
-		},
-		{
-			name:                   "drop-index-unsplit-sync",
-			query:                  "DROP INDEX t.test1@foo",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs - 1,
-			allKeyCntAfterGC:       numRows * 2,
-			hasSplitOnTableAfterGC: true, // It's true since we only unsplit ranges of index foo
-			hasSplitOnKeyAfterGC:   true,
-			gcSucceedFunc:          indexDropSucceed,
 		},
 		{
 			name:                   "drop-index-unsplit-async",
 			query:                  "DROP INDEX t.test1@foo",
-			binaryVersion:          clusterversion.UnsplitRangesInAsyncGCJobs,
 			allKeyCntAfterGC:       numRows * 2,
 			hasSplitOnTableAfterGC: true, // It's true since we only unsplit ranges of index foo
 			hasSplitOnKeyAfterGC:   true,
@@ -316,65 +277,81 @@ func TestUnsplitRanges(t *testing.T) {
 
 	ctx := context.Background()
 	run := func(t *testing.T, tc testCase) {
-		params, _ := tests.CreateTestServerParams()
-		// Override binary version to be older.
-		params.Knobs.Server = &server.TestingKnobs{
-			DisableAutomaticVersionUpgrade: 1,
-			BinaryVersionOverride:          clusterversion.ByKey(tc.binaryVersion),
+		var params base.TestServerArgs
+		params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+		params.Knobs.GCJob = &sql.GCJobTestingKnobs{
+			SkipWaitingForMVCCGC: true,
 		}
 
 		defer gcjob.SetSmallMaxGCIntervalForTest()()
 
-		s, sqlDB, kvDB := serverutils.StartServer(t, params)
-		defer s.Stopper().Stop(context.Background())
+		srv, sqlDB, _ := serverutils.StartServer(t, params)
+		defer srv.Stopper().Stop(context.Background())
+		s := srv.ApplicationLayer()
+		// Disable the small-table size check so index backfills always
+		// create splits, matching the expectations of this test.
+		sql.SkipBackfillSplitsForSmallTables.Override(ctx, &s.ClusterSettings().SV, false)
+		// Use the application layer's DB for table data operations.
+		kvDB := s.DB()
+		// Use the system layer's DB for meta range operations (scanning meta
+		// ranges, checking sticky bits) since tenants cannot access meta ranges.
+		systemKVDB := srv.SystemLayer().DB()
+
+		// Grant the CanAdminUnsplit capability to the external tenant so the GC
+		// job can unsplit ranges.
+		if srv.DeploymentMode().IsExternal() {
+			require.NoError(t, srv.GrantTenantCapabilities(
+				ctx, serverutils.TestTenantID(),
+				map[tenantcapabilitiespb.ID]string{tenantcapabilitiespb.CanAdminUnsplit: "true"}))
+		}
+
+		// Speed up how long it takes for the zone config changes to propagate.
+		sqltestutils.SetShortRangeFeedIntervals(t, srv)
 
 		// Disable strict GC TTL enforcement because we're going to shove a zero-value
 		// TTL into the system with AddImmediateGCZoneConfig.
 		defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
 
 		require.NoError(t, tests.CreateKVTable(sqlDB, tableName, numRows))
+		_, err := sqlDB.Exec(fmt.Sprintf(`ALTER TABLE t.%s SET (schema_locked=false)`, tableName))
+		require.NoError(t, err)
 
-		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
-		tableSpan := tableDesc.TableSpan(keys.SystemSQLCodec)
+		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "t", tableName)
+		tableSpan := tableDesc.TableSpan(s.Codec())
 		tests.CheckKeyCount(t, kvDB, tableSpan, numKeys)
 
-		idx, err := tableDesc.FindIndexWithName("foo")
+		idx, err := catalog.MustFindIndexByName(tableDesc, "foo")
 		if err != nil {
 			t.Fatal(err)
 		}
-		indexSpan := tableDesc.IndexSpan(keys.SystemSQLCodec, idx.GetID())
+		indexSpan := tableDesc.IndexSpan(s.Codec(), idx.GetID())
 		tests.CheckKeyCount(t, kvDB, indexSpan, numRows)
 
-		// Split the last range.
-		splitKey := splitLastRangeInSpan(ctx, t, kvDB, tableSpan)
-		// Verify there are manually split ranges.
-		require.True(t, rangeIsManuallySplit(ctx, t, kvDB, tableSpan, splitKey))
-		require.True(t, hasManuallySplitRangesInSpan(ctx, t, kvDB, tableSpan))
-		require.True(t, hasManuallySplitRangesOnIndex(ctx, t, kvDB, tableSpan, idx.GetID()))
+		// Split the first range in the table using the system layer's DB.
+		splitKey := splitFirstRangeInSpan(ctx, t, systemKVDB, tableSpan)
+		// Verify there are manually split ranges using the system layer's DB.
+		require.True(t, rangeIsManuallySplit(ctx, t, systemKVDB, tableSpan, splitKey))
+		require.True(t, hasManuallySplitRangesInSpan(ctx, t, systemKVDB, tableSpan))
+		require.True(t, hasManuallySplitRangesOnIndex(ctx, t, s.Codec(), systemKVDB, tableSpan, idx.GetID()))
 
 		if _, err := sqlDB.Exec(tc.query); err != nil {
-			t.Fatal(err)
-		}
-		// Push a new zone config for a few tables with TTL=0 so the data
-		// is deleted immediately.
-		if _, err := sqltestutils.AddImmediateGCZoneConfig(sqlDB, tableDesc.GetID()); err != nil {
 			t.Fatal(err)
 		}
 
 		// Check GC worked!
 		testutils.SucceedsSoon(t, func() error {
-			return tc.gcSucceedFunc(kvDB, sqlDB, tableDesc, indexSpan)
+			return tc.gcSucceedFunc(s.Codec(), kvDB, sqlDB, tableDesc, indexSpan)
 		})
 		tests.CheckKeyCount(t, kvDB, tableSpan, tc.allKeyCntAfterGC)
 		// There should be always zero keys left since dropping index/table/database or
 		// truncating table all remove index "foo".
 		tests.CheckKeyCount(t, kvDB, indexSpan, 0 /*numKeys*/)
 
-		require.Equal(t, tc.hasSplitOnKeyAfterGC, rangeIsManuallySplit(ctx, t, kvDB, tableSpan, splitKey))
-		require.Equal(t, tc.hasSplitOnTableAfterGC, hasManuallySplitRangesInSpan(ctx, t, kvDB, tableSpan))
+		require.Equal(t, tc.hasSplitOnKeyAfterGC, rangeIsManuallySplit(ctx, t, systemKVDB, tableSpan, splitKey))
+		require.Equal(t, tc.hasSplitOnTableAfterGC, hasManuallySplitRangesInSpan(ctx, t, systemKVDB, tableSpan))
 		// This should be always false since dropping index/table/database or
 		// truncating table all remove index "foo".
-		require.False(t, hasManuallySplitRangesOnIndex(ctx, t, kvDB, tableSpan, idx.GetID()))
+		require.False(t, hasManuallySplitRangesOnIndex(ctx, t, s.Codec(), systemKVDB, tableSpan, idx.GetID()))
 	}
 
 	for _, tc := range testCases {

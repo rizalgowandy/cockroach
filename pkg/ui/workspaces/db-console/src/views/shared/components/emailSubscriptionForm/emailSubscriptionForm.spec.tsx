@@ -1,79 +1,56 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import { render, screen, fireEvent } from "@testing-library/react";
 import React from "react";
-import { assert } from "chai";
-import { mount, ReactWrapper } from "enzyme";
-import sinon, { SinonSpy } from "sinon";
-import classNames from "classnames/bind";
 
-import "src/enzymeInit";
 import { EmailSubscriptionForm } from "./index";
-import buttonStyles from "src/components/button/button.module.styl";
-
-const cx = classNames.bind(buttonStyles);
-const sandbox = sinon.createSandbox();
 
 describe("EmailSubscriptionForm", () => {
-  let wrapper: ReactWrapper;
-  let onSubmitHandler: SinonSpy;
+  const onSubmitHandler = jest.fn();
 
   beforeEach(() => {
-    sandbox.reset();
-    onSubmitHandler = sandbox.spy();
-    wrapper = mount(<EmailSubscriptionForm onSubmit={onSubmitHandler} />);
+    onSubmitHandler.mockReset();
   });
 
   describe("when correct email", () => {
     it("provides entered email on submit callback", () => {
+      render(<EmailSubscriptionForm onSubmit={onSubmitHandler} />);
       const emailAddress = "foo@bar.com";
-      const inputComponent = wrapper.find("input.crl-input__text").first();
-      inputComponent.simulate("change", { target: { value: emailAddress } });
-      const buttonComponent = wrapper
-        .find(`button.${cx("crl-button")}`)
-        .first();
-      buttonComponent.simulate("click");
+      fireEvent.change(screen.getByPlaceholderText("Enter your email"), {
+        target: { value: emailAddress },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Sign up" }));
 
-      onSubmitHandler.calledOnceWith(emailAddress);
+      expect(onSubmitHandler).toHaveBeenCalledWith(emailAddress);
     });
   });
 
   describe("when invalid email", () => {
     beforeEach(() => {
-      const emailAddress = "foo";
-      const inputComponent = wrapper.find("input.crl-input__text").first();
-      inputComponent.simulate("change", { target: { value: emailAddress } });
-      inputComponent.simulate("blur");
+      render(<EmailSubscriptionForm onSubmit={onSubmitHandler} />);
+      const input = screen.getByPlaceholderText("Enter your email");
+      fireEvent.change(input, { target: { value: "foo" } });
+      fireEvent.blur(input);
     });
 
     it("doesn't call onSubmit callback", () => {
-      const buttonComponent = wrapper
-        .find(`button.${cx("crl-button")}`)
-        .first();
-      buttonComponent.simulate("click");
-      assert.isTrue(onSubmitHandler.notCalled);
+      fireEvent.click(screen.getByRole("button", { name: "Sign up" }));
+      expect(onSubmitHandler).not.toHaveBeenCalled();
     });
 
     it("submit button is disabled", () => {
-      const buttonComponent = wrapper
-        .find(`button.${cx("crl-button")}.${cx("crl-button--disabled")}`)
-        .first();
-      assert.isTrue(buttonComponent.exists());
+      const button = screen.getByRole("button", {
+        name: "Sign up",
+      }) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
     });
 
     it("validation message is shown", () => {
-      const validationMessageWrapper = wrapper
-        .find(".crl-input__text--error-message")
-        .first();
-      assert.isTrue(validationMessageWrapper.exists());
-      assert.equal(validationMessageWrapper.text(), "Invalid email address.");
+      const errorMessage = screen.getByText("Invalid email address.");
+      expect(errorMessage).toBeDefined();
     });
   });
 });

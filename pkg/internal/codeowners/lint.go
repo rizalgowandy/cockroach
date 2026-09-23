@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package codeowners
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,11 +56,15 @@ func LintEverythingIsOwned(
 	skip := map[string]struct{}{
 		filepath.Join("ccl", "ccl_init.go"): {},
 		filepath.Join("node_modules"):       {},
-		filepath.Join("yarn-vendor"):        {},
 		"Makefile":                          {},
 		"BUILD.bazel":                       {},
 		".gitignore":                        {},
 		"README.md":                         {},
+	}
+	skipGlobs := []string{
+		"#*#", // editor backup files.
+		"*~",  // editor backup files.
+		".*",  // .DS_Store, vim temp files, etc.
 	}
 
 	// Map of (unowned dir relative to walkRoot) -> (triggering file relative to walkRoot).
@@ -73,14 +73,14 @@ func LintEverythingIsOwned(
 
 	walkRoot := filepath.Join(repoRoot, walkDir)
 
-	unownedWalkFn := func(path string, info os.FileInfo) error {
+	unownedWalkFn := func(path string, d fs.DirEntry) error {
 		teams := co.Match(path)
 		if len(teams) > 0 {
 			// The file has an owner, so nothing to report.
 			debug("%s <- has team(s) %v", path, teams)
 			return nil
 		}
-		if !info.IsDir() {
+		if !d.IsDir() {
 			// We're looking at a file that has no owner.
 			//
 			// Let's say `path = ./pkg/foo/bar/baz.go`.
@@ -91,6 +91,7 @@ func LintEverythingIsOwned(
 			// the file itself as unowned, but most of the time we have
 			// one owner for the directory and also the failures get less
 			// noisy by tracking per-directory.
+			debug("found unowned file: %s", path)
 			parts := strings.Split(path, string(filepath.Separator))
 			var ok bool
 			for i := range parts {
@@ -102,7 +103,7 @@ func LintEverythingIsOwned(
 				}
 			}
 			if !ok {
-				debug("unowned: %s", path)
+				debug("adding unowned: %s", path)
 				unowned[filepath.Dir(path)] = path
 			}
 		}
@@ -113,7 +114,7 @@ func LintEverythingIsOwned(
 	for len(dirsToWalk) != 0 {
 		// We first visit each directory's files, and then the subdirectories.
 		// See TestLintEverythingIsOwned for details.
-		require.NoError(t, filepath.Walk(dirsToWalk[0], func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, filepath.WalkDir(dirsToWalk[0], func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -125,30 +126,49 @@ func LintEverythingIsOwned(
 				return err
 			}
 
-			if _, ok := skip[relPath]; ok {
-				debug("skipping %s", relPath)
-				if info.IsDir() {
-					return filepath.SkipDir
+			if relPath != "." {
+				// We only apply filtering to relPath entries that are not ".".
+				// Directory-level matching for directory a/b is handled when entry "b"
+				// is matched inside directory "a".
+
+				if _, ok := skip[relPath]; ok {
+					debug("skipping %s", relPath)
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
 				}
-				return nil
-			}
-			fname := filepath.Base(relPath)
-			if _, ok := skip[fname]; ok {
-				debug("skipping %s", relPath)
-				if info.IsDir() {
-					return filepath.SkipDir
+				for _, g := range skipGlobs {
+					ok, err := filepath.Match(g, relPath)
+					if err != nil {
+						return err
+					}
+					if ok {
+						debug("skipping %s", relPath)
+						if d.IsDir() {
+							return filepath.SkipDir
+						}
+						return nil
+					}
 				}
-				return nil
+				fname := filepath.Base(relPath)
+				if _, ok := skip[fname]; ok {
+					debug("skipping %s", relPath)
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
 			}
 
-			if info.IsDir() {
+			if d.IsDir() {
 				if path == dirsToWalk[0] {
 					return nil
 				}
 				dirsToWalk = append(dirsToWalk, path)
 				return filepath.SkipDir
 			}
-			return unownedWalkFn(filepath.Join(walkDir, relPath), info)
+			return unownedWalkFn(filepath.Join(walkDir, relPath), d)
 		}))
 		dirsToWalk = dirsToWalk[1:]
 	}
@@ -168,4 +188,64 @@ Remove the '-noreview' suffix if the team should be requested for Github reviews
 
 %s`, buf.String())
 	}
+}
+
+// LintNoStalePaths checks that every path pattern in the CODEOWNERS file
+// corresponds to something that actually exists in the repository. It returns
+// a list of stale patterns.
+func LintNoStalePaths(co *CodeOwners, repoRoot string) []string {
+	var stale []string
+	for _, rule := range co.rules {
+		pattern := rule.Pattern
+		if !pathPatternExists(pattern, repoRoot) {
+			stale = append(stale, pattern)
+		}
+	}
+	return stale
+}
+
+// pathPatternExists checks whether a CODEOWNERS path pattern matches
+// anything in the repository.
+func pathPatternExists(pattern, repoRoot string) bool {
+	if strings.Contains(pattern, "**") {
+		// Double-star pattern (e.g. **.pb.go, **/BUILD.bazel): extract the
+		// filename suffix after the last / and search recursively.
+		filename := filepath.Base(pattern)
+		// Strip leading stars to get the suffix, e.g. "**.pb.go" -> ".pb.go".
+		suffix := strings.TrimLeft(filename, "*")
+		if suffix == "" {
+			// A pattern like "**" matches everything.
+			return true
+		}
+		found := false
+		err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(d.Name(), suffix) {
+				found = true
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		return found && err == nil
+	}
+
+	if strings.Contains(pattern, "*") {
+		// Single-star glob: expand relative to repo root.
+		full := filepath.Join(repoRoot, pattern)
+		matches, _ := filepath.Glob(full)
+		return len(matches) > 0
+	}
+
+	full := filepath.Join(repoRoot, pattern)
+	if strings.HasSuffix(pattern, "/") {
+		// Directory path.
+		info, err := os.Stat(full)
+		return err == nil && info.IsDir()
+	}
+
+	// File or directory without trailing slash.
+	_, err := os.Stat(full)
+	return err == nil
 }

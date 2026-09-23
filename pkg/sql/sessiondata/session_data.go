@@ -1,25 +1,26 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sessiondata
 
 import (
 	"net"
+	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // SessionData contains session parameters. They are all user-configurable.
@@ -53,7 +54,7 @@ type SessionData struct {
 // Clone returns a clone of SessionData.
 func (s *SessionData) Clone() *SessionData {
 	var newCustomOptions map[string]string
-	if s.CustomOptions != nil {
+	if len(s.CustomOptions) > 0 {
 		newCustomOptions = make(map[string]string, len(s.CustomOptions))
 		for k, v := range s.CustomOptions {
 			newCustomOptions[k] = v
@@ -148,12 +149,16 @@ func (s *SessionData) GetDateStyle() pgdate.DateStyle {
 // SessionUser retrieves the session_user.
 // The SessionUser is the username that originally logged into the session.
 // If a user applies SET ROLE, the SessionUser remains the same whilst the
-// CurrentUser() changes.
-func (s *SessionData) SessionUser() security.SQLUsername {
+// User() changes.
+func (s *SessionData) SessionUser() username.SQLUsername {
 	if s.SessionUserProto == "" {
 		return s.User()
 	}
 	return s.SessionUserProto.Decode()
+}
+
+func (s *SessionData) IsInternalAppName() bool {
+	return strings.HasPrefix(s.ApplicationName, catconstants.InternalAppNamePrefix)
 }
 
 // LocalUnmigratableSessionData contains session parameters that cannot
@@ -169,12 +174,18 @@ type LocalUnmigratableSessionData struct {
 	// dependencies. Temporary tables are not supported in session migrations.
 	DatabaseIDToTempSchemaID map[uint32]uint32
 
-	///////////////////////////////////////////////////////////////////////////
+	// IsSSL indicates whether the session is using SSL/TLS.
+	IsSSL bool
+
+	// AuthenticationMethod is the method used to authenticate this session.
+	AuthenticationMethod redact.SafeString
+
+	// ////////////////////////////////////////////////////////////////////////
 	// WARNING: consider whether a session parameter you're adding needs to  //
 	// be propagated to the remote nodes or needs to persist amongst session //
 	// migrations. If so, they should live in the LocalOnlySessionData or    //
 	// SessionData protobuf in the sessiondatapb package.                    //
-	///////////////////////////////////////////////////////////////////////////
+	// ////////////////////////////////////////////////////////////////////////
 }
 
 // IsTemporarySchemaID returns true if the given ID refers to any of the temp
@@ -207,19 +218,35 @@ func (s *SessionData) GetTemporarySchemaIDForDB(dbID uint32) (uint32, bool) {
 // Stack represents a stack of SessionData objects.
 // This is used to support transaction-scoped variables, where SET LOCAL only
 // affects the top of the stack.
-// There is always guaranteed to be one element in the stack.
+//
+// There is always guaranteed to be one element in the stack (the base session
+// frame). The stack contains session and transaction/savepoint frames only.
+//
+// Statement-level session data (used for statement hints) is managed separately
+// via a stmtLevel pointer that sits logically "above" the stack. When set,
+// Top() returns the stmtLevel data instead of the stack top, but stack
+// operations (Push/Pop/PopN/PopAll) operate only on the underlying stack and
+// assert that stmtLevel is not set.
 type Stack struct {
-	// Use an internal variable to prevent abstraction leakage.
+	// stack contains session and transaction/savepoint frames only.
 	stack []*SessionData
 	// base is a pointer to the first element of the stack.
 	// This avoids a race with stack being reassigned, as the first element
 	// is *always* set.
 	base *SessionData
+	// stmtLevel holds statement-scoped session data pushed by statement hints.
+	// When non-nil, Top() returns this instead of the stack top. This is
+	// pushed and popped independently of the main stack via PushStmtLevel
+	// and PopStmtLevel.
+	stmtLevel *SessionData
 }
 
-// NewStack creates a new tack.
+// NewStack creates a new stack.
 func NewStack(firstElem *SessionData) *Stack {
-	return &Stack{stack: []*SessionData{firstElem}, base: firstElem}
+	return &Stack{
+		stack: []*SessionData{firstElem},
+		base:  firstElem,
+	}
 }
 
 // Clone clones the current stack.
@@ -231,6 +258,9 @@ func (s *Stack) Clone() *Stack {
 		ret.stack[i] = st.Clone()
 	}
 	ret.base = ret.stack[0]
+	if s.stmtLevel != nil {
+		ret.stmtLevel = s.stmtLevel.Clone()
+	}
 	return ret
 }
 
@@ -240,12 +270,26 @@ func (s *Stack) Replace(repl *Stack) {
 	*s = *repl.Clone()
 }
 
-// Top returns the top element of the stack.
+// Top returns the active session data: the statement-level overlay if set,
+// otherwise the top of the stack.
 func (s *Stack) Top() *SessionData {
+	if s.stmtLevel != nil {
+		return s.stmtLevel
+	}
 	if len(s.stack) == 0 {
 		return nil
 	}
 	return s.stack[len(s.stack)-1]
+}
+
+// HasStmtLevel returns true if statement-level session data is active.
+func (s *Stack) HasStmtLevel() bool {
+	return s.stmtLevel != nil
+}
+
+// StmtLevel returns the statement-level session data, or nil if not set.
+func (s *Stack) StmtLevel() *SessionData {
+	return s.stmtLevel
 }
 
 // Base returns the bottom element of the stack.
@@ -254,22 +298,29 @@ func (s *Stack) Base() *SessionData {
 	return s.base
 }
 
-// Push pushes a SessionData element to the stack.
+// Push pushes a SessionData element to the stack. Only session and
+// transaction/savepoint frames belong on the stack; use PushStmtLevel for
+// statement-scoped session data.
 func (s *Stack) Push(elem *SessionData) {
+	s.checkNoStmtLevel()
 	s.stack = append(s.stack, elem)
 }
 
-// PushTopClone pushes a copy of the top element to the stack.
+// PushTopClone pushes a clone of the stack top. Only session and
+// transaction/savepoint frames belong on the stack; use PushStmtLevel for
+// statement-scoped session data.
 func (s *Stack) PushTopClone() {
 	if len(s.stack) == 0 {
 		return
 	}
+	s.checkNoStmtLevel()
 	sd := s.stack[len(s.stack)-1]
 	s.stack = append(s.stack, sd.Clone())
 }
 
 // Pop removes the top SessionData element from the stack.
 func (s *Stack) Pop() error {
+	s.checkNoStmtLevel()
 	if len(s.stack) <= 1 {
 		return errors.AssertionFailedf("there must always be at least one element in the SessionData stack")
 	}
@@ -281,6 +332,7 @@ func (s *Stack) Pop() error {
 
 // PopN removes the top SessionData N elements from the stack.
 func (s *Stack) PopN(n int) error {
+	s.checkNoStmtLevel()
 	if len(s.stack)-n <= 0 {
 		return errors.AssertionFailedf("there must always be at least one element in the SessionData stack")
 	}
@@ -294,6 +346,7 @@ func (s *Stack) PopN(n int) error {
 
 // PopAll removes all except the base SessionData element from the stack.
 func (s *Stack) PopAll() {
+	s.checkNoStmtLevel()
 	// Explicitly unassign each pointer.
 	for i := 1; i < len(s.stack); i++ {
 		s.stack[i] = nil
@@ -304,4 +357,147 @@ func (s *Stack) PopAll() {
 // Elems returns all elements in the Stack.
 func (s *Stack) Elems() []*SessionData {
 	return s.stack
+}
+
+// PushStmtLevel clones the current Top() and sets it as the statement-level
+// session data overlay. While set, Top() returns the overlay instead of the
+// stack top. Must be paired with PopStmtLevel.
+func (s *Stack) PushStmtLevel() {
+	if buildutil.CrdbTestBuild && s.stmtLevel != nil {
+		panic(errors.AssertionFailedf(
+			"statement-level session data already set"))
+	}
+	s.stmtLevel = s.Top().Clone()
+}
+
+// PopStmtLevel removes the statement-level session data overlay.
+func (s *Stack) PopStmtLevel() {
+	if buildutil.CrdbTestBuild && s.stmtLevel == nil {
+		panic(errors.AssertionFailedf(
+			"no statement-level session data to pop"))
+	}
+	s.stmtLevel = nil
+}
+
+// checkNoStmtLevel panics in test builds if statement-level session data is
+// set. Stack operations (Push, Pop, etc.) should not be called while a
+// statement-level overlay is active.
+func (s *Stack) checkNoStmtLevel() {
+	if buildutil.CrdbTestBuild && s.stmtLevel != nil {
+		panic(errors.AssertionFailedf(
+			"cannot perform stack operation while statement-level " +
+				"session data is set"))
+	}
+}
+
+// Update performs a best-effort update of the field specified in 'variable' to
+// the value specified in 'value'. Boolean indicating whether an update was
+// performed is returned.
+//
+// The method only looks through the fields of embedded
+// sessiondatapb.SessionData and sessiondatapb.LocalOnlySessionData structs and
+// performs string-matching on the field name. Most custom types aren't
+// supported.
+func (s *SessionData) Update(variable, value string) bool {
+	elem := reflect.ValueOf(&s.SessionData).Elem()
+	if updateField(elem, variable, value) {
+		return true
+	}
+	elem = reflect.ValueOf(&s.LocalOnlySessionData).Elem()
+	return updateField(elem, variable, value)
+}
+
+// getValueToSet converts the provided value to reflect.Value based on the
+// specified type. ok=false is returned if conversion isn't successful.
+func getValueToSet(value, typeName string) (_ reflect.Value, ok bool) {
+	switch typeName {
+	case "bool":
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return reflect.Value{}, false
+		}
+		return reflect.ValueOf(b), true
+	case "float64":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return reflect.Value{}, false
+		}
+		return reflect.ValueOf(f), true
+	case "int32":
+		i, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			return reflect.Value{}, false
+		}
+		return reflect.ValueOf(int32(i)), true
+	case "int64":
+		i, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return reflect.Value{}, false
+		}
+		return reflect.ValueOf(i), true
+	case "Duration":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return reflect.Value{}, false
+		}
+		return reflect.ValueOf(d), true
+	case "string":
+		return reflect.ValueOf(value), true
+	case "VectorizeExecMode":
+		v, ok := sessiondatapb.VectorizeExecModeFromString(value)
+		return reflect.ValueOf(v), ok
+	case "DistSQLExecMode":
+		v, ok := sessiondatapb.DistSQLExecModeFromString(value)
+		return reflect.ValueOf(v), ok
+	case "NewSchemaChangerMode":
+		v, ok := sessiondatapb.NewSchemaChangerModeFromString(value)
+		return reflect.ValueOf(v), ok
+	case "SQLUsernameProto":
+		return reflect.ValueOf(username.SQLUsernameProto(value)), true
+	}
+	return reflect.Value{}, false
+}
+
+// ValidateMultiOverride checks that each "variable=value" pair in a
+// comma-separated override string refers to a real SessionData field and that
+// the value can be parsed for that field's type.
+func ValidateMultiOverride(multiOverride string) error {
+	if multiOverride == "" {
+		return nil
+	}
+	var sd SessionData
+	for _, override := range strings.Split(multiOverride, ",") {
+		parts := strings.Split(override, "=")
+		if len(parts) != 2 {
+			return errors.Newf(
+				"invalid override format: expected 'variable=value', found %q",
+				override,
+			)
+		}
+		if !sd.Update(parts[0], parts[1]) {
+			return errors.Newf(
+				"unknown or unsupported session variable %q", parts[0],
+			)
+		}
+	}
+	return nil
+}
+
+// updateField updates a single field in elem (which must be of Struct kind)
+// that has the name specified in 'variable' to the value specified in 'value'.
+// Boolean value indicates whether the update was successful.
+func updateField(elem reflect.Value, variable, value string) bool {
+	typ := elem.Type()
+	for i := 0; i < elem.NumField(); i++ {
+		if typ.Field(i).Name == variable {
+			f := elem.Field(i)
+			v, ok := getValueToSet(value, f.Type().Name())
+			if !ok {
+				return false
+			}
+			f.Set(v)
+			return true
+		}
+	}
+	return false
 }

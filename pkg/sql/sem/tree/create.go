@@ -7,13 +7,8 @@
 //
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code was derived from https://github.com/youtube/vitess.
 
@@ -21,18 +16,19 @@ package tree
 
 import (
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/roleoption"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"golang.org/x/text/language"
 )
 
@@ -49,6 +45,9 @@ type CreateDatabase struct {
 	Regions         NameList
 	SurvivalGoal    SurvivalGoal
 	Placement       DataPlacement
+	Owner           RoleSpec
+	SuperRegion     SuperRegion
+	SecondaryRegion Name
 }
 
 // Format implements the NodeFormatter interface.
@@ -115,6 +114,20 @@ func (node *CreateDatabase) Format(ctx *FmtCtx) {
 		ctx.WriteString(" ")
 		ctx.FormatNode(&node.Placement)
 	}
+
+	if node.Owner.Name != "" {
+		ctx.WriteString(" OWNER = ")
+		ctx.FormatNode(&node.Owner)
+	}
+
+	if node.SuperRegion.Name != "" {
+		ctx.FormatNode(&node.SuperRegion)
+	}
+
+	if node.SecondaryRegion != "" {
+		ctx.WriteString(" SECONDARY REGION ")
+		ctx.FormatNode(&node.SecondaryRegion)
+	}
 }
 
 // IndexElem represents a column with a direction in a CREATE INDEX statement.
@@ -126,6 +139,9 @@ type IndexElem struct {
 	Expr       Expr
 	Direction  Direction
 	NullsOrder NullsOrder
+
+	// OpClass is set if an index element was created using a named opclass.
+	OpClass Name
 }
 
 // Format implements the NodeFormatter interface.
@@ -144,6 +160,10 @@ func (node *IndexElem) Format(ctx *FmtCtx) {
 			ctx.WriteByte(')')
 		}
 	}
+	if node.OpClass != "" {
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.OpClass.String())
+	}
 	if node.Direction != DefaultDirection {
 		ctx.WriteByte(' ')
 		ctx.WriteString(node.Direction.String())
@@ -154,7 +174,7 @@ func (node *IndexElem) Format(ctx *FmtCtx) {
 	}
 }
 
-func (node *IndexElem) doc(p *PrettyCfg) pretty.Doc {
+func (node *IndexElem) Doc(p *PrettyCfg) pretty.Doc {
 	var d pretty.Doc
 	if node.Expr == nil {
 		d = p.Doc(&node.Column)
@@ -165,6 +185,9 @@ func (node *IndexElem) doc(p *PrettyCfg) pretty.Doc {
 		if _, isFunc := node.Expr.(*FuncExpr); !isFunc {
 			d = p.bracket("(", d, ")")
 		}
+	}
+	if node.OpClass != "" {
+		d = pretty.ConcatSpace(d, pretty.Text(node.OpClass.String()))
 	}
 	if node.Direction != DefaultDirection {
 		d = pretty.ConcatSpace(d, pretty.Keyword(node.Direction.String()))
@@ -189,8 +212,8 @@ func (l *IndexElemList) Format(ctx *FmtCtx) {
 	}
 }
 
-// doc is part of the docer interface.
-func (l *IndexElemList) doc(p *PrettyCfg) pretty.Doc {
+// Doc is part of the Docer interface.
+func (l *IndexElemList) Doc(p *PrettyCfg) pretty.Doc {
 	if l == nil || len(*l) == 0 {
 		return pretty.Nil
 	}
@@ -201,12 +224,17 @@ func (l *IndexElemList) doc(p *PrettyCfg) pretty.Doc {
 	return p.commaSeparated(d...)
 }
 
+type IndexInvisibility struct {
+	Value         float64
+	FloatProvided bool
+}
+
 // CreateIndex represents a CREATE INDEX statement.
 type CreateIndex struct {
 	Name        Name
 	Table       TableName
 	Unique      bool
-	Inverted    bool
+	Type        idxtype.T
 	IfNotExists bool
 	Columns     IndexElemList
 	Sharded     *ShardedIndexDef
@@ -217,16 +245,23 @@ type CreateIndex struct {
 	StorageParams    StorageParams
 	Predicate        Expr
 	Concurrently     bool
+	Invisibility     IndexInvisibility
 }
 
 // Format implements the NodeFormatter interface.
 func (node *CreateIndex) Format(ctx *FmtCtx) {
+	// Please also update indexForDisplay function in
+	// pkg/sql/catalog/catformat/index.go if there's any update to index
+	// definition components.
 	ctx.WriteString("CREATE ")
 	if node.Unique {
 		ctx.WriteString("UNIQUE ")
 	}
-	if node.Inverted && !ctx.HasFlags(FmtPGCatalog) {
+	switch node.Type {
+	case idxtype.INVERTED:
 		ctx.WriteString("INVERTED ")
+	case idxtype.VECTOR:
+		ctx.WriteString("VECTOR ")
 	}
 	ctx.WriteString("INDEX ")
 	if node.Concurrently {
@@ -241,14 +276,7 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 	}
 	ctx.WriteString("ON ")
 	ctx.FormatNode(&node.Table)
-	if ctx.HasFlags(FmtPGCatalog) {
-		ctx.WriteString(" USING")
-		if node.Inverted {
-			ctx.WriteString(" gin")
-		} else {
-			ctx.WriteString(" btree")
-		}
-	}
+
 	ctx.WriteString(" (")
 	ctx.FormatNode(&node.Columns)
 	ctx.WriteByte(')')
@@ -269,14 +297,14 @@ func (node *CreateIndex) Format(ctx *FmtCtx) {
 		ctx.WriteString(")")
 	}
 	if node.Predicate != nil {
-		if ctx.HasFlags(FmtPGCatalog) {
-			ctx.WriteString(" WHERE (")
-			ctx.FormatNode(node.Predicate)
-			ctx.WriteString(")")
-		} else {
-			ctx.WriteString(" WHERE ")
-			ctx.FormatNode(node.Predicate)
-		}
+		ctx.WriteString(" WHERE ")
+		ctx.FormatNode(node.Predicate)
+	}
+	switch {
+	case node.Invisibility.FloatProvided:
+		ctx.WriteString(" VISIBILITY " + fmt.Sprintf("%.2f", 1-node.Invisibility.Value))
+	case node.Invisibility.Value == 1.0:
+		ctx.WriteString(" NOT VISIBLE")
 	}
 }
 
@@ -308,6 +336,10 @@ func (n *EnumValue) Format(ctx *FmtCtx) {
 	f := ctx.flags
 	if f.HasFlags(FmtAnonymize) {
 		ctx.WriteByte('_')
+	} else if f.HasFlags(FmtMarkRedactionNode) {
+		ctx.WriteString(string(redact.StartMarker()))
+		lexbase.EncodeSQLString(&ctx.Buffer, string(*n))
+		ctx.WriteString(string(redact.EndMarker()))
 	} else {
 		lexbase.EncodeSQLString(&ctx.Buffer, string(*n))
 	}
@@ -326,21 +358,70 @@ func (l *EnumValueList) Format(ctx *FmtCtx) {
 	}
 }
 
+// CompositeTypeElem is a single element in a composite type definition.
+type CompositeTypeElem struct {
+	Label Name
+	Type  ResolvableTypeReference
+}
+
+// DomainConstraintDef defines a CHECK constraint on a DOMAIN type.
+type DomainConstraintDef struct {
+	Name Name
+	Expr Expr
+}
+
 // CreateType represents a CREATE TYPE statement.
 type CreateType struct {
 	TypeName *UnresolvedObjectName
 	Variety  CreateTypeVariety
 	// EnumLabels is set when this represents a CREATE TYPE ... AS ENUM statement.
 	EnumLabels EnumValueList
+	// CompositeTypeList is set when this represents a CREATE TYPE ... AS ( )
+	// statement.
+	CompositeTypeList []CompositeTypeElem
 	// IfNotExists is true if IF NOT EXISTS was requested.
 	IfNotExists bool
+	// DomainType is the base type for a DOMAIN.
+	DomainType ResolvableTypeReference
+	// DomainDefault is the DEFAULT expression for a DOMAIN.
+	DomainDefault Expr
+	// DomainNotNull is true if the DOMAIN has a NOT NULL constraint.
+	DomainNotNull bool
+	// DomainConstraints is the list of CHECK constraints for a DOMAIN.
+	DomainConstraints []DomainConstraintDef
 }
 
 var _ Statement = &CreateType{}
 
 // Format implements the NodeFormatter interface.
 func (node *CreateType) Format(ctx *FmtCtx) {
-	ctx.WriteString("CREATE TYPE ")
+	switch node.Variety {
+	case Domain:
+		ctx.WriteString("CREATE DOMAIN ")
+		ctx.FormatNode(node.TypeName)
+		ctx.WriteString(" AS ")
+		ctx.FormatTypeReference(node.DomainType)
+		if node.DomainDefault != nil {
+			ctx.WriteString(" DEFAULT ")
+			ctx.FormatNode(node.DomainDefault)
+		}
+		if node.DomainNotNull {
+			ctx.WriteString(" NOT NULL")
+		}
+		for i := range node.DomainConstraints {
+			c := &node.DomainConstraints[i]
+			if c.Name != "" {
+				ctx.WriteString(" CONSTRAINT ")
+				ctx.FormatNode(&c.Name)
+			}
+			ctx.WriteString(" CHECK (")
+			ctx.FormatNode(c.Expr)
+			ctx.WriteString(")")
+		}
+		return
+	default:
+		ctx.WriteString("CREATE TYPE ")
+	}
 	if node.IfNotExists {
 		ctx.WriteString("IF NOT EXISTS ")
 	}
@@ -350,6 +431,18 @@ func (node *CreateType) Format(ctx *FmtCtx) {
 	case Enum:
 		ctx.WriteString("AS ENUM (")
 		ctx.FormatNode(&node.EnumLabels)
+		ctx.WriteString(")")
+	case Composite:
+		ctx.WriteString("AS (")
+		for i := range node.CompositeTypeList {
+			elem := &node.CompositeTypeList[i]
+			if i != 0 {
+				ctx.WriteString(", ")
+			}
+			ctx.FormatNode(&elem.Label)
+			ctx.WriteString(" ")
+			ctx.FormatTypeReference(elem.Type)
+		}
 		ctx.WriteString(")")
 	}
 }
@@ -398,6 +491,17 @@ const (
 	SilentNull
 )
 
+// RandomNullability returns a random valid Nullability, given a random number
+// generator, `rand`. If nullableOnly is true, the random Nullability will not
+// be `NotNull`.
+func RandomNullability(rand *rand.Rand, nullableOnly bool) Nullability {
+	if nullableOnly {
+		// Add 1 after getting the random number to exclude the zero-value NotNull.
+		return Nullability(rand.Intn(int(SilentNull)) + 1)
+	}
+	return Nullability(rand.Intn(int(SilentNull) + 1))
+}
+
 // GeneratedIdentityType represents either GENERATED ALWAYS AS IDENTITY
 // or GENERATED BY DEFAULT AS IDENTITY.
 type GeneratedIdentityType int
@@ -411,9 +515,12 @@ const (
 // ColumnTableDef represents a column definition within a CREATE TABLE
 // statement.
 type ColumnTableDef struct {
-	Name              Name
-	Type              ResolvableTypeReference
-	IsSerial          bool
+	Name     Name
+	Type     ResolvableTypeReference
+	IsSerial bool
+	// IsCreateAs is set to true if the Type is resolved after parsing.
+	// CREATE AS statements must not display column types during formatting.
+	IsCreateAs        bool
 	GeneratedIdentity struct {
 		IsGeneratedAsIdentity   bool
 		GeneratedAsIdentityType GeneratedIdentityType
@@ -425,9 +532,10 @@ type ColumnTableDef struct {
 		ConstraintName Name
 	}
 	PrimaryKey struct {
-		IsPrimaryKey bool
-		Sharded      bool
-		ShardBuckets Expr
+		IsPrimaryKey  bool
+		Sharded       bool
+		ShardBuckets  Expr
+		StorageParams StorageParams
 	}
 	Unique struct {
 		IsUnique       bool
@@ -518,7 +626,7 @@ func NewColumnTableDef(
 			// In CRDB, collated strings are treated separately to string family types.
 			// To most behave like postgres, set the CollatedString type if a non-"default"
 			// collation is used.
-			if locale != DefaultCollationTag {
+			if locale != collatedstring.DefaultCollationTag {
 				_, err := language.Parse(locale)
 				if err != nil {
 					return nil, pgerror.Wrapf(err, pgcode.Syntax, "invalid locale %s", locale)
@@ -604,12 +712,14 @@ func NewColumnTableDef(
 			d.Nullable.ConstraintName = c.Name
 		case PrimaryKeyConstraint:
 			d.PrimaryKey.IsPrimaryKey = true
+			d.PrimaryKey.StorageParams = c.Qualification.(PrimaryKeyConstraint).StorageParams
 			d.Unique.ConstraintName = c.Name
 		case ShardedPrimaryKeyConstraint:
 			d.PrimaryKey.IsPrimaryKey = true
 			constraint := c.Qualification.(ShardedPrimaryKeyConstraint)
 			d.PrimaryKey.Sharded = true
 			d.PrimaryKey.ShardBuckets = constraint.ShardBuckets
+			d.PrimaryKey.StorageParams = constraint.StorageParams
 			d.Unique.ConstraintName = c.Name
 		case UniqueConstraint:
 			d.Unique.IsUnique = true
@@ -690,9 +800,9 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 
 	// ColumnTableDef node type will not be specified if it represents a CREATE
 	// TABLE ... AS query.
-	if node.Type != nil {
+	if !node.IsCreateAs && node.Type != nil {
 		ctx.WriteByte(' ')
-		ctx.WriteString(node.columnTypeString())
+		node.formatColumnType(ctx)
 	}
 
 	if node.Nullable.Nullability != SilentNull && node.Nullable.ConstraintName != "" {
@@ -715,9 +825,26 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 		}
 		if node.PrimaryKey.IsPrimaryKey {
 			ctx.WriteString(" PRIMARY KEY")
+
+			// Always prefer to output hash sharding bucket count as a storage param.
+			pkStorageParams := node.PrimaryKey.StorageParams
 			if node.PrimaryKey.Sharded {
-				ctx.WriteString(" USING HASH WITH BUCKET_COUNT=")
-				ctx.FormatNode(node.PrimaryKey.ShardBuckets)
+				ctx.WriteString(" USING HASH")
+				bcStorageParam := node.PrimaryKey.StorageParams.GetVal(`bucket_count`)
+				if _, ok := node.PrimaryKey.ShardBuckets.(DefaultVal); !ok && bcStorageParam == nil {
+					pkStorageParams = append(
+						pkStorageParams,
+						StorageParam{
+							Key:   `bucket_count`,
+							Value: node.PrimaryKey.ShardBuckets,
+						},
+					)
+				}
+			}
+			if len(pkStorageParams) > 0 {
+				ctx.WriteString(" WITH (")
+				ctx.FormatNode(&pkStorageParams)
+				ctx.WriteString(")")
 			}
 		} else if node.Unique.IsUnique {
 			ctx.WriteString(" UNIQUE")
@@ -749,7 +876,7 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 		case GeneratedByDefault:
 			ctx.WriteString(" GENERATED BY DEFAULT AS IDENTITY")
 		}
-		if genSeqOpt := node.GeneratedIdentity.SeqOptions; genSeqOpt != nil {
+		if genSeqOpt := node.GeneratedIdentity.SeqOptions; len(genSeqOpt) > 0 {
 			ctx.WriteString(" (")
 			// TODO(janexing): remove the leading and ending space of the
 			// sequence option expression.
@@ -808,7 +935,15 @@ func (node *ColumnTableDef) Format(ctx *FmtCtx) {
 	}
 }
 
-func (node *ColumnTableDef) columnTypeString() string {
+func (node *ColumnTableDef) formatColumnType(ctx *FmtCtx) {
+	if replaced, ok := node.replacedSerialTypeName(); ok {
+		ctx.WriteString(replaced)
+	} else {
+		ctx.FormatTypeReference(node.Type)
+	}
+}
+
+func (node *ColumnTableDef) replacedSerialTypeName() (string, bool) {
 	if node.IsSerial {
 		// Map INT types to SERIAL keyword.
 		// TODO (rohany): This should be pushed until type resolution occurs.
@@ -816,13 +951,14 @@ func (node *ColumnTableDef) columnTypeString() string {
 		//  so we handle those cases here.
 		switch MustBeStaticallyKnownType(node.Type).Width() {
 		case 16:
-			return "SERIAL2"
+			return "SERIAL2", true
 		case 32:
-			return "SERIAL4"
+			return "SERIAL4", true
+		default:
+			return "SERIAL8", true
 		}
-		return "SERIAL8"
 	}
-	return node.Type.SQLString()
+	return "", false
 }
 
 // String implements the fmt.Stringer interface.
@@ -888,13 +1024,16 @@ type NullConstraint struct{}
 type HiddenConstraint struct{}
 
 // PrimaryKeyConstraint represents PRIMARY KEY on a column.
-type PrimaryKeyConstraint struct{}
+type PrimaryKeyConstraint struct {
+	StorageParams StorageParams
+}
 
 // ShardedPrimaryKeyConstraint represents `PRIMARY KEY .. USING HASH..`
 // on a column.
 type ShardedPrimaryKeyConstraint struct {
-	Sharded      bool
-	ShardBuckets Expr
+	Sharded       bool
+	ShardBuckets  Expr
+	StorageParams StorageParams
 }
 
 // UniqueConstraint represents UNIQUE on a column.
@@ -935,16 +1074,20 @@ type IndexTableDef struct {
 	Columns          IndexElemList
 	Sharded          *ShardedIndexDef
 	Storing          NameList
-	Inverted         bool
+	Type             idxtype.T
 	PartitionByIndex *PartitionByIndex
 	StorageParams    StorageParams
 	Predicate        Expr
+	Invisibility     IndexInvisibility
 }
 
 // Format implements the NodeFormatter interface.
 func (node *IndexTableDef) Format(ctx *FmtCtx) {
-	if node.Inverted {
+	switch node.Type {
+	case idxtype.INVERTED:
 		ctx.WriteString("INVERTED ")
+	case idxtype.VECTOR:
+		ctx.WriteString("VECTOR ")
 	}
 	ctx.WriteString("INDEX ")
 	if node.Name != "" {
@@ -973,6 +1116,12 @@ func (node *IndexTableDef) Format(ctx *FmtCtx) {
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
 		ctx.FormatNode(node.Predicate)
+	}
+	switch {
+	case node.Invisibility.FloatProvided:
+		ctx.WriteString(" VISIBILITY " + fmt.Sprintf("%.2f", 1-node.Invisibility.Value))
+	case node.Invisibility.Value == 1.0:
+		ctx.WriteString(" NOT VISIBLE")
 	}
 }
 
@@ -1003,6 +1152,10 @@ type UniqueConstraintTableDef struct {
 	PrimaryKey   bool
 	WithoutIndex bool
 	IfNotExists  bool
+	// FormatAsIndex indicates if the constraint should be formatted as an index
+	// definition. This is needed since indexes support syntax for things like
+	// storage parameters and sharding, while constraints do not.
+	FormatAsIndex bool
 }
 
 // SetName implements the TableDef interface.
@@ -1017,7 +1170,7 @@ func (node *UniqueConstraintTableDef) SetIfNotExists() {
 
 // Format implements the NodeFormatter interface.
 func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
-	if node.Name != "" {
+	if node.Name != "" && !node.FormatAsIndex {
 		ctx.WriteString("CONSTRAINT ")
 		if node.IfNotExists {
 			ctx.WriteString("IF NOT EXISTS ")
@@ -1029,6 +1182,13 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 		ctx.WriteString("PRIMARY KEY ")
 	} else {
 		ctx.WriteString("UNIQUE ")
+		if node.FormatAsIndex {
+			ctx.WriteString("INDEX ")
+			if node.Name != "" {
+				ctx.FormatNode(&node.Name)
+				ctx.WriteByte(' ')
+			}
+		}
 	}
 	if node.WithoutIndex {
 		ctx.WriteString("WITHOUT INDEX ")
@@ -1047,77 +1207,21 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 	if node.PartitionByIndex != nil {
 		ctx.FormatNode(node.PartitionByIndex)
 	}
+	if node.StorageParams != nil {
+		ctx.WriteString(" WITH (")
+		ctx.FormatNode(&node.StorageParams)
+		ctx.WriteString(")")
+	}
 	if node.Predicate != nil {
 		ctx.WriteString(" WHERE ")
 		ctx.FormatNode(node.Predicate)
 	}
-}
-
-// ReferenceAction is the method used to maintain referential integrity through
-// foreign keys.
-type ReferenceAction int
-
-// The values for ReferenceAction.
-const (
-	NoAction ReferenceAction = iota
-	Restrict
-	SetNull
-	SetDefault
-	Cascade
-)
-
-var referenceActionName = [...]string{
-	NoAction:   "NO ACTION",
-	Restrict:   "RESTRICT",
-	SetNull:    "SET NULL",
-	SetDefault: "SET DEFAULT",
-	Cascade:    "CASCADE",
-}
-
-func (ra ReferenceAction) String() string {
-	return referenceActionName[ra]
-}
-
-// ReferenceActions contains the actions specified to maintain referential
-// integrity through foreign keys for different operations.
-type ReferenceActions struct {
-	Delete ReferenceAction
-	Update ReferenceAction
-}
-
-// Format implements the NodeFormatter interface.
-func (node *ReferenceActions) Format(ctx *FmtCtx) {
-	if node.Delete != NoAction {
-		ctx.WriteString(" ON DELETE ")
-		ctx.WriteString(node.Delete.String())
+	switch {
+	case node.Invisibility.FloatProvided:
+		ctx.WriteString(" VISIBILITY " + fmt.Sprintf("%.2f", 1-node.Invisibility.Value))
+	case node.Invisibility.Value == 1.0:
+		ctx.WriteString(" NOT VISIBLE")
 	}
-	if node.Update != NoAction {
-		ctx.WriteString(" ON UPDATE ")
-		ctx.WriteString(node.Update.String())
-	}
-}
-
-// CompositeKeyMatchMethod is the algorithm use when matching composite keys.
-// See https://github.com/cockroachdb/cockroach/issues/20305 or
-// https://www.postgresql.org/docs/11/sql-createtable.html for details on the
-// different composite foreign key matching methods.
-type CompositeKeyMatchMethod int
-
-// The values for CompositeKeyMatchMethod.
-const (
-	MatchSimple CompositeKeyMatchMethod = iota
-	MatchFull
-	MatchPartial // Note: PARTIAL not actually supported at this point.
-)
-
-var compositeKeyMatchMethodName = [...]string{
-	MatchSimple:  "MATCH SIMPLE",
-	MatchFull:    "MATCH FULL",
-	MatchPartial: "MATCH PARTIAL",
-}
-
-func (c CompositeKeyMatchMethod) String() string {
-	return compositeKeyMatchMethodName[c]
 }
 
 // ForeignKeyConstraintTableDef represents a FOREIGN KEY constraint in the AST.
@@ -1174,10 +1278,10 @@ func (node *ForeignKeyConstraintTableDef) SetIfNotExists() {
 // CheckConstraintTableDef represents a check constraint within a CREATE
 // TABLE statement.
 type CheckConstraintTableDef struct {
-	Name        Name
-	Expr        Expr
-	Hidden      bool
-	IfNotExists bool
+	Name                  Name
+	Expr                  Expr
+	FromHashShardedColumn bool
+	IfNotExists           bool
 }
 
 // SetName implements the ConstraintTableDef interface.
@@ -1232,6 +1336,10 @@ type ShardedIndexDef struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShardedIndexDef) Format(ctx *FmtCtx) {
+	if _, ok := node.ShardBuckets.(DefaultVal); ok {
+		ctx.WriteString(" USING HASH")
+		return
+	}
 	ctx.WriteString(" USING HASH WITH BUCKET_COUNT = ")
 	ctx.FormatNode(node.ShardBuckets)
 }
@@ -1345,7 +1453,7 @@ func (node *PartitionBy) formatListOrRange(ctx *FmtCtx) {
 
 // ListPartition represents a PARTITION definition within a PARTITION BY LIST.
 type ListPartition struct {
-	Name         UnrestrictedName
+	Name         Name
 	Exprs        Exprs
 	Subpartition *PartitionBy
 }
@@ -1364,7 +1472,7 @@ func (node *ListPartition) Format(ctx *FmtCtx) {
 
 // RangePartition represents a PARTITION definition within a PARTITION BY RANGE.
 type RangePartition struct {
-	Name         UnrestrictedName
+	Name         Name
 	From         Exprs
 	To           Exprs
 	Subpartition *PartitionBy
@@ -1386,7 +1494,7 @@ func (node *RangePartition) Format(ctx *FmtCtx) {
 
 // StorageParam is a key-value parameter for table storage.
 type StorageParam struct {
-	Key   Name
+	Key   string
 	Value Expr
 }
 
@@ -1395,19 +1503,29 @@ type StorageParams []StorageParam
 
 // Format implements the NodeFormatter interface.
 func (o *StorageParams) Format(ctx *FmtCtx) {
+	buf, f := &ctx.Buffer, ctx.flags
 	for i := range *o {
 		n := &(*o)[i]
 		if i > 0 {
 			ctx.WriteString(", ")
 		}
-		// TODO(knz): the key may need to be formatted differently
-		// if we want to de-anonymize it.
-		ctx.FormatNode(&n.Key)
+		lexbase.EncodeSQLStringWithFlags(buf, n.Key, f.EncodeFlags())
 		if n.Value != nil {
 			ctx.WriteString(` = `)
 			ctx.FormatNode(n.Value)
 		}
 	}
+}
+
+// GetVal returns corresponding value if a key exists, otherwise nil is
+// returned.
+func (o *StorageParams) GetVal(key string) Expr {
+	for _, param := range *o {
+		if param.Key == key {
+			return param.Value
+		}
+	}
+	return nil
 }
 
 // CreateTableOnCommitSetting represents the CREATE TABLE ... ON COMMIT <action>
@@ -1432,9 +1550,10 @@ type CreateTable struct {
 	// In CREATE...AS queries, Defs represents a list of ColumnTableDefs, one for
 	// each column, and a ConstraintTableDef for each constraint on a subset of
 	// these columns.
-	Defs     TableDefs
-	AsSource *Select
-	Locality *Locality
+	Defs       TableDefs
+	AsSource   *Select
+	WithNoData bool
+	Locality   *Locality
 }
 
 // As returns true if this table represents a CREATE TABLE ... AS statement,
@@ -1484,8 +1603,16 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 			ctx.FormatNode(&node.Defs)
 			ctx.WriteByte(')')
 		}
+		if node.StorageParams != nil {
+			ctx.WriteString(` WITH (`)
+			ctx.FormatNode(&node.StorageParams)
+			ctx.WriteByte(')')
+		}
 		ctx.WriteString(" AS ")
 		ctx.FormatNode(node.AsSource)
+		if node.WithNoData {
+			ctx.WriteString(" WITH NO DATA")
+		}
 	} else {
 		ctx.WriteString(" (")
 		ctx.FormatNode(&node.Defs)
@@ -1493,12 +1620,22 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 		if node.PartitionByTable != nil {
 			ctx.FormatNode(node.PartitionByTable)
 		}
-		// No storage parameters are implemented, so we never list the storage
-		// parameters in the output format.
-		if node.Locality != nil {
-			ctx.WriteString(" ")
-			ctx.FormatNode(node.Locality)
+		if node.StorageParams != nil {
+			ctx.WriteString(` WITH (`)
+			ctx.FormatNode(&node.StorageParams)
+			ctx.WriteByte(')')
 		}
+	}
+	switch node.OnCommit {
+	case CreateTableOnCommitUnset:
+	case CreateTableOnCommitPreserveRows:
+		ctx.WriteString(" ON COMMIT PRESERVE ROWS")
+	default:
+		panic(errors.AssertionFailedf("unexpected CreateTableOnCommitSetting: %d", node.OnCommit))
+	}
+	if node.Locality != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(node.Locality)
 	}
 }
 
@@ -1506,19 +1643,19 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 // inline with their columns and makes them table-level constraints, stored in
 // n.Defs. For example, the foreign key constraint in
 //
-//     CREATE TABLE foo (a INT REFERENCES bar(a))
+//	CREATE TABLE foo (a INT REFERENCES bar(a))
 //
 // gets pulled into a top-level constraint like:
 //
-//     CREATE TABLE foo (a INT, FOREIGN KEY (a) REFERENCES bar(a))
+//	CREATE TABLE foo (a INT, FOREIGN KEY (a) REFERENCES bar(a))
 //
 // Similarly, the CHECK constraint in
 //
-//    CREATE TABLE foo (a INT CHECK (a < 1), b INT)
+//	CREATE TABLE foo (a INT CHECK (a < 1), b INT)
 //
 // gets pulled into a top-level constraint like:
 //
-//    CREATE TABLE foo (a INT, b INT, CHECK (a < 1))
+//	CREATE TABLE foo (a INT, b INT, CHECK (a < 1))
 //
 // Note that some SQL databases require that a constraint attached to a column
 // to refer only to the column it is attached to. We follow Postgres' behavior,
@@ -1526,10 +1663,9 @@ func (node *CreateTable) FormatBody(ctx *FmtCtx) {
 // constraints. For example, the following table definition is accepted in
 // CockroachDB and Postgres, but not necessarily other SQL databases:
 //
-//    CREATE TABLE foo (a INT CHECK (a < b), b INT)
+//	CREATE TABLE foo (a INT CHECK (a < b), b INT)
 //
 // Unique constraints are not hoisted.
-//
 func (node *CreateTable) HoistConstraints() {
 	for _, d := range node.Defs {
 		if col, ok := d.(*ColumnTableDef); ok {
@@ -1615,6 +1751,23 @@ func (node *CreateSequence) Format(ctx *FmtCtx) {
 // SequenceOptions represents a list of sequence options.
 type SequenceOptions []SequenceOption
 
+// ExtractIdentitySeqName returns the explicit sequence name supplied via the
+// PG18 SEQUENCE NAME clause (if any) and a copy of the option list with that
+// entry removed. The SEQUENCE NAME entry is metadata about how to name the
+// sequence and never makes it into the persisted sequence options.
+func (node *SequenceOptions) ExtractIdentitySeqName() (*TableName, SequenceOptions) {
+	var explicit *TableName
+	remaining := make(SequenceOptions, 0, len(*node))
+	for _, opt := range *node {
+		if opt.Name == SeqOptName {
+			explicit = opt.NameVal
+			continue
+		}
+		remaining = append(remaining, opt)
+	}
+	return explicit, remaining
+}
+
 // Format implements the NodeFormatter interface.
 func (node *SequenceOptions) Format(ctx *FmtCtx) {
 	for i := range *node {
@@ -1627,7 +1780,7 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 			ctx.WriteString(option.AsIntegerType.SQLString())
 		case SeqOptCycle, SeqOptNoCycle:
 			ctx.WriteString(option.Name)
-		case SeqOptCache:
+		case SeqOptCacheNode, SeqOptCacheSession:
 			ctx.WriteString(option.Name)
 			ctx.WriteByte(' ')
 			// TODO(knz): replace all this with ctx.FormatNode if/when
@@ -1655,9 +1808,6 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 		case SeqOptStart:
 			ctx.WriteString(option.Name)
 			ctx.WriteByte(' ')
-			if option.OptionalWord {
-				ctx.WriteString("WITH ")
-			}
 			// TODO(knz): replace all this with ctx.FormatNode if/when
 			// the start option supports expressions.
 			if ctx.flags.HasFlags(FmtHideConstants) {
@@ -1665,12 +1815,19 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 			} else {
 				ctx.Printf("%d", *option.IntVal)
 			}
+		case SeqOptRestart:
+			ctx.WriteString(option.Name)
+			if option.IntVal != nil {
+				ctx.WriteByte(' ')
+				if ctx.flags.HasFlags(FmtHideConstants) {
+					ctx.WriteByte('0')
+				} else {
+					ctx.Printf("%d", *option.IntVal)
+				}
+			}
 		case SeqOptIncrement:
 			ctx.WriteString(option.Name)
 			ctx.WriteByte(' ')
-			if option.OptionalWord {
-				ctx.WriteString("BY ")
-			}
 			// TODO(knz): replace all this with ctx.FormatNode if/when
 			// the increment option supports expressions.
 			if ctx.flags.HasFlags(FmtHideConstants) {
@@ -1689,6 +1846,10 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 			default:
 				ctx.FormatNode(option.ColumnItemVal)
 			}
+		case SeqOptName:
+			ctx.WriteString(option.Name)
+			ctx.WriteByte(' ')
+			ctx.FormatNode(option.NameVal)
 		default:
 			panic(errors.AssertionFailedf("unexpected SequenceOption: %v", option))
 		}
@@ -1704,23 +1865,33 @@ type SequenceOption struct {
 
 	IntVal *int64
 
-	OptionalWord bool
-
 	ColumnItemVal *ColumnItem
+
+	// NameVal carries the explicit sequence name supplied by the
+	// PG18 SEQUENCE NAME clause when this option appears on a
+	// GENERATED AS IDENTITY column. It is meaningless in other
+	// contexts.
+	NameVal *TableName
 }
 
 // Names of options on CREATE SEQUENCE.
 const (
-	SeqOptAs        = "AS"
-	SeqOptCycle     = "CYCLE"
-	SeqOptNoCycle   = "NO CYCLE"
-	SeqOptOwnedBy   = "OWNED BY"
-	SeqOptCache     = "CACHE"
-	SeqOptIncrement = "INCREMENT"
-	SeqOptMinValue  = "MINVALUE"
-	SeqOptMaxValue  = "MAXVALUE"
-	SeqOptStart     = "START"
-	SeqOptVirtual   = "VIRTUAL"
+	SeqOptAs           = "AS"
+	SeqOptCycle        = "CYCLE"
+	SeqOptNoCycle      = "NO CYCLE"
+	SeqOptOwnedBy      = "OWNED BY"
+	SeqOptCacheNode    = "PER NODE CACHE"
+	SeqOptCacheSession = "PER SESSION CACHE"
+	SeqOptIncrement    = "INCREMENT"
+	SeqOptMinValue     = "MINVALUE"
+	SeqOptMaxValue     = "MAXVALUE"
+	SeqOptStart        = "START"
+	SeqOptRestart      = "RESTART"
+	SeqOptVirtual      = "VIRTUAL"
+	// SeqOptName is the PG18 "SEQUENCE NAME <name>" option for
+	// identity columns. It is only valid inside the parenthesized
+	// option list of GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY.
+	SeqOptName = "SEQUENCE NAME"
 
 	// Avoid unused warning for constants.
 	_ = SeqOptAs
@@ -1778,9 +1949,9 @@ const (
 // LikeTableOptAll is the full LikeTableOpt bitmap.
 const LikeTableOptAll = ^likeTableOptInvalid
 
-// Has returns true if the receiver has the other options bits set.
+// Has returns true if the receiver has all of the given option bits set.
 func (o LikeTableOpt) Has(other LikeTableOpt) bool {
-	return int(o)&int(other) != 0
+	return int(o)&int(other) == int(other)
 }
 
 func (o LikeTableOpt) String() string {
@@ -1798,47 +1969,6 @@ func (o LikeTableOpt) String() string {
 	default:
 		panic("unknown like table opt" + strconv.Itoa(int(o)))
 	}
-}
-
-// ToRoleOptions converts KVOptions to a roleoption.List using
-// typeAsString to convert exprs to strings.
-func (o KVOptions) ToRoleOptions(
-	typeAsStringOrNull func(e Expr, op string) (func() (bool, string, error), error), op string,
-) (roleoption.List, error) {
-	roleOptions := make(roleoption.List, len(o))
-
-	for i, ro := range o {
-		// Role options are always stored as keywords in ro.Key by the
-		// parser.
-		option, err := roleoption.ToOption(string(ro.Key))
-		if err != nil {
-			return nil, err
-		}
-
-		if ro.Value != nil {
-			if ro.Value == DNull {
-				roleOptions[i] = roleoption.RoleOption{
-					Option: option, HasValue: true, Value: func() (bool, string, error) {
-						return true, "", nil
-					},
-				}
-			} else {
-				strFn, err := typeAsStringOrNull(ro.Value, op)
-				if err != nil {
-					return nil, err
-				}
-				roleOptions[i] = roleoption.RoleOption{
-					Option: option, Value: strFn, HasValue: true,
-				}
-			}
-		} else {
-			roleOptions[i] = roleoption.RoleOption{
-				Option: option, HasValue: false,
-			}
-		}
-	}
-
-	return roleOptions, nil
 }
 
 func (o *KVOptions) formatAsRoleOptions(ctx *FmtCtx) {
@@ -1894,6 +2024,28 @@ func (node *CreateRole) Format(ctx *FmtCtx) {
 	}
 }
 
+// ViewOptions represents options for CREATE VIEW statements.
+type ViewOptions struct {
+	SecurityInvoker bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ViewOptions) Format(ctx *FmtCtx) {
+	if node.SecurityInvoker {
+		ctx.WriteString("security_invoker = true")
+	} else {
+		ctx.WriteString("security_invoker = false")
+	}
+}
+
+func (node *ViewOptions) Doc(p *PrettyCfg) pretty.Doc {
+	if node.SecurityInvoker {
+		return pretty.Text("security_invoker = true")
+	} else {
+		return pretty.Text("security_invoker = false")
+	}
+}
+
 // CreateView represents a CREATE VIEW statement.
 type CreateView struct {
 	Name         TableName
@@ -1901,8 +2053,10 @@ type CreateView struct {
 	AsSource     *Select
 	IfNotExists  bool
 	Persistence  Persistence
+	Options      *ViewOptions
 	Replace      bool
 	Materialized bool
+	WithData     bool
 }
 
 // Format implements the NodeFormatter interface.
@@ -1935,8 +2089,19 @@ func (node *CreateView) Format(ctx *FmtCtx) {
 		ctx.WriteByte(')')
 	}
 
+	if node.Options != nil {
+		ctx.WriteString(` WITH ( `)
+		ctx.FormatNode(node.Options)
+		ctx.WriteString(` )`)
+	}
+
 	ctx.WriteString(" AS ")
 	ctx.FormatNode(node.AsSource)
+	if node.Materialized && node.WithData {
+		ctx.WriteString(" WITH DATA")
+	} else if node.Materialized && !node.WithData {
+		ctx.WriteString(" WITH NO DATA")
+	}
 }
 
 // RefreshMaterializedView represents a REFRESH MATERIALIZED VIEW statement.
@@ -1944,12 +2109,7 @@ type RefreshMaterializedView struct {
 	Name              *UnresolvedObjectName
 	Concurrently      bool
 	RefreshDataOption RefreshDataOption
-}
-
-// TelemetryCounter returns the telemetry counter to increment
-// when this command is used.
-func (node *RefreshMaterializedView) TelemetryCounter() telemetry.Counter {
-	return sqltelemetry.SchemaRefreshMaterializedView
+	AsOf              AsOfClause
 }
 
 // RefreshDataOption corresponds to arguments for the REFRESH MATERIALIZED VIEW
@@ -1975,6 +2135,10 @@ func (node *RefreshMaterializedView) Format(ctx *FmtCtx) {
 		ctx.WriteString("CONCURRENTLY ")
 	}
 	ctx.FormatNode(node.Name)
+	if node.AsOf.Expr != nil {
+		ctx.WriteString(" ")
+		ctx.FormatNode(&node.AsOf)
+	}
 	switch node.RefreshDataOption {
 	case RefreshDataWithData:
 		ctx.WriteString(" WITH DATA")
@@ -2005,7 +2169,7 @@ func (node *CreateStats) Format(ctx *FmtCtx) {
 	ctx.FormatNode(node.Table)
 
 	if !node.Options.Empty() {
-		ctx.WriteString(" WITH OPTIONS ")
+		ctx.WriteString(" WITH OPTIONS")
 		ctx.FormatNode(&node.Options)
 	}
 }
@@ -2020,18 +2184,32 @@ type CreateStatsOptions struct {
 	// Note that the timestamp will be moved up during the operation if it gets
 	// too old (in order to avoid problems with TTL expiration).
 	AsOf AsOfClause
+
+	// UsingExtremes is true when the statistics collection is at
+	// extreme values of the table or the index specified.
+	UsingExtremes bool
+
+	// Where will specify statistics collection in a set of rows of the table
+	// or index specified.
+	Where *Where
 }
 
 // Empty returns true if no options were provided.
 func (o *CreateStatsOptions) Empty() bool {
-	return o.Throttling == 0 && o.AsOf.Expr == nil
+	return o.Throttling == 0 && o.AsOf.Expr == nil && o.Where == nil && !o.UsingExtremes
 }
 
 // Format implements the NodeFormatter interface.
 func (o *CreateStatsOptions) Format(ctx *FmtCtx) {
-	sep := ""
+	if o.UsingExtremes {
+		ctx.WriteString(" USING EXTREMES")
+	}
+	if o.Where != nil {
+		ctx.WriteByte(' ')
+		ctx.FormatNode(o.Where)
+	}
 	if o.Throttling != 0 {
-		ctx.WriteString("THROTTLING ")
+		ctx.WriteString(" THROTTLING ")
 		// TODO(knz): Remove all this with ctx.FormatNode()
 		// if/when throttling supports full expressions.
 		if ctx.flags.HasFlags(FmtHideConstants) {
@@ -2042,12 +2220,10 @@ func (o *CreateStatsOptions) Format(ctx *FmtCtx) {
 		} else {
 			fmt.Fprintf(ctx, "%g", o.Throttling)
 		}
-		sep = " "
 	}
 	if o.AsOf.Expr != nil {
-		ctx.WriteString(sep)
+		ctx.WriteByte(' ')
 		ctx.FormatNode(&o.AsOf)
-		sep = " "
 	}
 }
 
@@ -2066,12 +2242,27 @@ func (o *CreateStatsOptions) CombineWith(other *CreateStatsOptions) error {
 		}
 		o.AsOf = other.AsOf
 	}
+	if other.UsingExtremes {
+		if o.UsingExtremes {
+			return errors.New("USING EXTREMES specified multiple times")
+		}
+		o.UsingExtremes = other.UsingExtremes
+	}
+	if other.Where != nil {
+		if o.Where != nil {
+			return errors.New("WHERE specified multiple times")
+		}
+		o.Where = other.Where
+	}
+	if other.Where != nil && o.UsingExtremes || o.Where != nil && other.UsingExtremes {
+		return errors.New("USING EXTREMES and WHERE may not be specified together")
+	}
 	return nil
 }
 
 // CreateExtension represents a CREATE EXTENSION statement.
 type CreateExtension struct {
-	Name        string
+	Name        Name
 	IfNotExists bool
 }
 
@@ -2086,5 +2277,220 @@ func (node *CreateExtension) Format(ctx *FmtCtx) {
 	// do not contain sensitive information and
 	// 2) we want to get telemetry on which extensions
 	// users attempt to load.
-	ctx.WriteString(node.Name)
+	ctx.WithFlags(ctx.flags&^FmtAnonymize, func() {
+		ctx.FormatNode(&node.Name)
+	})
+}
+
+// CreateLanguage represents a parameterless CREATE LANGUAGE statement (i.e.
+// without HANDLER/INLINE/VALIDATOR clauses). Only plpgsql is accepted; other
+// languages are rejected at parse time. Since CockroachDB has built-in
+// PL/pgSQL, the statement is a no-op and exists for compatibility with
+// PostgreSQL clients that issue CREATE LANGUAGE plpgsql defensively before
+// creating functions.
+type CreateLanguage struct {
+	Name    Name
+	Replace bool
+}
+
+// Format implements the NodeFormatter interface. The parser swallows the
+// optional TRUSTED/PROCEDURAL modifiers and legacy HANDLER/INLINE/VALIDATOR
+// clauses without recording them, so this does not round-trip the original
+// SQL. That's fine because the statement is a no-op.
+func (node *CreateLanguage) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE ")
+	if node.Replace {
+		ctx.WriteString("OR REPLACE ")
+	}
+	ctx.WriteString("LANGUAGE ")
+	ctx.FormatNode(&node.Name)
+}
+
+// CreateExternalConnection represents a CREATE EXTERNAL CONNECTION statement.
+type CreateExternalConnection struct {
+	ConnectionLabelSpec LabelSpec
+	As                  Expr
+}
+
+var _ Statement = &CreateExternalConnection{}
+
+// Format implements the Statement interface.
+func (node *CreateExternalConnection) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE EXTERNAL CONNECTION")
+	ctx.FormatNode(&node.ConnectionLabelSpec)
+	ctx.WriteString(" AS ")
+	ctx.FormatURI(node.As)
+}
+
+// CreateTenant represents a CREATE VIRTUAL CLUSTER statement.
+type CreateTenant struct {
+	IfNotExists bool
+	TenantSpec  *TenantSpec
+}
+
+// Format implements the NodeFormatter interface.
+func (node *CreateTenant) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE VIRTUAL CLUSTER ")
+	if node.IfNotExists {
+		ctx.WriteString("IF NOT EXISTS ")
+	}
+	ctx.FormatNode(node.TenantSpec)
+}
+
+// CreateTenantFromReplication represents a CREATE VIRTUAL CLUSTER...FROM REPLICATION
+// statement.
+type CreateTenantFromReplication struct {
+	IfNotExists bool
+	TenantSpec  *TenantSpec
+
+	// ReplicationSourceTenantName is the name of the tenant that
+	// we are replicating into the newly created tenant.
+	// Note: even though this field can only be a name
+	// (this is guaranteed during parsing), we still want
+	// to use the TenantSpec type. This supports the auto-promotion
+	// of simple identifiers to strings.
+	ReplicationSourceTenantName *TenantSpec
+	// ReplicationSourceConnUri is the address of the source cluster that we are
+	// replicating data from.
+	ReplicationSourceConnUri Expr
+
+	Options TenantReplicationOptions
+}
+
+// TenantReplicationOptions  options for the CREATE/ALTER VIRTUAL CLUSTER FROM REPLICATION command.
+type TenantReplicationOptions struct {
+	Retention          Expr
+	ExpirationWindow   Expr
+	EnableReaderTenant *DBool
+}
+
+var _ NodeFormatter = &TenantReplicationOptions{}
+
+// Format implements the NodeFormatter interface.
+func (node *CreateTenantFromReplication) Format(ctx *FmtCtx) {
+	ctx.WriteString("CREATE VIRTUAL CLUSTER ")
+	if node.IfNotExists {
+		ctx.WriteString("IF NOT EXISTS ")
+	}
+	// NB: we do not anonymize the tenant name because we assume that tenant names
+	// do not contain sensitive information.
+	ctx.FormatNode(node.TenantSpec)
+
+	if node.ReplicationSourceConnUri != nil {
+		ctx.WriteString(" FROM REPLICATION OF ")
+		ctx.FormatNode(node.ReplicationSourceTenantName)
+		ctx.WriteString(" ON ")
+		_, canOmitParentheses := node.ReplicationSourceConnUri.(alreadyDelimitedAsSyntacticDExpr)
+		if !canOmitParentheses {
+			ctx.WriteByte('(')
+		}
+		ctx.FormatNode(node.ReplicationSourceConnUri)
+		if !canOmitParentheses {
+			ctx.WriteByte(')')
+		}
+
+	}
+	if !node.Options.IsDefault() {
+		ctx.WriteString(" WITH ")
+		ctx.FormatNode(&node.Options)
+	}
+}
+
+// Format implements the NodeFormatter interface
+func (o *TenantReplicationOptions) Format(ctx *FmtCtx) {
+	var addSep bool
+	maybeAddSep := func() {
+		if addSep {
+			ctx.WriteString(", ")
+		}
+		addSep = true
+	}
+	if o.Retention != nil {
+		maybeAddSep()
+		ctx.WriteString("RETENTION = ")
+		_, canOmitParentheses := o.Retention.(alreadyDelimitedAsSyntacticDExpr)
+		if !canOmitParentheses {
+			ctx.WriteByte('(')
+		}
+		ctx.FormatNode(o.Retention)
+		if !canOmitParentheses {
+			ctx.WriteByte(')')
+		}
+	}
+	if o.ExpirationWindow != nil {
+		maybeAddSep()
+		ctx.WriteString("EXPIRATION WINDOW = ")
+		_, canOmitParentheses := o.ExpirationWindow.(alreadyDelimitedAsSyntacticDExpr)
+		if !canOmitParentheses {
+			ctx.WriteByte('(')
+		}
+		ctx.FormatNode(o.ExpirationWindow)
+		if !canOmitParentheses {
+			ctx.WriteByte(')')
+		}
+	}
+	if o.EnableReaderTenant != nil {
+		maybeAddSep()
+		ctx.WriteString("READ VIRTUAL CLUSTER")
+	}
+}
+
+// CombineWith merges other TenantReplicationOptions into this struct.
+// An error is returned if the same option merged multiple times.
+func (o *TenantReplicationOptions) CombineWith(other *TenantReplicationOptions) error {
+	if o.Retention != nil {
+		if other.Retention != nil {
+			return errors.New("RETENTION option specified multiple times")
+		}
+	} else {
+		o.Retention = other.Retention
+	}
+
+	if o.ExpirationWindow != nil {
+		if other.ExpirationWindow != nil {
+			return errors.New("EXPIRATION WINDOW option specified multiple times")
+		}
+	} else {
+		o.ExpirationWindow = other.ExpirationWindow
+	}
+
+	if o.EnableReaderTenant != nil {
+		if other.EnableReaderTenant != nil {
+			return errors.New("READ VIRTUAL CLUSTER option specified multiple times")
+		}
+	} else {
+		o.EnableReaderTenant = other.EnableReaderTenant
+	}
+
+	return nil
+}
+
+// IsDefault returns true if this backup options struct has default value.
+func (o TenantReplicationOptions) IsDefault() bool {
+	options := TenantReplicationOptions{}
+	return o.Retention == options.Retention &&
+		o.ExpirationWindow == options.ExpirationWindow &&
+		o.EnableReaderTenant == options.EnableReaderTenant
+}
+
+func (o TenantReplicationOptions) ExpirationWindowSet() bool {
+	options := TenantReplicationOptions{}
+	return o.ExpirationWindow != options.ExpirationWindow
+}
+
+type SuperRegion struct {
+	Name    Name
+	Regions NameList
+}
+
+func (node *SuperRegion) Format(ctx *FmtCtx) {
+	ctx.WriteString(" SUPER REGION ")
+	ctx.FormatNode(&node.Name)
+	ctx.WriteString(" VALUES ")
+	for i := range node.Regions {
+		if i != 0 {
+			ctx.WriteString(",")
+		}
+		ctx.FormatNode(&node.Regions[i])
+	}
 }

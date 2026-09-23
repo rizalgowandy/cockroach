@@ -1,20 +1,17 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cat
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 )
 
 // IndexOrdinal identifies an index (in the context of a Table).
@@ -48,13 +45,16 @@ type Index interface {
 
 	// Ordinal returns the ordinal of this index within the context of its Table.
 	// Specifically idx = Table().Index(idx.Ordinal).
-	Ordinal() int
+	Ordinal() IndexOrdinal
+
+	// Type returns the type of this index: forward, inverted, vector, etc.
+	Type() idxtype.T
 
 	// IsUnique returns true if this index is declared as UNIQUE in the schema.
 	IsUnique() bool
 
-	// IsInverted returns true if this is an inverted index.
-	IsInverted() bool
+	// GetInvisibility returns index invisibility.
+	GetInvisibility() float64
 
 	// ColumnCount returns the number of columns in the index. This includes
 	// columns that were part of the index definition (including the STORING
@@ -126,12 +126,12 @@ type Index interface {
 	// columns is data-dependent, not schema-dependent.
 	LaxKeyColumnCount() int
 
-	// NonInvertedPrefixColumnCount returns the number of non-inverted columns
-	// in the inverted index. An inverted index only has non-inverted columns if
-	// it is a multi-column inverted index. Therefore, a non-zero value is only
-	// returned for multi-column inverted indexes. This function panics if the
-	// index is not an inverted index.
-	NonInvertedPrefixColumnCount() int
+	// PrefixColumnCount can only be called for inverted or vector indexes, and
+	// will panic otherwise. It returns the number of forward-indexed columns that
+	// prefix the inverted or vector column. This is only the case for a
+	// multi-column inverted/vector index. Therefore, a non-zero value is only
+	// returned for multi-column inverted/vector indexes.
+	PrefixColumnCount() int
 
 	// Column returns the ith IndexColumn within the index definition, where
 	// i < ColumnCount.
@@ -140,6 +140,10 @@ type Index interface {
 	// InvertedColumn returns the inverted IndexColumn of the index. Panics if
 	// the index is not an inverted index.
 	InvertedColumn() IndexColumn
+
+	// VectorColumn returns the vector IndexColumn of the index. Panics if the
+	// index is not a vector index.
+	VectorColumn() IndexColumn
 
 	// Predicate returns the partial index predicate expression and true if the
 	// index is a partial index. If it is not a partial index, the empty string
@@ -159,28 +163,41 @@ type Index interface {
 	// Span returns the KV span associated with the index.
 	Span() roachpb.Span
 
-	// ImplicitPartitioningColumnCount returns the number of implicit partitioning
-	// columns at the front of the index. For example, consider the following
-	// table:
+	// ImplicitColumnCount returns the number of implicit columns at the front of
+	// the index including implicit partitioning columns and shard columns of hash
+	// sharded indexes. For example, consider the following table:
 	//
 	// CREATE TABLE t (
 	//   x INT,
 	//   y INT,
-	//   INDEX (y) PARTITION BY LIST (x) (
-	//     PARTITION p1 VALUES IN (1)
-	//   )
+	//   z INT,
+	//   INDEX (y),
+	//   INDEX (z) USING HASH
+	// ) PARTITION ALL BY LIST (x) (
+	//   PARTITION p1 VALUES IN (1)
 	// );
 	//
-	// In this case, the number of implicit partitioning columns in the index on
-	// y is 1, since x is implicitly added to the front of the index.
+	// In this case, the number of implicit columns in the index on y is 1, since
+	// x is implicitly added to the front of the index. The number of implicit
+	// columns in the index on z is 2, since x and a shard column are implicitly
+	// added to the front of the index.
 	//
 	// The implicit partitioning columns are always a prefix of the full column
-	// list, and ImplicitPartitioningColumnCount < LaxKeyColumnCount.
+	// list, and ImplicitColumnCount < LaxKeyColumnCount.
+	ImplicitColumnCount() int
+
+	// ImplicitPartitioningColumnCount returns the number of implicit columns at
+	// the front of the index that are implicit partitioning columns. The value
+	// returned is always <= ImplicitColumnCount.
 	ImplicitPartitioningColumnCount() int
 
-	// GeoConfig returns a geospatial index configuration. If non-nil, it
+	// GeoConfig returns a geospatial index configuration. If not empty, it
 	// describes the configuration for this geospatial inverted index.
-	GeoConfig() *geoindex.Config
+	GeoConfig() geopb.Config
+
+	// VecConfig returns a vector index configuration. If not empty, it describes
+	// the configuration for this vector index.
+	VecConfig() *vecpb.Config
 
 	// Version returns the IndexDescriptorVersion of the index.
 	Version() descpb.IndexDescriptorVersion
@@ -192,6 +209,10 @@ type Index interface {
 	// Partition returns the ith PARTITION BY LIST partition within the index
 	// definition, where i < PartitionCount.
 	Partition(i int) Partition
+
+	// IsTemporaryIndexForBackfill returns true if the index is a temporary index
+	// for an in-progress index backfill.
+	IsTemporaryIndexForBackfill() bool
 }
 
 // IndexColumn describes a single column that is part of an index definition.
@@ -209,6 +230,12 @@ type IndexColumn struct {
 // the given ordinal position is a mutation index.
 func IsMutationIndex(table Table, ord IndexOrdinal) bool {
 	return ord >= table.IndexCount()
+}
+
+// IsTemporaryMutationIndex is a convenience function that returns true if the index at
+// the given ordinal position is a mutation index and is temporary.
+func IsTemporaryMutationIndex(table Table, ord IndexOrdinal) bool {
+	return IsMutationIndex(table, ord) && table.Index(ord).IsTemporaryIndexForBackfill()
 }
 
 // Partition is an interface to a PARTITION BY LIST partition of an index. The

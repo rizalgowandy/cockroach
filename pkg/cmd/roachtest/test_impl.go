@@ -1,39 +1,49 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
-	// For the debug http handlers.
-	_ "net/http/pprof"
-	"runtime"
+	"math/rand"
+	"os"
+	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/logger"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestflags"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/version"
 	"github.com/petermattis/goid"
 )
 
 // perfArtifactsDir is the directory on cluster nodes in which perf artifacts
-// reside. Upon success this directory is copied into test artifactsDir from
+// reside. Upon success this directory is copied into the test's ArtifactsDir() from
 // each node in the cluster.
 const perfArtifactsDir = "perf"
+
+// goCoverArtifactsDir is the directory on cluster nodes in which go coverage
+// profiles are dumped. At the end of a test this directory is copied into the
+// test's ArtifactsDir() from each node in the cluster.
+const goCoverArtifactsDir = "gocover"
+
+// cpuProfilesDir is the directory on cluster nodes in which pprof (CPU) profiles
+// are dumped. At the end of a test, this directory is copied into the test's
+// ArtifactsDir() from each node in the cluster if --force-cpu-profile is set.
+const cpuProfilesDir = "pprof_dump"
 
 type testStatus struct {
 	msg      string
@@ -41,17 +51,45 @@ type testStatus struct {
 	progress float64
 }
 
+// Holds all error information from a single invocation of t.{Fatal,Error}{,f} to
+// preserve any structured errors
+// e.g. t.Fatalf("foo %s %s %s", "hello", err1, err2) would mean that
+// failure.errors == [err1, err2], with all args (including the non error "hello")
+// being captured in the squashedErr
+type failure struct {
+	// This is the single error created from variadic args passed to t.{Fatal,Error}{,f}
+	squashedErr error
+	// errors are all the `errors` present in the variadic args
+	errors []error
+}
+
 type testImpl struct {
 	spec *registry.TestSpec
 
-	cockroach          string // path to main cockroach binary
+	cockroach   string // path to main cockroach binary
+	cockroachEA string // path to cockroach binary compiled with --crdb_test build tag
+
+	randomCockroachOnce sync.Once
+	randomizedCockroach string // either `cockroach` or `cockroach-ea`, picked randomly
+
 	deprecatedWorkload string // path to workload binary
+	debug              bool   // whether the test is in debug mode.
 	// buildVersion is the version of the Cockroach binary that the test will run
 	// against.
-	buildVersion version.Version
+	buildVersion *version.Version
 
 	// l is the logger that the test will use for its output.
-	l *logger.Logger
+	//
+	// N.B. We need to use an atomic pointer here since the test
+	// runner can swap the logger out when running post test assertions
+	// and artifacts collection.
+	l atomic.Pointer[logger.Logger]
+
+	// taskManager manages tasks (goroutines) for tests.
+	taskManager task.Manager
+
+	// monitor monitors for process death in the cluster.
+	monitor test.Monitor
 
 	runner string
 	// runnerID is the test's main goroutine ID.
@@ -69,62 +107,158 @@ type testImpl struct {
 
 	mu struct {
 		syncutil.RWMutex
-		done    bool
-		failed  bool
-		timeout bool // if failed == true, this indicates whether the test timed out
+		done bool
+
 		// cancel, if set, is called from the t.Fatal() family of functions when the
 		// test is being marked as failed (i.e. when the failed field above is also
 		// set). This is used to cancel the context passed to t.spec.Run(), so async
 		// test goroutines can be notified.
-		cancel  func()
-		failLoc struct {
-			file string
-			line int
-		}
-		failureMsg string
+		cancel func()
+
+		// failures added via addFailures, in order
+		// A test can have multiple calls to t.Fail()/Error(), with each call
+		// referencing 0+ errors. failure captures all the errors
+		failures []failure
+
+		// failuresSuppressed indicates if further failures should be added to mu.failures.
+		failuresSuppressed bool
+
+		// numFailures is the number of failures that have been added via addFailures.
+		// This can deviate from len(failures) if failures have been suppressed.
+		numFailures int
+
 		// status is a map from goroutine id to status set by that goroutine. A
 		// special goroutine is indicated by runnerID; that one provides the test's
 		// "main status".
 		status map[int64]testStatus
+
+		// TODO(test-eng): this should just be an in-mem (ring) buffer attached to
+		// `t.L()`.
 		output []byte
+
+		// extraParams are test-specific parameters that will be added to the Github issue as
+		// parameters if there is a failure. They will additionally be logged in the test itself
+		// in case github issue posting is disabled.
+		extraParams map[string]string
+
+		// githubFatalLogs contains node fatal logs that will be passed to
+		// github.MaybePost
+		githubFatalLogs string
+
+		// githubIpToNodeMapping contains the ip to node map that will be passed to
+		// github.MaybePost
+		githubIpToNodeMapping string
+
+		// preempted is set when the test's failure was attributed to a VM
+		// preemption by runTest's post-failure checks. Read by the test runner
+		// after runTest returns to decide whether to requeue (e.g. retry a
+		// benchmark on non-spot VMs).
+		preempted bool
 	}
 	// Map from version to path to the cockroach binary to be used when
 	// mixed-version test wants a binary for that binary. If a particular version
 	// <ver> is found in this map, it is used instead of the binary coming from
-	// `roachprod stage release <ver>`. See the --version-binary-override flags.
+	// `roachprod stage release <ver>`. See the --versions-binary-override flags.
 	//
 	// Version strings look like "20.1.4".
 	versionsBinaryOverride map[string]string
+	skipInit               bool
+	// If true, go coverage is enabled and the BAZEL_COVER_DIR env var will be set
+	// when starting nodes.
+	goCoverEnabled bool
+	// If true, the stats exporter will export metrics in openmetrics format.
+	// else the exporter will export in the JSON format.
+	exportOpenmetrics bool
+	// If set, this is used for adding labels to the benchmark metrics
+	runID string
 }
 
-func (t *testImpl) timedOut() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.mu.timeout
-}
-
-func (t *testImpl) setTimedOut() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.mu.timeout = true
+func newFailure(squashedErr error, errs []error) failure {
+	return failure{squashedErr: squashedErr, errors: errs}
 }
 
 // BuildVersion exposes the build version of the cluster
 // in this test.
 func (t *testImpl) BuildVersion() *version.Version {
-	return &t.buildVersion
+	return t.buildVersion
 }
 
+// Cockroach will return either `RuntimeAssertionsCockroach()` or
+// StandardCockroach(), picked based off of the test spec. Once a choice
+// has been made, the same binary will be returned on every call to
+// Cockroach, to avoid errors that may arise from binaries having a
+// different value for metamorphic constants.
 func (t *testImpl) Cockroach() string {
+	t.randomCockroachOnce.Do(func() {
+		switch t.Spec().(*registry.TestSpec).CockroachBinary {
+		case registry.RandomizedCockroach:
+			// If the test is a benchmark test, we don't want to enable assertions
+			// as it will slow down performance.
+			if t.spec.Benchmark {
+				t.L().Printf("Benchmark test, running with standard cockroach")
+				t.randomizedCockroach = t.StandardCockroach()
+				return
+			}
+
+			if rand.Float64() < roachtestflags.CockroachEAProbability {
+				// The build with runtime assertions should exist in every nightly
+				// CI build, but we can't assume it exists in every roachtest call.
+				if path := t.RuntimeAssertionsCockroach(); path != "" {
+					t.L().Printf("Runtime assertions enabled")
+					t.randomizedCockroach = path
+					return
+				} else {
+					t.L().Printf("WARNING: running without runtime assertions since the corresponding binary was not specified")
+				}
+			}
+			t.L().Printf("Runtime assertions disabled")
+			t.randomizedCockroach = t.StandardCockroach()
+		case registry.StandardCockroach:
+			t.L().Printf("Runtime assertions disabled: registry.StandardCockroach set")
+			t.randomizedCockroach = t.StandardCockroach()
+		case registry.RuntimeAssertionsCockroach:
+			t.L().Printf("Runtime assertions enabled: registry.RuntimeAssertionsCockroach set")
+			t.randomizedCockroach = t.RuntimeAssertionsCockroach()
+		default:
+			t.Fatal("Specified cockroach binary does not exist.")
+		}
+	})
+
+	return t.randomizedCockroach
+}
+
+func (t *testImpl) ExportOpenmetrics() bool {
+	return t.exportOpenmetrics
+}
+
+func (t *testImpl) GetRunId() string {
+	return t.runID
+}
+
+func (t *testImpl) RuntimeAssertionsCockroach() string {
+	return t.cockroachEA
+}
+
+func (t *testImpl) StandardCockroach() string {
 	return t.cockroach
 }
 
 func (t *testImpl) DeprecatedWorkload() string {
+	// Discourage usage of the deprecated workload by gating it behind the
+	// 'RequiresDeprecatedWorkload' test spec. Tests should use 'cockroach
+	// workload' instead when possible.
+	if !t.spec.RequiresDeprecatedWorkload {
+		t.Fatal("Using deprecated workload but `RequiresDeprecatedWorkload` is not set in test spec.")
+	}
 	return t.deprecatedWorkload
 }
 
 func (t *testImpl) VersionsBinaryOverride() map[string]string {
 	return t.versionsBinaryOverride
+}
+
+func (t *testImpl) SkipInit() bool {
+	return t.skipInit
 }
 
 // Spec returns the TestSpec.
@@ -138,15 +272,22 @@ func (t *testImpl) Name() string {
 	return t.spec.Name
 }
 
+func (t *testImpl) Owner() string {
+	return string(t.spec.Owner)
+}
+
+func (t *testImpl) SnapshotPrefix() string {
+	return t.spec.SnapshotPrefix
+}
+
 // L returns the test's logger.
 func (t *testImpl) L() *logger.Logger {
-	return t.l
+	return t.l.Load()
 }
 
 // ReplaceL replaces the test's logger.
 func (t *testImpl) ReplaceL(l *logger.Logger) {
-	// TODO(tbg): get rid of this, this is racy & hacky.
-	t.l = l
+	t.l.Store(l)
 }
 
 func (t *testImpl) status(ctx context.Context, id int64, args ...interface{}) {
@@ -180,6 +321,31 @@ func (t *testImpl) status(ctx context.Context, id int64, args ...interface{}) {
 // status message is erased.
 func (t *testImpl) Status(args ...interface{}) {
 	t.status(context.TODO(), t.runnerID, args...)
+}
+
+// AddParam adds a parameter to the test. This parameter will be logged both in
+// the github issue if one is created and in the artifacts directory. This is useful if a test
+// has metamorphic properties as it makes it easier to spot the differences between runs
+// without digging into the logs (i.e. mixed version test deployment mode). It also helps
+// debugging when the test failure is not posted to github (i.e. qualification runs).
+func (t *testImpl) AddParam(label, value string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.mu.extraParams == nil {
+		t.mu.extraParams = make(map[string]string)
+	}
+	t.mu.extraParams[label] = value
+}
+
+func (t *testImpl) getExtraParams() map[string]string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.mu.extraParams
+}
+
+// IsDebug returns true if the test is in a debug state.
+func (t *testImpl) IsDebug() bool {
+	return t.debug
 }
 
 // GetStatus returns the status of the tests's main goroutine.
@@ -247,6 +413,17 @@ func (t *testImpl) Skipf(format string, args ...interface{}) {
 	panic(errTestFatal)
 }
 
+// collectErrors extracts any arg that is an error
+func collectErrors(args []interface{}) []error {
+	var errs []error
+	for _, a := range args {
+		if err, ok := a.(error); ok {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
 // Fatal marks the test as failed, prints the args to t.L(), and calls
 // panic(errTestFatal). It can be called multiple times.
 //
@@ -256,144 +433,130 @@ func (t *testImpl) Skipf(format string, args ...interface{}) {
 // ATTENTION: Since this calls panic(errTestFatal), it should only be called
 // from a test's closure. The test runner itself should never call this.
 func (t *testImpl) Fatal(args ...interface{}) {
-	t.fatalfInner("" /* format */, args...)
+	t.addFailureAndCancel(1, "", args...)
+	panic(errTestFatal)
 }
 
 // Fatalf is like Fatal, but takes a format string.
 func (t *testImpl) Fatalf(format string, args ...interface{}) {
-	t.fatalfInner(format, args...)
+	t.addFailureAndCancel(1, format, args...)
+	panic(errTestFatal)
 }
 
 // FailNow implements the TestingT interface.
 func (t *testImpl) FailNow() {
-	t.Fatal()
+	t.addFailureAndCancel(1, "FailNow called")
+	panic(errTestFatal)
+}
+
+// Error implements the TestingT interface
+func (t *testImpl) Error(args ...interface{}) {
+	t.addFailureAndCancel(1, "", args...)
 }
 
 // Errorf implements the TestingT interface.
 func (t *testImpl) Errorf(format string, args ...interface{}) {
-	t.Fatalf(format, args...)
+	t.addFailureAndCancel(1, format, args...)
 }
 
-func (t *testImpl) fatalfInner(format string, args ...interface{}) {
-	// Skip two frames: our own and the caller.
-	if format != "" {
-		t.printfAndFail(2 /* skip */, format, args...)
-	} else {
-		t.printAndFail(2 /* skip */, args...)
-	}
-	panic(errTestFatal)
-}
-
-func (t *testImpl) printAndFail(skip int, args ...interface{}) {
-	var msg string
-	if len(args) == 1 {
-		// If we were passed only an error, then format it with "%+v" in order to
-		// get any stack traces.
-		if err, ok := args[0].(error); ok {
-			msg = fmt.Sprintf("%+v", err)
-		}
-	}
-	if msg == "" {
-		msg = fmt.Sprint(args...)
-	}
-	t.failWithMsg(t.decorate(skip+1, msg))
-}
-
-func (t *testImpl) printfAndFail(skip int, format string, args ...interface{}) {
-	if format == "" {
-		panic(fmt.Sprintf("invalid empty format. args: %s", args))
-	}
-	t.failWithMsg(t.decorate(skip+1, fmt.Sprintf(format, args...)))
-}
-
-func (t *testImpl) failWithMsg(msg string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	prefix := ""
-	if t.mu.failed {
-		prefix = "[not the first failure] "
-		// NB: the first failure is not always the relevant one due to:
-		// https://github.com/cockroachdb/cockroach/issues/44436
-		//
-		// So we chain all failures together in the order in which we see
-		// them.
-		msg = "\n" + msg
-	}
-	t.L().Printf("%stest failure: %s", prefix, msg)
-
-	t.mu.failed = true
-	t.mu.failureMsg += msg
-	t.mu.output = append(t.mu.output, msg...)
+func (t *testImpl) addFailureAndCancel(depth int, format string, args ...interface{}) {
+	t.addFailure(depth+1, format, args...)
 	if t.mu.cancel != nil {
 		t.mu.cancel()
 	}
 }
 
-// Args:
-// skip: The number of stack frames to exclude from the result. 0 means that
-//   the caller will be the first frame identified. 1 means the caller's caller
-//   will be the first, etc.
-func (t *testImpl) decorate(skip int, s string) string {
-	// Skip two extra frames to account for this function and runtime.Callers
-	// itself.
-	var pc [50]uintptr
-	n := runtime.Callers(2+skip, pc[:])
-	if n == 0 {
-		panic("zero callers found")
+// addFailure depth indicates how many stack frames to skip when reporting the
+// site of the failure in logs. `0` will report the caller of addFailure, `1` the
+// caller of the caller of addFailure, etc.
+func (t *testImpl) addFailure(depth int, format string, args ...interface{}) {
+	if format == "" {
+		format = strings.Repeat(" %v", len(args))[1:]
+	}
+	reportFailure := newFailure(errors.NewWithDepthf(depth+1, format, args...), collectErrors(args))
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.mu.failuresSuppressed {
+		t.mu.failures = append(t.mu.failures, reportFailure)
 	}
 
-	buf := new(bytes.Buffer)
-	frames := runtime.CallersFrames(pc[:n])
-	sep := "\t"
-	runnerFound := false
-	for {
-		if runnerFound {
-			break
-		}
+	var b strings.Builder
+	formatFailure(&b, reportFailure)
+	msg := b.String()
 
-		frame, more := frames.Next()
-		if !more {
-			break
-		}
-		if frame.Function == t.runner {
-			runnerFound = true
-
-			// Handle the special case of the runner function being the caller of
-			// t.Fatal(). In that case, that's the line to be used for issue creation.
-			if t.mu.failLoc.file == "" {
-				t.mu.failLoc.file = frame.File
-				t.mu.failLoc.line = frame.Line
+	t.mu.numFailures++
+	failureNum := t.mu.numFailures
+	failureLog := fmt.Sprintf("failure_%d", failureNum)
+	t.L().Printf("test failure #%d: full stack retained in %s.log: %s", failureNum, failureLog, msg)
+	// Also dump the verbose error (incl. all stack traces) to a log file, in case
+	// we need it. The stacks are sometimes helpful, but we don't want them in the
+	// main log as they are highly verbose.
+	{
+		cl, err := t.L().ChildLogger(failureLog, logger.QuietStderr, logger.QuietStdout)
+		if err == nil {
+			// We don't actually log through this logger since it adds an unrelated
+			// file:line caller (namely ours). The error already has stack traces
+			// so it's better to write only it to the file to avoid confusion.
+			if cl.File != nil {
+				path := cl.File.Name()
+				if len(path) > 0 {
+					_ = os.WriteFile(path, []byte(fmt.Sprintf("%+v", reportFailure.squashedErr)), 0644)
+				}
 			}
+			cl.Close() // we just wanted the filename
 		}
-		if !t.mu.failed && !runnerFound {
-			// Keep track of the highest stack frame that is lower than the t.runner
-			// stack frame. This is used to determine the author of that line of code
-			// and issue assignment.
-			t.mu.failLoc.file = frame.File
-			t.mu.failLoc.line = frame.Line
-		}
-		file := frame.File
-		if index := strings.LastIndexByte(file, '/'); index >= 0 {
-			file = file[index+1:]
-		}
-		fmt.Fprintf(buf, "%s%s:%d", sep, file, frame.Line)
-		sep = ","
 	}
-	buf.WriteString(": ")
 
-	lines := strings.Split(s, "\n")
-	if l := len(lines); l > 1 && lines[l-1] == "" {
-		lines = lines[:l-1]
-	}
-	for i, line := range lines {
+	t.mu.output = append(t.mu.output, msg...)
+	t.mu.output = append(t.mu.output, '\n')
+}
+
+// suppressFailures will stop future failures from being surfaced to github posting
+// or the test logger. It will not stop those failures from being logged in their
+// own failure.log files. Used if we are confident on the root cause of a failure and
+// want to reduce noise of other failures, i.e. timeouts.
+func (t *testImpl) suppressFailures() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.failuresSuppressed = true
+}
+
+func (t *testImpl) resetFailures() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.failures = nil
+	t.mu.failuresSuppressed = false
+}
+
+// markPreempted records that this test's failure was attributed to a VM
+// preemption. See the comment on the preempted field for details.
+func (t *testImpl) markPreempted() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.preempted = true
+}
+
+// wasPreempted reports whether markPreempted was called.
+func (t *testImpl) wasPreempted() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.mu.preempted
+}
+
+// We take the "squashed" error that contains information of all the errors for each failure.
+func formatFailure(b *strings.Builder, reportFailures ...failure) {
+	for i, failure := range reportFailures {
 		if i > 0 {
-			buf.WriteString("\n\t\t")
+			fmt.Fprintln(b)
 		}
-		buf.WriteString(line)
+		file, line, fn, ok := errors.GetOneLineSource(failure.squashedErr)
+		if !ok {
+			file, line, fn = "<unknown>", 0, "unknown"
+		}
+		fmt.Fprintf(b, "(%s:%d).%s: %v", file, line, fn, failure.squashedErr)
 	}
-	buf.WriteByte('\n')
-	return buf.String()
 }
 
 func (t *testImpl) duration() time.Duration {
@@ -403,13 +566,169 @@ func (t *testImpl) duration() time.Duration {
 func (t *testImpl) Failed() bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.mu.failed
+	return t.failedRLocked()
 }
 
-func (t *testImpl) FailureMsg() string {
+func (t *testImpl) failedRLocked() bool {
+	return t.mu.numFailures > 0
+}
+
+func (t *testImpl) failures() []failure {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.mu.failureMsg
+	return t.mu.failures
+}
+
+func (t *testImpl) failureMsg() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var b strings.Builder
+	formatFailure(&b, t.mu.failures...)
+	return b.String()
+}
+
+func (t *testImpl) getGithubFatalLogs() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.mu.githubFatalLogs
+}
+
+func (t *testImpl) appendGithubFatalLogs(msg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.githubFatalLogs += msg
+}
+
+func (t *testImpl) getGithubIpToNodeMapping() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.mu.githubIpToNodeMapping
+}
+
+func (t *testImpl) appendGithubIpToNodeMapping(msg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mu.githubIpToNodeMapping += msg
+}
+
+// getGithubMessage abstracts details on how the Github message is constructed
+// TODO(wchoe): Currently, all information we want to include in the Github
+// message must be passed in as a single string. This is not ideal, especially
+// as we add more information or want to format based on the failure or what
+// information is available. #157021 aims to address this.
+func (t *testImpl) getGithubMessage(failureMsg string) string {
+	githubMsg := failureMsg
+	if githubFatalLogs := t.getGithubFatalLogs(); githubFatalLogs != "" {
+		githubMsg = fmt.Sprintf("%s\n%s", githubMsg, githubFatalLogs)
+	}
+	if githubIpToNodeMapping := t.getGithubIpToNodeMapping(); githubIpToNodeMapping != "" {
+		githubMsg = fmt.Sprintf("%s\n%s", githubMsg, githubIpToNodeMapping)
+	}
+	t.L().Printf("github message: %s", githubMsg)
+	return githubMsg
+}
+
+// failuresMatchingError checks whether the first error in trees of
+// any of the errors in the failures passed match the `refError`
+// target. If it does, `refError` is set to that target error value
+// and returns true. Otherwise, it returns false.
+func failuresMatchingError(failures []failure, refError any) bool {
+	// unwrap unwraps the error passed to find the innermost error in the
+	// chain that satisfies the `refError` provided.
+	unwrap := func(err error) bool {
+		var matched bool
+		for {
+			if isRef := errors.As(err, refError); !isRef {
+				break
+			}
+
+			matched = true
+			err = errors.Unwrap(err)
+			if err == nil {
+				break
+			}
+		}
+
+		return matched
+	}
+
+	for _, f := range failures {
+		for _, err := range f.errors {
+			if unwrap(err) {
+				return true
+			}
+		}
+
+		if unwrap(f.squashedErr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+var transientErrorRegex = regexp.MustCompile(`TRANSIENT_ERROR\((.+)\)`)
+
+// transientErrorOwnershipFallback string matches for `TRANSIENT_ERROR` in the provided
+// failures and returns a new ErrorWithOwnership if it does. It iterates through each failure,
+// checking both the squashedErr and list of errors for `TRANSIENT_ERROR`.
+//
+// This is needed as the `require` package does not preserve the error object needed
+// for us to properly check if it is a transient error using `failuresMatchingError`.
+// Note the match is additionally guarded by the unique substring which denotes that
+// the error originated from the require package. If we see somewhere else that does not
+// preserve the error object, we want to investigate whether it can be fixed before resorting
+// to this fallback. See: #131094
+func transientErrorOwnershipFallback(failures []failure) *registry.ErrorWithOwnership {
+	const unexpectedErrPrefix = "Received unexpected error:"
+	var errWithOwner registry.ErrorWithOwnership
+	isTransient := func(err error) bool {
+		// Both squashedErr and errors should be non nil in actual roachtest failures,
+		// but for testing we sometimes only set one for simplicity.
+		if err == nil {
+			return false
+		}
+		// The require package prepends this message to `require.NoError` failures.
+		// We may see `TRANSIENT_ERROR` without this prefix, but don't mark it as
+		// a flake as we may be able to fix the code that doesn't preserve the error.
+		if !strings.Contains(err.Error(), unexpectedErrPrefix) {
+			return false
+		}
+
+		if match := transientErrorRegex.FindString(err.Error()); match != "" {
+			problemCause := strings.TrimPrefix(match, "TRANSIENT_ERROR(")
+			problemCause = strings.TrimSuffix(problemCause, ")")
+			// The cause will be used to create the github issue creation, so we don't want
+			// it to be blank. Instead, return false and let us investigate what is creating
+			// a transient error with no cause.
+			if problemCause == "" {
+				return false
+			}
+
+			errWithOwner = registry.ErrorWithOwner(
+				registry.OwnerTestEng, err,
+				registry.WithTitleOverride(problemCause),
+				registry.InfraFlake,
+			)
+			return true
+		}
+
+		return false
+	}
+
+	for _, f := range failures {
+		for _, err := range f.errors {
+			if isTransient(err) {
+				return &errWithOwner
+			}
+		}
+
+		if isTransient(f.squashedErr) {
+			return &errWithOwner
+		}
+	}
+
+	return nil
 }
 
 func (t *testImpl) ArtifactsDir() string {
@@ -418,6 +737,13 @@ func (t *testImpl) ArtifactsDir() string {
 
 func (t *testImpl) PerfArtifactsDir() string {
 	return perfArtifactsDir
+}
+
+func (t *testImpl) GoCoverArtifactsDir() string {
+	if t.goCoverEnabled {
+		return goCoverArtifactsDir
+	}
+	return ""
 }
 
 // IsBuildVersion returns true if the build version is greater than or equal to
@@ -430,8 +756,8 @@ func (t *testImpl) IsBuildVersion(minVersion string) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := vers.PreRelease(); p != "" {
-		panic("cannot specify a prerelease: " + p)
+	if vers.IsPrerelease() {
+		panic("cannot specify a prerelease: " + vers.Format("%P"))
 	}
 	// We append "-0" to the min-version spec so that we capture all
 	// prereleases of the specified version. Otherwise, "v2.1.0" would compare
@@ -440,18 +766,73 @@ func (t *testImpl) IsBuildVersion(minVersion string) bool {
 	return t.BuildVersion().AtLeast(vers)
 }
 
-// teamCityEscape escapes a string for use as <value> in a key='<value>' attribute
-// in TeamCity build output marker.
-// Documentation here: https://confluence.jetbrains.com/display/TCD10/Build+Script+Interaction+with+TeamCity#BuildScriptInteractionwithTeamCity-Escapedvalues
-func teamCityEscape(s string) string {
-	r := strings.NewReplacer(
-		"\n", "|n",
-		"'", "|'",
-		"|", "||",
-		"[", "|[",
-		"]", "|]",
+// defaultTaskOptions returns the default options for a task started by the test.
+func defaultTaskOptions() []task.Option {
+	return []task.Option{
+		task.PanicHandler(func(_ context.Context, name string, l *logger.Logger, r interface{}) error {
+			return fmt.Errorf("test task %s panicked: %v", name, r)
+		}),
+	}
+}
+
+// GoWithCancel runs the given function in a goroutine and returns a
+// CancelFunc that can be used to cancel the function.
+func (t *testImpl) GoWithCancel(fn task.Func, opts ...task.Option) context.CancelFunc {
+	return t.taskManager.GoWithCancel(
+		fn, task.OptionList(defaultTaskOptions()...), task.OptionList(opts...),
 	)
-	return r.Replace(s)
+}
+
+// Go is like GoWithCancel but without a cancel function.
+func (t *testImpl) Go(fn task.Func, opts ...task.Option) {
+	_ = t.GoWithCancel(fn, task.OptionList(opts...))
+}
+
+// NewGroup starts a new task group.
+func (t *testImpl) NewGroup(opts ...task.Option) task.Group {
+	return t.taskManager.NewGroup(task.OptionList(defaultTaskOptions()...), task.OptionList(opts...))
+}
+
+// NewErrorGroup starts a new task error group.
+func (t *testImpl) NewErrorGroup(opts ...task.Option) task.ErrorGroup {
+	return t.taskManager.NewErrorGroup(task.OptionList(defaultTaskOptions()...), task.OptionList(opts...))
+}
+
+// Monitor returns the test's monitor.
+func (t *testImpl) Monitor() test.Monitor {
+	return t.monitor
+}
+
+// TeamCityEscape escapes a string for use as <value> in a key='<value>' attribute
+// in TeamCity build output marker.
+// See https://www.jetbrains.com/help/teamcity/2023.05/service-messages.html#Escaped+Values
+func TeamCityEscape(s string) string {
+	var sb strings.Builder
+
+	for _, runeValue := range s {
+		switch runeValue {
+		case '\n':
+			sb.WriteString("|n")
+		case '\r':
+			sb.WriteString("|r")
+		case '|':
+			sb.WriteString("||")
+		case '[':
+			sb.WriteString("|[")
+		case ']':
+			sb.WriteString("|]")
+		case '\'':
+			sb.WriteString("|'")
+		default:
+			if runeValue > 127 {
+				// escape unicode
+				sb.WriteString(fmt.Sprintf("|0x%04x", runeValue))
+			} else {
+				sb.WriteRune(runeValue)
+			}
+		}
+	}
+	return sb.String()
 }
 
 func teamCityNameEscape(name string) string {
@@ -468,13 +849,13 @@ type clusterType int
 
 const (
 	localCluster clusterType = iota
-	roachprodCluster
+	roachprodClusterType
 )
 
 type loggingOpt struct {
-	// l is the test runner logger.
+	// runnerL is the test runner logger.
 	// Note that individual test runs will use a different logger.
-	l *logger.Logger
+	runnerL *logger.Logger
 	// tee controls whether test logs (not test runner logs) also go to stdout or
 	// not.
 	tee            logger.TeeOptType
@@ -501,7 +882,10 @@ type workerStatus struct {
 
 		ttr testToRunRes
 		t   *testImpl
-		c   *clusterImpl
+		// The cluster that the worker is currently operating on. If the worker is
+		// currently running a test, the test is using this cluster. Nil if the
+		// worker does not currently have a cluster.
+		c testCluster
 	}
 }
 
@@ -517,13 +901,13 @@ func (w *workerStatus) SetStatus(status string) {
 	w.mu.Unlock()
 }
 
-func (w *workerStatus) Cluster() *clusterImpl {
+func (w *workerStatus) Cluster() testCluster {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.mu.c
 }
 
-func (w *workerStatus) SetCluster(c *clusterImpl) {
+func (w *workerStatus) SetCluster(c testCluster) {
 	w.mu.Lock()
 	w.mu.c = c
 	w.mu.Unlock()

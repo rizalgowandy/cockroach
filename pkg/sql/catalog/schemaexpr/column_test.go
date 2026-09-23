@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package schemaexpr
 
@@ -14,9 +9,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -26,7 +23,7 @@ func TestDequalifyColumnRefs(t *testing.T) {
 
 	database := tree.Name("foo")
 	table := tree.Name("bar")
-	tn := tree.MakeTableNameWithSchema(database, tree.PublicSchemaName, table)
+	tn := tree.MakeTableNameWithSchema(database, catconstants.PublicSchemaName, table)
 
 	cols := []descpb.ColumnDescriptor{
 		{Name: "a", Type: types.Int},
@@ -86,8 +83,8 @@ func TestRenameColumn(t *testing.T) {
 	to := tree.Name("bar")
 
 	testData := []struct {
-		expr     string
-		expected string
+		expr     catpb.Expression
+		expected catpb.Expression
 	}{
 		{"foo", "bar"},
 		{"foo = 1", "bar = 1"},
@@ -97,7 +94,7 @@ func TestRenameColumn(t *testing.T) {
 	}
 
 	for _, d := range testData {
-		t.Run(d.expr, func(t *testing.T) {
+		t.Run(string(d.expr), func(t *testing.T) {
 			res, err := RenameColumn(d.expr, from, to)
 			if err != nil {
 				t.Fatalf("%s: unexpected error: %s", d.expr, err)

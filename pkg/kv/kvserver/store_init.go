@@ -1,75 +1,25 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/errors"
 )
-
-// FirstNodeID is the NodeID assigned to the node bootstrapping a new cluster.
-const FirstNodeID = roachpb.NodeID(1)
-
-// FirstStoreID is the StoreID assigned to the first store on the node with ID
-// FirstNodeID.
-const FirstStoreID = roachpb.StoreID(1)
-
-// InitEngine writes a new store ident to the underlying engine. To
-// ensure that no crufty data already exists in the engine, it scans
-// the engine contents before writing the new store ident. The engine
-// should be completely empty save for a cluster version, which must
-// already have been persisted to it. Returns an error if this is not
-// the case.
-func InitEngine(ctx context.Context, eng storage.Engine, ident roachpb.StoreIdent) error {
-	exIdent, err := ReadStoreIdent(ctx, eng)
-	if err == nil {
-		return errors.Errorf("engine %s is already initialized with ident %s", eng, exIdent.String())
-	}
-	if !errors.HasType(err, (*NotBootstrappedError)(nil)) {
-		return err
-	}
-
-	if err := checkCanInitializeEngine(ctx, eng); err != nil {
-		return errors.Wrap(err, "while trying to initialize engine")
-	}
-
-	batch := eng.NewBatch()
-	if err := storage.MVCCPutProto(
-		ctx,
-		batch,
-		nil,
-		keys.StoreIdentKey(),
-		hlc.Timestamp{},
-		nil,
-		&ident,
-	); err != nil {
-		batch.Close()
-		return err
-	}
-	if err := batch.Commit(true /* sync */); err != nil {
-		return errors.Wrap(err, "persisting engine initialization data")
-	}
-
-	return nil
-}
 
 // WriteInitialClusterData writes initialization data to an engine. It creates
 // system ranges (filling in meta1 and meta2) and the default zone config.
@@ -77,15 +27,19 @@ func InitEngine(ctx context.Context, eng storage.Engine, ident roachpb.StoreIden
 // Args:
 // eng: the engine to which data is to be written.
 // initialValues: an optional list of k/v to be written as well after each
-//   value's checksum is initialized.
+//
+//	value's checksum is initialized.
+//
 // bootstrapVersion: the version at which the cluster is bootstrapped.
 // numStores: the number of stores this node will have.
 // splits: an optional list of split points. Range addressing will be created
-//   for all the splits. The list needs to be sorted.
+//
+//	for all the splits. The list needs to be sorted.
+//
 // nowNanos: the timestamp at which to write the initial engine data.
 func WriteInitialClusterData(
 	ctx context.Context,
-	eng storage.Engine,
+	eng kvstorage.Engines,
 	initialValues []roachpb.KeyValue,
 	bootstrapVersion roachpb.Version,
 	numStores int,
@@ -107,9 +61,9 @@ func WriteInitialClusterData(
 	// Initialize various sequence generators.
 	var nodeIDVal, storeIDVal, rangeIDVal, livenessVal roachpb.Value
 
-	nodeIDVal.SetInt(int64(FirstNodeID))
+	nodeIDVal.SetInt(int64(kvstorage.FirstNodeID))
 	// The caller will initialize the stores with ids FirstStoreID, ..., FirstStoreID+numStores-1.
-	storeIDVal.SetInt(int64(FirstStoreID) + int64(numStores) - 1)
+	storeIDVal.SetInt(int64(kvstorage.FirstStoreID) + int64(numStores) - 1)
 	// The last range has id = len(splits) + 1
 	rangeIDVal.SetInt(int64(len(splits) + 1))
 
@@ -123,7 +77,7 @@ func WriteInitialClusterData(
 	//
 	// [1]: See `(*NodeLiveness).CreateLivenessRecord` and usages for where that happens.
 	// [2]: See `(*NodeLiveness).Start` for where that happens.
-	livenessRecord := livenesspb.Liveness{NodeID: FirstNodeID, Epoch: 0}
+	livenessRecord := livenesspb.Liveness{NodeID: kvstorage.FirstNodeID, Epoch: 0}
 	if err := livenessVal.SetProto(&livenessRecord); err != nil {
 		return err
 	}
@@ -131,11 +85,11 @@ func WriteInitialClusterData(
 		roachpb.KeyValue{Key: keys.NodeIDGenerator, Value: nodeIDVal},
 		roachpb.KeyValue{Key: keys.StoreIDGenerator, Value: storeIDVal},
 		roachpb.KeyValue{Key: keys.RangeIDGenerator, Value: rangeIDVal},
-		roachpb.KeyValue{Key: keys.NodeLivenessKey(FirstNodeID), Value: livenessVal})
+		roachpb.KeyValue{Key: keys.NodeLivenessKey(kvstorage.FirstNodeID), Value: livenessVal})
 
-	// firstRangeMS is going to accumulate the stats for the first range, as we
-	// write the meta records for all the other ranges.
-	firstRangeMS := &enginepb.MVCCStats{}
+	// meta2RangeMS is going to accumulate the stats for the second range
+	// (meta2), as we write the meta records for all the other ranges.
+	meta2RangeMS := &enginepb.MVCCStats{}
 
 	// filter initial values for a given descriptor, returning only the ones that
 	// pertain to the respective range.
@@ -153,10 +107,18 @@ func WriteInitialClusterData(
 	if knobs.InitialReplicaVersionOverride != nil {
 		initialReplicaVersion = *knobs.InitialReplicaVersionOverride
 	}
+
+	// Some tests run this function without providing any splits. In that case, we
+	// don't split meta2. We explicitly record whether we're splitting meta2 or
+	// not because it will be used later when writing meta1 key range addressing.
+	shouldSplitMeta2 := slices.ContainsFunc(splits, func(split roachpb.RKey) bool {
+		return split.Equal(keys.Meta2Prefix)
+	})
+
 	// We iterate through the ranges backwards, since they all need to contribute
-	// to the stats of the first range (i.e. because they all write meta2 records
-	// in the first range), and so we want to create the first range last so that
-	// the stats we compute for it are correct.
+	// to the stats of the second range (i.e. because they all write meta2 records
+	// in the second range), and so we want to create the second range at the end
+	// so that the stats we compute for it are correct.
 	startKey := roachpb.RKeyMax
 	for i := len(splits) - 1; i >= -1; i-- {
 		endKey := startKey
@@ -173,11 +135,13 @@ func WriteInitialClusterData(
 			EndKey:        endKey,
 			NextReplicaID: 2,
 		}
+
+		const firstReplicaID = 1
 		replicas := []roachpb.ReplicaDescriptor{
 			{
-				NodeID:    FirstNodeID,
-				StoreID:   FirstStoreID,
-				ReplicaID: 1,
+				NodeID:    kvstorage.FirstNodeID,
+				StoreID:   kvstorage.FirstStoreID,
+				ReplicaID: firstReplicaID,
 			},
 		}
 		desc.SetReplicas(roachpb.MakeReplicaSet(replicas))
@@ -188,79 +152,158 @@ func WriteInitialClusterData(
 		log.VEventf(
 			ctx, 2, "creating range %d [%s, %s). Initial values: %d",
 			desc.RangeID, desc.StartKey, desc.EndKey, len(rangeInitialValues))
-		batch := eng.NewBatch()
-		defer batch.Close()
 
-		now := hlc.Timestamp{
-			WallTime: nowNanos,
-			Logical:  0,
-		}
+		// TODO(#97616): the ranges are written one by one, so it is possible to end
+		// up with a partially initialized store if there is a crash in the middle.
+		// Write through a single batch, or find another way to make this atomic.
 
-		// NOTE: We don't do stats computations in any of the puts below. Instead,
-		// we write everything and then compute the stats over the whole range.
+		// TODO(sep-raft-log): this code path initializes replicas when bootstrapping
+		// the cluster and will need to write through WAG.
+		factory := kvstorage.MakeBatchFactory(&eng, nil /* seq */)
 
-		// Range descriptor.
-		if err := storage.MVCCPutProto(
-			ctx, batch, nil /* ms */, keys.RangeDescriptorKey(desc.StartKey),
-			now, nil /* txn */, desc,
-		); err != nil {
-			return err
-		}
+		err := func() error {
+			batch := factory.NewBatch()
+			defer batch.Close()
 
-		// Replica GC timestamp.
-		if err := storage.MVCCPutProto(
-			ctx, batch, nil /* ms */, keys.RangeLastReplicaGCTimestampKey(desc.RangeID),
-			hlc.Timestamp{}, nil /* txn */, &now,
-		); err != nil {
-			return err
-		}
-		// Range addressing for meta2.
-		meta2Key := keys.RangeMetaKey(endKey)
-		if err := storage.MVCCPutProto(ctx, batch, firstRangeMS, meta2Key.AsRawKey(),
-			now, nil /* txn */, desc,
-		); err != nil {
-			return err
-		}
+			now := hlc.Timestamp{
+				WallTime: nowNanos,
+				Logical:  0,
+			}
 
-		// The first range gets some special treatment.
-		if startKey.Equal(roachpb.RKeyMin) {
-			// Range addressing for meta1.
-			meta1Key := keys.RangeMetaKey(keys.RangeMetaKey(roachpb.RKeyMax))
+			// NOTE: We don't do stats computations in any of the puts below. Instead,
+			// we write everything and then compute the stats over the whole range.
+
+			// If requested, write an MVCC range tombstone at the bottom of the
+			// keyspace, for performance and correctness testing.
+			if knobs.GlobalMVCCRangeTombstone {
+				if err := writeGlobalMVCCRangeTombstone(ctx, batch.State(), desc, now.Prev()); err != nil {
+					return err
+				}
+			}
+
+			// Range descriptor.
 			if err := storage.MVCCPutProto(
-				ctx, batch, nil /* ms */, meta1Key.AsRawKey(), now, nil /* txn */, desc,
+				ctx, batch.State(), keys.RangeDescriptorKey(desc.StartKey),
+				now, desc, storage.MVCCWriteOptions{},
 			); err != nil {
 				return err
 			}
-		}
 
-		// Now add all passed-in default entries.
-		for _, kv := range rangeInitialValues {
-			// Initialize the checksums.
-			kv.Value.InitChecksum(kv.Key)
-			if err := storage.MVCCPut(
-				ctx, batch, nil /* ms */, kv.Key, now, kv.Value, nil, /* txn */
+			// Replica GC timestamp.
+			if err := storage.MVCCBlindPutProto(
+				ctx, batch.Raft(), keys.RangeLastReplicaGCTimestampKey(desc.RangeID),
+				hlc.Timestamp{}, &now, storage.MVCCWriteOptions{},
 			); err != nil {
 				return err
 			}
-		}
 
-		if err := stateloader.WriteInitialRangeState(ctx, batch, *desc, initialReplicaVersion); err != nil {
-			return err
-		}
-		computedStats, err := rditer.ComputeStatsForRange(desc, batch, now.WallTime)
+			// Set the last processed timestamp for the consistency checker as "now".
+			// This helps delay running the consistency checker for
+			// 'server.consistency_check.interval'. Note that splitting this range
+			// will copy the last processed timestamp to the right hand side, so newly
+			// split ranges will also delay running the consistency checker. This
+			// should improve the performance in workloads that cause many range
+			// splits by delaying the consistency checker.
+			if err := storage.MVCCPutProto(
+				ctx, batch.State(), keys.QueueLastProcessedKey(desc.StartKey, "consistencyChecker"),
+				hlc.Timestamp{}, &now, storage.MVCCWriteOptions{},
+			); err != nil {
+				return err
+			}
+
+			// All range descriptors are stored in meta2. Note that we're also storing
+			// the range descriptor for the second range in meta2 as well. This is
+			// because the second range doesn't end at the end of meta2 -- there's
+			// still some keys between the end of meta2 and the start of node
+			// liveness.
+			metaKey := keys.RangeMetaKey(endKey)
+			if err := storage.MVCCPutProto(
+				ctx, batch.State(), metaKey.AsRawKey(),
+				now, desc, storage.MVCCWriteOptions{Stats: meta2RangeMS},
+			); err != nil {
+				return err
+			}
+
+			// If we want to split meta2 range, we need to write the meta1 record
+			// for it.
+			// Also, some tests call this function with an empty splits list. In that
+			// case, we also need to write the meta1 but for the range, except that
+			// range is the one starting at KeyMin since both meta1 and meta2 are on
+			// the same range.
+			if startKey.Equal(keys.Meta2Prefix) || !shouldSplitMeta2 {
+				// The range descriptor is stored in meta1.
+				meta1Key := keys.RangeMetaKey(keys.RangeMetaKey(roachpb.RKeyMax)) // range addressing for meta1
+				if err := storage.MVCCPutProto(
+					ctx, batch.State(), meta1Key.AsRawKey(), now, desc, storage.MVCCWriteOptions{},
+				); err != nil {
+					return err
+				}
+			}
+
+			// Now add all passed-in default entries.
+			for _, kv := range rangeInitialValues {
+				// Initialize the checksums.
+				kv.Value.InitChecksum(kv.Key)
+				if _, err := storage.MVCCPut(
+					ctx, batch.State(), kv.Key, now, kv.Value, storage.MVCCWriteOptions{},
+				); err != nil {
+					return err
+				}
+			}
+
+			if err := kvstorage.WriteInitialRangeState(
+				ctx, batch.State(), batch.Raft(),
+				*desc, firstReplicaID, initialReplicaVersion,
+			); err != nil {
+				return err
+			}
+
+			// TODO(sep-raft-log): the computed stats much be reflected in the WAG
+			// node written in WriteInitialRangeState, before the write is committed.
+			// Decompose WriteInitialRangeState to make it possible.
+			computedStats, err := rditer.ComputeStatsForRange(
+				ctx, desc, batch.State(), fs.UnknownReadCategory, now.WallTime)
+			if err != nil {
+				return err
+			}
+
+			sl := kvstorage.MakeStateLoader(rangeID)
+			if err := sl.SetMVCCStats(ctx, batch.State(), &computedStats); err != nil {
+				return err
+			}
+
+			return batch.Commit(true /* sync */)
+		}()
 		if err != nil {
-			return err
-		}
-
-		sl := stateloader.Make(rangeID)
-		if err := sl.SetMVCCStats(ctx, batch, &computedStats); err != nil {
-			return err
-		}
-
-		if err := batch.Commit(true /* sync */); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+// writeGlobalMVCCRangeTombstone writes an MVCC range tombstone across the
+// entire table data keyspace of the range. This is used to test that storage
+// operations are correct and performant in the presence of range tombstones. An
+// MVCC range tombstone below all other data should in principle not affect
+// anything at all.
+func writeGlobalMVCCRangeTombstone(
+	ctx context.Context, w storage.Writer, desc *roachpb.RangeDescriptor, ts hlc.Timestamp,
+) error {
+	rangeKey := storage.MVCCRangeKey{
+		StartKey:  desc.StartKey.AsRawKey(),
+		EndKey:    desc.EndKey.AsRawKey(),
+		Timestamp: ts,
+	}
+	if rangeKey.EndKey.Compare(keys.TableDataMin) <= 0 {
+		return nil
+	}
+	if rangeKey.StartKey.Compare(keys.TableDataMin) < 0 {
+		rangeKey.StartKey = keys.TableDataMin
+	}
+	if err := w.PutMVCCRangeKey(rangeKey, storage.MVCCValue{}); err != nil {
+		return err
+	}
+	log.KvDistribution.Warningf(ctx, "wrote global MVCC range tombstone %s", rangeKey)
 	return nil
 }

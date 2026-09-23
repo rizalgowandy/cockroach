@@ -1,23 +1,17 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package workloadimpl_test
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadimpl"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/rand"
 )
 
 const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -25,9 +19,9 @@ const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 func TestPrecomputedRand(t *testing.T) {
 	const precomputeLen = 100
 
-	seed0 := workloadimpl.PrecomputedRandInit(rand.NewSource(0), precomputeLen, alphabet)()
-	seed1 := workloadimpl.PrecomputedRandInit(rand.NewSource(1), precomputeLen, alphabet)()
-	numbers := workloadimpl.PrecomputedRandInit(rand.NewSource(0), precomputeLen, `0123456789`)()
+	seed0 := workloadimpl.PrecomputedRandInit(rand.NewPCG(0, 0), precomputeLen, alphabet)()
+	seed1 := workloadimpl.PrecomputedRandInit(rand.NewPCG(1, 1), precomputeLen, alphabet)()
+	numbers := workloadimpl.PrecomputedRandInit(rand.NewPCG(0, 0), precomputeLen, `0123456789`)()
 
 	const shorterThanPrecomputed, longerThanPrecomputed = precomputeLen / 10, precomputeLen + 7
 
@@ -71,7 +65,7 @@ func TestPrecomputedRand(t *testing.T) {
 func BenchmarkPrecomputedRand(b *testing.B) {
 	const precomputeLen = 10000
 	pr := workloadimpl.PrecomputedRandInit(
-		rand.NewSource(uint64(timeutil.Now().UnixNano())), precomputeLen, alphabet)()
+		rand.NewPCG(rand.Uint64(), rand.Uint64()), precomputeLen, alphabet)()
 
 	const shortLen, mediumLen, longLen = 2, 100, 100000
 	scratch := make([]byte, longLen)

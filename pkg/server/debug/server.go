@@ -1,39 +1,40 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package debug
 
 import (
-	"bytes"
 	"context"
 	"expvar"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/pprof"
-	"path"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/goroutineui"
 	"github.com/cockroachdb/cockroach/pkg/server/debug/pprofui"
+	"github.com/cockroachdb/cockroach/pkg/server/debug/replay"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	pebbletool "github.com/cockroachdb/pebble/tool"
+	"github.com/cockroachdb/pebble/vfs"
+	"github.com/felixge/fgprof"
 	metrics "github.com/rcrowley/go-metrics"
 	"github.com/rcrowley/go-metrics/exp"
 	"github.com/spf13/cobra"
@@ -50,78 +51,81 @@ func init() {
 // Endpoint is the entry point under which the debug tools are housed.
 const Endpoint = "/debug/"
 
-var _ = func() *settings.StringSetting {
-	// This setting definition still exists so as to not break
-	// deployment scripts that set it unconditionally.
-	v := settings.RegisterStringSetting("server.remote_debugging.mode", "unused", "local")
-	v.SetRetired()
-	return v
-}()
+// This setting definition still exists so as to not break
+// deployment scripts that set it unconditionally.
+var _ = settings.RegisterStringSetting(
+	settings.ApplicationLevel, "server.remote_debugging.mode", "unused", "local",
+	settings.Retired)
 
 // Server serves the /debug/* family of tools.
 type Server struct {
-	st  *cluster.Settings
-	mux *http.ServeMux
-	spy logSpy
+	ambientCtx log.AmbientContext
+	st         *cluster.Settings
+	mux        *http.ServeMux
+	spy        logSpy
 }
 
-// NewServer sets up a debug server.
-func NewServer(
-	st *cluster.Settings, hbaConfDebugFn http.HandlerFunc, profiler pprofui.Profiler,
-) *Server {
-	mux := http.NewServeMux()
+func setupProcessWideRoutes(
+	mux *http.ServeMux,
+	st *cluster.Settings,
+	tenantID roachpb.TenantID,
+	authorizer tenantcapabilities.Authorizer,
+	vsrv *vmoduleServer,
+	profiler pprofui.Profiler,
+	logMetadata func(ctx context.Context, source string),
+) {
+	authzCheck := func(w http.ResponseWriter, r *http.Request) bool {
+		if err := authorizer.HasProcessDebugCapability(r.Context(), tenantID); err != nil {
+			http.Error(w, "tenant does not have capability to debug the running process", http.StatusForbidden)
+			return false
+		}
+		return true
+	}
 
-	// Install a redirect to the UI's collection of debug tools.
-	mux.HandleFunc(Endpoint, handleLanding)
+	authzFunc := func(origHandler http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if authzCheck(w, r) {
+				origHandler(w, r)
+			}
+		}
+	}
 
 	// Cribbed straight from pprof's `init()` method. See:
 	// https://golang.org/src/net/http/pprof/pprof.go
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/debug/pprof/", authzFunc(pprof.Index))
+	mux.HandleFunc("/debug/pprof/cmdline", authzFunc(pprof.Cmdline))
+	mux.HandleFunc("/debug/pprof/profile", authzFunc(func(w http.ResponseWriter, r *http.Request) {
 		CPUProfileHandler(st, w, r)
-	})
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}))
+	mux.HandleFunc("/debug/pprof/symbol", authzFunc(pprof.Symbol))
+	mux.HandleFunc("/debug/pprof/trace", authzFunc(func(w http.ResponseWriter, r *http.Request) {
+		ExecutionTraceHandler(logMetadata, w, r)
+	}))
 
 	// Cribbed straight from trace's `init()` method. See:
 	// https://github.com/golang/net/blob/master/trace/trace.go
-	mux.HandleFunc("/debug/requests", trace.Traces)
-	mux.HandleFunc("/debug/events", trace.Events)
+	mux.HandleFunc("/debug/requests", authzFunc(trace.Traces))
 
 	// This registers a superset of the variables exposed through the
 	// /debug/vars endpoint onto the /debug/metrics endpoint. It includes all
 	// expvars registered globally and all metrics registered on the
 	// DefaultRegistry.
-	mux.Handle("/debug/metrics", exp.ExpHandler(metrics.DefaultRegistry))
+	mux.HandleFunc("/debug/metrics", authzFunc(exp.ExpHandler(metrics.DefaultRegistry).ServeHTTP))
 	// Also register /debug/vars (even though /debug/metrics is better).
-	mux.Handle("/debug/vars", expvar.Handler())
-
-	if hbaConfDebugFn != nil {
-		// Expose the processed HBA configuration through the debug
-		// interface for inspection during troubleshooting.
-		mux.HandleFunc("/debug/hba_conf", hbaConfDebugFn)
-	}
+	mux.HandleFunc("/debug/vars", authzFunc(expvar.Handler().ServeHTTP))
 
 	// Register the stopper endpoint, which lists all active tasks.
-	mux.HandleFunc("/debug/stopper", stop.HandleDebug)
+	mux.HandleFunc("/debug/stopper", authzFunc(stop.HandleDebug))
 
 	// Set up the vmodule endpoint.
-	vsrv := &vmoduleServer{}
-	mux.HandleFunc("/debug/vmodule", vsrv.vmoduleHandleDebug)
+	mux.HandleFunc("/debug/vmodule", authzFunc(vsrv.vmoduleHandleDebug))
 
-	// Set up the log spy, a tool that allows inspecting filtered logs at high
-	// verbosity.
-	spy := logSpy{
-		vsrv:         vsrv,
-		setIntercept: log.InterceptWith,
-	}
-	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
+	ps := pprofui.NewServer(pprofui.NewMemStorage(pprofui.ProfileConcurrency, pprofui.ProfileExpiry), profiler)
+	mux.Handle("/debug/pprof/ui/", authzFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.StripPrefix("/debug/pprof/ui", ps).ServeHTTP(w, r)
+	}))
 
-	ps := pprofui.NewServer(pprofui.NewMemStorage(1, 0), profiler)
-	mux.Handle("/debug/pprof/ui/", http.StripPrefix("/debug/pprof/ui", ps))
-
-	mux.HandleFunc("/debug/pprof/goroutineui/", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("/debug/pprof/goroutineui/", authzFunc(func(w http.ResponseWriter, req *http.Request) {
 		dump := goroutineui.NewDump()
 
 		_ = req.ParseForm()
@@ -133,24 +137,81 @@ func NewServer(
 		default:
 		}
 		_ = dump.HTML(w)
-	})
+	}))
+
+	// WARNING: The /debug/pprof/fgprof endpoint provides wall-clock profiling for
+	// both On-CPU and Off-CPU time. While it is safe to use in production, note
+	// that profiling can introduce performance overhead, especially in
+	// applications with a large number of goroutines (>10k). Use this endpoint
+	// judiciously and monitor its impact on system performance.
+	mux.HandleFunc("/debug/pprof/fgprof", authzFunc(fgprof.Handler().ServeHTTP))
+}
+
+// NewServer sets up a debug server. The logMetadata callback, if non-nil, is
+// called when serving /debug/pprof/trace to embed CRDB metadata (node ID,
+// version, wallclock) into Go execution traces.
+func NewServer(
+	ambientContext log.AmbientContext,
+	st *cluster.Settings,
+	hbaConfDebugFn http.HandlerFunc,
+	profiler pprofui.Profiler,
+	tenantID roachpb.TenantID,
+	authorizer tenantcapabilities.Authorizer,
+	logMetadata func(ctx context.Context, source string),
+) *Server {
+	mux := http.NewServeMux()
+
+	// Install a redirect to the UI's collection of debug tools.
+	mux.HandleFunc(Endpoint, handleLanding)
+
+	// Debug routes that retrieve process-wide state.
+	vsrv := &vmoduleServer{}
+	setupProcessWideRoutes(mux, st, tenantID, authorizer, vsrv, profiler, logMetadata)
+
+	if hbaConfDebugFn != nil {
+		// Expose the processed HBA configuration through the debug
+		// interface for inspection during troubleshooting.
+		mux.HandleFunc("/debug/hba_conf", hbaConfDebugFn)
+	}
+
+	// Set up the log spy, a tool that allows inspecting filtered logs at high
+	// verbosity. We require the tenant ID from the ambientCtx to set the logSpy
+	// tenant filter.
+	spy := logSpy{
+		vsrv:         vsrv,
+		setIntercept: log.InterceptWith,
+	}
+	serverTenantID := ambientContext.ServerIDs.ServerIdentityString(serverident.IdentifyTenantID)
+	if serverTenantID == "" {
+		panic("programmer error: cannot instantiate a debug.Server with no tenantID in the ambientCtx")
+	}
+	parsed, err := strconv.ParseUint(serverTenantID, 10, 64)
+	if err != nil {
+		panic("programmer error: failed parsing ambientCtx tenantID during debug.Server initialization")
+	}
+	spy.tenantID = roachpb.MustMakeTenantID(parsed)
+
+	mux.HandleFunc("/debug/logspy", spy.handleDebugLogSpy)
 
 	return &Server{
-		st:  st,
-		mux: mux,
-		spy: spy,
+		ambientCtx: ambientContext,
+		st:         st,
+		mux:        mux,
+		spy:        spy,
 	}
 }
 
 func analyzeLSM(dir string, writer io.Writer) error {
-	manifestName, err := ioutil.ReadFile(path.Join(dir, "CURRENT"))
+	db, err := pebble.Peek(dir, vfs.Default)
 	if err != nil {
 		return err
 	}
 
-	manifestPath := path.Join(dir, string(bytes.TrimSpace(manifestName)))
-
-	t := pebbletool.New(pebbletool.Comparers(storage.EngineComparer))
+	t := pebbletool.New(
+		pebbletool.Comparers(&storage.EngineComparer),
+		pebbletool.KeySchema(storage.DefaultKeySchema),
+		pebbletool.KeySchemas(storage.KeySchemas...),
+	)
 
 	// TODO(yevgeniy): Consider exposing LSM tool directly.
 	var lsm *cobra.Command
@@ -164,46 +225,89 @@ func analyzeLSM(dir string, writer io.Writer) error {
 	}
 
 	lsm.SetOutput(writer)
-	lsm.Run(lsm, []string{manifestPath})
+	return lsm.RunE(lsm, []string{db.ManifestFilename})
+}
+
+func (ds *Server) RegisterWorkloadCollector(stores *kvserver.Stores) error {
+	h := replay.HTTPHandler{Stores: stores}
+	ds.mux.HandleFunc("/debug/workload_capture", h.HandleRequest)
 	return nil
 }
 
-// RegisterEngines setups up debug engine endpoints for the known storage engines.
-func (ds *Server) RegisterEngines(specs []base.StoreSpec, engines []storage.Engine) error {
-	if len(specs) != len(engines) {
-		// TODO(yevgeniy): Consider adding accessors to storage.Engine to get their path.
-		return errors.New("number of store specs must match number of engines")
-	}
-
-	storeIDs := make([]roachpb.StoreIdent, len(engines))
-	for i := range engines {
-		id, err := kvserver.ReadStoreIdent(context.Background(), engines[i])
+// GetLSMStats creates a mapping between store IDs and LSM stats for all of the
+// provided storage engines.
+func GetLSMStats(engines []kvstorage.Engines) (map[roachpb.StoreID]string, error) {
+	stats := make(map[roachpb.StoreID]string, len(engines))
+	for _, eng := range engines {
+		storeID, err := eng.TODOBothEngines().GetStoreID()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		storeIDs[i] = id
+		stats[roachpb.StoreID(storeID)] = eng.TODOBothEngines().GetMetrics().String()
 	}
+	return stats, nil
+}
 
+// FormatLSMStats combines LSM stats from multiple stores into a single string.
+func FormatLSMStats(stats map[roachpb.StoreID]string) string {
+	var sb strings.Builder
+	for storeID, stat := range stats {
+		sb.WriteString(fmt.Sprintf("Store %d:\n%s\n\n", storeID, stat))
+	}
+	return sb.String()
+}
+
+// RegisterEngines setups up debug engine endpoints for the known storage engines.
+func (ds *Server) RegisterEngines(engines []kvstorage.Engines) error {
 	ds.mux.HandleFunc("/debug/lsm", func(w http.ResponseWriter, req *http.Request) {
-		for i := range engines {
-			fmt.Fprintf(w, "Store %d:\n", storeIDs[i].StoreID)
-			_, _ = io.WriteString(w, engines[i].GetMetrics().String())
-			fmt.Fprintln(w)
+		stats, err := GetLSMStats(engines)
+		if err != nil {
+			fmt.Fprintf(w, "error retrieving LSM stats: %v", err)
 		}
+		fmt.Fprint(w, FormatLSMStats(stats))
 	})
 
-	for i := 0; i < len(specs); i++ {
-		if specs[i].InMemory {
+	for _, e := range engines {
+		eng := e.TODOBothEngines()
+		dir := eng.Env().Dir
+		if dir == "" {
 			// TODO(yevgeniy): Add plumbing to support LSM visualization for in memory engines.
 			continue
 		}
 
-		dir := specs[i].Path
-		ds.mux.HandleFunc(fmt.Sprintf("/debug/lsm-viz/%d", storeIDs[i].StoreID),
+		storeID, err := eng.GetStoreID()
+		if err != nil {
+			return err
+		}
+
+		ds.mux.HandleFunc(fmt.Sprintf("/debug/lsm-viz/%d", storeID),
 			func(w http.ResponseWriter, req *http.Request) {
 				if err := analyzeLSM(dir, w); err != nil {
 					fmt.Fprintf(w, "error analyzing LSM at %s: %v", dir, err)
 				}
+			})
+		ds.mux.HandleFunc(fmt.Sprintf("/debug/storage/%d/profiles/separated-value-retrievals", storeID),
+			func(w http.ResponseWriter, req *http.Request) {
+				dur := 30 * time.Second
+				if secsStr := req.Header.Get("seconds"); secsStr != "" {
+					secs, err := strconv.ParseInt(secsStr, 10, 64)
+					if err != nil {
+						http.Error(w, "error parsing seconds", http.StatusBadRequest)
+						return
+					}
+					dur = time.Duration(secs) * time.Second
+				}
+				ctx := req.Context()
+				ctx, cancel := context.WithTimeout(ctx, dur)
+				defer cancel()
+				profile, err := eng.ProfileSeparatedValueRetrievals(ctx)
+				if err != nil {
+					http.Error(w, "error profiling separated value retrievals", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, profile.String())
 			})
 	}
 	return nil

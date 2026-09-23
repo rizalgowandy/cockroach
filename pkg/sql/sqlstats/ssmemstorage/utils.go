@@ -1,20 +1,9 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ssmemstorage
-
-import (
-	"strings"
-
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-)
 
 type stmtList []stmtKey
 
@@ -25,18 +14,16 @@ func (s stmtList) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 func (s stmtList) Less(i, j int) bool {
-	cmp := strings.Compare(s[i].anonymizedStmt, s[j].anonymizedStmt)
-	if cmp == -1 {
-		return true
+	if s[i].fingerprintID != s[j].fingerprintID {
+		return s[i].fingerprintID < s[j].fingerprintID
 	}
-
-	if cmp == 1 {
-		return false
+	if s[i].transactionFingerprintID != s[j].transactionFingerprintID {
+		return s[i].transactionFingerprintID < s[j].transactionFingerprintID
 	}
-	return s[i].transactionFingerprintID < s[j].transactionFingerprintID
+	return s[i].aggregatedTs.Before(s[j].aggregatedTs)
 }
 
-type txnList []roachpb.TransactionFingerprintID
+type txnList []txnKey
 
 func (t txnList) Len() int {
 	return len(t)
@@ -47,5 +34,8 @@ func (t txnList) Swap(i, j int) {
 }
 
 func (t txnList) Less(i, j int) bool {
-	return t[i] < t[j]
+	if t[i].transactionFingerprintID != t[j].transactionFingerprintID {
+		return t[i].transactionFingerprintID < t[j].transactionFingerprintID
+	}
+	return t[i].aggregatedTs.Before(t[j].aggregatedTs)
 }

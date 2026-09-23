@@ -1,26 +1,33 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ptstorage
 
 const (
 
-	// currentMetaCTE is used by all queries which access the meta row.
-	// The query returns a default row if there currently is no meta row.
-	// At the time of writing, there will never be a physical row in the meta
-	// table with version zero.
-	currentMetaCTE = `
+	// currentMetaCTEForUpdate reads the singleton meta row with FOR UPDATE,
+	// returning a default zero row if none exists yet. At the time of writing,
+	// there will never be a physical row in the meta table with version zero.
+	//
+	// It is used by the protect and release queries. Both are read-modify-
+	// writes against the singleton meta row: every concurrent caller reads the
+	// same row, then upserts a new version. Without serialization the writers
+	// race, producing a storm of WriteTooOld retries on the shared key.
+	// Acquiring an exclusive lock on the real meta row during the read forces
+	// those callers to queue rather than collide. The FOR UPDATE clause is
+	// bound to the real-table leg only; the synthetic zero-row fallback (used
+	// when no meta row exists yet) does not lock anything.
+	currentMetaCTEForUpdate = `
 SELECT
     version, num_records, num_spans, total_bytes
 FROM
-    system.protected_ts_meta
+    (
+        SELECT version, num_records, num_spans, total_bytes
+        FROM system.protected_ts_meta
+        FOR UPDATE
+    )
 UNION ALL
     SELECT 0 AS version, 0 AS num_records, 0 AS num_spans, 0 AS total_bytes
 ORDER BY
@@ -31,13 +38,12 @@ LIMIT
 
 	protectQuery = `
 WITH
-    current_meta AS (` + currentMetaCTE + `),
+    current_meta AS (` + currentMetaCTEForUpdate + `),
     checks AS (` + protectChecksCTE + `),
     updated_meta AS (` + protectUpsertMetaCTE + `),
-    new_record AS (` + protectInsertRecordCTE + `)
+    new_record AS (` + protectInsertRecordCTEWithChecks + `)
 SELECT
     failed,
-    num_spans AS prev_spans,
     total_bytes AS prev_total_bytes,
     version AS prev_version
 FROM
@@ -82,13 +88,13 @@ RETURNING
     version, num_records, num_spans, total_bytes
 `
 
-	protectInsertRecordCTE = `
+	protectInsertRecordCTEWithChecks = `
 INSERT
 INTO
-    system.protected_ts_records (id, ts, meta_type, meta, num_spans, spans)
+    system.protected_ts_records (id, ts, meta_type, meta, num_spans, spans, target)
 (
     SELECT
-        $4, $5, $6, $7, $8, $9
+        $4, $5, $6, $7, $8, $9, $10
     WHERE
         NOT EXISTS(SELECT * FROM checks WHERE failed)
 )
@@ -98,7 +104,7 @@ RETURNING
 
 	getRecordsQueryBase = `
 SELECT
-    id, ts, meta_type, meta, spans, verified
+    id, ts, meta_type, meta, spans, verified, target
 FROM
     system.protected_ts_records`
 
@@ -118,9 +124,9 @@ RETURNING
     true
 `
 
-	releaseQuery = `
+	releaseQueryWithMeta = `
 WITH
-    current_meta AS (` + currentMetaCTE + `),
+    current_meta AS (` + currentMetaCTEForUpdate + `),
     record AS (` + releaseSelectRecordCTE + `),
     updated_meta AS (` + releaseUpsertMetaCTE + `)
 DELETE FROM
@@ -165,33 +171,6 @@ RETURNING
     1
 `
 
-	updateTimestampQuery = `
-WITH
-    current_meta AS (` + currentMetaCTE + `),
-    updated_meta AS (` + updateTimestampUpsertMetaCTE + `),
-    updated_record AS (` + updateTimestampUpsertRecordCTE + `)
-SELECT
-    id
-FROM
-    updated_record;`
-
-	updateTimestampUpsertMetaCTE = `
-UPSERT
-INTO
-    system.protected_ts_meta (version, num_records, num_spans, total_bytes)
-(
-    SELECT
-        version + 1,
-        num_records,
-        num_spans,
-        total_bytes
-    FROM
-        current_meta
-)
-RETURNING
-    NULL
-`
-
 	updateTimestampUpsertRecordCTE = `
 UPDATE
     system.protected_ts_records
@@ -202,12 +181,4 @@ WHERE
 RETURNING
     id
 `
-
-	getMetadataQuery = `
-WITH
-    current_meta AS (` + currentMetaCTE + `)
-SELECT
-    version, num_records, num_spans, total_bytes
-FROM
-    current_meta;`
 )

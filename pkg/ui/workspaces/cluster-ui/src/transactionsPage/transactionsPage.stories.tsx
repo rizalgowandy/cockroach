@@ -1,137 +1,68 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
 import { storiesOf } from "@storybook/react";
+import cloneDeep from "lodash/cloneDeep";
+import noop from "lodash/noop";
+import React from "react";
 import { MemoryRouter } from "react-router-dom";
-import { cloneDeep, noop, extend } from "lodash";
+
+import { SqlStatsSortOptions } from "../api";
+
 import {
-  data,
-  nodeRegions,
   columns,
-  routeProps,
-  dateRange,
-  sortSetting,
   filters,
+  requestTime,
+  routeProps,
+  sortSetting,
+  timeScale,
 } from "./transactions.fixture";
 
 import { TransactionsPage } from ".";
-import { RequestError } from "../util";
 
-const getEmptyData = () =>
-  extend({}, data, { transactions: [], statements: [] });
+const defaultProps = {
+  ...routeProps,
+  columns,
+  timeScale,
+  filters,
+  search: "",
+  sortSetting,
+  requestTime,
+  limit: 100,
+  reqSortSetting: SqlStatsSortOptions.PCT_RUNTIME,
+  onChangeLimit: noop,
+  onChangeReqSort: noop,
+  onApplySearchCriteria: noop,
+  onFilterChange: noop,
+  onSortingChange: noop,
+  onRequestTimeChange: noop,
+};
 
 storiesOf("Transactions Page", module)
   .addDecorator(storyFn => <MemoryRouter>{storyFn()}</MemoryRouter>)
   .addDecorator(storyFn => (
     <div style={{ backgroundColor: "#F5F7FA" }}>{storyFn()}</div>
   ))
-  .add("with data", () => (
-    <TransactionsPage
-      {...routeProps}
-      columns={columns}
-      data={data}
-      dateRange={dateRange}
-      filters={filters}
-      nodeRegions={nodeRegions}
-      onFilterChange={noop}
-      onSortingChange={noop}
-      refreshData={noop}
-      resetSQLStats={noop}
-      search={""}
-      sortSetting={sortSetting}
-    />
-  ))
+  .add("with data", () => {
+    return <TransactionsPage {...defaultProps} />;
+  })
   .add("without data", () => {
-    return (
-      <TransactionsPage
-        {...routeProps}
-        columns={columns}
-        data={getEmptyData()}
-        dateRange={dateRange}
-        filters={filters}
-        nodeRegions={nodeRegions}
-        onFilterChange={noop}
-        onSortingChange={noop}
-        refreshData={noop}
-        resetSQLStats={noop}
-        search={""}
-        sortSetting={sortSetting}
-      />
-    );
+    return <TransactionsPage {...defaultProps} />;
   })
   .add("with empty search result", () => {
-    const route = cloneDeep(routeProps);
-    const { history } = route;
+    const props = cloneDeep(defaultProps);
+    const { history } = props;
     const searchParams = new URLSearchParams(history.location.search);
     searchParams.set("q", "aaaaaaa");
     history.location.search = searchParams.toString();
 
-    return (
-      <TransactionsPage
-        {...routeProps}
-        columns={columns}
-        data={getEmptyData()}
-        dateRange={dateRange}
-        filters={filters}
-        history={history}
-        nodeRegions={nodeRegions}
-        onFilterChange={noop}
-        onSortingChange={noop}
-        refreshData={noop}
-        resetSQLStats={noop}
-        search={""}
-        sortSetting={sortSetting}
-      />
-    );
+    return <TransactionsPage {...props} history={history} />;
   })
   .add("with loading indicator", () => {
-    return (
-      <TransactionsPage
-        {...routeProps}
-        columns={columns}
-        data={undefined}
-        dateRange={dateRange}
-        filters={filters}
-        nodeRegions={nodeRegions}
-        onFilterChange={noop}
-        onSortingChange={noop}
-        refreshData={noop}
-        resetSQLStats={noop}
-        search={""}
-        sortSetting={sortSetting}
-      />
-    );
+    return <TransactionsPage {...defaultProps} />;
   })
   .add("with error alert", () => {
-    return (
-      <TransactionsPage
-        {...routeProps}
-        columns={columns}
-        data={undefined}
-        dateRange={dateRange}
-        error={
-          new RequestError(
-            "Forbidden",
-            403,
-            "this operation requires admin privilege",
-          )
-        }
-        filters={filters}
-        nodeRegions={nodeRegions}
-        onFilterChange={noop}
-        onSortingChange={noop}
-        refreshData={noop}
-        resetSQLStats={noop}
-        search={""}
-        sortSetting={sortSetting}
-      />
-    );
+    return <TransactionsPage {...defaultProps} />;
   });

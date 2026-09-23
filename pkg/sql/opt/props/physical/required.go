@@ -1,18 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package physical
 
 import (
 	"bytes"
 	"fmt"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
@@ -45,14 +41,31 @@ type Required struct {
 	// is required or provided.
 	Ordering props.OrderingChoice
 
+	// Distribution specifies the physical distribution of result rows. This is
+	// defined as the set of regions that may contain result rows. If
+	// Distribution is not defined, then no particular distribution is required.
+	// Currently, the only operator in a plan tree that has a required
+	// distribution is the root, since data must always be returned to the gateway
+	// region.
+	Distribution Distribution
+
 	// LimitHint specifies a "soft limit" to the number of result rows that may
 	// be required of the expression. If requested, an expression will still need
 	// to return all result rows, but it can be optimized based on the assumption
 	// that only the hinted number of rows will be needed.
 	// A LimitHint of 0 indicates "no limit". The LimitHint is an intermediate
 	// float64 representation, and can be converted to an integer number of rows
-	// using math.Ceil.
+	// using LimitHintInt64.
 	LimitHint float64
+
+	// RemoteBranch signals that the expression is on the remote side of a
+	// locality-optimized search. If the local branch fulfills the query, the
+	// remote branch is not executed.
+	RemoteBranch bool
+
+	// PlanGram is a pattern describing the approved optimizer plans. If possible,
+	// the optimizer will favor expressions matching the PlanGram.
+	PlanGram PlanGram
 }
 
 // MinRequired are the default physical properties that require nothing and
@@ -62,7 +75,8 @@ var MinRequired = &Required{}
 // Defined is true if any physical property is defined. If none is defined, then
 // this is an instance of MinRequired.
 func (p *Required) Defined() bool {
-	return !p.Presentation.Any() || !p.Ordering.Any() || p.LimitHint != 0
+	return !p.Presentation.Any() || !p.Ordering.Any() || !p.Distribution.Any() ||
+		p.LimitHint != 0 || p.RemoteBranch || !p.PlanGram.Any()
 }
 
 // ColSet returns the set of columns used by any of the physical properties.
@@ -93,8 +107,17 @@ func (p *Required) String() string {
 	if !p.Ordering.Any() {
 		output("ordering", p.Ordering.Format)
 	}
+	if !p.Distribution.Any() {
+		output("distribution", p.Distribution.format)
+	}
 	if p.LimitHint != 0 {
 		output("limit hint", func(buf *bytes.Buffer) { fmt.Fprintf(buf, "%.2f", p.LimitHint) })
+	}
+	if p.RemoteBranch {
+		output("remote branch", func(buf *bytes.Buffer) { buf.WriteString("true") })
+	}
+	if !p.PlanGram.Any() {
+		output("plangram", p.PlanGram.Format)
 	}
 
 	// Handle empty properties case.
@@ -106,7 +129,20 @@ func (p *Required) String() string {
 
 // Equals returns true if the two physical properties are identical.
 func (p *Required) Equals(rhs *Required) bool {
-	return p.Presentation.Equals(rhs.Presentation) && p.Ordering.Equals(&rhs.Ordering) && p.LimitHint == rhs.LimitHint
+	return p.Presentation.Equals(rhs.Presentation) && p.Ordering.Equals(&rhs.Ordering) &&
+		p.Distribution.Equals(rhs.Distribution) &&
+		p.LimitHint == rhs.LimitHint && p.RemoteBranch == rhs.RemoteBranch &&
+		p.PlanGram.Equals(rhs.PlanGram)
+}
+
+// LimitHintInt64 returns the limit hint converted to an int64.
+func (p *Required) LimitHintInt64() int64 {
+	h := int64(math.Ceil(p.LimitHint))
+	if h < 0 {
+		// If we have an overflow, then disable the limit hint.
+		h = 0
+	}
+	return h
 }
 
 // Presentation specifies the naming, membership (including duplicates), and
@@ -114,7 +150,8 @@ func (p *Required) Equals(rhs *Required) bool {
 // While it cannot add unique columns, Presentation can rename, reorder,
 // duplicate and discard columns. If Presentation is not defined, then no
 // particular column presentation is required or provided. For example:
-//   a.y:2 a.x:1 a.y:2 column1:3
+//
+//	a.y:2 a.x:1 a.y:2 column1:3
 type Presentation []opt.AliasedColumn
 
 // Any is true if any column presentation is allowed or can be provided.

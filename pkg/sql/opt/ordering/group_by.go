@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ordering
 
@@ -30,7 +25,8 @@ func groupByCanProvideOrdering(expr memo.RelExpr, required *props.OrderingChoice
 	// GroupBy may require a certain ordering of its input, but can also pass
 	// through a stronger ordering on the grouping columns.
 	groupBy := expr.(*memo.GroupByExpr)
-	return required.CanProjectCols(groupBy.GroupingCols) && required.Intersects(&groupBy.Ordering)
+	return required.CanProjectCols(groupBy.GroupingCols) &&
+		required.Intersects(&groupBy.Ordering)
 }
 
 func groupByBuildChildReqOrdering(
@@ -41,9 +37,9 @@ func groupByBuildChildReqOrdering(
 	}
 	groupBy := parent.(*memo.GroupByExpr)
 	result := *required
-	if !result.SubsetOfCols(groupBy.GroupingCols) {
+	if !result.SubsetOfCols(groupBy.Input.Relational().OutputCols) {
 		result = result.Copy()
-		result.ProjectCols(groupBy.GroupingCols)
+		result.ProjectCols(groupBy.Input.Relational().OutputCols)
 	}
 
 	result = result.Intersection(&groupBy.Ordering)

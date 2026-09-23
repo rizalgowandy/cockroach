@@ -1,19 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package dumpstore
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,13 +138,7 @@ func TestRemoveOldAndTooBig(t *testing.T) {
 
 	for i, tc := range testData {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			path, err := ioutil.TempDir("", "remove")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = os.RemoveAll(path) }()
-
-			files := populate(t, path, tc.startFiles, tc.sizes)
+			files := populate(t, t.TempDir(), tc.startFiles, tc.sizes)
 
 			cleaned := []string{}
 			cleanupFn := func(s string) error {
@@ -167,16 +155,16 @@ func TestRemoveOldAndTooBig(t *testing.T) {
 type myDumper struct{}
 
 func (myDumper) PreFilter(
-	_ context.Context, files []os.FileInfo, cleanupFn func(fileName string) error,
+	_ context.Context, files []os.DirEntry, cleanupFn func(fileName string) error,
 ) (preserved map[int]bool, err error) {
 	panic("unimplemented")
 }
 
-func (myDumper) CheckOwnsFile(_ context.Context, fi os.FileInfo) bool {
+func (myDumper) CheckOwnsFile(_ context.Context, fi os.DirEntry) bool {
 	return strings.HasPrefix(fi.Name(), "memprof")
 }
 
-func populate(t *testing.T, dirName string, fileNames []string, sizes []int64) []os.FileInfo {
+func populate(t *testing.T, dirName string, fileNames []string, sizes []int64) []os.DirEntry {
 	if len(sizes) > 0 {
 		require.Equal(t, len(fileNames), len(sizes))
 	}
@@ -198,7 +186,7 @@ func populate(t *testing.T, dirName string, fileNames []string, sizes []int64) [
 	}
 
 	// Retrieve the file list for the remainder of the test.
-	files, err := ioutil.ReadDir(dirName)
+	files, err := os.ReadDir(dirName)
 	if err != nil {
 		t.Fatal(err)
 	}

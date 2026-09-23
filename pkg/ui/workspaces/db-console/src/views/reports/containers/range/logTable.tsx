@@ -1,28 +1,23 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import _ from "lodash";
+import { Loading, util } from "@cockroachlabs/cluster-ui";
+import isEmpty from "lodash/isEmpty";
+import map from "lodash/map";
+import orderBy from "lodash/orderBy";
 import React from "react";
 
 import * as protos from "src/js/protos";
-import { CachedDataReducerState } from "src/redux/cachedDataReducer";
 import { FixLong } from "src/util/fixLong";
 import Print from "src/views/reports/containers/range/print";
-import { Loading } from "@cockroachlabs/cluster-ui";
-import { TimestampToMoment } from "src/util/convert";
 
 interface LogTableProps {
   rangeID: Long;
-  log: CachedDataReducerState<
-    protos.cockroach.server.serverpb.RangeLogResponse
-  >;
+  data: protos.cockroach.server.serverpb.RangeLogResponse;
+  error?: Error;
+  isLoading?: boolean;
 }
 
 function printLogEventType(
@@ -42,16 +37,50 @@ function printLogEventType(
       return "Split";
     case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.merge:
       return "Merge";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType
+      .unsafe_quorum_recovery:
+      return "Unsafe Quorum Recovery";
     default:
       return "Unknown";
   }
 }
 
-export default class LogTable extends React.Component<LogTableProps, {}> {
+function renderLogInfoDescriptor(title: string, desc: string) {
+  if (isEmpty(desc)) {
+    return null;
+  }
+  return (
+    <li>
+      {title}: {desc}
+    </li>
+  );
+}
+
+function renderLogInfo(
+  info: protos.cockroach.server.serverpb.RangeLogResponse.IPrettyInfo,
+) {
+  return (
+    <ul className="log-entries-list">
+      {renderLogInfoDescriptor("Updated Range Descriptor", info.updated_desc)}
+      {renderLogInfoDescriptor("New Range Descriptor", info.new_desc)}
+      {renderLogInfoDescriptor("Added Replica", info.added_replica)}
+      {renderLogInfoDescriptor("Removed Replica", info.removed_replica)}
+      {renderLogInfoDescriptor("Reason", info.reason)}
+      {renderLogInfoDescriptor("Details", info.details)}
+    </ul>
+  );
+}
+
+export default function LogTable({
+  rangeID,
+  data,
+  error,
+  isLoading: loading,
+}: LogTableProps): React.ReactElement {
   // If there is no otherRangeID, it comes back as the number 0.
-  renderRangeID(otherRangeID: Long | number) {
+  const renderRangeID = (otherRangeID: Long | number) => {
     const fixedOtherRangeID = FixLong(otherRangeID);
-    const fixedCurrentRangeID = FixLong(this.props.rangeID);
+    const fixedCurrentRangeID = FixLong(rangeID);
     if (fixedOtherRangeID.eq(0)) {
       return null;
     }
@@ -65,44 +94,13 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
         r{fixedOtherRangeID.toString()}
       </a>
     );
-  }
+  };
 
-  renderLogInfoDescriptor(title: string, desc: string) {
-    if (_.isEmpty(desc)) {
-      return null;
-    }
-    return (
-      <li>
-        {title}: {desc}
-      </li>
-    );
-  }
-
-  renderLogInfo(
-    info: protos.cockroach.server.serverpb.RangeLogResponse.IPrettyInfo,
-  ) {
-    return (
-      <ul className="log-entries-list">
-        {this.renderLogInfoDescriptor(
-          "Updated Range Descriptor",
-          info.updated_desc,
-        )}
-        {this.renderLogInfoDescriptor("New Range Descriptor", info.new_desc)}
-        {this.renderLogInfoDescriptor("Added Replica", info.added_replica)}
-        {this.renderLogInfoDescriptor("Removed Replica", info.removed_replica)}
-        {this.renderLogInfoDescriptor("Reason", info.reason)}
-        {this.renderLogInfoDescriptor("Details", info.details)}
-      </ul>
-    );
-  }
-
-  renderContent = () => {
-    const { log } = this.props;
-
+  const renderContent = () => {
     // Sort by descending timestamp.
-    const events = _.orderBy(
-      log && log.data && log.data.events,
-      event => TimestampToMoment(event.event.timestamp).valueOf(),
+    const events = orderBy(
+      data && data.events,
+      event => util.TimestampToMoment(event.event.timestamp).valueOf(),
       "desc",
     );
 
@@ -123,7 +121,7 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
             </th>
             <th className="log-table__cell log-table__cell--header">Info</th>
           </tr>
-          {_.map(events, (event, key) => (
+          {map(events, (event, key) => (
             <tr key={key} className="log-table__row">
               <td className="log-table__cell log-table__cell--date">
                 {Print.Timestamp(event.event.timestamp)}
@@ -133,13 +131,13 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
                 {printLogEventType(event.event.event_type)}
               </td>
               <td className="log-table__cell">
-                {this.renderRangeID(event.event.range_id)}
+                {renderRangeID(event.event.range_id)}
               </td>
               <td className="log-table__cell">
-                {this.renderRangeID(event.event.other_range_id)}
+                {renderRangeID(event.event.other_range_id)}
               </td>
               <td className="log-table__cell">
-                {this.renderLogInfo(event.pretty_info)}
+                {renderLogInfo(event.pretty_info)}
               </td>
             </tr>
           ))}
@@ -148,18 +146,15 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
     );
   };
 
-  render() {
-    const { log } = this.props;
-
-    return (
-      <div>
-        <h2 className="base-heading">Range Log</h2>
-        <Loading
-          loading={!log || log.inFlight}
-          error={log && log.lastError}
-          render={this.renderContent}
-        />
-      </div>
-    );
-  }
+  return (
+    <div>
+      <h2 className="base-heading">Range Log</h2>
+      <Loading
+        loading={loading}
+        page={"log table"}
+        error={error}
+        render={renderContent}
+      />
+    </div>
+  );
 }

@@ -2,13 +2,8 @@
 //
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package timeutil
 
@@ -108,9 +103,11 @@ var lowercaseTimezones = map[string]string{
 	`america/cayman`:                   `America/Cayman`,
 	`america/chicago`:                  `America/Chicago`,
 	`america/chihuahua`:                `America/Chihuahua`,
+	`america/ciudad_juarez`:            `America/Ciudad_Juarez`,
 	`america/coral_harbour`:            `America/Coral_Harbour`,
 	`america/cordoba`:                  `America/Cordoba`,
 	`america/costa_rica`:               `America/Costa_Rica`,
+	`america/coyhaique`:                `America/Coyhaique`,
 	`america/creston`:                  `America/Creston`,
 	`america/cuiaba`:                   `America/Cuiaba`,
 	`america/curacao`:                  `America/Curacao`,
@@ -462,6 +459,7 @@ var lowercaseTimezones = map[string]string{
 	`europe/kaliningrad`:               `Europe/Kaliningrad`,
 	`europe/kiev`:                      `Europe/Kiev`,
 	`europe/kirov`:                     `Europe/Kirov`,
+	`europe/kyiv`:                      `Europe/Kyiv`,
 	`europe/lisbon`:                    `Europe/Lisbon`,
 	`europe/ljubljana`:                 `Europe/Ljubljana`,
 	`europe/london`:                    `Europe/London`,
@@ -557,6 +555,7 @@ var lowercaseTimezones = map[string]string{
 	`pacific/guam`:                     `Pacific/Guam`,
 	`pacific/honolulu`:                 `Pacific/Honolulu`,
 	`pacific/johnston`:                 `Pacific/Johnston`,
+	`pacific/kanton`:                   `Pacific/Kanton`,
 	`pacific/kiritimati`:               `Pacific/Kiritimati`,
 	`pacific/kosrae`:                   `Pacific/Kosrae`,
 	`pacific/kwajalein`:                `Pacific/Kwajalein`,

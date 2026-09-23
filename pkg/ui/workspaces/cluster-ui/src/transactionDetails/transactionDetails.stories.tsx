@@ -1,60 +1,49 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { storiesOf } from "@storybook/react";
+import noop from "lodash/noop";
+import React from "react";
 import { MemoryRouter } from "react-router-dom";
-import { transactionDetails } from "./transactionDetails.fixture";
+
+import {
+  requestTime,
+  routeProps,
+  timeScale,
+  transactionFingerprintId,
+} from "./transactionDetails.fixture";
 
 import { TransactionDetails } from ".";
 
-const { data, nodeRegions, error } = transactionDetails;
+import StatsSortOptions = cockroach.server.serverpb.StatsSortOptions;
+
+const defaultProps = {
+  ...routeProps,
+  timeScale,
+  transactionFingerprintId: transactionFingerprintId.toString(),
+  limit: 100,
+  reqSortSetting: StatsSortOptions.SERVICE_LAT,
+  requestTime,
+  onTimeScaleChange: noop,
+  onRequestTimeChange: noop,
+};
 
 storiesOf("Transactions Details", module)
   .addDecorator(storyFn => <MemoryRouter>{storyFn()}</MemoryRouter>)
   .addDecorator(storyFn => (
     <div style={{ backgroundColor: "#F5F7FA" }}>{storyFn()}</div>
   ))
-  .add("with data", () => (
-    <TransactionDetails
-      transactionText={data.statements
-        .map(s => s.key.key_data.query)
-        .join("\n")}
-      statements={data.statements as any}
-      nodeRegions={nodeRegions}
-      lastReset={Date().toString()}
-      handleDetails={() => {}}
-      resetSQLStats={() => {}}
-      isTenant={false}
-    />
-  ))
-  .add("with loading indicator", () => (
-    <TransactionDetails
-      transactionText={""}
-      statements={undefined}
-      nodeRegions={nodeRegions}
-      lastReset={Date().toString()}
-      handleDetails={() => {}}
-      resetSQLStats={() => {}}
-      isTenant={false}
-    />
-  ))
+  .add("with data", () => <TransactionDetails {...defaultProps} />)
+  .add("with loading indicator", () => <TransactionDetails {...defaultProps} />)
   .add("with error alert", () => (
     <TransactionDetails
-      transactionText={""}
-      statements={undefined}
-      nodeRegions={nodeRegions}
-      error={error}
-      lastReset={Date().toString()}
-      handleDetails={() => {}}
-      resetSQLStats={() => {}}
-      isTenant={false}
+      {...defaultProps}
+      transactionFingerprintId={undefined}
     />
-  ));
+  ))
+  .add("No data for this time frame; no cached transaction text", () => {
+    return <TransactionDetails {...defaultProps} />;
+  });

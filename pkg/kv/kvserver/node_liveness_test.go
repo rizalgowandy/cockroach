@@ -1,18 +1,14 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver_test
 
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"reflect"
 	"sort"
 	"strconv"
@@ -23,15 +19,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/fs"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -51,17 +55,15 @@ func verifyLiveness(t *testing.T, tc *testcluster.TestCluster) {
 		return nil
 	})
 }
-func verifyLivenessServer(s *server.TestServer, numServers int64) error {
+
+func verifyLivenessServer(s serverutils.TestServerInterface, numServers int64) error {
 	nl := s.NodeLiveness().(*liveness.NodeLiveness)
-	live, err := nl.IsLive(s.Gossip().NodeID.Get())
-	if err != nil {
-		return err
-	} else if !live {
-		return errors.Errorf("node %d not live", s.Gossip().NodeID.Get())
+	if !nl.GetNodeVitalityFromCache(s.NodeID()).IsLive(livenesspb.TestingIsAliveAndHasHeartbeated) {
+		return errors.Errorf("node %d not live", s.NodeID())
 	}
 	if a, e := nl.Metrics().LiveNodes.Value(), numServers; a != e {
 		return errors.Errorf("expected node %d's LiveNodes metric to be %d; got %d",
-			s.Gossip().NodeID.Get(), e, a)
+			s.NodeID(), e, a)
 	}
 	return nil
 }
@@ -89,7 +91,7 @@ func TestNodeLiveness(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -101,15 +103,12 @@ func TestNodeLiveness(t *testing.T) {
 	pauseNodeLivenessHeartbeatLoops(tc)
 
 	// Advance clock past the liveness threshold to verify IsLive becomes false.
-	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLivenessThreshold().Nanoseconds() + 1)
+	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).TestingGetLivenessThreshold().Nanoseconds() + 1)
 
 	for _, s := range tc.Servers {
 		nl := s.NodeLiveness().(*liveness.NodeLiveness)
-		nodeID := s.Gossip().NodeID.Get()
-		live, err := nl.IsLive(nodeID)
-		if err != nil {
-			t.Error(err)
-		} else if live {
+		nodeID := s.NodeID()
+		if nl.GetNodeVitalityFromCache(nodeID).IsLive(livenesspb.IsAliveNotification) {
 			t.Errorf("expected node %d to be considered not-live after advancing node clock", nodeID)
 		}
 		testutils.SucceedsSoon(t, func() error {
@@ -131,7 +130,7 @@ func TestNodeLiveness(t *testing.T) {
 				break
 			}
 			if errors.Is(err, liveness.ErrEpochIncremented) {
-				log.Warningf(context.Background(), "retrying after %s", err)
+				log.KvExec.Warningf(context.Background(), "retrying after %s", err)
 				continue
 			}
 
@@ -153,23 +152,25 @@ func TestNodeLivenessInitialIncrement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
 			ServerArgs: base.TestServerArgs{
 				StoreSpecs: []base.StoreSpec{
 					{
-						InMemory:               true,
-						StickyInMemoryEngineID: "1",
+						InMemory:    true,
+						StickyVFSID: "1",
 					},
 				},
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						StickyEngineRegistry: stickyEngineRegistry,
+						StickyVFSRegistry: stickyVFSRegistry,
 					},
 				},
 			},
@@ -179,10 +180,10 @@ func TestNodeLivenessInitialIncrement(t *testing.T) {
 	// Verify liveness of all nodes for all nodes.
 	verifyLiveness(t, tc)
 
-	nl, ok := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLiveness(tc.Servers[0].Gossip().NodeID.Get())
+	nl, ok := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLiveness(tc.Servers[0].NodeID())
 	assert.True(t, ok)
 	if nl.Epoch != 1 {
-		t.Errorf("expected epoch to be set to 1 initially; got %d", nl.Epoch)
+		t.Fatalf("expected epoch to be set to 1 initially; got %d; liveness %s", nl.Epoch, nl)
 	}
 
 	// Restart the node and verify the epoch is incremented with initial heartbeat.
@@ -192,7 +193,7 @@ func TestNodeLivenessInitialIncrement(t *testing.T) {
 
 func verifyEpochIncremented(t *testing.T, tc *testcluster.TestCluster, nodeIdx int) {
 	testutils.SucceedsSoon(t, func() error {
-		liv, ok := tc.Servers[nodeIdx].NodeLiveness().(*liveness.NodeLiveness).GetLiveness(tc.Servers[nodeIdx].Gossip().NodeID.Get())
+		liv, ok := tc.Servers[nodeIdx].NodeLiveness().(*liveness.NodeLiveness).GetLiveness(tc.Servers[nodeIdx].NodeID())
 		if !ok {
 			return errors.New("liveness not found")
 		}
@@ -211,9 +212,8 @@ func TestRedundantNodeLivenessHeartbeatsAvoided(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	s := serv.(*server.TestServer)
-	store, err := s.Stores().GetStore(s.GetFirstStoreID())
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 	require.NoError(t, err)
 	defer s.Stopper().Stop(ctx)
 
@@ -288,13 +288,26 @@ func TestNodeIsLiveCallback(t *testing.T) {
 
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
+	var started atomic.Bool
+	var cbMu syncutil.Mutex
+	cbs := map[roachpb.NodeID]struct{}{}
 	tc := testcluster.StartTestCluster(t, 3,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
+
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
+					},
+					NodeLiveness: kvserver.NodeLivenessTestingKnobs{
+						IsLiveCallback: func(l livenesspb.Liveness) {
+							if started.Load() {
+								cbMu.Lock()
+								defer cbMu.Unlock()
+								cbs[l.NodeID] = struct{}{}
+							}
+						},
 					},
 				},
 			},
@@ -304,17 +317,12 @@ func TestNodeIsLiveCallback(t *testing.T) {
 	// Verify liveness of all nodes for all nodes.
 	verifyLiveness(t, tc)
 	pauseNodeLivenessHeartbeatLoops(tc)
-
-	var cbMu syncutil.Mutex
-	cbs := map[roachpb.NodeID]struct{}{}
-	tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).RegisterCallback(func(l livenesspb.Liveness) {
-		cbMu.Lock()
-		defer cbMu.Unlock()
-		cbs[l.NodeID] = struct{}{}
-	})
+	// Only record entires after we have paused the normal heartbeat loop to make
+	// sure they come from the Heartbeat below.
+	started.Store(true)
 
 	// Advance clock past the liveness threshold.
-	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLivenessThreshold().Nanoseconds() + 1)
+	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).TestingGetLivenessThreshold().Nanoseconds() + 1)
 
 	// Trigger a manual heartbeat and verify callbacks for each node ID are invoked.
 	for _, s := range tc.Servers {
@@ -330,13 +338,242 @@ func TestNodeIsLiveCallback(t *testing.T) {
 		cbMu.Lock()
 		defer cbMu.Unlock()
 		for _, s := range tc.Servers {
-			nodeID := s.Gossip().NodeID.Get()
+			nodeID := s.NodeID()
 			if _, ok := cbs[nodeID]; !ok {
 				return errors.Errorf("expected IsLive callback for node %d", nodeID)
 			}
 		}
 		return nil
 	})
+}
+
+// TestNodeIsLiveCallbackBypassWithLeaderLeases verifies that expensive work to
+// check whether replicas need to be unquiesced does not happen when all ranges
+// are using leader leases.
+//
+// See https://github.com/cockroachdb/cockroach/issues/157089.
+func TestNodeIsLiveCallbackBypassWithLeaderLeases(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	manualClock := hlc.NewHybridManualClock()
+	// We only want to record entries after the heartbeat loop has been paused.
+	var started atomic.Bool
+	var invokedCount, workDoneCount atomic.Int64
+
+	st := cluster.MakeTestingClusterSettings()
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		Settings: st,
+		Knobs: base.TestingKnobs{
+			Server: &server.TestingKnobs{
+				WallClock: manualClock,
+			},
+			Store: &kvserver.StoreTestingKnobs{
+				NodeIsLiveCallbackInvoked: func(l livenesspb.Liveness) {
+					if started.Load() {
+						invokedCount.Add(1)
+					}
+				},
+				NodeIsLiveCallbackWorkDone: func(l livenesspb.Liveness) {
+					if started.Load() {
+						workDoneCount.Add(1)
+					}
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	nl := s.NodeLiveness().(*liveness.NodeLiveness)
+	testutils.SucceedsSoon(t, func() error {
+		return verifyLivenessServer(s, 1)
+	})
+	nl.PauseHeartbeatLoopForTest()
+	started.Store(true)
+
+	testCases := []struct {
+		name                string
+		leaderLeasesEnabled bool
+		fortificationFrac   float64
+		expectWorkDone      bool
+	}{
+		{
+			name:                "leader_leases_disabled",
+			leaderLeasesEnabled: false,
+			fortificationFrac:   0.0,
+			expectWorkDone:      true,
+		},
+		{
+			name:                "leader_leases_enabled_fortification_0",
+			leaderLeasesEnabled: true,
+			fortificationFrac:   0.0,
+			expectWorkDone:      true,
+		},
+		{
+			name:                "leader_leases_enabled_fortification_50",
+			leaderLeasesEnabled: true,
+			fortificationFrac:   0.5,
+			expectWorkDone:      true,
+		},
+		{
+			name:                "leader_leases_disabled_fortification_100",
+			leaderLeasesEnabled: false,
+			fortificationFrac:   1.0,
+			expectWorkDone:      true,
+		},
+		{
+			name:                "leader_leases_enabled_fortification_100",
+			leaderLeasesEnabled: true,
+			fortificationFrac:   1.0,
+			expectWorkDone:      false, // bypass
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			kvserver.LeaderLeasesEnabled.Override(ctx, &st.SV, testCase.leaderLeasesEnabled)
+			kvserver.RaftLeaderFortificationFractionEnabled.Override(ctx, &st.SV, testCase.fortificationFrac)
+			invokedCount.Store(0)  // reset
+			workDoneCount.Store(0) // reset
+
+			// Advance clock past the liveness threshold so the node is
+			// considered non-live. Then, trigger a heartbeat to make the node
+			// transition to live.
+			manualClock.Increment(nl.TestingGetLivenessThreshold().Nanoseconds() + 1)
+			l, ok := nl.Self()
+			require.True(t, ok)
+			require.NoError(t, nl.Heartbeat(ctx, l))
+
+			// The callback should always be invoked when transitioning from
+			// non-live to live. It's invoked async, so wait for it before asserting
+			// expectations below.
+			testutils.SucceedsSoon(t, func() error {
+				if invokedCount.Load() == 0 {
+					return errors.New("callback not yet invoked")
+				}
+				return nil
+			})
+
+			if testCase.expectWorkDone {
+				require.Equal(t, int64(1), workDoneCount.Load())
+			} else {
+				require.Zero(t, workDoneCount.Load())
+			}
+		})
+	}
+}
+
+// TestNodeIsLiveCallbackReactsToTransitions tests that when LeaderLeasesEnabled
+// or RaftLeaderFortificationFractionEnabled settings change, the
+// nodeIsLiveCallback is invoked for all live nodes, and we iterate over all
+// replicas only as necessary. See
+// https://github.com/cockroachdb/cockroach/issues/157089 for more details.
+func TestNodeIsLiveCallbackReactsToTransitions(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	var started atomic.Bool
+	var invokedCount, workDoneCount atomic.Int64
+
+	st := cluster.MakeTestingClusterSettings()
+
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Settings: st,
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				NodeIsLiveCallbackInvoked: func(l livenesspb.Liveness) {
+					if started.Load() {
+						invokedCount.Add(1)
+					}
+				},
+				NodeIsLiveCallbackWorkDone: func(l livenesspb.Liveness) {
+					if started.Load() {
+						workDoneCount.Add(1)
+					}
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	nl := s.NodeLiveness().(*liveness.NodeLiveness)
+	testutils.SucceedsSoon(t, func() error {
+		return verifyLivenessServer(s, 1)
+	})
+	nl.PauseHeartbeatLoopForTest()
+	started.Store(true)
+
+	testCases := []struct {
+		name string
+		// NB: SetOnChange is only called when there's a difference in setting
+		// values. This is used to setup initial state that differs from the
+		// defaults.
+		setup          func(sv *settings.Values)
+		testSQL        string
+		expectWorkDone bool
+	}{
+		{
+			name:           "leader_leases_turned_off",
+			testSQL:        "SET CLUSTER SETTING kv.leases.leader_leases.enabled = false",
+			expectWorkDone: true,
+		},
+		{
+			name:           "fortification_set_to_50%",
+			testSQL:        "SET CLUSTER SETTING kv.raft.leader_fortification.fraction_enabled = 0.5",
+			expectWorkDone: true,
+		},
+		{
+			name: "leader_leases_turned_on",
+			setup: func(sv *settings.Values) {
+				kvserver.LeaderLeasesEnabled.Override(ctx, sv, false)
+			},
+			testSQL:        "SET CLUSTER SETTING kv.leases.leader_leases.enabled = true",
+			expectWorkDone: false,
+		},
+		{
+			name: "fortification_set_to_100%",
+			setup: func(sv *settings.Values) {
+				kvserver.RaftLeaderFortificationFractionEnabled.Override(ctx, sv, 0.5)
+			},
+			testSQL:        "SET CLUSTER SETTING kv.raft.leader_fortification.fraction_enabled = 1.0",
+			expectWorkDone: false,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Restore defaults before each test, before running any
+			// test-specific setup and resetting counters.
+			kvserver.LeaderLeasesEnabled.Override(ctx, &st.SV, true)
+			kvserver.RaftLeaderFortificationFractionEnabled.Override(ctx, &st.SV, 1.0)
+			if testCase.setup != nil {
+				testCase.setup(&st.SV)
+			}
+			invokedCount.Store(0)
+			workDoneCount.Store(0)
+
+			_, err := db.Exec(testCase.testSQL) // execute the settings change
+			require.NoError(t, err)
+
+			// The callback should always be invoked when the setting changes, though
+			// this happens async.
+			testutils.SucceedsSoon(t, func() error {
+				if invokedCount.Load() == 0 {
+					return errors.New("callback not yet invoked")
+				}
+				return nil
+			})
+			if testCase.expectWorkDone {
+				require.NotZero(t, workDoneCount.Load(), "expected work to be done")
+			} else {
+				require.Zero(t, workDoneCount.Load(), "expected no work to be done")
+			}
+		})
+	}
 }
 
 // TestNodeHeartbeatCallback verifies that HeartbeatCallback is invoked whenever
@@ -346,63 +583,26 @@ func TestNodeHeartbeatCallback(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	manualClock := hlc.NewHybridManualClock()
-	expected := manualClock.UnixNano()
-	tc := testcluster.StartTestCluster(t, 3,
+	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
-			ServerArgs: base.TestServerArgs{
-				Knobs: base.TestingKnobs{
-					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
-					},
-				},
-			},
 		})
 	defer tc.Stopper().Stop(ctx)
 
 	// Verify liveness of all nodes for all nodes.
 	verifyLiveness(t, tc)
-	pauseNodeLivenessHeartbeatLoops(tc)
 
 	// Verify that last update time has been set for all nodes.
-	verifyUptimes := func() error {
+	verifyUptimes := func() {
 		for i := range tc.Servers {
 			s := tc.GetFirstStoreFromServer(t, i)
 			uptm, err := s.ReadLastUpTimestamp(context.Background())
-			if err != nil {
-				return errors.Wrapf(err, "error reading last up time from store %d", i)
-			}
-			if a, e := uptm.WallTime, expected; a < e {
-				return errors.Errorf("store %d last uptime = %d; wanted %d", i, a, e)
-			}
-		}
-		return nil
-	}
-
-	if err := verifyUptimes(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Advance clock past the liveness threshold and force a manual heartbeat on
-	// all node liveness objects, which should update the last up time for each
-	// store.
-	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLivenessThreshold().Nanoseconds() + 1)
-	expected = manualClock.UnixNano()
-	for _, s := range tc.Servers {
-		nl := s.NodeLiveness().(*liveness.NodeLiveness)
-		l, ok := nl.Self()
-		assert.True(t, ok)
-		if err := nl.Heartbeat(context.Background(), l); err != nil {
-			t.Fatal(err)
+			require.NoError(t, err)
+			require.NotZero(t, uptm)
 		}
 	}
-	// NB: since the heartbeat callback is invoked synchronously in
-	// `Heartbeat()` which this goroutine invoked, we don't need to wrap this in
-	// a retry.
-	if err := verifyUptimes(); err != nil {
-		t.Fatal(err)
-	}
+
+	verifyUptimes()
 }
 
 // TestNodeLivenessEpochIncrement verifies that incrementing the epoch
@@ -421,7 +621,7 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -433,7 +633,7 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 	pauseNodeLivenessHeartbeatLoops(tc)
 
 	// First try to increment the epoch of a known-live node.
-	deadNodeID := tc.Servers[1].Gossip().NodeID.Get()
+	deadNodeID := tc.Servers[1].NodeID()
 	oldLiveness, ok := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLiveness(deadNodeID)
 	assert.True(t, ok)
 	if err := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).IncrementEpoch(
@@ -443,7 +643,7 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 	}
 
 	// Advance clock past liveness threshold & increment epoch.
-	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetLivenessThreshold().Nanoseconds() + 1)
+	manualClock.Increment(tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).TestingGetLivenessThreshold().Nanoseconds() + 1)
 	if err := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).IncrementEpoch(ctx, oldLiveness.Liveness); err != nil {
 		t.Fatalf("unexpected error incrementing a non-live node: %+v", err)
 	}
@@ -460,8 +660,8 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 		if newLiveness.Expiration != oldLiveness.Expiration {
 			return errors.Errorf("expected expiration to remain unchanged")
 		}
-		if live, err := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).IsLive(deadNodeID); live || err != nil {
-			return errors.Errorf("expected dead node to remain dead after epoch increment %t: %v", live, err)
+		if tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness).GetNodeVitalityFromCache(deadNodeID).IsLive(livenesspb.IsAliveNotification) {
+			return errors.Errorf("expected dead node to remain dead after epoch increment")
 		}
 		return nil
 	})
@@ -493,8 +693,7 @@ func TestNodeLivenessRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
 
 	const numServers int = 2
 	stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -502,13 +701,13 @@ func TestNodeLivenessRestart(t *testing.T) {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: stickyVFSRegistry,
 				},
 			},
 		}
@@ -530,10 +729,11 @@ func TestNodeLivenessRestart(t *testing.T) {
 	// seeing the liveness record properly gossiped at store startup.
 	var expKeys []string
 	for _, s := range tc.Servers {
-		nodeID := s.Gossip().NodeID.Get()
+		nodeID := s.NodeID()
 		key := gossip.MakeNodeLivenessKey(nodeID)
 		expKeys = append(expKeys, key)
-		if err := s.Gossip().AddInfoProto(key, &livenesspb.Liveness{NodeID: nodeID}, 0); err != nil {
+		if err := s.GossipI().(*gossip.Gossip).
+			AddInfoProto(key, &livenesspb.Liveness{NodeID: nodeID}, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -547,18 +747,19 @@ func TestNodeLivenessRestart(t *testing.T) {
 	}
 
 	// Restart store and verify gossip contains liveness record for nodes 1&2.
-	require.NoError(t, tc.RestartServerWithInspect(1, func(s *server.TestServer) {
+	require.NoError(t, tc.RestartServerWithInspect(1, func(s serverutils.TestServerInterface) {
 		livenessRegex := gossip.MakePrefixPattern(gossip.KeyNodeLivenessPrefix)
-		s.Gossip().RegisterCallback(livenessRegex, func(key string, _ roachpb.Value) {
-			keysMu.Lock()
-			defer keysMu.Unlock()
-			for _, k := range keysMu.keys {
-				if k == key {
-					return
+		s.GossipI().(*gossip.Gossip).
+			RegisterCallback(livenessRegex, func(key string, _ roachpb.Value, _ int64) {
+				keysMu.Lock()
+				defer keysMu.Unlock()
+				for _, k := range keysMu.keys {
+					if k == key {
+						return
+					}
 				}
-			}
-			keysMu.keys = append(keysMu.keys, key)
-		})
+				keysMu.keys = append(keysMu.keys, key)
+			})
 	}))
 	testutils.SucceedsSoon(t, func() error {
 		keysMu.Lock()
@@ -583,10 +784,9 @@ func TestNodeLivenessSelf(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	s := serv.(*server.TestServer)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	g := s.Gossip()
+	g := s.GossipI().(*gossip.Gossip)
 	nl := s.NodeLiveness().(*liveness.NodeLiveness)
 	nl.PauseHeartbeatLoopForTest()
 
@@ -610,7 +810,7 @@ func TestNodeLivenessSelf(t *testing.T) {
 	// the node's own node ID returns the "correct" value.
 	key := gossip.MakeNodeLivenessKey(g.NodeID.Get())
 	var count int32
-	g.RegisterCallback(key, func(_ string, val roachpb.Value) {
+	g.RegisterCallback(key, func(_ string, val roachpb.Value, _ int64) {
 		atomic.AddInt32(&count, 1)
 	})
 	testutils.SucceedsSoon(t, func() error {
@@ -652,7 +852,7 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -662,24 +862,15 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 	verifyLiveness(t, tc)
 	pauseNodeLivenessHeartbeatLoops(tc)
 	nl := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness)
-	lMap := nl.GetIsLiveMap()
-	l1, _ := nl.GetLiveness(1)
-	l2, _ := nl.GetLiveness(2)
-	l3, _ := nl.GetLiveness(3)
-	expectedLMap := liveness.IsLiveMap{
-		1: {Liveness: l1.Liveness, IsLive: true},
-		2: {Liveness: l2.Liveness, IsLive: true},
-		3: {Liveness: l3.Liveness, IsLive: true},
-	}
-	if !reflect.DeepEqual(expectedLMap, lMap) {
-		t.Errorf("expected liveness map %+v; got %+v", expectedLMap, lMap)
-	}
+	require.True(t, nl.GetNodeVitalityFromCache(1).IsLive(livenesspb.IsAliveNotification))
+	require.True(t, nl.GetNodeVitalityFromCache(2).IsLive(livenesspb.IsAliveNotification))
+	require.True(t, nl.GetNodeVitalityFromCache(3).IsLive(livenesspb.IsAliveNotification))
 
 	// Advance the clock but only heartbeat node 0.
-	manualClock.Increment(nl.GetLivenessThreshold().Nanoseconds() + 1)
+	manualClock.Increment(nl.TestingGetLivenessThreshold().Nanoseconds() + 1)
 	var livenessRec liveness.Record
 	testutils.SucceedsSoon(t, func() error {
-		lr, ok := nl.GetLiveness(tc.Servers[0].Gossip().NodeID.Get())
+		lr, ok := nl.GetLiveness(tc.Servers[0].NodeID())
 		if !ok {
 			return errors.New("liveness not found")
 		}
@@ -698,18 +889,9 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 	})
 
 	// Now verify only node 0 is live.
-	lMap = nl.GetIsLiveMap()
-	l1, _ = nl.GetLiveness(1)
-	l2, _ = nl.GetLiveness(2)
-	l3, _ = nl.GetLiveness(3)
-	expectedLMap = liveness.IsLiveMap{
-		1: {Liveness: l1.Liveness, IsLive: true},
-		2: {Liveness: l2.Liveness, IsLive: false},
-		3: {Liveness: l3.Liveness, IsLive: false},
-	}
-	if !reflect.DeepEqual(expectedLMap, lMap) {
-		t.Errorf("expected liveness map %+v; got %+v", expectedLMap, lMap)
-	}
+	require.True(t, nl.GetNodeVitalityFromCache(1).IsLive(livenesspb.IsAliveNotification))
+	require.False(t, nl.GetNodeVitalityFromCache(2).IsLive(livenesspb.IsAliveNotification))
+	require.False(t, nl.GetNodeVitalityFromCache(3).IsLive(livenesspb.IsAliveNotification))
 }
 
 func TestNodeLivenessGetLivenesses(t *testing.T) {
@@ -724,7 +906,7 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -736,15 +918,15 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 
 	nl := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness)
 	actualLMapNodes := make(map[roachpb.NodeID]struct{})
-	originalExpiration := testStartTime + nl.GetLivenessThreshold().Nanoseconds()
-	for _, l := range nl.GetLivenesses() {
-		if a, e := l.Epoch, int64(1); a != e {
+	originalExpiration := testStartTime + nl.TestingGetLivenessThreshold().Nanoseconds()
+	for id, v := range nl.ScanNodeVitalityFromCache() {
+		if a, e := v.GetInternalLiveness().Epoch, int64(1); a != e {
 			t.Errorf("liveness record had epoch %d, wanted %d", a, e)
 		}
-		if a, e := l.Expiration.WallTime, originalExpiration; a < e {
+		if a, e := v.GetInternalLiveness().Expiration.WallTime, originalExpiration; a < e {
 			t.Errorf("liveness record had expiration %d, wanted %d", a, e)
 		}
-		actualLMapNodes[l.NodeID] = struct{}{}
+		actualLMapNodes[id] = struct{}{}
 	}
 	expectedLMapNodes := map[roachpb.NodeID]struct{}{1: {}, 2: {}, 3: {}}
 	if !reflect.DeepEqual(actualLMapNodes, expectedLMapNodes) {
@@ -752,10 +934,10 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 	}
 
 	// Advance the clock but only heartbeat node 0.
-	manualClock.Increment(nl.GetLivenessThreshold().Nanoseconds() + 1)
+	manualClock.Increment(nl.TestingGetLivenessThreshold().Nanoseconds() + 1)
 	var livenessRecord liveness.Record
 	testutils.SucceedsSoon(t, func() error {
-		livenessRec, ok := nl.GetLiveness(tc.Servers[0].Gossip().NodeID.Get())
+		livenessRec, ok := nl.GetLiveness(tc.Servers[0].NodeID())
 		if !ok {
 			return errors.New("liveness not found")
 		}
@@ -768,18 +950,18 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 
 	// Verify that node liveness receives the change.
 	actualLMapNodes = make(map[roachpb.NodeID]struct{})
-	for _, l := range nl.GetLivenesses() {
-		if a, e := l.Epoch, int64(1); a != e {
+	for id, v := range nl.ScanNodeVitalityFromCache() {
+		if a, e := v.GetInternalLiveness().Epoch, int64(1); a != e {
 			t.Errorf("liveness record had epoch %d, wanted %d", a, e)
 		}
 		expectedExpiration := originalExpiration
-		if l.NodeID == 1 {
-			expectedExpiration += nl.GetLivenessThreshold().Nanoseconds() + 1
+		if id == 1 {
+			expectedExpiration += nl.TestingGetLivenessThreshold().Nanoseconds() + 1
 		}
-		if a, e := l.Expiration.WallTime, expectedExpiration; a < e {
+		if a, e := v.GetInternalLiveness().Expiration.WallTime, expectedExpiration; a < e {
 			t.Errorf("liveness record had expiration %d, wanted %d", a, e)
 		}
-		actualLMapNodes[l.NodeID] = struct{}{}
+		actualLMapNodes[id] = struct{}{}
 	}
 	if !reflect.DeepEqual(actualLMapNodes, expectedLMapNodes) {
 		t.Errorf("got liveness map nodes %+v; wanted %+v", actualLMapNodes, expectedLMapNodes)
@@ -794,14 +976,13 @@ func TestNodeLivenessConcurrentHeartbeats(t *testing.T) {
 
 	ctx := context.Background()
 	manualClock := hlc.NewHybridManualClock()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
-				ClockSource: manualClock.UnixNano,
+				WallClock: manualClock,
 			},
 		},
 	})
-	s := serv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
 
 	testutils.SucceedsSoon(t, func() error {
@@ -813,7 +994,7 @@ func TestNodeLivenessConcurrentHeartbeats(t *testing.T) {
 	const concurrency = 10
 
 	// Advance clock past the liveness threshold & concurrently heartbeat node.
-	manualClock.Increment(nl.GetLivenessThreshold().Nanoseconds() + 1)
+	manualClock.Increment(nl.TestingGetLivenessThreshold().Nanoseconds() + 1)
 	l, ok := nl.Self()
 	assert.True(t, ok)
 	errCh := make(chan error, concurrency)
@@ -843,7 +1024,7 @@ func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
-						ClockSource: manualClock.UnixNano,
+						WallClock: manualClock,
 					},
 				},
 			},
@@ -857,8 +1038,8 @@ func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 
 	// Advance the clock and this time increment epoch concurrently for node 1.
 	nl := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness)
-	manualClock.Increment(nl.GetLivenessThreshold().Nanoseconds() + 1)
-	l, ok := nl.GetLiveness(tc.Servers[1].Gossip().NodeID.Get())
+	manualClock.Increment(nl.TestingGetLivenessThreshold().Nanoseconds() + 1)
+	l, ok := nl.GetLiveness(tc.Servers[1].NodeID())
 	assert.True(t, ok)
 	errCh := make(chan error, concurrency)
 	for i := 0; i < concurrency; i++ {
@@ -880,8 +1061,9 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -889,13 +1071,13 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: stickyVFSRegistry,
 				},
 			},
 		}
@@ -904,8 +1086,9 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, numServers,
 		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 
@@ -913,10 +1096,10 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 	verifyLiveness(t, tc)
 
 	drainingNodeIdx := 0
-	drainingNodeID := tc.Servers[0].Gossip().NodeID.Get()
+	drainingNodeID := tc.Servers[0].NodeID()
 
-	nodeIDAppearsInStoreList := func(id roachpb.NodeID, sl kvserver.StoreList) bool {
-		for _, store := range sl.Stores() {
+	nodeIDAppearsInStoreList := func(id roachpb.NodeID, sl storepool.StoreList) bool {
+		for _, store := range sl.TestingStores() {
 			if store.Node.NodeID == id {
 				return true
 			}
@@ -945,8 +1128,8 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 		// been gossiped to the rest of the cluster.
 		testutils.SucceedsSoon(t, func() error {
 			for i, s := range tc.Servers {
-				curNodeID := s.Gossip().NodeID.Get()
-				sl, alive, _ := tc.GetFirstStoreFromServer(t, i).GetStoreConfig().StorePool.GetStoreList()
+				curNodeID := s.NodeID()
+				sl, alive, _ := tc.GetFirstStoreFromServer(t, i).GetStoreConfig().StorePool.TestingGetStoreList()
 				if alive != expectedLive {
 					return errors.Errorf(
 						"expected %d live stores but got %d from node %d",
@@ -979,8 +1162,8 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 		// been gossiped to the rest of the cluster.
 		testutils.SucceedsSoon(t, func() error {
 			for i, s := range tc.Servers {
-				curNodeID := s.Gossip().NodeID.Get()
-				sl, alive, _ := tc.GetFirstStoreFromServer(t, i).GetStoreConfig().StorePool.GetStoreList()
+				curNodeID := s.NodeID()
+				sl, alive, _ := tc.GetFirstStoreFromServer(t, i).GetStoreConfig().StorePool.TestingGetStoreList()
 				if alive != expectedLive {
 					return errors.Errorf(
 						"expected %d live stores but got %d from node %d",
@@ -994,7 +1177,7 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 						"expected node %d to appear in node %d's store list: %+v",
 						drainingNodeID,
 						curNodeID,
-						sl.Stores(),
+						sl.TestingStores(),
 					)
 				}
 			}
@@ -1007,23 +1190,22 @@ func TestNodeLivenessRetryAmbiguousResultError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	var injectError atomic.Value
-	var injectedErrorCount int32
+	var injectError atomic.Bool
+	var injectedErrorCount atomic.Int32
 
 	injectError.Store(true)
-	testingEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
-		if _, ok := args.Req.(*roachpb.ConditionalPutRequest); !ok {
+	testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
+		if _, ok := args.Req.(*kvpb.ConditionalPutRequest); !ok {
 			return nil
 		}
-		if val := injectError.Load(); val != nil && val.(bool) {
-			atomic.AddInt32(&injectedErrorCount, 1)
-			injectError.Store(false)
-			return roachpb.NewError(roachpb.NewAmbiguousResultError("test"))
+		if injectError.Swap(false) {
+			injectedErrorCount.Add(1)
+			return kvpb.NewError(kvpb.NewAmbiguousResultErrorf("test"))
 		}
 		return nil
 	}
 	ctx := context.Background()
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
@@ -1032,26 +1214,32 @@ func TestNodeLivenessRetryAmbiguousResultError(t *testing.T) {
 			},
 		},
 	})
-	s := serv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
 
 	// Verify retry of the ambiguous result for heartbeat loop.
 	testutils.SucceedsSoon(t, func() error {
 		return verifyLivenessServer(s, 1)
 	})
-	nl := s.NodeLiveness().(*liveness.NodeLiveness)
-
-	l, ok := nl.Self()
-	assert.True(t, ok)
 
 	// And again on manual heartbeat.
+	// NOTE: we make sure to set pause the heartbeat loop before we grab the
+	// liveness record to ensure that we don't race with the heartbeat loop in
+	// a way that allows our manual heartbeat to short-circuit.
+	nl := s.NodeLiveness().(*liveness.NodeLiveness)
+	defer nl.PauseHeartbeatLoopForTest()
+
 	injectError.Store(true)
-	if err := nl.Heartbeat(context.Background(), l); err != nil {
-		t.Fatal(err)
-	}
-	if count := atomic.LoadInt32(&injectedErrorCount); count != 2 {
-		t.Errorf("expected injected error count of 2; got %d", count)
-	}
+	l, ok := nl.Self()
+	assert.True(t, ok)
+	require.NoError(t, nl.Heartbeat(context.Background(), l))
+
+	// TODO(baptist): Once we remove epoch leases, we should remove the manual
+	// Heartbeat call on node liveness and remove the manual heartbeat from this
+	// test.
+	// Verify that the error was injected twice (or fewer times).
+	// We mostly expect exactly twice but it's been tricky to actually make this
+	// be true in all cases (see #126040, which didn't manage).
+	require.LessOrEqual(t, injectedErrorCount.Load(), int32(2))
 }
 
 // This tests the create code path for node liveness, for that we need to create
@@ -1060,75 +1248,65 @@ func TestNodeLivenessRetryAmbiguousResultOnCreateError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	errorsToTest := []error{
-		roachpb.NewAmbiguousResultError("test"),
-		roachpb.NewTransactionStatusError(roachpb.TransactionStatusError_REASON_UNKNOWN, "foo"),
-		kv.OnePCNotAllowedError{},
+	testcases := []struct {
+		err error
+	}{
+		{kvpb.NewAmbiguousResultErrorf("test")},
+		{kvpb.NewTransactionStatusError(kvpb.TransactionStatusError_REASON_UNKNOWN, "foo")},
+		{kv.OnePCNotAllowedError{}},
 	}
+	for _, tc := range testcases {
+		t.Run(tc.err.Error(), func(t *testing.T) {
 
-	for _, errorToTest := range errorsToTest {
-		var injectError atomic.Value
-		type injectErrorData struct {
-			shouldError bool
-			count       int32
-		}
+			// Keeps track of node IDs that have errored.
+			var errored syncutil.Set[roachpb.NodeID]
 
-		injectError.Store(map[roachpb.NodeID]injectErrorData{
-			roachpb.NodeID(1): {true, 0},
-			roachpb.NodeID(2): {true, 0},
-			roachpb.NodeID(3): {true, 0},
-		})
-		testingEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
-			if req, ok := args.Req.(*roachpb.ConditionalPutRequest); ok {
-				if val := injectError.Load(); val != nil {
-					var liveness livenesspb.Liveness
-					if err := req.Value.GetProto(&liveness); err != nil {
+			testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
+				if req, ok := args.Req.(*kvpb.ConditionalPutRequest); ok {
+					if !keys.NodeLivenessSpan.ContainsKey(req.Key) {
 						return nil
 					}
-					injectErrorMap := val.(map[roachpb.NodeID]injectErrorData)
-					if injectErrorMap[liveness.NodeID].shouldError {
+					var liveness livenesspb.Liveness
+					assert.NoError(t, req.Value.GetProto(&liveness))
+					if errored.Add(liveness.NodeID) {
 						if liveness.NodeID != 1 {
 							// We expect this to come from the create code path on all nodes
 							// except the first. Make sure that is actually true.
-							assert.Equal(t, liveness.Epoch, int64(0))
+							assert.Zero(t, liveness.Epoch)
 						}
-						injectErrorMap[liveness.NodeID] = injectErrorData{false, injectErrorMap[liveness.NodeID].count + 1}
-						injectError.Store(injectErrorMap)
-						return roachpb.NewError(errorToTest)
+						return kvpb.NewError(tc.err)
 					}
 				}
+				return nil
 			}
-			return nil
-		}
-		ctx := context.Background()
-		tc := testcluster.StartTestCluster(t, 3,
-			base.TestClusterArgs{
-				ReplicationMode: base.ReplicationManual,
-				ServerArgs: base.TestServerArgs{
-					Knobs: base.TestingKnobs{
-						Store: &kvserver.StoreTestingKnobs{
-							EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-								TestingEvalFilter: testingEvalFilter,
+
+			ctx := context.Background()
+			tc := testcluster.StartTestCluster(t, 3,
+				base.TestClusterArgs{
+					ReplicationMode: base.ReplicationManual,
+					ServerArgs: base.TestServerArgs{
+						Knobs: base.TestingKnobs{
+							Store: &kvserver.StoreTestingKnobs{
+								EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
+									TestingEvalFilter: testingEvalFilter,
+								},
 							},
 						},
 					},
-				},
-			})
-		defer tc.Stopper().Stop(ctx)
+				})
+			defer tc.Stopper().Stop(ctx)
 
-		for _, s := range tc.Servers {
-			// Verify retry of the ambiguous result for heartbeat loop.
-			testutils.SucceedsSoon(t, func() error {
-				return verifyLivenessServer(s, 3)
-			})
-			nl := s.NodeLiveness().(*liveness.NodeLiveness)
-			_, ok := nl.Self()
-			assert.True(t, ok)
-
-			injectErrorMap := injectError.Load().(map[roachpb.NodeID]injectErrorData)
-			assert.NotNil(t, injectErrorMap)
-			assert.Equal(t, int32(1), injectErrorMap[s.NodeID()].count)
-		}
+			for _, s := range tc.Servers {
+				// Verify retry of the ambiguous result for heartbeat loop.
+				testutils.SucceedsSoon(t, func() error {
+					return verifyLivenessServer(s, 3)
+				})
+				_, ok := s.NodeLiveness().(*liveness.NodeLiveness).Self()
+				require.True(t, ok)
+				ok = errored.Contains(s.NodeID())
+				require.True(t, ok)
+			}
+		})
 	}
 }
 
@@ -1141,9 +1319,9 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 
 	ctx := context.Background()
 	var sem chan struct{}
-	testingEvalFilter := func(args kvserverbase.FilterArgs) *roachpb.Error {
+	testingEvalFilter := func(args kvserverbase.FilterArgs) *kvpb.Error {
 		// Maybe trap a liveness heartbeat.
-		_, ok := args.Req.(*roachpb.ConditionalPutRequest)
+		_, ok := args.Req.(*kvpb.ConditionalPutRequest)
 		if !ok {
 			return nil
 		}
@@ -1160,7 +1338,7 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 		<-sem
 		return nil
 	}
-	serv, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
@@ -1175,9 +1353,12 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 			},
 		},
 	})
-	s := serv.(*server.TestServer)
 	defer s.Stopper().Stop(ctx)
 	nl := s.NodeLiveness().(*liveness.NodeLiveness)
+
+	testutils.SucceedsSoon(t, func() error {
+		return verifyLivenessServer(s, 1)
+	})
 
 	// We want to control the heartbeats.
 	nl.PauseHeartbeatLoopForTest()
@@ -1185,7 +1366,7 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 	sem = make(chan struct{})
 
 	l, ok := nl.Self()
-	assert.True(t, ok)
+	require.True(t, ok)
 
 	hbCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1205,20 +1386,15 @@ func TestNodeLivenessNoRetryOnAmbiguousResultCausedByCancellation(t *testing.T) 
 
 	// Check that Heartbeat() returned an ambiguous error, and take that as proof
 	// that the heartbeat wasn't retried.
-	require.Error(t, err)
-	require.Equal(t, "result is ambiguous (context done during DistSender.Send: context canceled)", err.Error())
+	require.True(t, errors.HasType(err, (*kvpb.AmbiguousResultError)(nil)), "%+v", err)
 }
 
 func verifyNodeIsDecommissioning(t *testing.T, tc *testcluster.TestCluster, nodeID roachpb.NodeID) {
 	testutils.SucceedsSoon(t, func() error {
 		for _, s := range tc.Servers {
-			for _, liv := range s.NodeLiveness().(*liveness.NodeLiveness).GetLivenesses() {
-				if liv.NodeID != nodeID {
-					continue
-				}
-				if !liv.Membership.Decommissioning() {
-					return errors.Errorf("unexpected Membership value of %v for node %v", liv.Membership, liv.NodeID)
-				}
+			liv, _ := s.NodeLiveness().(*liveness.NodeLiveness).GetLiveness(nodeID)
+			if !liv.Membership.Decommissioning() {
+				return errors.Errorf("unexpected Membership value of %v for node %v", liv.Membership, liv.NodeID)
 			}
 		}
 		return nil
@@ -1226,8 +1402,9 @@ func verifyNodeIsDecommissioning(t *testing.T, tc *testcluster.TestCluster, node
 }
 
 func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	stickyVFSRegistry := fs.NewStickyRegistry()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	const numServers int = 3
 	stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -1235,13 +1412,13 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 		stickyServerArgs[i] = base.TestServerArgs{
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: stickyVFSRegistry,
 				},
 			},
 		}
@@ -1250,8 +1427,9 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, numServers,
 		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 
@@ -1259,7 +1437,7 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 	verifyLiveness(t, tc)
 
 	callerNodeLiveness := tc.Servers[0].NodeLiveness().(*liveness.NodeLiveness)
-	nodeID := tc.Servers[decommissionNodeIdx].Gossip().NodeID.Get()
+	nodeID := tc.Servers[decommissionNodeIdx].NodeID()
 
 	// Verify success on failed update of a liveness record that already has the
 	// given decommissioning setting.
@@ -1362,4 +1540,148 @@ func TestNodeLivenessDecommissionAbsent(t *testing.T) {
 	setMembershipStatus(nl1, livenesspb.MembershipStatus_DECOMMISSIONING, true)
 	// Recommission from third node.
 	setMembershipStatus(nl2, livenesspb.MembershipStatus_ACTIVE, true)
+}
+
+func BenchmarkNodeLivenessScanStorage(b *testing.B) {
+	skip.UnderShort(b)
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	const numNodes = 100
+	setupEng := func(b *testing.B, numLiveVersions int, haveFullyDeadKeys bool) storage.Engine {
+		eng := storage.NewDefaultInMemForTesting(storage.DisableAutomaticCompactions)
+		// 20 per minute, so 1000 represents 50 min of liveness writes in a level.
+		// This is unusual, but we can have such accumulation if flushes and
+		// compactions are rare.
+		const numVersionsPerLevel = 1000
+		// All versions in level l will be deleted in level l+1. The versions
+		// written at the highest level are not deleted and the number of these
+		// per node is controlled by numLiveVersions. Additionally, if
+		// haveFullyDeadKeys is true, the highest level only has live versions for
+		// alternating nodes.
+		//
+		// NB: haveFullyDeadKeys=true is not representative of NodeLiveness, since
+		// we don't remove decommissioned entries. It is included here just to
+		// understand the effect on the NextPrefix optimization.
+		const numLevels = 7
+		tsFunc := func(l int, v int) int64 {
+			return int64(l*numVersionsPerLevel + v + 10)
+		}
+		for l := 0; l < numLevels; l++ {
+			for v := 0; v < numVersionsPerLevel; v++ {
+				ts := tsFunc(l, v)
+				for n := roachpb.NodeID(0); n < numNodes; n++ {
+					lKey := keys.NodeLivenessKey(n)
+					// Always write a version if not at the highest level. If at the
+					// highest level, only write if v < numLiveVersions. Additionally,
+					// either haveFullyDeadKeys must be false or this node is one that
+					// has live versions.
+					if l < numLevels-1 || (v < numLiveVersions && (!haveFullyDeadKeys || n%2 == 0)) {
+						liveness := livenesspb.Liveness{
+							NodeID:     n,
+							Epoch:      100,
+							Expiration: hlc.LegacyTimestamp{WallTime: ts},
+							Draining:   false,
+							Membership: livenesspb.MembershipStatus_ACTIVE,
+						}
+
+						require.NoError(b, storage.MVCCPutProto(
+							ctx, eng, lKey, hlc.Timestamp{WallTime: ts}, &liveness,
+							storage.MVCCWriteOptions{}))
+					}
+					// Else most recent level and the other conditions for writing a
+					// version are not satisfied.
+
+					if l != 0 {
+						// Clear the key from the next older level.
+						require.NoError(b, eng.ClearMVCC(storage.MVCCKey{
+							Key:       lKey,
+							Timestamp: hlc.Timestamp{WallTime: tsFunc(l-1, v)},
+						}, storage.ClearOptions{}))
+					}
+				}
+				if l == 0 && v < 10 {
+					// Flush to grow the memtable size.
+					require.NoError(b, eng.Flush())
+				}
+			}
+			if l == 0 {
+				// Since did many flushes, compact everything down.
+				require.NoError(b, eng.Compact(ctx))
+			} else {
+				// Flush the next level. This will become a L0 sub-level.
+				require.NoError(b, eng.Flush())
+			}
+		}
+		return eng
+	}
+	scanLiveness := func(b *testing.B, eng storage.Engine, expectedCount int) (blockBytes uint64) {
+		ss := &kvpb.ScanStats{}
+		opts := storage.MVCCScanOptions{
+			ScanStats: ss,
+		}
+		scanRes, err := storage.MVCCScan(
+			ctx, eng.NewReader(storage.StandardDurability), keys.NodeLivenessPrefix,
+			keys.NodeLivenessKeyMax, hlc.MaxTimestamp, opts)
+		if err != nil {
+			b.Fatal(err.Error())
+		}
+		if expectedCount != len(scanRes.KVs) {
+			b.Fatalf("expected %d != actual %d", expectedCount, len(scanRes.KVs))
+		}
+		return ss.BlockBytes
+	}
+
+	// We expect active nodes to have 100s of live versions since liveness is
+	// written every 3s, and GC is configured to happen after 10min. But GC can
+	// be delayed, and decommissioned nodes will only have 1 version, so we
+	// explore those extremes.
+	//
+	// Results on M1 macbook with dead-keys=false and compacted=true:
+	// NodeLivenessScanStorage/num-live=2/compacted=true-10   26.80µ ± 9%
+	// NodeLivenessScanStorage/num-live=5/compacted=true-10   30.34µ ± 3%
+	// NodeLivenessScanStorage/num-live=10/compacted=true-10   38.88µ ± 8%
+	// NodeLivenessScanStorage/num-live=1000/compacted=true-10 861.5µ ± 3%
+	//
+	// When compacted=false the scan takes ~10ms, which is > 100x slower, but
+	// probably acceptable for this workload.
+	// NodeLivenessScanStorage/num-live=2/compacted=false-10     9.430m ± 5%
+	// NodeLivenessScanStorage/num-live=5/compacted=false-10     9.534m ± 4%
+	// NodeLivenessScanStorage/num-live=10/compacted=false-10    9.456m ± 2%
+	// NodeLivenessScanStorage/num-live=1000/compacted=false-10 10.34m ± 7%
+	//
+	// dead-keys=true (and compacted=false) defeats the NextPrefix optimization,
+	// since the next prefix can have all its keys deleted and the iterator has
+	// to step through all of them (it can't be sure that all the keys for that
+	// next prefix are deleted). This case should not occur in the liveness
+	// range, as discussed earlier.
+	//
+	// NodeLivenessScanStorage/num-live=2/dead-keys=true/compacted=false-10 58.33m
+	for _, numLiveVersions := range []int{2, 5, 10, 1000} {
+		b.Run(fmt.Sprintf("num-live=%d", numLiveVersions), func(b *testing.B) {
+			for _, haveDeadKeys := range []bool{false, true} {
+				b.Run(fmt.Sprintf("dead-keys=%t", haveDeadKeys), func(b *testing.B) {
+					for _, compacted := range []bool{false, true} {
+						b.Run(fmt.Sprintf("compacted=%t", compacted), func(b *testing.B) {
+							eng := setupEng(b, numLiveVersions, haveDeadKeys)
+							defer eng.Close()
+							if compacted {
+								require.NoError(b, eng.Compact(ctx))
+							}
+							b.ResetTimer()
+							blockBytes := uint64(0)
+							for i := 0; i < b.N; i++ {
+								expectedCount := numNodes
+								if haveDeadKeys {
+									expectedCount /= 2
+								}
+								blockBytes += scanLiveness(b, eng, expectedCount)
+							}
+							b.ReportMetric(float64(blockBytes)/float64(b.N), "block-bytes/op")
+						})
+					}
+				})
+			}
+		})
+	}
 }

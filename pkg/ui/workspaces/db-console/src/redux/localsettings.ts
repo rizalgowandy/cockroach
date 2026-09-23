@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 /**
  * The local settings reducer is designed to store local-only UI settings in
@@ -19,15 +14,16 @@
  * it should be given the full redux treatment with unique modification actions.
  */
 
-import _ from "lodash";
-import { createSelector, Selector } from "reselect";
+import { util } from "@cockroachlabs/cluster-ui";
+import clone from "lodash/clone";
+import isNil from "lodash/isNil";
 import { Action } from "redux";
-import { call, takeEvery } from "redux-saga/effects";
+import { createSelector, Selector } from "reselect";
 
 import { PayloadAction } from "src/interfaces/action";
 
 const STORAGE_PREFIX = "cockroachui";
-const SET_UI_VALUE = `${STORAGE_PREFIX}/ui/SET_UI_VALUE`;
+export const SET_UI_VALUE = `${STORAGE_PREFIX}/ui/SET_UI_VALUE`;
 
 export interface LocalSettingData {
   key: string;
@@ -53,7 +49,8 @@ function saveToSessionStorage(data: LocalSettingData) {
   try {
     sessionStorage.setItem(`${STORAGE_PREFIX}/${data.key}`, value);
   } catch (e) {
-    console.warn(e.message);
+    // eslint-disable-next-line no-console
+    console.warn(util.maybeError(e).message);
   }
 }
 
@@ -61,7 +58,7 @@ function saveToSessionStorage(data: LocalSettingData) {
  * Retrieve local setting value by key from sessionStorage.
  * Value is stored as a stringified JSON so has to be parsed back.
  */
-function getValueFromSessionStorage(key: string) {
+export function getValueFromSessionStorage(key: string) {
   const value = sessionStorage.getItem(`${STORAGE_PREFIX}/${key}`);
   return JSON.parse(value);
 }
@@ -73,15 +70,17 @@ export function localSettingsReducer(
   state: LocalSettingsState = {},
   action: Action,
 ): LocalSettingsState {
-  if (_.isNil(action)) {
+  if (isNil(action)) {
     return state;
   }
 
   switch (action.type) {
     case SET_UI_VALUE: {
       const { payload } = action as PayloadAction<LocalSettingData>;
-      state = _.clone(state);
+      state = clone(state);
       state[payload.key] = payload.value;
+      // Persist to sessionStorage as a side effect.
+      saveToSessionStorage(payload);
       return state;
     }
     default:
@@ -131,15 +130,13 @@ export class LocalSetting<S, T> {
 
   /**
    * Selector which retrieves this setting from the LocalSettingsState
-   * and return as an array.
+   * and return as an array. Returns null if the setting was undefined or null.
    * @param state The current top-level redux state of the application.
    */
-  selectorToArray = (state: S): string[] => {
-    return this._value(state)
-      ? this._value(state)
-          .toString()
-          .split(",")
-      : null;
+  selectorToArray = (state: S): string[] | null => {
+    const value = this._value(state)?.toString().split(",");
+
+    return value ?? null;
   };
 
   /**
@@ -159,16 +156,8 @@ export class LocalSetting<S, T> {
       innerSelector,
       () => getValueFromSessionStorage(this.key),
       (uiSettings, cachedValue) => {
-        return uiSettings[this.key] || cachedValue || defaultValue;
+        return uiSettings[this.key] ?? cachedValue ?? defaultValue;
       },
     );
   }
-}
-
-export function* persistLocalSetting(action: PayloadAction<LocalSettingData>) {
-  yield call(saveToSessionStorage, action.payload);
-}
-
-export function* localSettingsSaga() {
-  yield takeEvery(SET_UI_VALUE, persistLocalSetting);
 }

@@ -1,36 +1,75 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
-	"io"
+	"html"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
+	"github.com/cockroachdb/cockroach/pkg/internal/codeowners"
+	"github.com/cockroachdb/cockroach/pkg/internal/metricscan"
+	"github.com/cockroachdb/cockroach/pkg/internal/reporoot"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/startupmigrations"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/ts/catalog"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
+	slugify "github.com/mozillazg/go-slugify"
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
+	"gopkg.in/yaml.v2"
 )
 
+type MetricInfo struct {
+	Name         string `yaml:"name"`
+	ExportedName string `yaml:"exported_name"`
+	LabeledName  string `yaml:"labeled_name,omitempty"`
+	Description  string `yaml:"description"`
+	YAxisLabel   string `yaml:"y_axis_label"`
+	Type         string `yaml:"type"`
+	Unit         string `yaml:"unit"`
+	Aggregation  string `yaml:"aggregation"`
+	Derivative   string `yaml:"derivative"`
+	HowToUse     string `yaml:"how_to_use,omitempty"`
+	Visibility   string `yaml:"visibility,omitempty"`
+	Owner        string `yaml:"owner,omitempty"`
+}
+
+type Category struct {
+	Name    string
+	Metrics []MetricInfo
+}
+
+type Layer struct {
+	Name       string
+	Categories []Category
+}
+
+type YAMLOutput struct {
+	Layers []*Layer
+}
+
 var manPath string
+var metricOwnersFile string
 
 var genManCmd = &cobra.Command{
 	Use:   "man",
@@ -135,62 +174,21 @@ func runGenAutocompleteCmd(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-var aesSize int
-var overwriteKey bool
-
-var genEncryptionKeyCmd = &cobra.Command{
-	Use:   "encryption-key <key-file>",
-	Short: "generate store key for encryption at rest",
-	Long: `Generate store key for encryption at rest.
-
-Generates a key suitable for use as a store key for Encryption At Rest.
-The resulting key file will be 32 bytes (random key ID) + key_size in bytes.
-`,
-	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		encryptionKeyPath := args[0]
-
-		// Check encryptionKeySize is suitable for the encryption algorithm.
-		if aesSize != 128 && aesSize != 192 && aesSize != 256 {
-			return fmt.Errorf("store key size should be 128, 192, or 256 bits, got %d", aesSize)
-		}
-
-		// 32 bytes are reserved for key ID.
-		kSize := aesSize/8 + 32
-		b := make([]byte, kSize)
-		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("failed to create key with size %d bytes", kSize)
-		}
-
-		// Write key to the file with owner read/write permission.
-		openMode := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-		if !overwriteKey {
-			openMode |= os.O_EXCL
-		}
-
-		f, err := os.OpenFile(encryptionKeyPath, openMode, 0600)
-		if err != nil {
-			return err
-		}
-		n, err := f.Write(b)
-		if err == nil && n < len(b) {
-			err = io.ErrShortWrite
-		}
-		if err1 := f.Close(); err == nil {
-			err = err1
-		}
-
-		if err != nil {
-			return err
-		}
-
-		fmt.Printf("successfully created AES-%d key: %s\n", aesSize, encryptionKeyPath)
-		return nil
-	},
-}
-
-var includeReservedSettings bool
+var includeAllSettings bool
 var excludeSystemSettings bool
+var showSettingClass bool
+var classHeaderLabel string
+var classLabels []string
+
+// vCPUDependentClusterSettings contains all cluster settings which have default
+// values computed based on the number of vCPUs.
+var vCPUDependentClusterSettings = map[settings.InternalKey]struct{}{
+	"kv.dist_sender.concurrency_limit":                 {},
+	"kv.streamer.concurrency_limit":                    {},
+	"sql.distsql.num_runners":                          {},
+	"sql.distsql.parallelize_checks.concurrency_limit": {},
+	"sql.stats.automatic_full_concurrency_limit":       {},
+}
 
 var genSettingsListCmd = &cobra.Command{
 	Use:   "settings-list",
@@ -206,23 +204,37 @@ Output the list of cluster settings known to this binary.
 			return s
 		}
 
+		wrapDivSlug := func(key settings.InternalKey, name settings.SettingName) string {
+			toDisplay := string(name)
+			if sqlExecCtx.TableDisplayFormat == clisqlexec.TableDisplayRawHTML {
+				if string(key) != string(name) {
+					toDisplay = fmt.Sprintf("%s<br />(alias: %s)", name, key)
+				}
+				return fmt.Sprintf(`<div id="setting-%s" class="anchored">%s</div>`, slugify.Slugify(string(key)), wrapCode(toDisplay))
+			}
+			if string(key) != string(name) {
+				toDisplay = fmt.Sprintf("%s (alias: %s)", name, key)
+			}
+			return toDisplay
+		}
+
 		// Fill a Values struct with the defaults.
 		s := cluster.MakeTestingClusterSettings()
 		settings.NewUpdater(&s.SV).ResetRemaining(context.Background())
 
 		var rows [][]string
-		for _, name := range settings.Keys() {
-			setting, ok := settings.Lookup(name, settings.LookupForLocalAccess)
+		for _, key := range settings.Keys(settings.ForSystemTenant) {
+			setting, ok := settings.LookupForLocalAccessByKey(key, settings.ForSystemTenant)
 			if !ok {
-				panic(fmt.Sprintf("could not find setting %q", name))
+				panic(fmt.Sprintf("could not find setting %q", key))
 			}
+			name := setting.Name()
 
-			if excludeSystemSettings && setting.SystemOnly() {
+			if excludeSystemSettings && setting.Class() == settings.SystemOnly {
 				continue
 			}
 
-			if setting.Visibility() != settings.Public {
-				// We don't document non-public settings at this time.
+			if !includeAllSettings && setting.Visibility() != settings.Public {
 				continue
 			}
 
@@ -235,21 +247,104 @@ Output the list of cluster settings known to this binary.
 				defaultVal = sm.SettingsListDefault()
 			} else {
 				defaultVal = setting.String(&s.SV)
-				if override, ok := startupmigrations.SettingsDefaultOverrides[name]; ok {
+				if override, ok := upgrades.SettingsDefaultOverrides[key]; ok {
 					defaultVal = override
+				} else if _, ok := vCPUDependentClusterSettings[key]; ok {
+					// These cluster settings are special, so we hard-code
+					// a custom default value.
+					defaultVal = "See description."
 				}
 			}
-			row := []string{wrapCode(name), typ, wrapCode(defaultVal), setting.Description()}
+
+			settingDesc := setting.Description()
+			alterRoleLink := "ALTER ROLE... SET: https://www.cockroachlabs.com/docs/stable/alter-role.html"
+			if sqlExecCtx.TableDisplayFormat == clisqlexec.TableDisplayRawHTML {
+				settingDesc = html.EscapeString(settingDesc)
+				alterRoleLink = `<a href="alter-role.html"><code>ALTER ROLE... SET</code></a>`
+			}
+			if strings.Contains(string(name), "sql.defaults") || strings.Contains(string(key), "sql.defaults") {
+				settingDesc = fmt.Sprintf(`%s
+This cluster setting is being kept to preserve backwards-compatibility.
+This session variable default should now be configured using %s`,
+					settingDesc,
+					alterRoleLink,
+				)
+			}
+
+			row := []string{wrapDivSlug(key, name), typ, wrapCode(defaultVal), settingDesc}
+			if showSettingClass {
+				class := "unknown"
+				switch setting.Class() {
+				case settings.SystemOnly:
+					class = classLabels[0]
+				case settings.SystemVisible:
+					class = classLabels[1]
+				case settings.ApplicationLevel:
+					class = classLabels[2]
+				}
+				row = append(row, class)
+			}
+			if includeAllSettings {
+				if setting.Visibility() == settings.Public {
+					row = append(row, "public")
+				} else {
+					row = append(row, "reserved")
+				}
+			}
 			rows = append(rows, row)
 		}
 
-		sliceIter := clisqlexec.NewRowSliceIter(rows, "dddd")
 		cols := []string{"Setting", "Type", "Default", "Description"}
+		align := "dddd"
+		if showSettingClass {
+			cols = append(cols, classHeaderLabel)
+			align += "d"
+		}
+		if includeAllSettings {
+			cols = append(cols, "Visibility")
+			align += "d"
+		}
+		sliceIter := clisqlexec.NewRowSliceIter(rows, align)
 		return sqlExecCtx.PrintQueryOutput(os.Stdout, stderr, cols, sliceIter)
 	},
 }
 
-var genCmd = &cobra.Command{
+var genMetricListCmd = &cobra.Command{
+	Use:   "metric-list",
+	Short: "output a list of available metrics",
+	Long: `
+Output the list of metrics typical for a node.
+`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		layers, err := generateMetricList(context.Background(), false /* skipFiltering */)
+		if err != nil {
+			return err
+		}
+
+		output := YAMLOutput{}
+
+		var layerNames []string
+		for name := range layers {
+			layerNames = append(layerNames, name)
+		}
+		sort.Strings(layerNames)
+
+		for _, layer := range layerNames {
+			output.Layers = append(output.Layers, layers[layer])
+		}
+
+		// Output YAML
+		yamlData, err := yaml.Marshal(output)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stdout, "%s", yamlData)
+		return nil
+	},
+}
+
+// GenCmd is the root of all gen commands. Exported to allow modification by CCL code.
+var GenCmd = &cobra.Command{
 	Use:   "gen [command]",
 	Short: "generate auxiliary files",
 	Long:  "Generate manpages, example shell settings, example databases, etc.",
@@ -262,7 +357,9 @@ var genCmds = []*cobra.Command{
 	genExamplesCmd,
 	genHAProxyCmd,
 	genSettingsListCmd,
+	genMetricListCmd,
 	genEncryptionKeyCmd,
+	genDashboardCmd,
 }
 
 func init() {
@@ -272,15 +369,224 @@ func init() {
 		"path to generated autocomplete file")
 	genHAProxyCmd.PersistentFlags().StringVar(&haProxyPath, "out", "haproxy.cfg",
 		"path to generated haproxy configuration file")
-	varFlag(genHAProxyCmd.Flags(), &haProxyLocality, cliflags.Locality)
-	genEncryptionKeyCmd.PersistentFlags().IntVarP(&aesSize, "size", "s", 128,
-		"AES key size for encryption at rest (one of: 128, 192, 256)")
-	genEncryptionKeyCmd.PersistentFlags().BoolVar(&overwriteKey, "overwrite", false,
-		"Overwrite key if it exists")
-	genSettingsListCmd.PersistentFlags().BoolVar(&includeReservedSettings, "include-reserved", false,
-		"include undocumented 'reserved' settings")
-	genSettingsListCmd.PersistentFlags().BoolVar(&excludeSystemSettings, "without-system-only", false,
-		"do not list settings only applicable to system tenant")
+	cliflagcfg.VarFlag(genHAProxyCmd.Flags(), &haProxyLocality, cliflags.Locality)
+	cliflagcfg.BoolFlag(genHAProxyCmd.Flags(), &baseCfg.UseDRPC, cliflags.UseNewRPC)
+	_ = genHAProxyCmd.Flags().MarkHidden(cliflags.UseNewRPC.Name)
 
-	genCmd.AddCommand(genCmds...)
+	f := genSettingsListCmd.PersistentFlags()
+	f.BoolVar(&includeAllSettings, "all-settings", false,
+		"include undocumented 'internal' settings")
+	f.BoolVar(&excludeSystemSettings, "without-system-only", false,
+		"do not list settings only applicable to system tenant")
+	f.BoolVar(&showSettingClass, "show-class", false,
+		"show the setting class")
+	f.StringVar(&classHeaderLabel, "class-header-label", "Class",
+		"label to use in the output for the class column")
+	f.StringSliceVar(&classLabels, "class-labels",
+		[]string{"system-only", "system-visible", "application"},
+		"label to use in the output for the various setting classes")
+
+	genMetricListCmd.Flags().Bool("essential", false, "only emit essential metrics")
+	genMetricListCmd.Flags().StringVar(&metricOwnersFile, "metric-owners", "",
+		"path to pre-computed metric owners YAML file (avoids AST scan + CODEOWNERS)")
+
+	GenCmd.AddCommand(genCmds...)
+}
+
+// loadMetricOwners fetches a mapping from metric name to owning team.
+// When --metric-owners is provided (Bazel genrule), the pre-computed
+// file is loaded directly. Otherwise, the mapping is built from an
+// AST scan of Go sources combined with CODEOWNERS.
+func loadMetricOwners() *metricscan.MetricOwners {
+	if metricOwnersFile != "" {
+		data, err := os.ReadFile(metricOwnersFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"reading metric owners failed (owner will be omitted): %v\n", err)
+			return nil
+		}
+		mo, err := metricscan.LoadMetricOwners(data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"parsing metric owners failed (owner will be omitted): %v\n", err)
+			return nil
+		}
+		return mo
+	}
+	repoRoot := reporoot.Get()
+	if repoRoot == "" {
+		return nil
+	}
+	scanResult, scanErr := metricscan.Scan(repoRoot)
+	if scanErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"metric source scan failed (owner will be omitted): %v\n", scanErr)
+		return nil
+	}
+	owners, ownersErr := codeowners.DefaultLoadCodeOwners()
+	if ownersErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"CODEOWNERS load failed (owner will be omitted): %v\n", ownersErr)
+		return nil
+	}
+	return metricscan.BuildMetricOwners(scanResult, func(file string) string {
+		teams := owners.Match(file)
+		if len(teams) > 0 {
+			return string(teams[0].Name())
+		}
+		return ""
+	})
+}
+
+func generateMetricList(ctx context.Context, skipFiltering bool) (map[string]*Layer, error) {
+	metricOwners := loadMetricOwners()
+
+	sArgs := base.TestServerArgs{
+		Insecure:          true,
+		DefaultTestTenant: base.ExternalTestTenantAlwaysEnabled,
+	}
+	s, err := server.TestServerFactory.New(sArgs)
+	if err != nil {
+		return nil, err
+	}
+	srv := s.(serverutils.TestServerInterfaceRaw)
+	defer srv.Stopper().Stop(ctx)
+
+	// We want to only return after the server is ready.
+	readyCh := make(chan struct{})
+	srv.SetReadyFn(func(bool) {
+		close(readyCh)
+	})
+
+	// Start the server.
+	if err := srv.Start(ctx); err != nil {
+		return nil, err
+	}
+
+	// Wait until the server is ready to action.
+	select {
+	case <-readyCh:
+	case <-time.After(5 * time.Second):
+		return nil, errors.AssertionFailedf("could not initialize server in time")
+	}
+
+	var sections []catalog.ChartSection
+
+	// Retrieve the chart catalog (metric list) for the system tenant over RPC.
+	retrieve := func(layer serverutils.ApplicationLayerInterface, predicate func(catalog.MetricLayer) bool) error {
+		conn, err := layer.RPCClientConnE(username.RootUserName())
+		if err != nil {
+			return err
+		}
+		client := conn.NewAdminClient()
+
+		resp, err := client.ChartCatalog(ctx, &serverpb.ChartCatalogRequest{})
+		if err != nil {
+			return err
+		}
+		for _, section := range resp.Catalog {
+			if !predicate(section.MetricLayer) {
+				continue
+			}
+			sections = append(sections, section)
+		}
+		return nil
+	}
+
+	if err := retrieve(srv, func(layer catalog.MetricLayer) bool {
+		if skipFiltering {
+			return true
+		}
+		return layer != catalog.MetricLayer_APPLICATION
+	}); err != nil {
+		return nil, err
+	}
+	if err := retrieve(srv.TestTenant(), func(layer catalog.MetricLayer) bool {
+		if skipFiltering {
+			return true
+		}
+		return layer == catalog.MetricLayer_APPLICATION
+	}); err != nil {
+		return nil, err
+	}
+
+	// Sort by layer then category name.
+	sort.Slice(sections, func(i, j int) bool {
+		return sections[i].MetricLayer < sections[j].MetricLayer ||
+			(sections[i].MetricLayer == sections[j].MetricLayer &&
+				sections[i].Title < sections[j].Title)
+	})
+
+	// Structure for file is:
+	// layers:
+	//  - name: APPLICATION
+	//    categories:
+	//      - name: SQL
+	//        metrics:
+	//          - name: sql.statements.active
+	//            exported_name: sql_statements_active
+	//            description: Number of currently active user SQL statements
+	//            y_axis_label: Active Statements
+
+	layers := make(map[string]*Layer)
+	for _, section := range sections {
+		// Get or create the layer that the current section is in
+		layerName := section.MetricLayer.String()
+		layer, ok := layers[layerName]
+		if !ok {
+			layer = &Layer{
+				Name:       layerName,
+				Categories: []Category{},
+			}
+			layers[layerName] = layer
+		}
+
+		// Every section is a separate category
+		category := Category{
+			Name: section.Title,
+		}
+
+		for _, chart := range section.Charts {
+			// There are many charts, but only 1 metric per chart.
+			visibility := chart.Metrics[0].Visibility
+			// Only include visibility if it's not the default INTERNAL value
+			if visibility == "INTERNAL" {
+				visibility = ""
+			}
+			// Resolve the owning team for this metric.
+			var owner string
+			if metricOwners != nil {
+				exportedName := chart.Metrics[0].ExportedName
+				owner, _ = metricOwners.Resolve(exportedName)
+			}
+			metric := MetricInfo{
+				Name:         chart.Metrics[0].Name,
+				ExportedName: chart.Metrics[0].ExportedName,
+				LabeledName:  chart.Metrics[0].LabeledName,
+				Description:  strings.TrimSpace(chart.Metrics[0].Help),
+				YAxisLabel:   chart.AxisLabel,
+				Type:         chart.Metrics[0].MetricType.String(),
+				Unit:         chart.Units.String(),
+				Aggregation:  chart.Aggregator.String(),
+				Derivative:   chart.Derivative.String(),
+				HowToUse:     strings.TrimSpace(chart.Metrics[0].HowToUse),
+				Visibility:   visibility,
+				Owner:        owner,
+			}
+			category.Metrics = append(category.Metrics, metric)
+		}
+
+		layer.Categories = append(layer.Categories, category)
+	}
+
+	// Sort metrics within each layer by name
+	for _, layer := range layers {
+		for _, cat := range layer.Categories {
+			sort.Slice(cat.Metrics, func(i, j int) bool {
+				return cat.Metrics[i].Name < cat.Metrics[j].Name
+			})
+		}
+	}
+
+	return layers, nil
 }

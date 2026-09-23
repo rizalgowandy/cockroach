@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package norm
 
@@ -108,8 +103,12 @@ func (c *CustomFuncs) PruneSetPrivate(needed opt.ColSet, set *memo.SetPrivate) *
 func (c *CustomFuncs) CanConvertUnionToDistinctUnionAll(
 	leftCols, rightCols opt.ColList,
 ) (keyCols opt.ColSet, ok bool) {
-	if len(leftCols) != len(rightCols) || len(leftCols) == 0 {
+	if len(leftCols) != len(rightCols) {
 		panic(errors.AssertionFailedf("invalid union"))
+	}
+	if len(leftCols) == 0 {
+		// We must have some columns so that we have a non-empty key.
+		return opt.ColSet{}, false
 	}
 	md := c.mem.Metadata()
 	leftTableID, rightTableID := md.ColumnMeta(leftCols[0]).Table, md.ColumnMeta(rightCols[0]).Table
@@ -143,6 +142,10 @@ func (c *CustomFuncs) CanConvertUnionToDistinctUnionAll(
 		return opt.ColSet{}, false
 	}
 	keyCols = leftFDs.ReduceCols(leftColSet)
+	if keyCols.Empty() {
+		// The key columns set must not be empty
+		return opt.ColSet{}, false
+	}
 	if keyCols.Equals(leftColSet) {
 		// The key columns must form a strict subset of the union columns, or the
 		// transformation is not worth it.

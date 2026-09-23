@@ -1,26 +1,23 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,7 +40,7 @@ func (p *planner) renameDatabase(
 	}
 
 	// Check that the new name is available.
-	if exists, _, err := catalogkv.LookupDatabaseID(ctx, p.txn, p.ExecCfg().Codec, newName); err == nil && exists {
+	if dbID, err := p.Descriptors().LookupDatabaseID(ctx, p.txn, newName); err == nil && dbID != descpb.InvalidID {
 		return pgerror.Newf(pgcode.DuplicateDatabase,
 			"the new database name %q already exists", newName)
 	} else if err != nil {
@@ -55,7 +52,9 @@ func (p *planner) renameDatabase(
 
 	// Populate the namespace update batch.
 	b := p.txn.NewBatch()
-	p.renameNamespaceEntry(ctx, b, oldNameKey, desc)
+	if err := p.renameNamespaceEntry(ctx, b, oldNameKey, desc); err != nil {
+		return err
+	}
 
 	// Write the updated database descriptor.
 	if err := p.writeNonDropDatabaseChange(ctx, desc, stmt); err != nil {
@@ -72,6 +71,11 @@ func (p *planner) renameDatabase(
 func (p *planner) writeNonDropDatabaseChange(
 	ctx context.Context, desc *dbdesc.Mutable, jobDesc string,
 ) error {
+	// Exit early with an error if the table is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(desc) {
+		return scerrors.ConcurrentSchemaChangeError(desc)
+	}
 	if err := p.createNonDropDatabaseChangeJob(ctx, desc.ID, jobDesc); err != nil {
 		return err
 	}
@@ -104,24 +108,62 @@ func (p *planner) forEachMutableTableInDatabase(
 	dbDesc catalog.DatabaseDescriptor,
 	fn func(ctx context.Context, scName string, tbDesc *tabledesc.Mutable) error,
 ) error {
-	allDescs, err := p.Descriptors().GetAllDescriptors(ctx, p.txn)
+	all, err := p.Descriptors().GetAllInDatabase(ctx, p.txn, dbDesc)
 	if err != nil {
 		return err
 	}
 
-	lCtx := newInternalLookupCtx(ctx, allDescs, dbDesc, nil /* fallback */)
-	for _, tbID := range lCtx.tbIDs {
-		desc := lCtx.tbDescs[tbID]
-		if desc.Dropped() {
-			continue
+	// Collect non-dropped, non-virtual table IDs.
+	var tableIDs []descpb.ID
+	if err := all.ForEachDescriptor(func(desc catalog.Descriptor) error {
+		if desc.DescriptorType() != catalog.Table {
+			return nil
 		}
-		mutable := tabledesc.NewBuilder(desc.TableDesc()).BuildExistingMutableTable()
-		schemaName, found, err := lCtx.GetSchemaName(ctx, desc.GetParentSchemaID(), desc.GetParentID(), p.ExecCfg().Settings.Version)
+		if desc.Dropped() {
+			return nil
+		}
+		tbl, err := catalog.AsTableDescriptor(desc)
 		if err != nil {
 			return err
 		}
-		if !found {
-			return errors.AssertionFailedf("schema id %d not found", desc.GetParentSchemaID())
+		if tbl.IsVirtualTable() {
+			return nil
+		}
+		tableIDs = append(tableIDs, desc.GetID())
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Fetch mutable versions of the tables.
+	descs, err := p.Descriptors().MutableByID(p.Txn()).Descs(ctx, tableIDs)
+	if err != nil {
+		return err
+	}
+
+	// Helper to look up schema name, handling special cases for public schema.
+	getSchemaName := func(schemaID descpb.ID) (string, error) {
+		// Handle special case: system database with pseudo public schema.
+		if dbDesc.GetID() == keys.SystemDatabaseID && schemaID == keys.SystemPublicSchemaID {
+			return catconstants.PublicSchemaName, nil
+		}
+		// Handle special case: database without a public schema backed by a descriptor.
+		if !dbDesc.HasPublicSchemaWithDescriptor() && schemaID == keys.PublicSchemaID {
+			return catconstants.PublicSchemaName, nil
+		}
+		// Look up the schema descriptor from the catalog.
+		schemaDesc := all.LookupDescriptor(schemaID)
+		if schemaDesc == nil {
+			return "", errors.AssertionFailedf("schema id %d not found", schemaID)
+		}
+		return schemaDesc.GetName(), nil
+	}
+
+	for _, d := range descs {
+		mutable := d.(*tabledesc.Mutable)
+		schemaName, err := getSchemaName(d.GetParentSchemaID())
+		if err != nil {
+			return err
 		}
 		if err := fn(ctx, schemaName, mutable); err != nil {
 			return err

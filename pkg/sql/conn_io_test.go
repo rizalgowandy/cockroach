@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/stretchr/testify/require"
 )
 
 func assertStmt(t *testing.T, cmd Command, exp string) {
@@ -71,7 +67,7 @@ func TestStmtBuf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
 	mustPush(ctx, t, buf, ExecStmt{Statement: s2})
 	mustPush(ctx, t, buf, ExecStmt{Statement: s3})
@@ -144,7 +140,7 @@ func TestStmtBufSignal(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 	s1, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +165,7 @@ func TestStmtBufLtrim(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 	for i := 0; i < 5; i++ {
 		stmt, err := parser.ParseOne(
 			fmt.Sprintf("SELECT %d", i))
@@ -198,7 +194,7 @@ func TestStmtBufClose(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 	stmt, err := parser.ParseOne("SELECT 1")
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +213,7 @@ func TestStmtBufCloseUnblocksReader(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 
 	go func() {
 		buf.Close()
@@ -235,7 +231,7 @@ func TestStmtBufPreparedStmt(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 	ctx := context.Background()
 
 	s1, err := parser.ParseOne("SELECT 1")
@@ -279,7 +275,7 @@ func TestStmtBufBatching(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	buf := NewStmtBuf()
+	buf := NewStmtBuf(0 /* toReserve */)
 	ctx := context.Background()
 
 	s1, err := parser.ParseOne("SELECT 1")
@@ -306,7 +302,7 @@ func TestStmtBufBatching(t *testing.T) {
 	mustPush(ctx, t, buf, ExecStmt{Statement: s1})
 
 	// Go to 2nd batch.
-	if err := buf.seekToNextBatch(); err != nil {
+	if err := buf.seekToNextBatch(false /* requireClientSync */); err != nil {
 		t.Fatal(err)
 	}
 	_, pos, err := buf.CurCmd()
@@ -318,7 +314,7 @@ func TestStmtBufBatching(t *testing.T) {
 	}
 
 	// Go to 3rd batch.
-	if err := buf.seekToNextBatch(); err != nil {
+	if err := buf.seekToNextBatch(false /* requireClientSync */); err != nil {
 		t.Fatal(err)
 	}
 	_, pos, err = buf.CurCmd()
@@ -336,7 +332,7 @@ func TestStmtBufBatching(t *testing.T) {
 	}()
 
 	// Go to 4th batch.
-	if err := buf.seekToNextBatch(); err != nil {
+	if err := buf.seekToNextBatch(false /* requireClientSync */); err != nil {
 		t.Fatal(err)
 	}
 	_, pos, err = buf.CurCmd()
@@ -346,4 +342,53 @@ func TestStmtBufBatching(t *testing.T) {
 	if pos != CmdPos(9) {
 		t.Fatalf("expected pos to be %d, got: %d", 9, pos)
 	}
+}
+
+func TestStmtBufEmpty(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	t.Run("EmptyBuffer", func(t *testing.T) {
+		buf := NewStmtBuf(0)
+		empty, err := buf.Empty()
+		require.NoError(t, err)
+		require.True(t, empty)
+	})
+
+	t.Run("NonEmptyBuffer", func(t *testing.T) {
+		buf := NewStmtBuf(0)
+		s1, err := parser.ParseOne("SELECT 1")
+		require.NoError(t, err)
+		mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+
+		empty, err := buf.Empty()
+		require.NoError(t, err)
+		require.False(t, empty)
+	})
+
+	t.Run("EmptyAfterAdvancing", func(t *testing.T) {
+		buf := NewStmtBuf(0)
+		s1, err := parser.ParseOne("SELECT 1")
+		require.NoError(t, err)
+		mustPush(ctx, t, buf, ExecStmt{Statement: s1})
+
+		empty, err := buf.Empty()
+		require.NoError(t, err)
+		require.False(t, empty)
+
+		buf.AdvanceOne()
+		empty, err = buf.Empty()
+		require.NoError(t, err)
+		require.True(t, empty)
+	})
+
+	t.Run("ClosedBuffer", func(t *testing.T) {
+		buf := NewStmtBuf(0)
+		buf.Close()
+
+		_, err := buf.Empty()
+		require.Equal(t, io.EOF, err)
+	})
 }

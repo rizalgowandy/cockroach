@@ -1,18 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package execinfrapb
 
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -71,35 +67,15 @@ func ConvertToMappedSpecOrdering(
 	return specOrdering
 }
 
-// ExprFmtCtxBase produces a FmtCtx used for serializing expressions; a proper
-// IndexedVar formatting function needs to be added on. It replaces placeholders
-// with their values.
-func ExprFmtCtxBase(evalCtx *tree.EvalContext) *tree.FmtCtx {
-	fmtCtx := evalCtx.FmtCtx(
-		tree.FmtCheckEquivalence,
-		tree.FmtPlaceholderFormat(
-			func(fmtCtx *tree.FmtCtx, p *tree.Placeholder) {
-				d, err := p.Eval(evalCtx)
-				if err != nil {
-					panic(errors.AssertionFailedf("failed to serialize placeholder: %s", err))
-				}
-				d.Format(fmtCtx)
-			},
-		),
-	)
-	return fmtCtx
-}
-
 // Expression is the representation of a SQL expression.
+//
 // See data.proto for the corresponding proto definition. Its automatic type
 // declaration is suppressed in the proto via the typedecl=false option, so that
 // we can add the LocalExpr field which is not serialized. It never needs to be
-// serialized because we only use it in the case where we know we won't need to
-// send it, as a proto, to another machine.
+// serialized because it's just an optimization on the gateway to avoid
+// redundant deserialization (Expr will be set when protos are sent to remote
+// nodes).
 type Expression struct {
-	// Version is unused.
-	Version string
-
 	// Expr, if present, is the string representation of this expression.
 	// SQL expressions are passed as a string, with ordinal references
 	// (@1, @2, @3 ..) used for "input" variables.
@@ -182,7 +158,8 @@ type ProducerMetadata struct {
 	Ranges []roachpb.RangeInfo
 	// TODO(vivek): change to type Error
 	Err error
-	// TraceData is sent if tracing is enabled.
+	// TraceData is sent if tracing is enabled, by all processors on the remote
+	// nodes.
 	TraceData []tracingpb.RecordedSpan
 	// LeafTxnFinalState contains the final state of the LeafTxn to be
 	// sent from leaf flows to the RootTxn held by the flow's ultimate
@@ -200,6 +177,8 @@ type ProducerMetadata struct {
 	BulkProcessorProgress *RemoteProducerMetadata_BulkProcessorProgress
 	// Metrics contains information about goodput of the node.
 	Metrics *RemoteProducerMetadata_Metrics
+	// AggregatorEvents contains information from a tracing aggregator.
+	AggregatorEvents *TracingAggregatorEvents
 }
 
 var (
@@ -268,6 +247,8 @@ func RemoteProducerMetaToLocalMeta(
 		meta.Err = v.Error.ErrorDetail(ctx)
 	case *RemoteProducerMetadata_Metrics_:
 		meta.Metrics = v.Metrics
+	case *RemoteProducerMetadata_TracingAggregatorEvents:
+		meta.AggregatorEvents = v.TracingAggregatorEvents
 	default:
 		return *meta, false
 	}
@@ -316,8 +297,22 @@ func LocalMetaToRemoteProducerMeta(
 		rpm.Value = &RemoteProducerMetadata_Error{
 			Error: NewError(ctx, meta.Err),
 		}
+	} else if meta.AggregatorEvents != nil {
+		rpm.Value = &RemoteProducerMetadata_TracingAggregatorEvents{
+			TracingAggregatorEvents: meta.AggregatorEvents,
+		}
 	} else if buildutil.CrdbTestBuild {
 		panic("unhandled field in local meta or all fields are nil")
 	}
 	return rpm
+}
+
+// DistSQLRemoteFlowInfo contains some information about a single DistSQL remote
+// flow.
+type DistSQLRemoteFlowInfo struct {
+	FlowID FlowID
+	// Timestamp must be in the UTC timezone.
+	Timestamp time.Time
+	// StatementSQL is the SQL statement for which this flow is executing.
+	StatementSQL string
 }

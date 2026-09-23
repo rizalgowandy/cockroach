@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package geogfn
 
@@ -15,15 +10,16 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geodist"
-	"github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/golang/geo/s1"
 	"github.com/golang/geo/s2"
 )
 
 // SpheroidErrorFraction is an error fraction to compensate for using a sphere
 // to calculate the distance for what is actually a spheroid. The distance
-// calculation has an error that is bounded by (2 * spheroid.Flattening)%.
+// calculation has an error that is bounded by (2 * spheroid.flattening)%.
 // This 5% margin is pretty safe.
 const SpheroidErrorFraction = 0.05
 
@@ -31,6 +27,32 @@ const SpheroidErrorFraction = 0.05
 // Returns a geo.EmptyGeometryError if any of the Geographies are EMPTY.
 func Distance(
 	a geo.Geography, b geo.Geography, useSphereOrSpheroid UseSphereOrSpheroid,
+) (float64, error) {
+	return distanceImpl(a, b, nil /* explicitSpheroid */, useSphereOrSpheroid)
+}
+
+// DistanceWithSpheroid returns the distance in meters between geographies a
+// and b using the supplied spheroid for the geodesic computation, mirroring
+// the 3-argument form of PostGIS's ST_DistanceSpheroid. The spheroid derived
+// from the geographies' SRID is ignored; only the caller-supplied spheroid is
+// used. Returns the same errors as Distance, except that no SRID-to-spheroid
+// lookup is performed.
+func DistanceWithSpheroid(
+	a geo.Geography, b geo.Geography, spheroid geoprojbase.Spheroid,
+) (float64, error) {
+	return distanceImpl(a, b, spheroid, UseSpheroid)
+}
+
+// distanceImpl is the shared implementation of Distance and
+// DistanceWithSpheroid. If explicitSpheroid is nil, the spheroid is derived
+// from a's SRID; otherwise it is used as-is. The SRID-to-spheroid lookup is
+// deferred until after the SRID, empty-geometry, and bbox-NaN validation so
+// that callers see those errors in preference to a "no projection for SRID"
+// failure.
+func distanceImpl(
+	a, b geo.Geography,
+	explicitSpheroid geoprojbase.Spheroid,
+	useSphereOrSpheroid UseSphereOrSpheroid,
 ) (float64, error) {
 	if a.SRID() != b.SRID() {
 		return 0, geo.NewMismatchingSRIDsError(a.SpatialObject(), b.SpatialObject())
@@ -44,9 +66,15 @@ func Distance(
 	if err != nil {
 		return 0, err
 	}
-	spheroid, err := a.Spheroid()
-	if err != nil {
-		return 0, err
+	if BoundingBoxHasNaNCoordinates(a) || BoundingBoxHasNaNCoordinates(b) {
+		return 0, geo.OutOfRangeError()
+	}
+	spheroid := explicitSpheroid
+	if spheroid == nil {
+		spheroid, err = spheroidFromGeography(a)
+		if err != nil {
+			return 0, err
+		}
 	}
 	return distanceGeographyRegions(
 		spheroid,
@@ -186,16 +214,16 @@ func (c *s2GeodistEdgeCrosser) ChainCrossing(p geodist.Point) (bool, geodist.Poi
 // PostGIS evaluates the distance between spheroid regions by computing the min of
 // the pair-wise distance between the cross-product of the regions in A and the regions
 // in B, where the pair-wise distance is computed as:
-// * Find the two closest points between the pairs of regions using the sphere
-//   for distance calculations.
-// * Compute the spheroid distance between the two closest points.
+//   - Find the two closest points between the pairs of regions using the sphere
+//     for distance calculations.
+//   - Compute the spheroid distance between the two closest points.
 //
 // This is technically incorrect, since it is possible that the two closest points on
 // the spheroid are different than the two closest points on the sphere.
 // See distance_test.go for examples of the "truer" distance values.
 // Since we aim to be compatible with PostGIS, we adopt the same approach.
 func distanceGeographyRegions(
-	spheroid *geographiclib.Spheroid,
+	spheroid geoprojbase.Spheroid,
 	useSphereOrSpheroid UseSphereOrSpheroid,
 	aRegions []s2.Region,
 	bRegions []s2.Region,
@@ -243,7 +271,7 @@ func distanceGeographyRegions(
 // geographyMinDistanceUpdater finds the minimum distance using a sphere.
 // Methods will return early if it finds a minimum distance <= stopAfterLE.
 type geographyMinDistanceUpdater struct {
-	spheroid            *geographiclib.Spheroid
+	spheroid            geoprojbase.Spheroid
 	useSphereOrSpheroid UseSphereOrSpheroid
 	minEdge             s2.Edge
 	minD                s1.ChordAngle
@@ -256,7 +284,7 @@ var _ geodist.DistanceUpdater = (*geographyMinDistanceUpdater)(nil)
 // newGeographyMinDistanceUpdater returns a new geographyMinDistanceUpdater with the
 // correct arguments set up.
 func newGeographyMinDistanceUpdater(
-	spheroid *geographiclib.Spheroid,
+	spheroid geoprojbase.Spheroid,
 	useSphereOrSpheroid UseSphereOrSpheroid,
 	stopAfter float64,
 	exclusivity geo.FnExclusivity,
@@ -268,7 +296,7 @@ func newGeographyMinDistanceUpdater(
 		// buffer for spheroid distances being slightly off.
 		multiplier -= SpheroidErrorFraction
 	}
-	stopAfterChordAngle := s1.ChordAngleFromAngle(s1.Angle(stopAfter * multiplier / spheroid.SphereRadius))
+	stopAfterChordAngle := s1.ChordAngleFromAngle(s1.Angle(stopAfter * multiplier / spheroid.SphereRadius()))
 	return &geographyMinDistanceUpdater{
 		spheroid:            spheroid,
 		minD:                math.MaxFloat64,
@@ -287,7 +315,7 @@ func (u *geographyMinDistanceUpdater) Distance() float64 {
 	if u.useSphereOrSpheroid == UseSpheroid {
 		return spheroidDistance(u.spheroid, u.minEdge.V0, u.minEdge.V1)
 	}
-	return u.minD.Angle().Radians() * u.spheroid.SphereRadius
+	return u.minD.Angle().Radians() * u.spheroid.SphereRadius()
 }
 
 // Update implements the geodist.DistanceUpdater interface.
@@ -407,5 +435,5 @@ func regionToGeodistShape(r s2.Region) (geodist.Shape, error) {
 	case *s2.Polygon:
 		return &s2GeodistPolygon{Polygon: r}, nil
 	}
-	return nil, errors.Newf("unknown region: %T", r)
+	return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unknown region: %T", r)
 }

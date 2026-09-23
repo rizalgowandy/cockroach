@@ -1,18 +1,16 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logcrash
 
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -22,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/sentry-go"
+	sentry "github.com/getsentry/sentry-go"
 )
 
 // The call stack here is usually:
@@ -43,31 +41,39 @@ var (
 	// Collecting this data from production clusters helps us understand and improve
 	// how our storage systems behave in real-world use cases.
 	//
-	// Note: while the setting itself is actually defined with a default value of
-	// `false`, it is usually automatically set to `true` when a cluster is created
-	// (or is migrated from a earlier beta version). This can be prevented with the
+	// Note: while the setting defaults to `true`, it can be overridden with the
 	// env var COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING.
+	//
+	// Note: while this setting also controls crash reporting (see logcrash.ShouldSendReport), the updated setting
+	// isn't affected until after the server startup sequence is complete. Thus, if you also must disable crash reporting
+	// during server startup, you should set the env var `COCKROACH_CRASH_REPORTS=` to the empty value.
 	//
 	// Doing this, rather than just using a default of `true`, means that a node
 	// will not errantly send a report using a default before loading settings.
 	DiagnosticsReportingEnabled = settings.RegisterBoolSetting(
+		settings.ApplicationLevel,
 		"diagnostics.reporting.enabled",
-		"enable reporting diagnostic metrics to cockroach labs",
-		false,
-	).WithPublic()
+		"enable reporting diagnostic metrics to cockroach labs, but is ignored for Trial or Free licenses",
+		true,
+		settings.WithPublic,
+	)
 
-	// CrashReports wraps "diagnostics.reporting.send_crash_reports".
+	// CrashReports wraps "diagnostics.reporting.send_crash_reports.enabled".
 	CrashReports = settings.RegisterBoolSetting(
+		settings.ApplicationLevel,
 		"diagnostics.reporting.send_crash_reports",
 		"send crash and panic reports",
 		true,
+		settings.WithName("diagnostics.reporting.send_crash_reports.enabled"),
 	)
 
-	// PanicOnAssertions wraps "debug.panic_on_failed_assertions"
+	// PanicOnAssertions wraps "debug.panic_on_failed_assertions.enabled"
 	PanicOnAssertions = settings.RegisterBoolSetting(
+		settings.ApplicationLevel,
 		"debug.panic_on_failed_assertions",
 		"panic when an assertion fails rather than reporting",
 		false,
+		settings.WithName("debug.panic_on_failed_assertions.enabled"),
 	)
 
 	// startTime records when the process started so that crash reports can
@@ -79,11 +85,53 @@ var (
 	// This should not be used by anyone unwilling to share the whole cluster
 	// data with Cockroach Labs and various cloud services.
 	ReportSensitiveDetails = envutil.EnvOrDefaultBool("COCKROACH_REPORT_SENSITIVE_DETAILS", false)
+
+	// globalSettings stores a global reference to a *setting.Values container;
+	// used for code paths where the container is not available.
+	globalSettings atomic.Value
 )
+
+func init() {
+	// Inject ReportOrPanic into the log package.
+	log.SetReportOrPanicFn(ReportOrPanic)
+}
+
+// SetGlobalSettings sets the *settings.Values container that will be refreshed
+// at runtime -- ideally we should have no other *Values containers floating
+// around, as they will be stale / lies.
+func SetGlobalSettings(v *settings.Values) {
+	globalSettings.Store(v)
+}
+
+func getGlobalSettings() *settings.Values {
+	if ptr := globalSettings.Load(); ptr != nil {
+		return ptr.(*settings.Values)
+	}
+	return nil
+}
+
+// ReportPanicWithGlobalSettings is a variant of ReportPanic that uses the
+// *settings.Values that was set using SetGlobalSettings(). Does nothing if that
+// function was not called.
+//
+// Should be used only when strictly necessary; use ReportPanic whenever we have
+// access to the settings.
+func ReportPanicWithGlobalSettings(ctx context.Context, r interface{}, depth int) {
+	if sv := getGlobalSettings(); sv != nil {
+		ReportPanic(ctx, sv, r, depth+1)
+	}
+}
 
 // RecoverAndReportPanic can be invoked on goroutines that run with
 // stderr redirected to logs to ensure the user gets informed on the
 // real stderr a panic has occurred.
+// The argument sv may be nil; if it is, no Sentry report is sent.
+//
+// Note: this function _must_ be called with `defer log.RecoverAndReportPanic()`.
+// Do not use `defer func() { ... log.RecoverAndReportPanic() ...}` as this
+// will fail to actually catch the panic.
+// If you need more code around the call in your defer, use ReportPanic()
+// instead and do not forget to re-panic afterwards.
 func RecoverAndReportPanic(ctx context.Context, sv *settings.Values) {
 	if r := recover(); r != nil {
 		ReportPanic(ctx, sv, r, depthForRecoverAndReportPanic)
@@ -93,6 +141,13 @@ func RecoverAndReportPanic(ctx context.Context, sv *settings.Values) {
 
 // RecoverAndReportNonfatalPanic is an alternative RecoverAndReportPanic that
 // does not re-panic in Release builds.
+// The caller is responsible for ensuring that the argument sv is non-nil.
+//
+// Note: this function _must_ be called with `defer log.RecoverAndReportNonfatalPanic()`.
+// Do not use `defer func() { ... log.RecoverAndReportNonfatalPanic() ...}` as this
+// will fail to actually catch the panic.
+// If you need more code around the call in your defer, use ReportNonfatalPanic()
+// instead. The caller should not explicitly re-panic afterwards.
 func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
 	if r := recover(); r != nil {
 		ReportPanic(ctx, sv, r, depthForRecoverAndReportPanic)
@@ -107,7 +162,7 @@ func RecoverAndReportNonfatalPanic(ctx context.Context, sv *settings.Values) {
 // Note that ReportPanic() does not assume that the panic object
 // will be left uncaught to terminate the process. For example,
 // at the time of this writing, ReportPanic() is called from
-// RecoverAndReportNonfatalPanic() above.
+// ReportNonfatalPanic() above.
 func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth int) {
 	// Announce the panic has occurred to all places. The purpose
 	// of this call is threefold:
@@ -144,7 +199,7 @@ func ReportPanic(ctx context.Context, sv *settings.Values, r interface{}, depth 
 
 	// Ensure that the logs are flushed before letting a panic
 	// terminate the server.
-	log.Flush()
+	log.FlushAllSync()
 }
 
 // PanicAsError turns r into an error if it is not one already.
@@ -153,6 +208,21 @@ func PanicAsError(depth int, r interface{}) error {
 		return errors.WithStackDepth(err, depth+1)
 	}
 	return errors.NewWithDepthf(depth+1, "panic: %v", r)
+}
+
+// crashReportingDisabledString controls whether to opt out of crash reporting
+// or not compile time. The variable is set by bazel via stamping
+// (`stamp.sh -d true/false`, which controls telemetry opt out). Becuase Go only
+// supports strings for in `-ldflags "-X ..."`, we have to use a string
+// representation here.
+var crashReportingDisabledString = "false"
+
+func crashReportingDisabled() bool {
+	ret, err := strconv.ParseBool(crashReportingDisabledString)
+	if err != nil {
+		return false
+	}
+	return ret
 }
 
 // Crash reporting URL.
@@ -164,7 +234,7 @@ func PanicAsError(depth int, r interface{}) error {
 // Non-release builds wishing to use Sentry reports
 // are invited to use the following URL instead:
 //
-//   https://ignored@errors.cockroachdb.com/api/sentrydev/v2/1111
+//	https://ignored@errors.cockroachdb.com/api/sentrydev/v2/1111
 //
 // This can be set via e.g. the env var COCKROACH_CRASH_REPORTS.
 // Note that the special number "1111" is important as it
@@ -173,6 +243,9 @@ func PanicAsError(depth int, r interface{}) error {
 // TODO(knz): We could envision auto-selecting this alternate URL
 // when detecting a non-release build.
 var crashReportURL = func() string {
+	if crashReportingDisabled() {
+		return ""
+	}
 	var defaultURL string
 	if build.SeemsOfficial() {
 		defaultURL = "https://ignored@errors.cockroachdb.com/api/sentry/v2/1111"
@@ -206,14 +279,33 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 	crashReportingActive = true
 
 	sentry.ConfigureScope(func(scope *sentry.Scope) {
+		scope.SetTags(getTagsFromEnvironment())
 		scope.SetTags(map[string]string{
 			"cmd":          cmd,
 			"platform":     info.Platform,
 			"distribution": info.Distribution,
 			"rev":          info.Revision,
 			"goversion":    info.GoVersion,
+			"buildchannel": info.Channel,
+			"envchannel":   info.EnvChannel,
 		})
+
 	})
+}
+
+func getTagsFromEnvironment() map[string]string {
+	tags := map[string]string{}
+	rawTags := envutil.EnvOrDefaultString("COCKROACH_CRASH_REPORT_TAGS", "")
+	if len(rawTags) > 0 {
+		envTags := strings.Split(rawTags, ";")
+		for _, tag := range envTags {
+			parts := strings.Split(tag, "=")
+			if len(parts) == 2 {
+				tags[parts[0]] = parts[1]
+			}
+		}
+	}
+	return tags
 }
 
 func uptimeTag(now time.Time) string {
@@ -248,7 +340,7 @@ const (
 	// still may include an exception and stack trace.
 	ReportTypeError
 	// ReportTypeLogFatal signifies that this is an error report that
-	// was generated via a log.Fatal call.
+	// was generated via a log.Dev.Fatal call.
 	ReportTypeLogFatal
 )
 
@@ -320,10 +412,10 @@ func SendReport(
 
 	res := sentry.CaptureEvent(event)
 	if res != nil {
-		log.Shoutf(ctx, severity.ERROR, "Queued as error %v", string(*res))
+		log.Dev.Shoutf(ctx, severity.ERROR, "Queued as error %v", string(*res))
 	}
 	if !sentry.Flush(10 * time.Second) {
-		log.Shout(ctx, severity.ERROR, "Timeout trying to submit crash report")
+		log.Dev.Shout(ctx, severity.ERROR, "Timeout trying to submit crash report")
 	}
 }
 
@@ -341,7 +433,7 @@ func ReportOrPanic(
 	if !build.IsRelease() || (sv != nil && PanicOnAssertions.Get(sv)) {
 		panic(err)
 	}
-	log.Warningf(ctx, "%v", err)
+	log.Dev.Errorf(ctx, "%v", err)
 	sendCrashReport(ctx, sv, err, ReportTypeError)
 }
 
@@ -371,9 +463,8 @@ func RegisterTagFn(key string, value func(context.Context) string) {
 }
 
 func maybeSendCrashReport(ctx context.Context, err error) {
-	// We load the ReportingSettings from the a global singleton in this
-	// call path. See the singleton's comment for a rationale.
-	if sv := settings.TODO(); sv != nil {
+	// We load the ReportingSettings from global singleton in this call path.
+	if sv := getGlobalSettings(); sv != nil {
 		sendCrashReport(ctx, sv, err, ReportTypeLogFatal)
 	}
 }

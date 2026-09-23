@@ -9,22 +9,19 @@ eexpect ":/# "
 start_test "Check that --max-disk-temp-storage works."
 send "$argv start-single-node --insecure --store=path=logs/mystore --max-disk-temp-storage=10GiB\r"
 eexpect "node starting"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
 end_test
 
 start_test "Check that --max-disk-temp-storage can be expressed as a percentage."
 send "$argv start-single-node --insecure --store=path=logs/mystore --max-disk-temp-storage=10%\r"
 eexpect "node starting"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
 end_test
 
 start_test "Check that --max-disk-temp-storage percentage works when the store is in-memory."
 send "$argv start-single-node --insecure --store=type=mem,size=1GB --max-disk-temp-storage=10%\r"
 eexpect "node starting"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
 end_test
 
 start_test "Check that memory max flags do not exceed available RAM."
@@ -34,24 +31,33 @@ eexpect "is larger than"
 eexpect "of total RAM"
 eexpect "increased risk"
 eexpect "node starting"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
 end_test
 
 start_test "Check that not using --host nor --advertise causes a user warning."
 send "$argv start-single-node --insecure\r"
 eexpect "WARNING: neither --listen-addr nor --advertise-addr was specified"
 eexpect "node starting"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
+end_test
+
+start_test "Check that using --advertise-addr does not cause a user warning."
+send "$argv start-single-node --insecure --advertise-addr=172.31.11.189\r"
+expect {
+  "WARNING: neither --listen-addr nor --advertise-addr was specified" {
+    report "unexpected WARNING: neither --listen-addr nor --advertise-addr was specified"
+	  exit 1
+  }
+}
+eexpect "node starting"
+interrupt_and_wait
 end_test
 
 start_test "Check that --listening-url-file gets created with the right data"
 send "$argv start-single-node --insecure --listening-url-file=foourl\r"
 eexpect "node starting"
 system "grep -q 'postgresql://.*@.*:\[0-9\]\[0-9\]*' foourl"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
 end_test
 
 start_test {Check that the "failed running SUBCOMMAND" message does not consider a flag the subcommand}
@@ -80,7 +86,7 @@ eexpect {Failed running "start"}
 end_test
 
 start_test "Check that demo start-up flags are reported to telemetry"
-send "$argv demo --no-example-database --echo-sql --logtostderr=WARNING\r"
+send "$argv demo --no-line-editor --no-example-database --echo-sql --logtostderr=WARNING\r"
 eexpect "defaultdb>"
 send "SELECT * FROM crdb_internal.feature_usage WHERE feature_name LIKE 'cli.demo.%' ORDER BY 1;\r"
 eexpect feature_name
@@ -89,21 +95,20 @@ eexpect "cli.demo.explicitflags.logtostderr"
 eexpect "cli.demo.explicitflags.no-example-database"
 eexpect "cli.demo.runs"
 eexpect "defaultdb>"
-interrupt
+send_eof
 eexpect ":/# "
 end_test
 
 start_test "Check that locality flags without a region tier warn"
 send "$argv start-single-node --insecure --locality=data-center=us-east,zone=a\r"
 eexpect "WARNING: The --locality flag does not contain a"
-interrupt
-eexpect ":/# "
+interrupt_and_wait
 end_test
 
 start_server $argv
 
 start_test "Check that server start-up flags are reported to telemetry"
-send "$argv sql --insecure\r"
+send "$argv sql --insecure --no-line-editor\r"
 eexpect "defaultdb>"
 send "SELECT * FROM crdb_internal.feature_usage WHERE feature_name LIKE 'cli.start-single-node.%' ORDER BY 1;\r"
 eexpect feature_name
@@ -112,32 +117,63 @@ eexpect "cli.start-single-node.explicitflags.listening-url-file"
 eexpect "cli.start-single-node.explicitflags.max-sql-memory"
 eexpect "cli.start-single-node.runs"
 eexpect "defaultdb>"
-interrupt
+send_eof
 eexpect ":/# "
 end_test
 
 start_test "Check that a client can connect using the URL env var"
 send "export COCKROACH_URL=`cat server_url`;\r"
 eexpect ":/# "
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect "defaultdb>"
-interrupt
+send_eof
 eexpect ":/# "
 end_test
 
 start_test "Check that an invalid URL in the env var produces a reasonable error"
 send "export COCKROACH_URL=invalid_url;\r"
 eexpect ":/# "
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect "ERROR"
 eexpect "setting --url from COCKROACH_URL"
 eexpect "invalid argument"
 eexpect "unrecognized URL scheme"
 eexpect ":/# "
+send "unset COCKROACH_URL\r"
+eexpect ":/# "
 end_test
 
+start_test "Check that common URL mistakes are detected and the user is informed"
+send "$argv sql --no-line-editor --url='postgres://invalid:0/?-cinvalid'\r"
+eexpect "warning: found raw URL parameter \"-cinvalid"
+eexpect "are you sure"
+eexpect ":/# "
+
+send "$argv sql --no-line-editor --url='postgres://invalid:0/?options=-cluster=foo'\r"
+eexpect "warning: found \"-cluster=\" in URL \"options\" field"
+eexpect "are you sure"
+eexpect ":/# "
+end_test
 
 stop_server $argv
+
+start_test "Check that setting GOMEMLIMIT env var without specifying --max-go-memory works"
+send "export GOMEMLIMIT=1GiB;\r"
+eexpect ":/# "
+send "$argv start-single-node --insecure --store=path=logs/mystore\r"
+eexpect "node starting"
+interrupt_and_wait
+stop_server $argv
+end_test
+
+start_test "Check that setting GOGC env var without specifying --go-gc-percent works"
+send "export GOGC=500;\r"
+eexpect ":/# "
+send "$argv start-single-node --insecure --store=path=logs/mystore\r"
+eexpect "node starting"
+interrupt_and_wait
+stop_server $argv
+end_test
 
 send "exit 0\r"
 eexpect eof

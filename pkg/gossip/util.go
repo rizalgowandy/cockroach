@@ -1,21 +1,18 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
 import (
 	"bytes"
 	"sort"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
 
 // SystemConfigDeltaFilter keeps track of SystemConfig values so that unmodified
@@ -94,6 +91,21 @@ func (df *SystemConfigDeltaFilter) ForModified(
 			// New key.
 			fn(newKV)
 			newIdx++
+		}
+	}
+}
+
+// batchAndConsume waits on a channel to allow batching more events. It keeps
+// while consuming events as they come to avoid blocking the channel producer.
+func batchAndConsume(ch <-chan struct{}, batchDuration time.Duration) {
+	var batchTimer timeutil.Timer
+	defer batchTimer.Stop()
+	batchTimer.Reset(batchDuration)
+	for {
+		select {
+		case <-ch: // event happened while we are waiting for our batchTimer to end.
+		case <-batchTimer.C:
+			return
 		}
 	}
 }

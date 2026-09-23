@@ -122,7 +122,7 @@ CREATE TABLE uniontest (
   v INT
 )
 
-statement OK
+statement ok
 INSERT INTO uniontest VALUES
 (1, 1),
 (1, 1),
@@ -331,6 +331,8 @@ NULL
 
 statement ok
 DROP TABLE IF EXISTS t1, t2;
+
+statement ok
 CREATE TABLE t1 (a INT[]);
 CREATE TABLE t2 (b INT[]);
 INSERT INTO t1 VALUES (ARRAY[1]), (ARRAY[2]), (NULL);
@@ -347,12 +349,18 @@ NULL
 # Allow UNION of hidden and non-hidden columns.
 statement ok
 CREATE TABLE ab (a INT, b INT);
+
+statement ok
 SELECT a, b, rowid FROM ab UNION VALUES (1, 2, 3);
+
+statement ok
 DROP TABLE ab;
 
 # Regression test for #59148.
 statement ok
 CREATE TABLE ab (a INT4, b INT8);
+
+statement ok
 INSERT INTO ab VALUES (1, 1), (1, 2), (2, 1), (2, 2);
 
 query I rowsort
@@ -374,6 +382,8 @@ DROP TABLE ab;
 # between NULL and a tuple (#59611).
 statement ok
 CREATE TABLE t59611 (a INT);
+
+statement ok
 INSERT INTO t59611 VALUES (1)
 
 query T
@@ -554,9 +564,26 @@ SELECT a FROM ab UNION ALL SELECT x AS a FROM xy
 
 # If the ordering is only required on a subset of the columns, ensure that we
 # still produce the correct ordering.
+
+statement ok
+ALTER TABLE ab SET (schema_locked=false)
+
 statement ok
 TRUNCATE ab;
+
+statement ok
+ALTER TABLE ab RESET (schema_locked)
+
+statement ok
+ALTER TABLE xy SET (schema_locked=false)
+
+statement ok
 TRUNCATE xy;
+
+statement ok
+ALTER TABLE xy RESET (schema_locked)
+
+statement ok
 INSERT INTO ab VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
 INSERT INTO xy VALUES (1, 1), (3, 3), (5, 5), (7, 7);
 
@@ -666,3 +693,109 @@ SELECT a, b AS b1, b AS b2 FROM abc INTERSECT SELECT a, c, b FROM abc ORDER by a
 1  1  1
 1  2  2
 2  2  2
+
+# Regression test for #127043 where eager cancellation of the parallel unordered
+# synchronizer was causing spurious errors on queries with LIMIT.
+statement ok
+CREATE TABLE t127043_1 (k1 INT, v1 INT, INDEX (k1));
+INSERT INTO t127043_1 VALUES (1, 1);
+CREATE TABLE t127043_2 (k2 INT, v2 INT, INDEX (k2));
+INSERT INTO t127043_2 VALUES (1, 1);
+CREATE TABLE t127043_3 (k3 INT, v3 INT, INDEX (k3));
+INSERT INTO t127043_3 VALUES (1, 1);
+CREATE VIEW v127043_3 (k, v) AS
+  SELECT
+    k1 AS k, v1 AS v FROM t127043_1
+  UNION SELECT
+    k2 AS k, v2 AS v FROM t127043_2
+  UNION SELECT
+    k3 AS k, v3 AS v FROM t127043_3;
+CREATE VIEW v127043_3_idx (k, v) AS
+  SELECT
+    k1 AS k, v1 AS v FROM t127043_1@t127043_1_k1_idx
+  UNION SELECT
+    k2 AS k, v2 AS v FROM t127043_2@t127043_2_k2_idx
+  UNION SELECT
+    k3 AS k, v3 AS v FROM t127043_3@t127043_3_k3_idx;
+CREATE VIEW v127043_2 (k, v) AS
+  SELECT
+    k1 AS k, v1 AS v FROM t127043_1
+  UNION SELECT
+    k2 AS k, v2 AS v FROM t127043_2;
+
+statement ok
+ANALYZE t127043_1;
+
+statement ok
+ANALYZE t127043_2;
+
+statement ok
+ANALYZE t127043_3;
+
+# Scan and filter in all UNION branches.
+query II
+SELECT k, v FROM v127043_3 WHERE k = 1 LIMIT 1;
+----
+1  1
+
+# Scan and index join in all UNION branches.
+query II
+SELECT k, v FROM v127043_3_idx WHERE k = 1 LIMIT 1;
+----
+1  1
+
+# Hash join with two UNION branches (with a scan and an index join) on one side
+# and a scan on the other.
+query II
+SELECT k, v FROM v127043_2 INNER JOIN t127043_3 ON k = k3 WHERE k = 1 LIMIT 1;
+----
+1  1
+
+# Regression tests for #130593 (set operations with empty column sets).
+statement ok
+CREATE TABLE t130591_1 AS SELECT ALL;
+CREATE TABLE t130591_2 AS SELECT ALL
+
+statement count 0
+TABLE t130591_1 EXCEPT DISTINCT TABLE t130591_1;
+
+statement count 1
+TABLE t130591_1 INTERSECT DISTINCT TABLE t130591_1;
+
+statement count 1
+TABLE t130591_1 UNION DISTINCT TABLE t130591_1;
+
+statement count 0
+TABLE t130591_1 EXCEPT DISTINCT TABLE t130591_2;
+
+statement count 1
+TABLE t130591_1 INTERSECT DISTINCT TABLE t130591_2;
+
+statement count 1
+TABLE t130591_1 UNION DISTINCT TABLE t130591_2;
+
+statement ok
+INSERT INTO t130591_1 DEFAULT VALUES;
+
+query I
+SELECT count(*) FROM t130591_1;
+----
+2
+
+statement count 0
+TABLE t130591_1 EXCEPT DISTINCT TABLE t130591_1;
+
+statement count 1
+TABLE t130591_1 INTERSECT DISTINCT TABLE t130591_1;
+
+statement count 1
+TABLE t130591_1 UNION DISTINCT TABLE t130591_1;
+
+statement count 0
+TABLE t130591_1 EXCEPT TABLE t130591_1;
+
+statement count 1
+TABLE t130591_1 INTERSECT TABLE t130591_1;
+
+statement count 1
+TABLE t130591_1 UNION TABLE t130591_1;

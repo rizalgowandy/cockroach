@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package result
 
@@ -14,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -26,7 +22,7 @@ import (
 // the proposing node may die before the local results are processed,
 // so any side effects here are only best-effort.
 type LocalResult struct {
-	Reply *roachpb.BatchResponse
+	Reply *kvpb.BatchResponse
 
 	// EncounteredIntents stores any intents from other transactions that the
 	// request encountered but did not conflict with. They should be handed off
@@ -42,6 +38,10 @@ type LocalResult struct {
 	// UpdatedTxns stores transaction records that have been updated by
 	// calls to EndTxn, PushTxn, and RecoverTxn.
 	UpdatedTxns []*roachpb.Transaction
+	// ReportedMissingLocks stores lock acquisition structs that represent locks
+	// that have been reported as missing via QueryIntent. Such locks must be
+	// reported to the concurrency manager.
+	ReportedMissingLocks []roachpb.LockAcquisition
 	// EndTxns stores completed transactions. If the transaction
 	// contains unresolved intents, they should be handed off for
 	// asynchronous intent resolution. A bool in each EndTxnIntents
@@ -51,6 +51,14 @@ type LocalResult struct {
 	// commit fails, or we may accidentally make uncommitted values
 	// live.
 	EndTxns []EndTxnIntents
+	// PopulateBarrierResponse will populate a BarrierResponse with the lease
+	// applied index and range descriptor when applied.
+	PopulateBarrierResponse bool
+
+	// RepopulateRequestResponse will overwrite the SubsumeResponse's
+	// LeaseAppliedIndex field with the lease applied index of the
+	// SubsumeRequest itself.
+	RepopulateSubsumeResponseLAI bool
 
 	// When set (in which case we better be the first range), call
 	// GossipFirstRange if the Replica holds the lease.
@@ -78,6 +86,8 @@ func (lResult *LocalResult) IsZero() bool {
 		lResult.ResolvedLocks == nil &&
 		lResult.UpdatedTxns == nil &&
 		lResult.EndTxns == nil &&
+		!lResult.PopulateBarrierResponse &&
+		!lResult.RepopulateSubsumeResponseLAI &&
 		!lResult.GossipFirstRange &&
 		!lResult.MaybeGossipSystemConfig &&
 		!lResult.MaybeGossipSystemConfigIfHaveFailure &&
@@ -90,14 +100,16 @@ func (lResult *LocalResult) String() string {
 		return "LocalResult: nil"
 	}
 	return fmt.Sprintf("LocalResult (reply: %v, "+
-		"#encountered intents: %d, #acquired locks: %d, #resolved locks: %d"+
+		"#encountered intents: %d, #acquired locks: %d, #resolved locks: %d "+
 		"#updated txns: %d #end txns: %d, "+
+		"PopulateBarrierResponse:%t RepopulateSubsumeResponse:%t "+
 		"GossipFirstRange:%t MaybeGossipSystemConfig:%t "+
 		"MaybeGossipSystemConfigIfHaveFailure:%t MaybeAddToSplitQueue:%t "+
-		"MaybeGossipNodeLiveness:%s ",
+		"MaybeGossipNodeLiveness:%s",
 		lResult.Reply,
 		len(lResult.EncounteredIntents), len(lResult.AcquiredLocks), len(lResult.ResolvedLocks),
 		len(lResult.UpdatedTxns), len(lResult.EndTxns),
+		lResult.PopulateBarrierResponse, lResult.RepopulateSubsumeResponseLAI,
 		lResult.GossipFirstRange, lResult.MaybeGossipSystemConfig,
 		lResult.MaybeGossipSystemConfigIfHaveFailure, lResult.MaybeAddToSplitQueue,
 		lResult.MaybeGossipNodeLiveness)
@@ -120,6 +132,17 @@ func (lResult *LocalResult) DetachEncounteredIntents() []roachpb.Intent {
 	}
 	r := lResult.EncounteredIntents
 	lResult.EncounteredIntents = nil
+	return r
+}
+
+// DetachMissingLocks returns (and removes) those locks that have been reported
+// missing during an QueryIntentRequest and must be handled.
+func (lResult *LocalResult) DetachMissingLocks() []roachpb.LockAcquisition {
+	if lResult == nil {
+		return nil
+	}
+	r := lResult.ReportedMissingLocks
+	lResult.ReportedMissingLocks = nil
 	return r
 }
 
@@ -146,15 +169,40 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 	return r
 }
 
+// DetachPopulateBarrierResponse returns (and removes) the
+// PopulateBarrierResponse value from the local result.
+func (lResult *LocalResult) DetachPopulateBarrierResponse() bool {
+	if lResult == nil {
+		return false
+	}
+	r := lResult.PopulateBarrierResponse
+	lResult.PopulateBarrierResponse = false
+	return r
+}
+
+// DetachRepopulateSubsumeResponse returns (and removes) the
+// RepopulateSubsumeResponse value from the local result.
+func (lResult *LocalResult) DetachRepopulateSubsumeResponse() bool {
+	if lResult == nil {
+		return false
+	}
+	r := lResult.RepopulateSubsumeResponseLAI
+	lResult.RepopulateSubsumeResponseLAI = false
+	return r
+}
+
 // Result is the result of evaluating a KV request. That is, the
 // proposer (which holds the lease, at least in the case in which the command
 // will complete successfully) has evaluated the request and is holding on to:
 //
 // a) changes to be written to disk when applying the command
 // b) changes to the state which may require special handling (i.e. code
-//    execution) on all Replicas
+//
+//	execution) on all Replicas
+//
 // c) data which isn't sent to the followers but the proposer needs for tasks
-//    it must run when the command has applied (such as resolving intents).
+//
+//	it must run when the command has applied (such as resolving intents).
 type Result struct {
 	Local        LocalResult
 	Replicated   kvserverpb.ReplicatedEvalResult
@@ -193,13 +241,16 @@ func coalesceBool(lhs *bool, rhs *bool) {
 func (p *Result) MergeAndDestroy(q Result) error {
 	if q.Replicated.State != nil {
 		if q.Replicated.State.RaftAppliedIndex != 0 {
-			return errors.AssertionFailedf("must not specify RaftApplyIndex")
+			return errors.AssertionFailedf("must not specify RaftAppliedIndex")
 		}
 		if q.Replicated.State.LeaseAppliedIndex != 0 {
-			return errors.AssertionFailedf("must not specify RaftApplyIndex")
+			return errors.AssertionFailedf("must not specify LeaseAppliedIndex")
 		}
 		if p.Replicated.State == nil {
 			p.Replicated.State = &kvserverpb.ReplicaState{}
+		}
+		if q.Replicated.State.RaftAppliedIndexTerm != 0 {
+			return errors.AssertionFailedf("must not specify RaftAppliedIndexTerm")
 		}
 		if p.Replicated.State.Desc == nil {
 			p.Replicated.State.Desc = q.Replicated.State.Desc
@@ -217,6 +268,7 @@ func (p *Result) MergeAndDestroy(q Result) error {
 
 		if p.Replicated.State.TruncatedState == nil {
 			p.Replicated.State.TruncatedState = q.Replicated.State.TruncatedState
+			p.Replicated.RaftExpectedFirstIndex = q.Replicated.RaftExpectedFirstIndex
 		} else if q.Replicated.State.TruncatedState != nil {
 			return errors.AssertionFailedf("conflicting TruncatedState")
 		}
@@ -231,6 +283,13 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			q.Replicated.State.GCThreshold = nil
 		}
 
+		if p.Replicated.State.GCHint == nil {
+			p.Replicated.State.GCHint = q.Replicated.State.GCHint
+		} else if q.Replicated.State.GCHint != nil {
+			return errors.AssertionFailedf("conflicting GC hint")
+		}
+		q.Replicated.State.GCHint = nil
+
 		if p.Replicated.State.Version == nil {
 			p.Replicated.State.Version = q.Replicated.State.Version
 		} else if q.Replicated.State.Version != nil {
@@ -241,11 +300,28 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		if q.Replicated.State.Stats != nil {
 			return errors.AssertionFailedf("must not specify Stats")
 		}
+		if q.Replicated.State.ForceFlushIndex != (roachpb.ForceFlushIndex{}) {
+			return errors.AssertionFailedf("must not specify ForceFlushIndex")
+		}
 		if (*q.Replicated.State != kvserverpb.ReplicaState{}) {
-			log.Fatalf(context.TODO(), "unhandled EvalResult: %s",
+			log.KvExec.Fatalf(context.TODO(), "unhandled EvalResult: %s",
 				pretty.Diff(*q.Replicated.State, kvserverpb.ReplicaState{}))
 		}
 		q.Replicated.State = nil
+	}
+
+	if p.Replicated.RaftTruncatedState == nil {
+		p.Replicated.RaftTruncatedState = q.Replicated.RaftTruncatedState
+		p.Replicated.RaftExpectedFirstIndex = q.Replicated.RaftExpectedFirstIndex
+	} else if q.Replicated.RaftTruncatedState != nil {
+		return errors.AssertionFailedf("conflicting RaftTruncatedState")
+	}
+	q.Replicated.RaftTruncatedState = nil
+	q.Replicated.RaftExpectedFirstIndex = 0
+
+	if p.Replicated.State != nil && p.Replicated.State.TruncatedState != nil &&
+		p.Replicated.RaftTruncatedState != nil {
+		return errors.AssertionFailedf("conflicting RaftTruncatedState")
 	}
 
 	if p.Replicated.Split == nil {
@@ -290,6 +366,28 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	}
 	q.Replicated.AddSSTable = nil
 
+	if p.Replicated.LinkExternalSSTable == nil {
+		p.Replicated.LinkExternalSSTable = q.Replicated.LinkExternalSSTable
+	} else if q.Replicated.LinkExternalSSTable != nil {
+		return errors.AssertionFailedf("conflicting LinkExternalSSTable")
+	}
+	q.Replicated.LinkExternalSSTable = nil
+
+	if p.Replicated.Excise == nil {
+		p.Replicated.Excise = q.Replicated.Excise
+	} else if q.Replicated.Excise != nil {
+		return errors.AssertionFailedf("conflicting Excise")
+	}
+	q.Replicated.Excise = nil
+
+	if p.Replicated.MVCCHistoryMutation == nil {
+		p.Replicated.MVCCHistoryMutation = q.Replicated.MVCCHistoryMutation
+	} else if q.Replicated.MVCCHistoryMutation != nil {
+		p.Replicated.MVCCHistoryMutation.Spans = append(p.Replicated.MVCCHistoryMutation.Spans,
+			q.Replicated.MVCCHistoryMutation.Spans...)
+	}
+	q.Replicated.MVCCHistoryMutation = nil
+
 	if p.Replicated.PrevLeaseProposal == nil {
 		p.Replicated.PrevLeaseProposal = q.Replicated.PrevLeaseProposal
 	} else if q.Replicated.PrevLeaseProposal != nil {
@@ -303,6 +401,16 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		return errors.AssertionFailedf("conflicting prior read summary")
 	}
 	q.Replicated.PriorReadSummary = nil
+
+	if !p.Replicated.IsProbe {
+		p.Replicated.IsProbe = q.Replicated.IsProbe
+	}
+	q.Replicated.IsProbe = false
+
+	if q.Replicated.DoTimelyApplicationToAllReplicas {
+		p.Replicated.DoTimelyApplicationToAllReplicas = true
+	}
+	q.Replicated.DoTimelyApplicationToAllReplicas = false
 
 	if p.Local.EncounteredIntents == nil {
 		p.Local.EncounteredIntents = q.Local.EncounteredIntents
@@ -325,6 +433,13 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	}
 	q.Local.ResolvedLocks = nil
 
+	if p.Local.ReportedMissingLocks == nil {
+		p.Local.ReportedMissingLocks = q.Local.ReportedMissingLocks
+	} else {
+		p.Local.ReportedMissingLocks = append(p.Local.ReportedMissingLocks, q.Local.ReportedMissingLocks...)
+	}
+	q.Local.ReportedMissingLocks = nil
+
 	if p.Local.UpdatedTxns == nil {
 		p.Local.UpdatedTxns = q.Local.UpdatedTxns
 	} else {
@@ -338,6 +453,22 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		p.Local.EndTxns = append(p.Local.EndTxns, q.Local.EndTxns...)
 	}
 	q.Local.EndTxns = nil
+
+	if !p.Local.PopulateBarrierResponse {
+		p.Local.PopulateBarrierResponse = q.Local.PopulateBarrierResponse
+	} else {
+		// PopulateBarrierResponse is only valid for a single Barrier response.
+		return errors.AssertionFailedf("multiple PopulateBarrierResponse results")
+	}
+	q.Local.PopulateBarrierResponse = false
+
+	if !p.Local.RepopulateSubsumeResponseLAI {
+		p.Local.RepopulateSubsumeResponseLAI = q.Local.RepopulateSubsumeResponseLAI
+	} else {
+		// RepopulateSubsumeResponseLAI is only valid for a single Subsume response.
+		return errors.AssertionFailedf("multiple RepopulateSubsumeResponseLAI results")
+	}
+	q.Local.RepopulateSubsumeResponseLAI = false
 
 	if p.Local.MaybeGossipNodeLiveness == nil {
 		p.Local.MaybeGossipNodeLiveness = q.Local.MaybeGossipNodeLiveness
@@ -368,7 +499,7 @@ func (p *Result) MergeAndDestroy(q Result) error {
 	q.LogicalOpLog = nil
 
 	if !q.IsZero() {
-		log.Fatalf(context.TODO(), "unhandled EvalResult: %s", pretty.Diff(q, Result{}))
+		log.KvExec.Fatalf(context.TODO(), "unhandled EvalResult: %s", pretty.Diff(q, Result{}))
 	}
 
 	return nil

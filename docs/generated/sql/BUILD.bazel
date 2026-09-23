@@ -5,9 +5,15 @@ genrule(
         "functions.md",
         "operators.md",
         "window_functions.md",
+        "session_vars.md",
     ],
     cmd = """
 $(location //pkg/cmd/docgen) functions $(RULEDIR) --quiet
+$(location //pkg/cmd/docgen) session-vars $(RULEDIR) --quiet
 """,
-    exec_tools = ["//pkg/cmd/docgen"],
+    tools = ["//pkg/cmd/docgen"],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )

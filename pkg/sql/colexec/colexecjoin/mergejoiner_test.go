@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecjoin
 
@@ -25,7 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -55,18 +50,20 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 		skip.IgnoreLintf(t, "this test is too slow with relatively big batch size")
 	}
 	ctx := context.Background()
-	evalCtx := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(ctx)
 	nTuples := 2*coldata.BatchSize() + 1
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
+	diskQueueMemAcc := testMemMonitor.MakeBoundAccount()
+	defer diskQueueMemAcc.Close(ctx)
 	rng, _ := randutil.NewTestRand()
 	typs := []*types.T{types.Int, types.Bytes, types.Decimal}
-	colsLeft := make([]coldata.Vec, len(typs))
-	colsRight := make([]coldata.Vec, len(typs))
+	colsLeft := make([]*coldata.Vec, len(typs))
+	colsRight := make([]*coldata.Vec, len(typs))
 	for i, typ := range typs {
-		colsLeft[i] = testAllocator.NewMemColumn(typ, nTuples)
-		colsRight[i] = testAllocator.NewMemColumn(typ, nTuples)
+		colsLeft[i] = testAllocator.NewVec(typ, nTuples)
+		colsRight[i] = testAllocator.NewVec(typ, nTuples)
 	}
 	groupsLeft := colsLeft[0].Int64()
 	groupsRight := colsRight[0].Int64()
@@ -82,7 +79,7 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 		groupsRight[i] = int64(rightGroupIdx)
 	}
 	for i := range typs[1:] {
-		for _, vecs := range [][]coldata.Vec{colsLeft, colsRight} {
+		for _, vecs := range [][]*coldata.Vec{colsLeft, colsRight} {
 			coldatatestutils.RandomVec(coldatatestutils.RandomVecArgs{
 				Rand:            rng,
 				Vec:             vecs[i+1],
@@ -95,17 +92,19 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 	rightMJSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsRight, nTuples)
 	leftHJSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsLeft, nTuples)
 	rightHJSource := colexectestutils.NewChunkingBatchSource(testAllocator, typs, colsRight, nTuples)
-	mj := NewMergeJoinOp(
-		testAllocator, execinfra.DefaultMemoryLimit, queueCfg,
+	mj, _ := NewMergeJoinOp(
+		ctx, testAllocator, execinfra.DefaultMemoryLimit, queueCfg,
 		colexecop.NewTestingSemaphore(mjFDLimit), descpb.InnerJoin,
 		leftMJSource, rightMJSource, typs, typs,
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 		[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-		testDiskAcc, evalCtx,
+		testDiskAcc, &diskQueueMemAcc, evalCtx,
 	)
 	mj.Init(ctx)
-	hj := NewHashJoiner(
-		testAllocator, testAllocator, HashJoinerSpec{
+	hj := NewHashJoiner(NewHashJoinerArgs{
+		BuildSideAllocator:       testAllocator,
+		OutputUnlimitedAllocator: testAllocator,
+		Spec: HashJoinerSpec{
 			JoinType: descpb.InnerJoin,
 			Left: hashJoinerSourceSpec{
 				EqCols: []uint32{0}, SourceTypes: typs,
@@ -113,22 +112,25 @@ func TestMergeJoinCrossProduct(t *testing.T) {
 			Right: hashJoinerSourceSpec{
 				EqCols: []uint32{0}, SourceTypes: typs,
 			},
-		}, leftHJSource, rightHJSource, HashJoinerInitialNumBuckets,
-	)
+		},
+		LeftSource:        leftHJSource,
+		RightSource:       rightHJSource,
+		InitialNumBuckets: HashJoinerInitialNumBuckets,
+	})
 	hj.Init(ctx)
 
 	var mjOutputTuples, hjOutputTuples colexectestutils.Tuples
-	for b := mj.Next(); b.Length() != 0; b = mj.Next() {
+	for b := colexecop.NextNoMeta(mj); b.Length() != 0; b = colexecop.NextNoMeta(mj) {
 		for i := 0; i < b.Length(); i++ {
 			mjOutputTuples = append(mjOutputTuples, colexectestutils.GetTupleFromBatch(b, i))
 		}
 	}
-	for b := hj.Next(); b.Length() != 0; b = hj.Next() {
+	for b := colexecop.NextNoMeta(hj); b.Length() != 0; b = colexecop.NextNoMeta(hj) {
 		for i := 0; i < b.Length(); i++ {
 			hjOutputTuples = append(hjOutputTuples, colexectestutils.GetTupleFromBatch(b, i))
 		}
 	}
-	err := colexectestutils.AssertTuplesSetsEqual(hjOutputTuples, mjOutputTuples, evalCtx)
+	err := colexectestutils.AssertTuplesSetsEqual(ctx, hjOutputTuples, mjOutputTuples, evalCtx)
 	// Note that the error message can be extremely verbose (it
 	// might contain all output tuples), so we manually check that
 	// comparing err to nil returns true (if we were to use
@@ -190,7 +192,7 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			descpb.InnerJoin, leftSource, rightSource, sourceTypes, sourceTypes,
 			[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
 			[]execinfrapb.Ordering_Column{{ColIdx: 0, Direction: execinfrapb.Ordering_Column_ASC}},
-			testDiskAcc,
+			testDiskAcc, testMemAcc,
 		)
 		return &mergeJoinInnerOp{mergeJoinBase: base}
 	}
@@ -262,7 +264,7 @@ func BenchmarkMergeJoiner(b *testing.B) {
 					s.Init(ctx)
 
 					b.StartTimer()
-					for b := s.Next(); b.Length() != 0; b = s.Next() {
+					for b := colexecop.NextNoMeta(s); b.Length() != 0; b = colexecop.NextNoMeta(s) {
 					}
 					b.StopTimer()
 				}

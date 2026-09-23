@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexec
 
@@ -16,7 +11,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -45,47 +41,55 @@ func NewTupleProjOp(
 
 type tupleProjOp struct {
 	colexecop.OneInputHelper
-
 	allocator         *colmem.Allocator
 	converter         *colconv.VecToDatumConverter
-	tupleContentsIdxs []int
 	outputType        *types.T
+	tupleContentsIdxs []int
 	outputIdx         int
 }
 
 var _ colexecop.Operator = &tupleProjOp{}
-var _ execinfra.Releasable = &tupleProjOp{}
+var _ execreleasable.Releasable = &tupleProjOp{}
 
-func (t *tupleProjOp) Next() coldata.Batch {
-	batch := t.Input.Next()
+func (t *tupleProjOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batch, meta := t.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	n := batch.Length()
 	if n == 0 {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
 	t.converter.ConvertBatchAndDeselect(batch)
 	projVec := batch.ColVec(t.outputIdx)
-	if projVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		projVec.Nulls().UnsetNulls()
-	}
-	t.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
+
+	t.allocator.PerformOperation([]*coldata.Vec{projVec}, func() {
+		// Preallocate the tuples and their underlying datums in a contiguous
+		// slice to reduce allocations.
+		tuples := make([]tree.DTuple, n)
+		l := len(t.tupleContentsIdxs)
+		datums := make(tree.Datums, n*l)
 		projCol := projVec.Datum()
+		projectInto := func(dst, src int) {
+			tuples[src] = tree.MakeDTuple(
+				t.outputType, datums[src*l:(src+1)*l:(src+1)*l]...,
+			)
+			projCol.Set(dst, t.projectInto(&tuples[src], src))
+		}
 		if sel := batch.Selection(); sel != nil {
 			for convertedIdx, i := range sel[:n] {
-				projCol.Set(i, t.createTuple(convertedIdx))
+				projectInto(i, convertedIdx)
 			}
 		} else {
 			for i := 0; i < n; i++ {
-				projCol.Set(i, t.createTuple(i))
+				projectInto(i, i)
 			}
 		}
 	})
-	return batch
+	return batch, nil
 }
 
-func (t *tupleProjOp) createTuple(convertedIdx int) tree.Datum {
-	tuple := tree.NewDTupleWithLen(t.outputType, len(t.tupleContentsIdxs))
+func (t *tupleProjOp) projectInto(tuple *tree.DTuple, convertedIdx int) tree.Datum {
 	for i, columnIdx := range t.tupleContentsIdxs {
 		tuple.D[i] = t.converter.GetDatumColumn(columnIdx)[convertedIdx]
 	}

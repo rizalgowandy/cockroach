@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package debug
 
@@ -22,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
@@ -96,6 +92,10 @@ type logSpyOptions struct {
 	Grep           regexpAsString
 	Flatten        intAsString
 	vmoduleOptions `json:",inline"`
+	// tenantIDFilter filters entries based on the provided tenant ID.
+	// If empty, no filtering is applied (only relevant for the system
+	// tenant).
+	tenantIDFilter string
 }
 
 func logSpyOptionsFromValues(values url.Values) (logSpyOptions, error) {
@@ -121,6 +121,11 @@ func logSpyOptionsFromValues(values url.Values) (logSpyOptions, error) {
 }
 
 type logSpy struct {
+	// tenantID is the tenantID assigned to the server that's servicing this
+	// logSpy. If the value is any tenant other than the System tenant, we
+	// filter logs to only include those specific to this tenantID. For the
+	// system tenant however, we perform no such filtering.
+	tenantID     roachpb.TenantID
 	vsrv         *vmoduleServer
 	setIntercept func(ctx context.Context, f log.Interceptor) func()
 }
@@ -131,12 +136,15 @@ func (spy *logSpy) handleDebugLogSpy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "while parsing options: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if spy.tenantID != roachpb.SystemTenantID {
+		opts.tenantIDFilter = spy.tenantID.String()
+	}
 
 	w.Header().Add("Content-type", "text/plain; charset=UTF-8")
 	ctx := r.Context()
 	if err := spy.run(ctx, w, opts); err != nil {
 		// This is likely a broken HTTP connection, so nothing too unexpected.
-		log.Infof(ctx, "%v", err)
+		log.Dev.Infof(ctx, "%v", err)
 	}
 }
 
@@ -148,15 +156,19 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	// is never closed. This is because we don't know when that is
 	// safe. This is sketchy in general but OK here since we don't have
 	// to guarantee that the channel is fully consumed.
-	interceptor := newLogSpyInterceptor(opts)
+	interceptor := newLogSpyInterceptor(ctx, opts)
 
 	defer func() {
 		if dropped := atomic.LoadInt32(&interceptor.countDropped); dropped > 0 {
 			entry := log.MakeLegacyEntry(
 				ctx, severity.WARNING, channel.DEV,
 				0 /* depth */, true, /* redactable */
-				"%d messages were dropped", log.Safe(dropped))
-			err = errors.CombineErrors(err, interceptor.outputEntry(w, entry))
+				"%d messages were dropped", redact.Safe(dropped))
+			entryBytes, _ := json.Marshal(entry)
+			err = errors.CombineErrors(err, interceptor.outputEntry(w, logSpyInterceptorPayload{
+				entryBytes: entryBytes,
+				entry:      entry,
+			}))
 		}
 	}()
 
@@ -166,7 +178,7 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 	// This log message will be served through the interceptor
 	// AND it is also reported in other log sinks, so that
 	// administrators know the logspy was used.
-	log.Infof(ctx, "intercepting logs with options: %+v", opts)
+	log.Dev.Infof(ctx, "intercepting logs with options: %+v", opts)
 
 	// Set up the temporary vmodule config, if requested.
 	prevVModule := log.GetVModule()
@@ -176,23 +188,23 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 			return err
 		}
 
-		log.Infof(ctx, "previous vmodule configuration: %s", prevVModule)
+		log.Dev.Infof(ctx, "previous vmodule configuration: %s", prevVModule)
 		// Install the new configuration.
 		if err := log.SetVModule(opts.VModule); err != nil {
 			fmt.Fprintf(w, "error: %v", err)
 			return err
 		}
-		log.Infof(ctx, "new vmodule configuration (previous will be restored when logspy session completes): %s", redact.SafeString(opts.VModule))
+		log.Dev.Infof(ctx, "new vmodule configuration (previous will be restored when logspy session completes): %s", redact.SafeString(opts.VModule))
 		defer func() {
 			// Restore the configuration.
 			err := log.SetVModule(prevVModule)
 
 			// Report the change in logs.
-			log.Infof(ctx, "restoring vmodule configuration (%q): %v", redact.SafeString(prevVModule), err)
+			log.Dev.Infof(ctx, "restoring vmodule configuration (%q): %v", redact.SafeString(prevVModule), err)
 			spy.vsrv.unlockVModule(ctx)
 		}()
 	} else {
-		log.Infof(ctx, "current vmodule setting: %s", redact.SafeString(prevVModule))
+		log.Dev.Infof(ctx, "current vmodule setting: %s", redact.SafeString(prevVModule))
 	}
 
 	const flushInterval = time.Second
@@ -211,9 +223,12 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 			}
 			return err
 
-		case jsonEntry := <-interceptor.jsonEntries:
-			if err := interceptor.outputJSONEntry(w, jsonEntry); err != nil {
-				return errors.Wrapf(err, "while writing entry %s", jsonEntry)
+		case entryPayload := <-interceptor.jsonEntries:
+			if entryPayload.err != nil {
+				return err
+			}
+			if err := interceptor.outputEntry(w, entryPayload); err != nil {
+				return errors.Wrapf(err, "while writing entry %s", entryPayload.entryBytes)
 			}
 			numReportedEntries++
 			if numReportedEntries >= int(opts.Count) {
@@ -221,7 +236,6 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 			}
 
 		case <-flushTimer.C:
-			flushTimer.Read = true
 			flushTimer.Reset(flushInterval)
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -231,15 +245,32 @@ func (spy *logSpy) run(ctx context.Context, w io.Writer, opts logSpyOptions) (er
 }
 
 type logSpyInterceptor struct {
+	ctx          context.Context
 	opts         logSpyOptions
 	countDropped int32
-	jsonEntries  chan []byte
+	jsonEntries  chan logSpyInterceptorPayload
 }
 
-func newLogSpyInterceptor(opts logSpyOptions) *logSpyInterceptor {
+// logSpyInterceptorPayload exists for convenience. When we first
+// intercept, we need to perform some basic filtering that requires
+// us to unmarshall the entryBytes. Instead of performing this
+// operation multiple times, we store the entry in the payload
+// for reuse.
+type logSpyInterceptorPayload struct {
+	// The raw log entry bytes.
+	entryBytes []byte
+	// The unmarshalled result from entryBytes.
+	entry logpb.Entry
+	// If an error occurred during the intercept, we place it here
+	// to be processed by the logSpy consumer.
+	err error
+}
+
+func newLogSpyInterceptor(ctx context.Context, opts logSpyOptions) *logSpyInterceptor {
 	return &logSpyInterceptor{
+		ctx:         ctx,
 		opts:        opts,
-		jsonEntries: make(chan []byte, logSpyChanCap),
+		jsonEntries: make(chan logSpyInterceptorPayload, logSpyChanCap),
 	}
 }
 
@@ -251,6 +282,22 @@ func (i *logSpyInterceptor) Intercept(jsonEntry []byte) {
 			return
 		}
 	}
+	var entry logpb.Entry
+	if err := json.Unmarshal(jsonEntry, &entry); err != nil {
+		// If we can't unmarshal the entry, send an error along to be handled by the consumer and return.
+		select {
+		case i.jsonEntries <- logSpyInterceptorPayload{
+			err: errors.Wrapf(err, "logspy failed to unmarshal entry: %s", jsonEntry),
+		}:
+		default:
+			// Consumer fell behind, just drop the message.
+			atomic.AddInt32(&i.countDropped, 1)
+		}
+		return
+	}
+	if i.opts.tenantIDFilter != "" && i.opts.tenantIDFilter != entry.TenantID {
+		return
+	}
 
 	// The log.Interceptor interface requires us to copy the buffer
 	// before we can send it to a different goroutine.
@@ -258,30 +305,21 @@ func (i *logSpyInterceptor) Intercept(jsonEntry []byte) {
 	copy(jsonCopy, jsonEntry)
 
 	select {
-	case i.jsonEntries <- jsonCopy:
+	case i.jsonEntries <- logSpyInterceptorPayload{
+		entryBytes: jsonCopy,
+		entry:      entry,
+	}:
 	default:
 		// Consumer fell behind, just drop the message.
 		atomic.AddInt32(&i.countDropped, 1)
 	}
 }
 
-func (i *logSpyInterceptor) outputEntry(w io.Writer, entry logpb.Entry) error {
-	if i.opts.Flatten > 0 {
-		return log.FormatLegacyEntry(entry, w)
-	}
-	j, _ := json.Marshal(entry)
-	return i.outputJSONEntry(w, j)
-}
-
-func (i *logSpyInterceptor) outputJSONEntry(w io.Writer, jsonEntry []byte) error {
+func (i *logSpyInterceptor) outputEntry(w io.Writer, entry logSpyInterceptorPayload) error {
 	if i.opts.Flatten == 0 {
-		_, err1 := w.Write(jsonEntry)
+		_, err1 := w.Write(entry.entryBytes)
 		_, err2 := w.Write([]byte("\n"))
 		return errors.CombineErrors(err1, err2)
 	}
-	var legacyEntry logpb.Entry
-	if err := json.Unmarshal(jsonEntry, &legacyEntry); err != nil {
-		return errors.NewAssertionErrorWithWrappedErrf(err, "interceptor API does not seem to provide valid Entry payloads")
-	}
-	return i.outputEntry(w, legacyEntry)
+	return log.FormatLegacyEntry(entry.entry, w)
 }

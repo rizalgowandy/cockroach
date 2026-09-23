@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package workloadsql
 
@@ -18,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/v2/crdb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/workload"
@@ -31,6 +27,118 @@ import (
 type InsertsDataLoader struct {
 	BatchSize   int
 	Concurrency int
+}
+
+// SchemaOnlyDataLoader is an InitialDataLoader implementation that only creates
+// tables without loading any data. This is useful for benchmarks that only need
+// the schema structure without any row data.
+type SchemaOnlyDataLoader struct {
+	// URLs is the list of node URLs to distribute table creation across.
+	// If empty, the provided db connection is used directly.
+	URLs []string
+}
+
+// InitialDataLoad implements the InitialDataLoader interface.
+func (l SchemaOnlyDataLoader) InitialDataLoad(
+	ctx context.Context, db *gosql.DB, gen workload.Generator,
+) (int64, error) {
+	tables := gen.Tables()
+	var hooks workload.Hooks
+	if h, ok := gen.(workload.Hookser); ok {
+		hooks = h.Hooks()
+	}
+
+	if hooks.PreCreate != nil {
+		if err := hooks.PreCreate(db); err != nil {
+			return 0, errors.Wrapf(err, "Could not precreate")
+		}
+	}
+
+	log.Dev.Infof(ctx, `creating %d tables (schema only, no data)`, len(tables))
+	startTime := timeutil.Now()
+
+	// Create connections to each node if URLs are provided.
+	var dbs []*gosql.DB
+	if len(l.URLs) > 1 {
+		for _, url := range l.URLs {
+			nodeDB, err := gosql.Open("cockroach", url)
+			if err != nil {
+				// Close any already-opened connections before returning.
+				for _, openDB := range dbs {
+					_ = openDB.Close()
+				}
+				return 0, errors.Wrapf(err, "opening connection to %s", url)
+			}
+			dbs = append(dbs, nodeDB)
+		}
+		defer func() {
+			for _, nodeDB := range dbs {
+				_ = nodeDB.Close()
+			}
+		}()
+		log.Dev.Infof(ctx, `distributing table creation across %d nodes`, len(dbs))
+	} else {
+		dbs = []*gosql.DB{db}
+	}
+
+	const maxTableBatchSize = 5000
+	currentTable := 0
+	batchNum := 0
+	// When dealing with large number of tables, opt to use transactions
+	// to minimize the round trips involved, which can be bad on multi-region
+	// clusters.
+	for currentTable < len(tables) {
+		batchStart := timeutil.Now()
+		batchEnd := min(currentTable+maxTableBatchSize, len(tables))
+		nextBatch := tables[currentTable:batchEnd]
+		batchNum++
+
+		// Distribute batches across nodes round-robin.
+		nodeDB := dbs[(batchNum-1)%len(dbs)]
+		if err := crdb.ExecuteTx(ctx, nodeDB, &gosql.TxOptions{}, func(tx *gosql.Tx) error {
+			// Run the operations in a single txn so they complete more quickly.
+			if _, err := tx.Exec("SET LOCAL autocommit_before_ddl = false"); err != nil {
+				return err
+			}
+			currentDatabase := ""
+			for _, table := range nextBatch {
+				// Switch databases if one is explicitly specified for multi-region
+				// configurations with multiple databases.
+				if table.ObjectPrefix != nil &&
+					table.ObjectPrefix.ExplicitCatalog &&
+					currentDatabase != table.ObjectPrefix.Catalog() {
+					_, err := tx.ExecContext(ctx, "USE $1", table.ObjectPrefix.Catalog())
+					if err != nil {
+						return err
+					}
+					currentDatabase = table.ObjectPrefix.Catalog()
+				}
+				tableName := table.GetResolvedName()
+				createStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s %s`, tableName.String(), table.Schema)
+				if _, err := tx.ExecContext(ctx, createStmt); err != nil {
+					return errors.WithDetailf(errors.Wrapf(err, "could not create table: %q", table.Name),
+						"SQL: %s", createStmt)
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, err
+		}
+		currentTable = batchEnd
+		log.Dev.Infof(ctx, `created %d/%d tables (batch %d on node %d, %d tables in %s)`,
+			currentTable, len(tables), batchNum, (batchNum-1)%len(dbs)+1, len(nextBatch), timeutil.Since(batchStart).Round(time.Millisecond))
+	}
+
+	if hooks.PreLoad != nil {
+		if err := hooks.PreLoad(db); err != nil {
+			return 0, errors.Wrapf(err, "Could not preload")
+		}
+	}
+
+	// SchemaOnlyDataLoader does not load any data, so we return 0 bytes.
+	log.Dev.Infof(ctx, `finished creating %d tables in %s (schema only, no data loaded)`,
+		len(tables), timeutil.Since(startTime).Round(time.Second))
+	return 0, nil
 }
 
 // InitialDataLoad implements the InitialDataLoader interface.
@@ -61,11 +169,44 @@ func (l InsertsDataLoader) InitialDataLoad(
 		}
 	}
 
-	for _, table := range tables {
-		createStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" %s`, table.Name, table.Schema)
-		if _, err := db.ExecContext(ctx, createStmt); err != nil {
-			return 0, errors.Wrapf(err, "could not create table: %s", table.Name)
+	const maxTableBatchSize = 5000
+	currentTable := 0
+	// When dealing with large number of tables, opt to use transactions
+	// to minimize the round trips involved, which can be bad on multi-region
+	// clusters.
+	for currentTable < len(tables) {
+		batchEnd := min(currentTable+maxTableBatchSize, len(tables))
+		nextBatch := tables[currentTable:batchEnd]
+		if err := crdb.ExecuteTx(ctx, db, &gosql.TxOptions{}, func(tx *gosql.Tx) error {
+			// Run the operations in a single txn so they complete more quickly.
+			if _, err := tx.Exec("SET LOCAL autocommit_before_ddl = false"); err != nil {
+				return err
+			}
+			currentDatabase := ""
+			for _, table := range nextBatch {
+				// Switch databases if one is explicitly specified for multi-region
+				// configurations with multiple databases.
+				if table.ObjectPrefix != nil &&
+					table.ObjectPrefix.ExplicitCatalog &&
+					currentDatabase != table.ObjectPrefix.Catalog() {
+					_, err := tx.ExecContext(ctx, "USE $1", table.ObjectPrefix.Catalog())
+					if err != nil {
+						return err
+					}
+					currentDatabase = table.ObjectPrefix.Catalog()
+				}
+				tableName := table.GetResolvedName()
+				createStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s %s`, tableName.String(), table.Schema)
+				if _, err := tx.ExecContext(ctx, createStmt); err != nil {
+					return errors.WithDetailf(errors.Wrapf(err, "could not create table: %q", table.Name),
+						"SQL: %s", createStmt)
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, err
 		}
+		currentTable += maxTableBatchSize
 	}
 
 	if hooks.PreLoad != nil {
@@ -74,7 +215,7 @@ func (l InsertsDataLoader) InitialDataLoad(
 		}
 	}
 
-	var bytesAtomic int64
+	var bytesAtomic atomic.Int64
 	for _, table := range tables {
 		if table.InitialRows.NumBatches == 0 {
 			continue
@@ -83,7 +224,7 @@ func (l InsertsDataLoader) InitialDataLoad(
 				`initial data is not supported for workload %s`, gen.Meta().Name)
 		}
 		tableStart := timeutil.Now()
-		var tableRowsAtomic int64
+		var tableRowsAtomic atomic.Int64
 
 		batchesPerWorker := table.InitialRows.NumBatches / l.Concurrency
 		g, gCtx := errgroup.WithContext(ctx)
@@ -94,19 +235,24 @@ func (l InsertsDataLoader) InitialDataLoad(
 				// Account for any rounding error in batchesPerWorker.
 				endIdx = table.InitialRows.NumBatches
 			}
+			table := table // copy for safe reference in Go routine
+			tableName := table.GetResolvedName()
 			g.Go(func() error {
 				var insertStmtBuf bytes.Buffer
 				var params []interface{}
 				var numRows int
 				flush := func() error {
 					if len(params) > 0 {
+						if table.InitialRows.MayContainDuplicates {
+							fmt.Fprint(&insertStmtBuf, ` ON CONFLICT DO NOTHING`)
+						}
 						insertStmt := insertStmtBuf.String()
 						if _, err := db.ExecContext(gCtx, insertStmt, params...); err != nil {
-							return errors.Wrapf(err, "failed insert into %s", table.Name)
+							return errors.Wrapf(err, "failed insert into %s", tableName.String())
 						}
 					}
 					insertStmtBuf.Reset()
-					fmt.Fprintf(&insertStmtBuf, `INSERT INTO "%s" VALUES `, table.Name)
+					fmt.Fprintf(&insertStmtBuf, `INSERT INTO %s VALUES `, tableName.String())
 					params = params[:0]
 					numRows = 0
 					return nil
@@ -115,13 +261,13 @@ func (l InsertsDataLoader) InitialDataLoad(
 
 				for batchIdx := startIdx; batchIdx < endIdx; batchIdx++ {
 					for _, row := range table.InitialRows.BatchRows(batchIdx) {
-						atomic.AddInt64(&tableRowsAtomic, 1)
+						tableRowsAtomic.Add(1)
 						if len(params) != 0 {
 							insertStmtBuf.WriteString(`,`)
 						}
 						insertStmtBuf.WriteString(`(`)
 						for i, datum := range row {
-							atomic.AddInt64(&bytesAtomic, workload.ApproxDatumSize(datum))
+							bytesAtomic.Add(workload.ApproxDatumSize(datum))
 							if i != 0 {
 								insertStmtBuf.WriteString(`,`)
 							}
@@ -142,10 +288,10 @@ func (l InsertsDataLoader) InitialDataLoad(
 		if err := g.Wait(); err != nil {
 			return 0, err
 		}
-		tableRows := int(atomic.LoadInt64(&tableRowsAtomic))
-		log.Infof(ctx, `imported %s (%s, %d rows)`,
+		tableRows := int(tableRowsAtomic.Load())
+		log.Dev.Infof(ctx, `imported %s (%s, %d rows)`,
 			table.Name, timeutil.Since(tableStart).Round(time.Second), tableRows,
 		)
 	}
-	return atomic.LoadInt64(&bytesAtomic), nil
+	return bytesAtomic.Load(), nil
 }

@@ -1,19 +1,13 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,8 +42,7 @@ func installSessionsFileSink(sc *TestLogScope, t *testing.T) func() {
 	}
 
 	// Apply the configuration.
-	TestingResetActive()
-	cleanup, err := ApplyConfig(cfg)
+	cleanup, err := ApplyConfigForReconfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,17 +59,17 @@ func TestSecondaryLog(t *testing.T) {
 	ctx := context.Background()
 
 	// Interleave some messages.
-	Infof(context.Background(), "test1")
+	Dev.Infof(context.Background(), "test1")
 	ctx = logtags.AddTag(ctx, "hello", "world")
 	Sessions.Infof(ctx, "story time")
-	Infof(context.Background(), "test2")
+	Dev.Infof(context.Background(), "test2")
 
 	// Make sure the content made it to disk.
-	Flush()
+	FlushFiles()
 
 	// Check that the messages indeed made it to different files.
 
-	bcontents, err := ioutil.ReadFile(debugLog.getFileSink().mu.file.(*syncBuffer).file.Name())
+	bcontents, err := os.ReadFile(getDebugLogFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +82,8 @@ func TestSecondaryLog(t *testing.T) {
 	}
 
 	l := logging.getLogger(channel.SESSIONS)
-	bcontents, err = ioutil.ReadFile(l.getFileSink().mu.file.(*syncBuffer).file.Name())
+	fsFileName := l.getFileSink().getFileName(t)
+	bcontents, err = os.ReadFile(fsFileName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +116,7 @@ func TestRedirectStderrWithSecondaryLoggersActive(t *testing.T) {
 
 	// Check the stderr log file: we want our stderr text there.
 	stderrLog := logging.testingFd2CaptureLogger
-	contents, err := ioutil.ReadFile(stderrLog.getFileSink().mu.file.(*syncBuffer).file.Name())
+	contents, err := os.ReadFile(stderrLog.getFileSink().getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +126,7 @@ func TestRedirectStderrWithSecondaryLoggersActive(t *testing.T) {
 
 	// Check the secondary log file: we don't want our stderr text there.
 	l := logging.getLogger(channel.SESSIONS)
-	contents2, err := ioutil.ReadFile(l.getFileSink().mu.file.(*syncBuffer).file.Name())
+	contents2, err := os.ReadFile(l.getFileSink().getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +145,7 @@ func TestListLogFilesIncludeSecondaryLogs(t *testing.T) {
 	// Emit some logging and ensure the files gets created.
 	ctx := context.Background()
 	Sessions.Infof(ctx, "story time")
-	Flush()
+	FlushFiles()
 
 	results, err := ListLogFiles()
 	if err != nil {
@@ -159,7 +153,7 @@ func TestListLogFilesIncludeSecondaryLogs(t *testing.T) {
 	}
 
 	l := logging.getLogger(channel.SESSIONS)
-	expectedName := filepath.Base(l.getFileSink().mu.file.(*syncBuffer).file.Name())
+	expectedName := filepath.Base(l.getFileSink().getFileName(t))
 	foundExpected := false
 	for i := range results {
 		if results[i].Name == expectedName {

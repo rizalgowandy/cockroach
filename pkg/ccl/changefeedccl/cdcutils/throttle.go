@@ -1,10 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdcutils
 
@@ -12,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
@@ -21,8 +17,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/crlib/crtime"
 )
 
 // Throttler is a changefeed IO throttler.
@@ -69,7 +65,7 @@ func (t *Throttler) AcquireFlushQuota(ctx context.Context) error {
 func (t *Throttler) updateConfig(config changefeedbase.SinkThrottleConfig) {
 	setLimits := func(rl *quotapool.RateLimiter, rate, burst float64) {
 		// set rateBudget to unlimited if rate is 0.
-		rateBudget := quotapool.Limit(math.MaxInt64)
+		rateBudget := quotapool.Inf()
 		if rate > 0 {
 			rateBudget = quotapool.Limit(rate)
 		}
@@ -117,7 +113,7 @@ func NodeLevelThrottler(sv *settings.Values, metrics *Metrics) *Throttler {
 		configStr := changefeedbase.NodeSinkThrottleConfig.Get(sv)
 		if configStr != "" {
 			if err := json.Unmarshal([]byte(configStr), &config); err != nil {
-				log.Errorf(context.Background(),
+				log.Changefeed.Errorf(context.Background(),
 					"failed to parse node throttle config %q: err=%v; throttling disabled", configStr, err)
 			}
 		}
@@ -154,6 +150,7 @@ func MakeMetrics(histogramWindow time.Duration) Metrics {
 			Help:        fmt.Sprintf("Total time spent throttled for %s quota", n),
 			Measurement: "Nanoseconds",
 			Unit:        metric.Unit_NANOSECONDS,
+			Category:    metric.Metadata_CHANGEFEEDS,
 		}
 	}
 
@@ -172,9 +169,9 @@ func (m Metrics) MetricStruct() {}
 func waitQuota(
 	ctx context.Context, n int64, limit *quotapool.RateLimiter, c *metric.Counter,
 ) error {
-	start := timeutil.Now()
+	start := crtime.NowMono()
 	defer func() {
-		c.Inc(int64(timeutil.Since(start)))
+		c.Inc(start.Elapsed().Nanoseconds())
 	}()
 	return limit.WaitN(ctx, n)
 }

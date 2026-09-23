@@ -1,16 +1,10 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for rank.eg.go. It's formatted in a
@@ -75,7 +69,7 @@ func NewRankOperator(
 		}
 		return &denseRankNoPartitionOp{rankInitFields: initFields}, nil
 	default:
-		return nil, errors.Errorf("unsupported rank type %s", windowFn)
+		return nil, errors.AssertionFailedf("unsupported rank type %s", windowFn)
 	}
 }
 
@@ -169,22 +163,20 @@ func (r *_RANK_STRINGOp) Init(ctx context.Context) {
 	r.rankIncrement = 1
 }
 
-func (r *_RANK_STRINGOp) Next() coldata.Batch {
-	batch := r.Input.Next()
+func (r *_RANK_STRINGOp) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
+	batch, meta := r.Input.Next()
+	if meta != nil {
+		return nil, meta
+	}
 	n := batch.Length()
 	if n == 0 {
-		return coldata.ZeroBatch
+		return coldata.ZeroBatch, nil
 	}
 	// {{if .HasPartition}}
 	partitionCol := batch.ColVec(r.partitionColIdx).Bool()
 	// {{end}}
 	peersCol := batch.ColVec(r.peersColIdx).Bool()
 	rankVec := batch.ColVec(r.outputColIdx)
-	if rankVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		rankVec.Nulls().UnsetNulls()
-	}
 	rankCol := rankVec.Int64()
 	sel := batch.Selection()
 	if sel != nil {
@@ -201,7 +193,7 @@ func (r *_RANK_STRINGOp) Next() coldata.Batch {
 			_COMPUTE_RANK(false)
 		}
 	}
-	return batch
+	return batch, nil
 }
 
 // {{end}}

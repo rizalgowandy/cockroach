@@ -1,13 +1,9 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+// Package encoding exposes some utilities for encoding data as bytes.
 package encoding
 
 import (
@@ -16,7 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -24,18 +19,20 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/encodingtype"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
+	"github.com/cockroachdb/cockroach/pkg/util/ltree"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 const (
@@ -54,11 +51,11 @@ const (
 	// The gap between floatNaNDesc and bytesMarker was left for
 	// compatibility reasons.
 	bytesMarker          byte = 0x12
-	bytesDescMarker      byte = bytesMarker + 1
-	timeMarker           byte = bytesDescMarker + 1
-	durationBigNegMarker byte = timeMarker + 1 // Only used for durations < MinInt64 nanos.
-	durationMarker       byte = durationBigNegMarker + 1
-	durationBigPosMarker byte = durationMarker + 1 // Only used for durations > MaxInt64 nanos.
+	bytesDescMarker           = bytesMarker + 1
+	timeMarker                = bytesDescMarker + 1
+	durationBigNegMarker      = timeMarker + 1 // Only used for durations < MinInt64 nanos.
+	durationMarker            = durationBigNegMarker + 1
+	durationBigPosMarker      = durationMarker + 1 // Only used for durations > MaxInt64 nanos.
 
 	decimalNaN              = durationBigPosMarker + 1 // 24
 	decimalNegativeInfinity = decimalNaN + 1
@@ -101,6 +98,22 @@ const (
 	geoInvertedIndexMarker = box2DMarker + 1
 
 	emptyArray = geoInvertedIndexMarker + 1
+	voidMarker = emptyArray + 1
+
+	// Defining different key markers, for the ascending designation,
+	// for handling different JSON values.
+
+	// Postgres currently has a special case (maybe a bug) where the empty JSON
+	// Array sorts before all other JSON values. See the bug report:
+	// https://www.postgresql.org/message-id/17873-826fdc8bbcace4f1%40postgresql.org
+	jsonEmptyArrayKeyMarker = voidMarker + 1
+	jsonNullKeyMarker       = jsonEmptyArrayKeyMarker + 1
+	jsonStringKeyMarker     = jsonNullKeyMarker + 1
+	jsonNumberKeyMarker     = jsonStringKeyMarker + 1
+	jsonFalseKeyMarker      = jsonNumberKeyMarker + 1
+	jsonTrueKeyMarker       = jsonFalseKeyMarker + 1
+	jsonArrayKeyMarker      = jsonTrueKeyMarker + 1
+	jsonObjectKeyMarker     = jsonArrayKeyMarker + 1
 
 	arrayKeyTerminator           byte = 0x00
 	arrayKeyDescendingTerminator byte = 0xFF
@@ -111,6 +124,31 @@ const (
 	// Because of the context, they cannot be ambiguous with these other bytes.
 	ascendingNullWithinArrayKey  byte = 0x01
 	descendingNullWithinArrayKey byte = 0xFE
+
+	// Defining different key markers, for the descending designation,
+	// for handling different JSON values.
+	jsonEmptyArrayKeyDescendingMarker = jsonObjectKeyMarker + 8
+	jsonNullKeyDescendingMarker       = jsonEmptyArrayKeyDescendingMarker - 1
+	jsonStringKeyDescendingMarker     = jsonNullKeyDescendingMarker - 1
+	jsonNumberKeyDescendingMarker     = jsonStringKeyDescendingMarker - 1
+	jsonFalseKeyDescendingMarker      = jsonNumberKeyDescendingMarker - 1
+	jsonTrueKeyDescendingMarker       = jsonFalseKeyDescendingMarker - 1
+	jsonArrayKeyDescendingMarker      = jsonTrueKeyDescendingMarker - 1
+	jsonObjectKeyDescendingMarker     = jsonArrayKeyDescendingMarker - 1
+
+	// LTREE key encoding markers
+	ltreeKeyMarker           = jsonEmptyArrayKeyDescendingMarker + 1
+	ltreeKeyDescendingMarker = ltreeKeyMarker + 1
+
+	// Terminators for JSON Key encoding.
+	jsonKeyTerminator           byte = 0x00
+	jsonKeyDescendingTerminator byte = 0xFF
+
+	// Terminators for LTREE Key encoding.
+	ltreeKeyTerminator                byte = 0x00
+	ltreeKeyDescendingTerminator      byte = 0xFF
+	ltreeLabelKeyTerminator           byte = 0x01
+	ltreeLabelKeyDescendingTerminator byte = 0xFE
 
 	// IntMin is chosen such that the range of int tags does not overlap the
 	// ascii character set that is frequently used in testing.
@@ -153,6 +191,25 @@ const (
 
 const escapeLength = 2
 
+// EncodeUint16Ascending encodes the uint16 value using a big-endian 2 byte
+// representation. The bytes are appended to the supplied buffer and
+// the final buffer is returned.
+func EncodeUint16Ascending(b []byte, v uint16) []byte {
+	return append(b, byte(v>>8), byte(v))
+}
+
+// PutUint16Ascending encodes the uint16 value using a big-endian 2 byte
+// representation at the specified index, lengthening the input slice if
+// necessary.
+func PutUint16Ascending(b []byte, v uint16, idx int) []byte {
+	for len(b) < idx+2 {
+		b = append(b, 0)
+	}
+	b[idx] = byte(v >> 8)
+	b[idx+1] = byte(v)
+	return b
+}
+
 // EncodeUint32Ascending encodes the uint32 value using a big-endian 4 byte
 // representation. The bytes are appended to the supplied buffer and
 // the final buffer is returned.
@@ -178,6 +235,17 @@ func PutUint32Ascending(b []byte, v uint32, idx int) []byte {
 // reverse order, from largest to smallest.
 func EncodeUint32Descending(b []byte, v uint32) []byte {
 	return EncodeUint32Ascending(b, ^v)
+}
+
+// DecodeUint16Ascending decodes a uint16 from the input buffer, treating
+// the input as a big-endian 2 byte uint16 representation. The remainder
+// of the input buffer and the decoded uint16 are returned.
+func DecodeUint16Ascending(b []byte) ([]byte, uint16, error) {
+	if len(b) < 2 {
+		return nil, 0, errors.Errorf("insufficient bytes to decode uint16 int value")
+	}
+	v := binary.BigEndian.Uint16(b)
+	return b[2:], v, nil
 }
 
 // DecodeUint32Ascending decodes a uint32 from the input buffer, treating
@@ -373,6 +441,31 @@ func EncodeUvarintAscending(b []byte, v uint64) []byte {
 	}
 }
 
+// EncodedLengthUvarintAscending returns the length of the variable length
+// representation, i.e. the number of bytes appended by EncodeUvarintAscending.
+func EncodedLengthUvarintAscending(v uint64) int {
+	switch {
+	case v <= intSmall:
+		return 1
+	case v <= 0xff:
+		return 2
+	case v <= 0xffff:
+		return 3
+	case v <= 0xffffff:
+		return 4
+	case v <= 0xffffffff:
+		return 5
+	case v <= 0xffffffffff:
+		return 6
+	case v <= 0xffffffffffff:
+		return 7
+	case v <= 0xffffffffffffff:
+		return 8
+	default:
+		return 9
+	}
+}
+
 // EncodeUvarintDescending encodes the uint64 value so that it sorts in
 // reverse order, from largest to smallest.
 func EncodeUvarintDescending(b []byte, v uint64) []byte {
@@ -443,6 +536,31 @@ func EncLenUvarintDescending(v uint64) int {
 		return 1
 	}
 	return 2 + highestByteIndex(v)
+}
+
+// GetUvarintLen is similar to DecodeUvarintAscending except that it returns the
+// length of the prefix that encodes a uint64 value in bytes without actually
+// decoding the value. An error is returned if b does not contain a valid
+// encoding of an unsigned int datum.
+func GetUvarintLen(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, errors.Errorf("insufficient bytes to decode uvarint value")
+	}
+	length := int(b[0]) - intZero
+	if length <= intSmall {
+		return 1, nil
+	}
+	length -= intSmall
+	if length < 0 || length > 8 {
+		return 0, errors.Errorf("invalid uvarint length of %d", length)
+	} else if len(b) <= length {
+		// Note: we use <= for comparison here as opposed to the < in
+		// DecodeUvarintAscending because in the latter the first byte for the
+		// uvarint is removed as part of decoding. We need to account for the first
+		// byte when assessing the size.
+		return 0, errors.Errorf("insufficient bytes to decode uvarint value: %q", b)
+	}
+	return 1 + length, nil
 }
 
 // DecodeUvarintAscending decodes a uint64 encoded uint64 from the input
@@ -528,6 +646,23 @@ func EncodeBytesAscending(b []byte, data []byte) []byte {
 	return encodeBytesAscendingWithTerminatorAndPrefix(b, data, ascendingBytesEscapes.escapedTerm, bytesMarker)
 }
 
+// EncodeNextBytesAscending encodes the []byte value with an extra 0x00 byte
+// appended before encoding. It's equivalent to
+//
+//	EncodeBytesAscending(b, append(data, 0x00))
+//
+// but may avoid an allocation when the data slice does not have additional
+// capacity.
+func EncodeNextBytesAscending(b []byte, data []byte) []byte {
+	b = append(b, bytesMarker)
+	return encodeNextBytesAscendingWithTerminator(b, data, ascendingBytesEscapes.escapedTerm)
+}
+
+func encodeNextBytesAscendingWithTerminator(b []byte, data []byte, terminator byte) []byte {
+	bs := encodeBytesAscendingWithoutTerminatorOrPrefix(b, data)
+	return append(bs, escape, escaped00, escape, terminator)
+}
+
 // encodeBytesAscendingWithTerminatorAndPrefix encodes the []byte value using an escape-based
 // encoding. The encoded value is terminated with the sequence
 // "\x00\terminator". The encoded bytes are append to the supplied buffer
@@ -579,12 +714,49 @@ func EncodeBytesDescending(b []byte, data []byte) []byte {
 	return b
 }
 
+// EncodeBytesSize returns the size of the []byte value when encoded using
+// EncodeBytes{Ascending,Descending}. The function accounts for the encoding
+// marker, escaping, and the terminator.
+func EncodeBytesSize(data []byte) int {
+	// Encoding overhead:
+	// +1 for [bytesMarker] prefix
+	// +2 for [escape, escapedTerm] suffix
+	// +1 for each byte that needs to be escaped
+	//
+	// NOTE: bytes.Count is implemented by the go runtime in assembly and is
+	// much faster than looping over the bytes in the slice, especially when
+	// given a single-byte separator.
+	return len(data) + 3 + bytes.Count(data, []byte{escape})
+}
+
+// EncodeNextBytesSize returns the size of the []byte value when suffixed with a
+// zero byte and then encoded using EncodeNextBytes{Ascending,Descending}. The
+// function accounts for the encoding marker, escaping, and the terminator.
+func EncodeNextBytesSize(data []byte) int {
+	// Encoding overhead:
+	// +1 for [bytesMarker] prefix
+	// +2 for [escape, escapedTerm] suffix
+	// +1 for each byte that needs to be escaped
+	// +2 for the appended 0x00 byte, plus its escaping byte
+	//
+	// NOTE: bytes.Count is implemented by the go runtime in assembly and is
+	// much faster than looping over the bytes in the slice, especially when
+	// given a single-byte separator.
+	return len(data) + 5 + bytes.Count(data, []byte{escape})
+}
+
 // DecodeBytesAscending decodes a []byte value from the input buffer
 // which was encoded using EncodeBytesAscending. The decoded bytes
 // are appended to r. The remainder of the input buffer and the
 // decoded []byte are returned.
 func DecodeBytesAscending(b []byte, r []byte) ([]byte, []byte, error) {
 	return decodeBytesInternal(b, r, ascendingBytesEscapes, true /* expectMarker */, false /* deepCopy */)
+}
+
+// ValidateDecodeBytesAscending is like DecodeBytesAscending, but discards the
+// decoded bytes. The remainder of the input buffer is returned on success.
+func ValidateDecodeBytesAscending(b []byte) ([]byte, error) {
+	return validateDecodeBytesInternal(b, ascendingBytesEscapes, true /* expectMarker */)
 }
 
 // DecodeBytesAscendingDeepCopy is the same as DecodeBytesAscending, but the
@@ -651,6 +823,37 @@ func decodeBytesInternal(
 	}
 }
 
+// validateDecodeBytesInternal decodes an encoded []byte value from b,
+// discarding the decoded value. The remainder of b is returned on success, or a
+// non-nil error otherwise.
+func validateDecodeBytesInternal(b []byte, e escapes, expectMarker bool) ([]byte, error) {
+	if expectMarker {
+		if len(b) == 0 || b[0] != e.marker {
+			return nil, errors.Errorf("did not find marker %#x in buffer %#x", e.marker, b)
+		}
+		b = b[1:]
+	}
+
+	for {
+		i := bytes.IndexByte(b, e.escape)
+		if i == -1 {
+			return nil, errors.Errorf("did not find terminator %#x in buffer %#x", e.escape, b)
+		}
+		if i+1 >= len(b) {
+			return nil, errors.Errorf("malformed escape in buffer %#x", b)
+		}
+		v := b[i+1]
+		if v == e.escapedTerm {
+			return b[i+2:], nil
+		}
+
+		if v != e.escaped00 {
+			return nil, errors.Errorf("unknown escape sequence: %#x %#x", e.escape, v)
+		}
+		b = b[i+2:]
+	}
+}
+
 // getBytesLength finds the length of a bytes encoding.
 func getBytesLength(b []byte, e escapes) (int, error) {
 	// Skip the tag.
@@ -668,6 +871,20 @@ func getBytesLength(b []byte, e escapes) (int, error) {
 			return skipped, nil
 		}
 	}
+}
+
+// getLTreeLength finds the length of a ltree encoding.
+func getLTreeLength(b []byte, dir Direction) (int, error) {
+	var i int
+	if dir == Ascending {
+		i = bytes.IndexByte(b, ltreeKeyTerminator)
+	} else {
+		i = bytes.IndexByte(b, ltreeKeyDescendingTerminator)
+	}
+	if i == -1 {
+		return 0, errors.Errorf("did not find terminator")
+	}
+	return i + 1, nil
 }
 
 // prettyPrintInvertedIndexKey returns a string representation of the path part of a JSON inverted
@@ -689,7 +906,7 @@ func prettyPrintInvertedIndexKey(b []byte) (string, []byte, error) {
 		switch tempB[i+1] {
 		case escapedTerm:
 			if len(tempB[:i]) > 0 {
-				outBytes = outBytes + strconv.Quote(unsafeString(tempB[:i]))
+				outBytes = outBytes + strconv.Quote(UnsafeConvertBytesToString(tempB[:i]))
 			} else {
 				lenOut := len(outBytes)
 				if lenOut > 1 && outBytes[lenOut-1] == '/' {
@@ -698,9 +915,19 @@ func prettyPrintInvertedIndexKey(b []byte) (string, []byte, error) {
 			}
 			return outBytes, tempB[i+escapeLength:], nil
 		case escapedJSONObjectKeyTerm:
-			outBytes = outBytes + strconv.Quote(unsafeString(tempB[:i])) + "/"
+			outBytes = outBytes + strconv.Quote(UnsafeConvertBytesToString(tempB[:i])) + "/"
 		case escapedJSONArray:
 			outBytes = outBytes + "Arr/"
+			if i+2 >= len(tempB) {
+				// The key ends in an escaped JSON array byte, which is used in
+				// spans to scan over non-empty arrays.
+				return outBytes, nil, nil
+			}
+		case escaped00:
+			if i+2 >= len(tempB) {
+				// The key ends in an escaped NULL byte.
+				return outBytes, nil, nil
+			}
 		default:
 			return "", nil, errors.Errorf("malformed escape in buffer %#x", b)
 
@@ -715,18 +942,12 @@ func prettyPrintInvertedIndexKey(b []byte) (string, []byte, error) {
 // modified if the input string is expected to be used again - doing so could
 // violate Go semantics.
 func UnsafeConvertStringToBytes(s string) []byte {
+	// unsafe.StringData output is unspecified for empty string input so always
+	// return nil.
 	if len(s) == 0 {
 		return nil
 	}
-	// We unsafely convert the string to a []byte to avoid the
-	// usual allocation when converting to a []byte. This is
-	// kosher because we know that EncodeBytes{,Descending} does
-	// not keep a reference to the value it encodes. The first
-	// step is getting access to the string internals.
-	hdr := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	// Next we treat the string data as a maximally sized array which we
-	// slice. This usage is safe because the pointer value remains in the string.
-	return (*[0x7fffffff]byte)(unsafe.Pointer(hdr.Data))[:len(s):len(s)]
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // EncodeStringAscending encodes the string value using an escape-based encoding. See
@@ -770,6 +991,11 @@ func AddJSONPathTerminator(b []byte) []byte {
 	return append(b, escape, escapedTerm)
 }
 
+// AddJSONPathSeparator adds a json path separator to a byte array.
+func AddJSONPathSeparator(b []byte) []byte {
+	return append(b, escape, escapedJSONObjectKeyTerm)
+}
+
 // EncodeJSONEmptyObject returns a byte array b with a byte to signify an empty JSON object.
 func EncodeJSONEmptyObject(b []byte) []byte {
 	return append(b, escape, escapedTerm, jsonEmptyObject)
@@ -782,26 +1008,16 @@ func EncodeEmptyArray(b []byte) []byte {
 
 // EncodeStringDescending is the descending version of EncodeStringAscending.
 func EncodeStringDescending(b []byte, s string) []byte {
-	if len(s) == 0 {
-		return EncodeBytesDescending(b, nil)
-	}
-	// We unsafely convert the string to a []byte to avoid the
-	// usual allocation when converting to a []byte. This is
-	// kosher because we know that EncodeBytes{,Descending} does
-	// not keep a reference to the value it encodes. The first
-	// step is getting access to the string internals.
-	hdr := (*reflect.StringHeader)(unsafe.Pointer(&s))
-	// Next we treat the string data as a maximally sized array which we
-	// slice. This usage is safe because the pointer value remains in the string.
-	arg := (*[0x7fffffff]byte)(unsafe.Pointer(hdr.Data))[:len(s):len(s)]
+	arg := UnsafeConvertStringToBytes(s)
 	return EncodeBytesDescending(b, arg)
 }
 
-// unsafeString performs an unsafe conversion from a []byte to a string. The
-// returned string will share the underlying memory with the []byte which thus
-// allows the string to be mutable through the []byte. We're careful to use
-// this method only in situations in which the []byte will not be modified.
-func unsafeString(b []byte) string {
+// UnsafeConvertBytesToString performs an unsafe conversion from a []byte to a
+// string. The returned string will share the underlying memory with the
+// []byte which thus allows the string to be mutable through the []byte. We're
+// careful to use this method only in situations in which the []byte will not
+// be modified.
+func UnsafeConvertBytesToString(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
 }
 
@@ -812,7 +1028,7 @@ func unsafeString(b []byte) string {
 // string may share storage with the input buffer.
 func DecodeUnsafeStringAscending(b []byte, r []byte) ([]byte, string, error) {
 	b, r, err := DecodeBytesAscending(b, r)
-	return b, unsafeString(r), err
+	return b, UnsafeConvertBytesToString(r), err
 }
 
 // DecodeUnsafeStringAscendingDeepCopy is the same as
@@ -820,7 +1036,7 @@ func DecodeUnsafeStringAscending(b []byte, r []byte) ([]byte, string, error) {
 // with the input buffer.
 func DecodeUnsafeStringAscendingDeepCopy(b []byte, r []byte) ([]byte, string, error) {
 	b, r, err := DecodeBytesAscendingDeepCopy(b, r)
-	return b, unsafeString(r), err
+	return b, UnsafeConvertBytesToString(r), err
 }
 
 // DecodeUnsafeStringDescending decodes a string value from the input buffer which
@@ -831,7 +1047,7 @@ func DecodeUnsafeStringAscendingDeepCopy(b []byte, r []byte) ([]byte, string, er
 // buffer.
 func DecodeUnsafeStringDescending(b []byte, r []byte) ([]byte, string, error) {
 	b, r, err := DecodeBytesDescending(b, r)
-	return b, unsafeString(r), err
+	return b, UnsafeConvertBytesToString(r), err
 }
 
 // EncodeNullAscending encodes a NULL value. The encodes bytes are appended to the
@@ -1067,6 +1283,19 @@ func decodeTime(b []byte) (r []byte, sec int64, nsec int64, err error) {
 		return b, 0, 0, err
 	}
 	return b, sec, nsec, nil
+}
+
+// EncodeVoidAscendingOrDescending encodes a void (valid for both ascending and descending order).
+func EncodeVoidAscendingOrDescending(b []byte) []byte {
+	return append(b, voidMarker)
+}
+
+// DecodeVoidAscendingOrDescending decodes a void  (valid for both ascending and descending order).
+func DecodeVoidAscendingOrDescending(b []byte) ([]byte, error) {
+	if PeekType(b) != Void {
+		return nil, errors.Errorf("did not find Void marker")
+	}
+	return b[1:], nil
 }
 
 // EncodeBox2DAscending encodes a bounding box in ascending order.
@@ -1394,12 +1623,13 @@ func DecodeDurationDescending(b []byte) ([]byte, duration.Duration, error) {
 // backing word array as a byte array, using byte array encoding and escaped
 // special bytes (via  `encodeBytesAscendingWithoutTerminatorOrPrefix`).
 // There are two arguments against this alternative:
-// - the bytes must be encoded big endian, but the most common architectures
-//   running CockroachDB are little-endian, so the bytes would need
-//   to be reordered prior to encoding.
-// - when decoding or skipping over a value, the decoding/sizing loop
-//   would need to look at every byte of the encoding to find the
-//   terminator.
+//   - the bytes must be encoded big endian, but the most common architectures
+//     running CockroachDB are little-endian, so the bytes would need
+//     to be reordered prior to encoding.
+//   - when decoding or skipping over a value, the decoding/sizing loop
+//     would need to look at every byte of the encoding to find the
+//     terminator.
+//
 // In contrast, the chosen encoding using varints is endianness-agnostic
 // and enables fast decoding/skipping thanks ot the tag bytes.
 func EncodeBitArrayAscending(b []byte, d bitarray.BitArray) []byte {
@@ -1520,8 +1750,104 @@ func DecodeBitArrayDescending(b []byte) ([]byte, bitarray.BitArray, error) {
 	return b, ba, err
 }
 
+// EncodeLTreeAscending encodes a ltree.T value, appends it to the
+// supplied buffer, and returns the final buffer. The encoding is guaranteed to
+// be ordered such that if t1 < t2 then bytes.Compare will order them the same
+// way after encoding.
+//
+// The encoding is in the below format:
+// [ ltreeMarker ]
+// for each label:
+//
+//	[ label raw bytes ] [ ltreeLabelKeyTerminator ]
+//
+// [ ltreeKeyTerminator ]
+func EncodeLTreeAscending(b []byte, d ltree.T) []byte {
+	b = append(b, ltreeKeyMarker)
+	d.ForEachLabel(func(i int, label string) {
+		b = append(b, []byte(label)...)
+		b = append(b, ltreeLabelKeyTerminator)
+	})
+	b = append(b, ltreeKeyTerminator)
+	return b
+}
+
+// EncodeLTreeDescending is the descending version of EncodeLTreeAscending.
+func EncodeLTreeDescending(b []byte, d ltree.T) []byte {
+	b = append(b, ltreeKeyDescendingMarker)
+	d.ForEachLabel(func(i int, label string) {
+		n := len(b)
+		b = append(b, []byte(label)...)
+		onesComplement(b[n:])
+		b = append(b, ltreeLabelKeyDescendingTerminator)
+	})
+	b = append(b, ltreeKeyDescendingTerminator)
+	return b
+}
+
+// DecodeLTreeAscending decodes a ltree.T value which was encoded using
+// EncodeLTreeAscending. The remainder of the input buffer and the
+// decoded ltree.T are returned.
+func DecodeLTreeAscending(b []byte) ([]byte, ltree.T, error) {
+	if PeekType(b) != LTree {
+		return nil, ltree.Empty, errors.Errorf("did not find marker %#x", b)
+	}
+	b = b[1:]
+
+	var labels []string
+	for {
+		if len(b) != 0 && b[0] == ltreeKeyTerminator {
+			b = b[1:]
+			break
+		}
+		i := bytes.IndexByte(b, ltreeLabelKeyTerminator)
+		if i == -1 {
+			return nil, ltree.Empty, errors.Errorf("malformed ltree encoding")
+		}
+		labels = append(labels, string(b[:i]))
+		b = b[i+1:]
+	}
+	l, err := ltree.ParseLTreeFromLabels(labels)
+	if err != nil {
+		return nil, ltree.Empty, err
+	}
+	return b, l, nil
+}
+
+// DecodeLTreeDescending is the descending version of DecodeLTreeAscending.
+func DecodeLTreeDescending(b []byte) ([]byte, ltree.T, error) {
+	if PeekType(b) != LTreeDesc {
+		return nil, ltree.Empty, errors.Errorf("did not find marker %#x", b)
+	}
+	b = b[1:]
+
+	var labels []string
+	for {
+		if len(b) != 0 && b[0] == ltreeKeyDescendingTerminator {
+			b = b[1:]
+			break
+		}
+		i := bytes.IndexByte(b, ltreeLabelKeyDescendingTerminator)
+		if i == -1 {
+			return nil, ltree.Empty, errors.Errorf("malformed ltree encoding")
+		}
+		// Deep copying here is necessary to avoid modifying the input buffer slice.
+		var label []byte
+		label = append(label, b[:i]...)
+		onesComplement(label)
+		labels = append(labels, string(label))
+		b = b[i+1:]
+	}
+	l, err := ltree.ParseLTreeFromLabels(labels)
+	if err != nil {
+		return nil, ltree.Empty, err
+	}
+	return b, l, nil
+}
+
 // Type represents the type of a value encoded by
 // Encode{Null,NotNull,Varint,Uvarint,Float,Bytes}.
+//
 //go:generate stringer -type=Type
 type Type encodingtype.T
 
@@ -1548,17 +1874,40 @@ const (
 	// value requires more than 4 bits, and thus will be encoded in two bytes. It
 	// is not used as a type value, and thus intentionally overlaps with the
 	// subsequent type value. The 'Type' annotation is intentionally omitted here.
-	SentinelType      = 15
-	JSON         Type = 15
-	Tuple        Type = 16
-	BitArray     Type = 17
-	BitArrayDesc Type = 18 // BitArray encoded descendingly
-	TimeTZ       Type = 19
-	Geo          Type = 20
-	GeoDesc      Type = 21
-	ArrayKeyAsc  Type = 22 // Array key encoding
-	ArrayKeyDesc Type = 23 // Array key encoded descendingly
-	Box2D        Type = 24
+	SentinelType        = 15
+	JSON           Type = 15
+	Tuple          Type = 16
+	BitArray       Type = 17
+	BitArrayDesc   Type = 18 // BitArray encoded descendingly
+	TimeTZ         Type = 19
+	Geo            Type = 20
+	GeoDesc        Type = 21
+	ArrayKeyAsc    Type = 22 // Array key encoding
+	ArrayKeyDesc   Type = 23 // Array key encoded descendingly
+	Box2D          Type = 24
+	Void           Type = 25
+	TSQuery        Type = 26
+	TSVector       Type = 27
+	JSONNull       Type = 28
+	JSONNullDesc   Type = 29
+	JSONString     Type = 30
+	JSONStringDesc Type = 31
+	JSONNumber     Type = 32
+	JSONNumberDesc Type = 33
+	JSONFalse      Type = 34
+	JSONFalseDesc  Type = 35
+	JSONTrue       Type = 36
+	JSONTrueDesc   Type = 37
+	JSONArray      Type = 38
+	JSONArrayDesc  Type = 39
+	JSONObject     Type = 40
+	JSONObjectDesc Type = 41
+	// Special case
+	JsonEmptyArray     Type = 42
+	JsonEmptyArrayDesc Type = 43
+	PGVector           Type = 44
+	LTree              Type = 45
+	LTreeDesc          Type = 46
 )
 
 // typMap maps an encoded type byte to a decoded Type. It's got 256 slots, one
@@ -1595,6 +1944,38 @@ func slowPeekType(b []byte) Type {
 			return ArrayKeyAsc
 		case m == arrayKeyDescendingMarker:
 			return ArrayKeyDesc
+		case m == jsonNullKeyMarker:
+			return JSONNull
+		case m == jsonNullKeyDescendingMarker:
+			return JSONNullDesc
+		case m == jsonStringKeyMarker:
+			return JSONString
+		case m == jsonStringKeyDescendingMarker:
+			return JSONStringDesc
+		case m == jsonNumberKeyMarker:
+			return JSONNumber
+		case m == jsonNumberKeyDescendingMarker:
+			return JSONNumberDesc
+		case m == jsonFalseKeyMarker:
+			return JSONFalse
+		case m == jsonFalseKeyDescendingMarker:
+			return JSONFalseDesc
+		case m == jsonTrueKeyMarker:
+			return JSONTrue
+		case m == jsonTrueKeyDescendingMarker:
+			return JSONTrueDesc
+		case m == jsonArrayKeyMarker:
+			return JSONArray
+		case m == jsonArrayKeyDescendingMarker:
+			return JSONArrayDesc
+		case m == jsonEmptyArrayKeyMarker:
+			return JsonEmptyArray
+		case m == jsonEmptyArrayKeyDescendingMarker:
+			return JsonEmptyArrayDesc
+		case m == jsonObjectKeyMarker:
+			return JSONObject
+		case m == jsonObjectKeyDescendingMarker:
+			return JSONObjectDesc
 		case m == bytesMarker:
 			return Bytes
 		case m == bytesDescMarker:
@@ -1627,6 +2008,12 @@ func slowPeekType(b []byte) Type {
 			return Float
 		case m >= decimalNaN && m <= decimalNaNDesc:
 			return Decimal
+		case m == voidMarker:
+			return Void
+		case m == ltreeKeyMarker:
+			return LTree
+		case m == ltreeKeyDescendingMarker:
+			return LTreeDesc
 		}
 	}
 	return Unknown
@@ -1659,15 +2046,16 @@ func getMultiNonsortingVarintLen(b []byte, num int) (int, error) {
 	return p, nil
 }
 
-// getArrayLength returns the length of a key encoded array. The input
-// must have had the array type marker stripped from the front.
-func getArrayLength(buf []byte, dir Direction) (int, error) {
+func getArrayOrJSONLength(
+	buf []byte, dir Direction, keyDoneFn func(buf []byte, dir Direction) bool,
+) (int, error) {
 	result := 0
+
 	for {
 		if len(buf) == 0 {
-			return 0, errors.AssertionFailedf("invalid array encoding (unterminated)")
+			return 0, errors.AssertionFailedf("invalid encoding (unterminated)")
 		}
-		if IsArrayKeyDone(buf, dir) {
+		if keyDoneFn(buf, dir) {
 			// Increment to include the terminator byte.
 			result++
 			break
@@ -1716,7 +2104,9 @@ func PeekLength(b []byte) (int, error) {
 	switch m {
 	case encodedNull, encodedNullDesc, encodedNotNull, encodedNotNullDesc,
 		floatNaN, floatNaNDesc, floatZero, decimalZero, byte(True), byte(False),
-		emptyArray:
+		emptyArray, voidMarker, jsonNullKeyMarker, jsonNullKeyDescendingMarker,
+		jsonFalseKeyMarker, jsonFalseKeyDescendingMarker, jsonTrueKeyMarker,
+		jsonTrueKeyDescendingMarker:
 		// ascendingNullWithinArrayKey and descendingNullWithinArrayKey also
 		// contain the same byte values as encodedNotNull and encodedNotNullDesc
 		// respectively, but they cannot be included explicitly in the case
@@ -1736,12 +2126,42 @@ func PeekLength(b []byte) (int, error) {
 			return 1 + n + m + 1, err
 		}
 		return 1 + n + m + 1, nil
+	case jsonStringKeyMarker, jsonStringKeyDescendingMarker,
+		jsonNumberKeyMarker, jsonNumberKeyDescendingMarker:
+		dir := Ascending
+		if (m == jsonStringKeyDescendingMarker) ||
+			(m == jsonNumberKeyDescendingMarker) {
+			dir = Descending
+		}
+		length, err := getArrayOrJSONLength(b[1:], dir, IsJSONKeyDone)
+		return 1 + length, err
+	case jsonArrayKeyMarker, jsonArrayKeyDescendingMarker,
+		jsonObjectKeyMarker, jsonObjectKeyDescendingMarker,
+		jsonEmptyArrayKeyMarker, jsonEmptyArrayKeyDescendingMarker:
+		dir := Ascending
+		if (m == jsonArrayKeyDescendingMarker) ||
+			(m == jsonObjectKeyDescendingMarker) ||
+			(m == jsonEmptyArrayKeyDescendingMarker) {
+			dir = Descending
+		}
+		// removing the starter tag
+		b = b[1:]
+
+		// Getting the number of elements present
+		// in the container.
+		numberElems, err := getVarintLen(b)
+		if err != nil {
+			return -1, errors.AssertionFailedf("failed to get the number of elements" +
+				"in the container")
+		}
+		length, err := getArrayOrJSONLength(b[numberElems:], dir, IsJSONKeyDone)
+		return 1 + numberElems + length, err
 	case arrayKeyMarker, arrayKeyDescendingMarker:
 		dir := Ascending
 		if m == arrayKeyDescendingMarker {
 			dir = Descending
 		}
-		length, err := getArrayLength(b[1:], dir)
+		length, err := getArrayOrJSONLength(b[1:], dir, IsArrayKeyDone)
 		return 1 + length, err
 	case bytesMarker:
 		return getBytesLength(b, ascendingBytesEscapes)
@@ -1790,6 +2210,10 @@ func PeekLength(b []byte) (int, error) {
 			return 0, errors.Errorf("slice too short for float (%d)", len(b))
 		}
 		return 9, nil
+	case ltreeKeyMarker:
+		return getLTreeLength(b, Ascending)
+	case ltreeKeyDescendingMarker:
+		return getLTreeLength(b, Descending)
 	}
 	if m >= IntMin && m <= IntMax {
 		return getVarintLen(b)
@@ -1805,11 +2229,15 @@ func PeekLength(b []byte) (int, error) {
 // separator.
 // The directions each value is encoded may be provided. If valDirs is nil,
 // all values are decoded and printed with the default direction (ascending).
-func PrettyPrintValue(valDirs []Direction, b []byte, sep string) string {
-	s1, allDecoded := prettyPrintValueImpl(valDirs, b, sep)
+func PrettyPrintValue(buf *redact.StringBuilder, valDirs []Direction, b []byte, sep string) {
+	safeSep := redact.SafeString(sep)
+	allDecoded := prettyPrintValueImpl(buf, valDirs, b, safeSep)
 	if allDecoded {
-		return s1
+		return
 	}
+	// If we failed to decoded everything above, assume the key was the result of a
+	// `PrefixEnd()`. Attempt to undo PrefixEnd & retry the process, otherwise return
+	// what we were able to decode.
 	if undoPrefixEnd, ok := UndoPrefixEnd(b); ok {
 		// When we UndoPrefixEnd, we may have lost a tail of 0xFFs. Try to add
 		// enough of them to get something decoded. This is best-effort, we have to stop
@@ -1819,18 +2247,80 @@ func PrettyPrintValue(valDirs []Direction, b []byte, sep string) string {
 			cap = len(valDirs) - len(b)
 		}
 		for i := 0; i < cap; i++ {
-			if s2, allDecoded := prettyPrintValueImpl(valDirs, undoPrefixEnd, sep); allDecoded {
-				return s2 + sep + "PrefixEnd"
+			if allDecoded := prettyPrintValueImpl(buf, valDirs, undoPrefixEnd, safeSep); allDecoded {
+				buf.Reset()
+				buf.Print(sep + "PrefixEnd")
+				return
 			}
 			undoPrefixEnd = append(undoPrefixEnd, 0xFF)
 		}
 	}
-	return s1
 }
 
-func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bool) {
+// PrettyPrintValuesWithTypes returns a slice containing each contiguous decodable value
+// in the provided byte slice along with a slice containing the type of each value.
+// The directions each value is encoded may be provided. If valDirs is nil,
+// all values are decoded and printed with the default direction (ascending).
+func PrettyPrintValuesWithTypes(valDirs []Direction, b []byte) (vals []string, types []Type) {
+	vals1, types1, allDecoded := prettyPrintValuesWithTypesImpl(valDirs, b)
+	if allDecoded {
+		return vals1, types1
+	}
+	// If we failed to decoded everything above, assume the key was the result of a
+	// `PrefixEnd()`. Attempt to undo PrefixEnd & retry the process, otherwise return
+	// what we were able to decode.
+	if undoPrefixEnd, ok := UndoPrefixEnd(b); ok {
+		// When we UndoPrefixEnd, we may have lost a tail of 0xFFs. Try to add
+		// enough of them to get something decoded. This is best-effort, we have to stop
+		// somewhere.
+		cap := 20
+		if len(valDirs) > len(b) {
+			cap = len(valDirs) - len(b)
+		}
+		for i := 0; i < cap; i++ {
+			if vals2, types2, allDecoded := prettyPrintValuesWithTypesImpl(valDirs, undoPrefixEnd); allDecoded {
+				vals2 = append(vals2, "PrefixEnd")
+				types2 = append(types2, Bytes)
+				return vals2, types2
+			}
+			undoPrefixEnd = append(undoPrefixEnd, 0xFF)
+		}
+	}
+	return vals1, types1
+}
+
+func prettyPrintValuesWithTypesImpl(
+	valDirs []Direction, b []byte,
+) (vals []string, types []Type, allDecoded bool) {
+	allDecoded = true
+	for len(b) > 0 {
+		var valDir Direction
+		if len(valDirs) > 0 {
+			valDir = valDirs[0]
+			valDirs = valDirs[1:]
+		}
+
+		bb, s, err := prettyPrintFirstValue(valDir, b)
+		if err != nil {
+			// If we fail to decode, mark as unknown and attempt
+			// to continue - it's possible we can still decode the
+			// remainder of the key bytes.
+			allDecoded = false
+			vals = append(vals, "???")
+			types = append(types, Unknown)
+		} else {
+			vals = append(vals, s)
+			types = append(types, PeekType(b))
+		}
+		b = bb
+	}
+	return vals, types, allDecoded
+}
+
+func prettyPrintValueImpl(
+	buf *redact.StringBuilder, valDirs []Direction, b []byte, sep redact.SafeString,
+) bool {
 	allDecoded := true
-	var buf strings.Builder
 	for len(b) > 0 {
 		// If there are more values than encoding directions specified,
 		// valDir will contain the 0 value of Direction.
@@ -1844,18 +2334,20 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 
 		bb, s, err := prettyPrintFirstValue(valDir, b)
 		if err != nil {
+			// If we fail to decode, mark as unknown and attempt
+			// to continue - it's possible we can still decode the
+			// remainder of the key bytes.
 			allDecoded = false
-			buf.WriteString(sep)
-			buf.WriteByte('?')
-			buf.WriteByte('?')
-			buf.WriteByte('?')
+			// Mark the separator as safe.
+			buf.Print(sep)
+			buf.SafeString("???")
 		} else {
-			buf.WriteString(sep)
-			buf.WriteString(s)
+			buf.Print(sep)
+			buf.Print(redact.Safe(s))
 		}
 		b = bb
 	}
-	return buf.String(), allDecoded
+	return allDecoded
 }
 
 // prettyPrintFirstValue returns a string representation of the first decodable
@@ -1889,7 +2381,7 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 		build.WriteString("ARRAY[")
 		first := true
 		// Use the array key decoding logic, but instead of calling out
-		// to DecodeTableKey, just make a recursive call.
+		// to keyside.Decode, just make a recursive call.
 		for {
 			if len(buf) == 0 {
 				return nil, "", errors.AssertionFailedf("invalid array (unterminated)")
@@ -2020,6 +2512,26 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 			return b, "", err
 		}
 		return b, d.StringNanos(), nil
+	case LTree:
+		if dir == Descending {
+			return b, "", errors.Errorf("ascending ltree column dir but descending ltree encoding")
+		}
+		var l ltree.T
+		b, l, err = DecodeLTreeAscending(b)
+		if err != nil {
+			return b, "", err
+		}
+		return b, l.String(), nil
+	case LTreeDesc:
+		if dir == Ascending {
+			return b, "", errors.Errorf("descending ltree column dir but ascending ltree encoding")
+		}
+		var l ltree.T
+		b, l, err = DecodeLTreeDescending(b)
+		if err != nil {
+			return b, "", err
+		}
+		return b, l.String(), nil
 	default:
 		if len(b) >= 1 {
 			switch b[0] {
@@ -2068,8 +2580,8 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 //
 // Formally:
 //
-//     PrefixEnd(UndoPrefixEnd(p)) = p for all non-minimal prefixes p
-//     UndoPrefixEnd(PrefixEnd(p)) = p for all non-maximal prefixes p
+//	PrefixEnd(UndoPrefixEnd(p)) = p for all non-minimal prefixes p
+//	UndoPrefixEnd(PrefixEnd(p)) = p for all non-maximal prefixes p
 //
 // A minimal prefix is any prefix that consists only of one or more 0x00 bytes;
 // analogously, a maximal prefix is any prefix that consists only of one or more
@@ -2117,10 +2629,10 @@ const MaxNonsortingUvarintLen = 10
 // EncodeNonsortingUvarint encodes a uint64, appends it to the supplied buffer,
 // and returns the final buffer. The encoding used is similar to
 // encoding/binary, but with the most significant bits first:
-// - Unsigned integers are serialized 7 bits at a time, starting with the
-//   most significant bits.
-// - The most significant bit (msb) in each output byte indicates if there
-//   is a continuation byte (msb = 1).
+//   - Unsigned integers are serialized 7 bits at a time, starting with the
+//     most significant bits.
+//   - The most significant bit (msb) in each output byte indicates if there
+//     is a continuation byte (msb = 1).
 func EncodeNonsortingUvarint(appendTo []byte, x uint64) []byte {
 	switch {
 	case x < (1 << 7):
@@ -2191,8 +2703,8 @@ const NoColumnID uint32 = 0
 // methods.
 //
 // The prefix uses varints to encode a column id and type, packing them into a
-// single byte when they're small (colID < 8 and typ < 15). This works by
-// shifting the colID "left" by 4 and putting any type less than 15 in the low
+// single byte when they're small (colIDDelta < 8 and typ < 15). This works by
+// shifting the colIDDelta "left" by 4 and putting any type less than 15 in the low
 // bytes. The result is uvarint encoded and fits in one byte if the original
 // column id fit in 3 bits. If it doesn't fit in one byte, the most significant
 // bits spill to the "left", leaving the type bits always at the very "right".
@@ -2203,45 +2715,45 @@ const NoColumnID uint32 = 0
 //
 // Together, this means the everything but the last byte of the first uvarint
 // can be dropped if the column id isn't needed.
-func EncodeValueTag(appendTo []byte, colID uint32, typ Type) []byte {
+func EncodeValueTag(appendTo []byte, colIDDelta uint32, typ Type) []byte {
 	if typ >= SentinelType {
-		appendTo = EncodeNonsortingUvarint(appendTo, uint64(colID)<<4|uint64(SentinelType))
+		appendTo = EncodeNonsortingUvarint(appendTo, uint64(colIDDelta)<<4|uint64(SentinelType))
 		return EncodeNonsortingUvarint(appendTo, uint64(typ))
 	}
-	if colID == NoColumnID {
+	if colIDDelta == NoColumnID {
 		// TODO(dan): EncodeValueTag is not inlined by the compiler. Copying this
 		// special case into one of the EncodeFooValue functions speeds it up by
 		// ~4ns.
 		return append(appendTo, byte(typ))
 	}
-	return EncodeNonsortingUvarint(appendTo, uint64(colID)<<4|uint64(typ))
+	return EncodeNonsortingUvarint(appendTo, uint64(colIDDelta)<<4|uint64(typ))
 }
 
 // EncodeNullValue encodes a null value, appends it to the supplied buffer, and
 // returns the final buffer.
-func EncodeNullValue(appendTo []byte, colID uint32) []byte {
-	return EncodeValueTag(appendTo, colID, Null)
+func EncodeNullValue(appendTo []byte, colIDDelta uint32) []byte {
+	return EncodeValueTag(appendTo, colIDDelta, Null)
 }
 
 // EncodeNotNullValue encodes a not null value, appends it to the supplied
 // buffer, and returns the final buffer.
-func EncodeNotNullValue(appendTo []byte, colID uint32) []byte {
-	return EncodeValueTag(appendTo, colID, NotNull)
+func EncodeNotNullValue(appendTo []byte, colIDDelta uint32) []byte {
+	return EncodeValueTag(appendTo, colIDDelta, NotNull)
 }
 
 // EncodeBoolValue encodes a bool value, appends it to the supplied buffer, and
 // returns the final buffer.
-func EncodeBoolValue(appendTo []byte, colID uint32, b bool) []byte {
+func EncodeBoolValue(appendTo []byte, colIDDelta uint32, b bool) []byte {
 	if b {
-		return EncodeValueTag(appendTo, colID, True)
+		return EncodeValueTag(appendTo, colIDDelta, True)
 	}
-	return EncodeValueTag(appendTo, colID, False)
+	return EncodeValueTag(appendTo, colIDDelta, False)
 }
 
 // EncodeIntValue encodes an int value with its value tag, appends it to the
 // supplied buffer, and returns the final buffer.
-func EncodeIntValue(appendTo []byte, colID uint32, i int64) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Int)
+func EncodeIntValue(appendTo []byte, colIDDelta uint32, i int64) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Int)
 	return EncodeUntaggedIntValue(appendTo, i)
 }
 
@@ -2255,8 +2767,8 @@ const floatValueEncodedLength = uint64AscendingEncodedLength
 
 // EncodeFloatValue encodes a float value with its value tag, appends it to the
 // supplied buffer, and returns the final buffer.
-func EncodeFloatValue(appendTo []byte, colID uint32, f float64) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Float)
+func EncodeFloatValue(appendTo []byte, colIDDelta uint32, f float64) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Float)
 	return EncodeUntaggedFloatValue(appendTo, f)
 }
 
@@ -2266,10 +2778,16 @@ func EncodeUntaggedFloatValue(appendTo []byte, f float64) []byte {
 	return EncodeUint64Ascending(appendTo, math.Float64bits(f))
 }
 
+// EncodeUntaggedFloat32Value encodes a float32 value, appends it to the supplied buffer,
+// and returns the final buffer.
+func EncodeUntaggedFloat32Value(appendTo []byte, f float32) []byte {
+	return EncodeUint32Ascending(appendTo, math.Float32bits(f))
+}
+
 // EncodeBytesValue encodes a byte array value with its value tag, appends it to
 // the supplied buffer, and returns the final buffer.
-func EncodeBytesValue(appendTo []byte, colID uint32, data []byte) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Bytes)
+func EncodeBytesValue(appendTo []byte, colIDDelta uint32, data []byte) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Bytes)
 	return EncodeUntaggedBytesValue(appendTo, data)
 }
 
@@ -2282,15 +2800,15 @@ func EncodeUntaggedBytesValue(appendTo []byte, data []byte) []byte {
 
 // EncodeArrayValue encodes a byte array value with its value tag, appends it to
 // the supplied buffer, and returns the final buffer.
-func EncodeArrayValue(appendTo []byte, colID uint32, data []byte) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Array)
+func EncodeArrayValue(appendTo []byte, colIDDelta uint32, data []byte) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Array)
 	return EncodeUntaggedBytesValue(appendTo, data)
 }
 
 // EncodeTimeValue encodes a time.Time value with its value tag, appends it to
 // the supplied buffer, and returns the final buffer.
-func EncodeTimeValue(appendTo []byte, colID uint32, t time.Time) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Time)
+func EncodeTimeValue(appendTo []byte, colIDDelta uint32, t time.Time) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Time)
 	return EncodeUntaggedTimeValue(appendTo, t)
 }
 
@@ -2303,8 +2821,8 @@ func EncodeUntaggedTimeValue(appendTo []byte, t time.Time) []byte {
 
 // EncodeTimeTZValue encodes a timetz.TimeTZ value with its value tag, appends it to
 // the supplied buffer, and returns the final buffer.
-func EncodeTimeTZValue(appendTo []byte, colID uint32, t timetz.TimeTZ) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, TimeTZ)
+func EncodeTimeTZValue(appendTo []byte, colIDDelta uint32, t timetz.TimeTZ) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, TimeTZ)
 	return EncodeUntaggedTimeTZValue(appendTo, t)
 }
 
@@ -2315,10 +2833,16 @@ func EncodeUntaggedTimeTZValue(appendTo []byte, t timetz.TimeTZ) []byte {
 	return EncodeNonsortingStdlibVarint(appendTo, int64(t.OffsetSecs))
 }
 
+// EncodeVoidValue encodes a void with its value tag, appends it to
+// the supplied buffer and returns the final buffer.
+func EncodeVoidValue(appendTo []byte, colIDDelta uint32) []byte {
+	return EncodeValueTag(appendTo, colIDDelta, Void)
+}
+
 // EncodeBox2DValue encodes a geopb.BoundingBox with its value tag, appends it to
 // the supplied buffer and returns the final buffer.
-func EncodeBox2DValue(appendTo []byte, colID uint32, b geopb.BoundingBox) ([]byte, error) {
-	appendTo = EncodeValueTag(appendTo, colID, Box2D)
+func EncodeBox2DValue(appendTo []byte, colIDDelta uint32, b geopb.BoundingBox) ([]byte, error) {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Box2D)
 	return EncodeUntaggedBox2DValue(appendTo, b)
 }
 
@@ -2334,8 +2858,8 @@ func EncodeUntaggedBox2DValue(appendTo []byte, b geopb.BoundingBox) ([]byte, err
 
 // EncodeGeoValue encodes a geopb.SpatialObject value with its value tag, appends it to
 // the supplied buffer, and returns the final buffer.
-func EncodeGeoValue(appendTo []byte, colID uint32, so *geopb.SpatialObject) ([]byte, error) {
-	appendTo = EncodeValueTag(appendTo, colID, Geo)
+func EncodeGeoValue(appendTo []byte, colIDDelta uint32, so *geopb.SpatialObject) ([]byte, error) {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Geo)
 	return EncodeUntaggedGeoValue(appendTo, so)
 }
 
@@ -2351,8 +2875,8 @@ func EncodeUntaggedGeoValue(appendTo []byte, so *geopb.SpatialObject) ([]byte, e
 
 // EncodeDecimalValue encodes an apd.Decimal value with its value tag, appends
 // it to the supplied buffer, and returns the final buffer.
-func EncodeDecimalValue(appendTo []byte, colID uint32, d *apd.Decimal) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Decimal)
+func EncodeDecimalValue(appendTo []byte, colIDDelta uint32, d *apd.Decimal) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Decimal)
 	return EncodeUntaggedDecimalValue(appendTo, d)
 }
 
@@ -2375,8 +2899,8 @@ func EncodeUntaggedDecimalValue(appendTo []byte, d *apd.Decimal) []byte {
 
 // EncodeDurationValue encodes a duration.Duration value with its value tag,
 // appends it to the supplied buffer, and returns the final buffer.
-func EncodeDurationValue(appendTo []byte, colID uint32, d duration.Duration) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, Duration)
+func EncodeDurationValue(appendTo []byte, colIDDelta uint32, d duration.Duration) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, Duration)
 	return EncodeUntaggedDurationValue(appendTo, d)
 }
 
@@ -2390,8 +2914,8 @@ func EncodeUntaggedDurationValue(appendTo []byte, d duration.Duration) []byte {
 
 // EncodeBitArrayValue encodes a bit array value with its value tag,
 // appends it to the supplied buffer, and returns the final buffer.
-func EncodeBitArrayValue(appendTo []byte, colID uint32, d bitarray.BitArray) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, BitArray)
+func EncodeBitArrayValue(appendTo []byte, colIDDelta uint32, d bitarray.BitArray) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, BitArray)
 	return EncodeUntaggedBitArrayValue(appendTo, d)
 }
 
@@ -2410,8 +2934,8 @@ func EncodeUntaggedBitArrayValue(appendTo []byte, d bitarray.BitArray) []byte {
 
 // EncodeUUIDValue encodes a uuid.UUID value with its value tag, appends it to
 // the supplied buffer, and returns the final buffer.
-func EncodeUUIDValue(appendTo []byte, colID uint32, u uuid.UUID) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, UUID)
+func EncodeUUIDValue(appendTo []byte, colIDDelta uint32, u uuid.UUID) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, UUID)
 	return EncodeUntaggedUUIDValue(appendTo, u)
 }
 
@@ -2423,8 +2947,8 @@ func EncodeUntaggedUUIDValue(appendTo []byte, u uuid.UUID) []byte {
 
 // EncodeIPAddrValue encodes a ipaddr.IPAddr value with its value tag, appends
 // it to the supplied buffer, and returns the final buffer.
-func EncodeIPAddrValue(appendTo []byte, colID uint32, u ipaddr.IPAddr) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, IPAddr)
+func EncodeIPAddrValue(appendTo []byte, colIDDelta uint32, u ipaddr.IPAddr) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, IPAddr)
 	return EncodeUntaggedIPAddrValue(appendTo, u)
 }
 
@@ -2437,9 +2961,49 @@ func EncodeUntaggedIPAddrValue(appendTo []byte, u ipaddr.IPAddr) []byte {
 // EncodeJSONValue encodes an already-byte-encoded JSON value with no value tag
 // but with a length prefix, appends it to the supplied buffer, and returns the
 // final buffer.
-func EncodeJSONValue(appendTo []byte, colID uint32, data []byte) []byte {
-	appendTo = EncodeValueTag(appendTo, colID, JSON)
+func EncodeJSONValue(appendTo []byte, colIDDelta uint32, data []byte) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, JSON)
 	return EncodeUntaggedBytesValue(appendTo, data)
+}
+
+// EncodeTSQueryValue encodes an already-byte-encoded TSQuery value with no
+// value tag but with a length prefix, appends it to the supplied buffer, and
+// returns the final buffer.
+func EncodeTSQueryValue(appendTo []byte, colIDDelta uint32, data []byte) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, TSQuery)
+	return EncodeUntaggedBytesValue(appendTo, data)
+}
+
+// EncodeTSVectorValue encodes an already-byte-encoded TSVector value with no
+// value tag but with a length prefix, appends it to the supplied buffer, and
+// returns the final buffer.
+func EncodeTSVectorValue(appendTo []byte, colIDDelta uint32, data []byte) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, TSVector)
+	return EncodeUntaggedBytesValue(appendTo, data)
+}
+
+// EncodePGVectorValue encodes an already-byte-encoded PGVector value with no
+// value tag but with a length prefix, appends it to the supplied buffer, and
+// returns the final buffer.
+func EncodePGVectorValue(appendTo []byte, colIDDelta uint32, data []byte) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, PGVector)
+	return EncodeUntaggedBytesValue(appendTo, data)
+}
+
+// EncodeLTreeValue encodes a ltree.T value with its value tag, appends it to
+// the supplied buffer, and returns the final buffer.
+func EncodeLTreeValue(appendTo []byte, colIDDelta uint32, l ltree.T) []byte {
+	appendTo = EncodeValueTag(appendTo, colIDDelta, LTree)
+	return EncodeUntaggedLTreeValue(appendTo, l)
+}
+
+// EncodeUntaggedLTreeValue encodes a ltree.T value, appends it to the supplied
+// buffer, and returns the final buffer.
+func EncodeUntaggedLTreeValue(appendTo []byte, l ltree.T) []byte {
+	var buf bytes.Buffer
+	l.FormatToBuffer(&buf)
+	appendTo = EncodeUntaggedBytesValue(appendTo, buf.Bytes())
+	return appendTo
 }
 
 // DecodeValueTag decodes a value encoded by EncodeValueTag, used as a prefix in
@@ -2450,18 +3014,24 @@ func EncodeJSONValue(appendTo []byte, colID uint32, data []byte) []byte {
 // PeekValueLength and each of the DecodeFooValue methods will still work as
 // expected with `b[typeOffset:]`. (Except, obviously, the column id is no
 // longer encoded so if this suffix is passed back to DecodeValueTag, the
-// returned colID should be discarded.)
+// returned colIDDelta should be discarded.)
 //
 // Concretely:
-//     b := ...
-//     typeOffset, _, colID, typ, err := DecodeValueTag(b)
-//     _, _, _, typ, err := DecodeValueTag(b[typeOffset:])
+//
+//	b := ...
+//	typeOffset, _, colIDDelta, typ, err := DecodeValueTag(b)
+//	_, _, _, typ, err := DecodeValueTag(b[typeOffset:])
+//
 // will return the same typ and err and
-//     DecodeFooValue(b)
-//     DecodeFooValue(b[typeOffset:])
+//
+//	DecodeFooValue(b)
+//	DecodeFooValue(b[typeOffset:])
+//
 // will return the same thing. PeekValueLength works as expected with either of
 // `b` or `b[typeOffset:]`.
-func DecodeValueTag(b []byte) (typeOffset int, dataOffset int, colID uint32, typ Type, err error) {
+func DecodeValueTag(
+	b []byte,
+) (typeOffset int, dataOffset int, colIDDelta uint32, typ Type, err error) {
 	// TODO(dan): This can be made faster by special casing the single byte
 	// version and skipping the column id extraction when it's not needed.
 	if len(b) == 0 {
@@ -2473,7 +3043,7 @@ func DecodeValueTag(b []byte) (typeOffset int, dataOffset int, colID uint32, typ
 	if err != nil {
 		return 0, 0, 0, Unknown, err
 	}
-	colID = uint32(tag >> 4)
+	colIDDelta = uint32(tag >> 4)
 
 	typ = Type(tag & 0xf)
 	typeOffset = n - 1
@@ -2486,7 +3056,7 @@ func DecodeValueTag(b []byte) (typeOffset int, dataOffset int, colID uint32, typ
 		typ = Type(tag)
 		dataOffset += n
 	}
-	return typeOffset, dataOffset, colID, typ, nil
+	return typeOffset, dataOffset, colIDDelta, typ, nil
 }
 
 // DecodeBoolValue decodes a value encoded by EncodeBoolValue.
@@ -2538,6 +3108,16 @@ func DecodeUntaggedFloatValue(b []byte) (remaining []byte, f float64, err error)
 	var i uint64
 	b, i, err = DecodeUint64Ascending(b)
 	return b, math.Float64frombits(i), err
+}
+
+// DecodeUntaggedFloat32Value decodes a value encoded by EncodeUntaggedFloat32Value.
+func DecodeUntaggedFloat32Value(b []byte) (remaining []byte, f float32, err error) {
+	if len(b) < 4 {
+		return b, 0, fmt.Errorf("float32 value should be exactly 4 bytes: %d", len(b))
+	}
+	var i uint32
+	b, i, err = DecodeUint32Ascending(b)
+	return b, math.Float32frombits(i), err
 }
 
 // DecodeBytesValue decodes a value encoded by EncodeBytesValue.
@@ -2750,6 +3330,9 @@ func DecodeUUIDValue(b []byte) (remaining []byte, u uuid.UUID, err error) {
 
 // DecodeUntaggedUUIDValue decodes a value encoded by EncodeUntaggedUUIDValue.
 func DecodeUntaggedUUIDValue(b []byte) (remaining []byte, u uuid.UUID, err error) {
+	if len(b) < uuidValueEncodedLength {
+		return b, uuid.UUID{}, errors.Errorf("invalid uuid length of %d", len(b))
+	}
 	u, err = uuid.FromBytes(b[:uuidValueEncodedLength])
 	if err != nil {
 		return b, uuid.UUID{}, err
@@ -2770,6 +3353,28 @@ func DecodeIPAddrValue(b []byte) (remaining []byte, u ipaddr.IPAddr, err error) 
 func DecodeUntaggedIPAddrValue(b []byte) (remaining []byte, u ipaddr.IPAddr, err error) {
 	remaining, err = u.FromBuffer(b)
 	return remaining, u, err
+}
+
+// DecodeLTreeValue decodes a value encoded by EncodeLTreeValue.
+func DecodeLTreeValue(b []byte) (remaining []byte, l ltree.T, err error) {
+	b, err = decodeValueTypeAssert(b, LTree)
+	if err != nil {
+		return b, l, err
+	}
+	return DecodeUntaggedLTreeValue(b)
+}
+
+// DecodeUntaggedLTreeValue decodes a value encoded by EncodeUntaggedLTreeValue.
+func DecodeUntaggedLTreeValue(b []byte) (remaining []byte, l ltree.T, err error) {
+	remaining, data, err := DecodeUntaggedBytesValue(b)
+	if err != nil {
+		return b, l, err
+	}
+	l, err = ltree.ParseLTree(string(data))
+	if err != nil {
+		return b, l, err
+	}
+	return remaining, l, nil
 }
 
 func decodeValueTypeAssert(b []byte, expected Type) ([]byte, error) {
@@ -2817,6 +3422,8 @@ func PeekValueLengthWithOffsetsAndType(b []byte, dataOffset int, typ Type) (leng
 	switch typ {
 	case Null:
 		return dataOffset, nil
+	case Void:
+		return dataOffset, nil
 	case True, False:
 		return dataOffset, nil
 	case Int:
@@ -2824,7 +3431,7 @@ func PeekValueLengthWithOffsetsAndType(b []byte, dataOffset int, typ Type) (leng
 		return dataOffset + n, err
 	case Float:
 		return dataOffset + floatValueEncodedLength, nil
-	case Bytes, Array, JSON, Geo:
+	case Bytes, Array, JSON, Geo, TSVector, TSQuery, PGVector, LTree:
 		_, n, i, err := DecodeNonsortingUvarint(b)
 		return dataOffset + n + int(i), err
 	case Box2D:
@@ -2887,6 +3494,26 @@ func PrintableBytes(b []byte) bool {
 func isValidAndPrintableRune(r rune) bool {
 	return r != utf8.RuneError && unicode.IsPrint(r)
 }
+
+// PrettyPrintJSONValueEncoded returns a string representation of the encoded
+// JSON object. It is injected from util/json to avoid an import cycle.
+var PrettyPrintJSONValueEncoded func([]byte) (string, error)
+
+var prettyPrintJSONValueEncodedNilErr = errors.New("PrettyPrintJSONValueEncoded is not injected")
+
+// PrettyPrintArrayValueEncoded returns a string representation of the encoded
+// array object if possible. It is injected from rowenc/valueside to avoid an
+// import cycle.
+var PrettyPrintArrayValueEncoded func([]byte) (string, error)
+
+var prettyPrintArrayValueEncodedNilErr = errors.New("PrettyPrintArrayValueEncoded is not injected")
+
+// PrettyPrintTupleValueEncoded returns a string representation of the encoded
+// tuple object if possible. It is injected from rowenc/valueside to avoid an
+// import cycle.
+var PrettyPrintTupleValueEncoded func([]byte) ([]byte, string, error)
+
+var prettyPrintTupleValueEncodedNilErr = errors.New("PrettyPrintTupleValueEncoded is not injected")
 
 // PrettyPrintValueEncoded returns a string representation of the first
 // decodable value in the provided byte slice, along with the remaining byte
@@ -2983,6 +3610,47 @@ func PrettyPrintValueEncoded(b []byte) ([]byte, string, error) {
 			return b, "", err
 		}
 		return b, ipAddr.String(), nil
+	case JSON:
+		b = b[dataOffset:]
+		var data []byte
+		b, data, err = DecodeUntaggedBytesValue(b)
+		if err != nil {
+			return b, "", err
+		}
+		if PrettyPrintJSONValueEncoded == nil {
+			return b, "", prettyPrintJSONValueEncodedNilErr
+		}
+		var s string
+		s, err = PrettyPrintJSONValueEncoded(data)
+		return b, s, err
+	case Array:
+		b = b[dataOffset:]
+		var data []byte
+		b, data, err = DecodeUntaggedBytesValue(b)
+		if err != nil {
+			return b, "", err
+		}
+		if PrettyPrintArrayValueEncoded == nil {
+			return b, "", prettyPrintArrayValueEncodedNilErr
+		}
+		var s string
+		s, err = PrettyPrintArrayValueEncoded(data)
+		return b, s, err
+	case Tuple:
+		b = b[dataOffset:]
+		if PrettyPrintTupleValueEncoded == nil {
+			return b, "", prettyPrintTupleValueEncodedNilErr
+		}
+		var s string
+		b, s, err = PrettyPrintTupleValueEncoded(b)
+		return b, s, err
+	case LTree:
+		var l ltree.T
+		b, l, err = DecodeLTreeValue(b)
+		if err != nil {
+			return b, "", err
+		}
+		return b, l.String(), nil
 	default:
 		return b, "", errors.Errorf("unknown type %s", typ)
 	}
@@ -3046,6 +3714,142 @@ func getGeoInvertedIndexKeyLength(buf []byte) (int, error) {
 	return 1 + cellLen + 1 + floatsLen, nil
 }
 
+// EncodeJSONNullKeyMarker adds a JSON Null key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONNullKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonNullKeyMarker)
+	case Descending:
+		return append(buf, jsonNullKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONStringKeyMarker adds a JSON String key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONStringKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonStringKeyMarker)
+	case Descending:
+		return append(buf, jsonStringKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONNumberKeyMarker adds a JSON Number key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONNumberKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonNumberKeyMarker)
+	case Descending:
+		return append(buf, jsonNumberKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONFalseKeyMarker adds a JSON False key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONFalseKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonFalseKeyMarker)
+	case Descending:
+		return append(buf, jsonFalseKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONTrueKeyMarker adds a JSON True key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONTrueKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonTrueKeyMarker)
+	case Descending:
+		return append(buf, jsonTrueKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONArrayKeyMarker adds a JSON Array key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONArrayKeyMarker(buf []byte, dir Direction, arrayLength int64) []byte {
+	switch dir {
+	case Ascending:
+		if arrayLength == 0 {
+			return append(buf, jsonEmptyArrayKeyMarker)
+		}
+		return append(buf, jsonArrayKeyMarker)
+	case Descending:
+		if arrayLength == 0 {
+			return append(buf, jsonEmptyArrayKeyDescendingMarker)
+		}
+		return append(buf, jsonArrayKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONKeyTerminator adds a JSON Key terminator
+// to buf and returns the buffer.
+func EncodeJSONKeyTerminator(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonKeyTerminator)
+	case Descending:
+		return append(buf, jsonKeyDescendingTerminator)
+	default:
+		panic("invalid direction")
+	}
+}
+
+// EncodeJSONObjectKeyMarker adds a JSON Object key encoding marker
+// to buf and returns the new buffer.
+func EncodeJSONObjectKeyMarker(buf []byte, dir Direction) []byte {
+	switch dir {
+	case Ascending:
+		return append(buf, jsonObjectKeyMarker)
+	case Descending:
+		return append(buf, jsonObjectKeyDescendingMarker)
+	default:
+		panic("invalid direction")
+	}
+}
+
+func EncodeJSONValueLength(buf []byte, dir Direction, v int64) []byte {
+	switch dir {
+	case Ascending:
+		return EncodeVarintAscending(buf, v)
+	case Descending:
+		return EncodeVarintDescending(buf, v)
+	default:
+		panic("invalid direction")
+	}
+}
+
+func DecodeJSONValueLength(buf []byte, dir Direction) ([]byte, int64, error) {
+	var v int64
+	var err error
+	switch dir {
+	case Ascending:
+		buf, v, err = DecodeVarintAscending(buf)
+		return buf, v, err
+	case Descending:
+		buf, v, err = DecodeVarintDescending(buf)
+		return buf, v, err
+	default:
+		panic("invalid direction")
+	}
+}
+
 // EncodeArrayKeyMarker adds the array key encoding marker to buf and
 // returns the new buffer.
 func EncodeArrayKeyMarker(buf []byte, dir Direction) []byte {
@@ -3094,6 +3898,34 @@ func IsNextByteArrayEncodedNull(buf []byte, dir Direction) bool {
 	return buf[0] == expected
 }
 
+// ValidateAndConsumeJSONKeyMarker checks that the marker at the front
+// of buf is valid/invalid for a given JSON value for the given direction.
+// If the JSON marker is valid, the marker is consumed and the remaining
+// bytes in the array are returned.
+func ValidateAndConsumeJSONKeyMarker(buf []byte, dir Direction) ([]byte, Type, error) {
+	typ := PeekType(buf)
+	switch dir {
+	case Descending:
+		switch typ {
+		case JSONNullDesc, JSONNumberDesc, JSONStringDesc, JSONFalseDesc,
+			JSONTrueDesc, JSONArrayDesc, JSONObjectDesc, JsonEmptyArrayDesc:
+			return buf[1:], typ, nil
+		default:
+			return nil, Unknown, errors.Newf("invalid type found %s", typ)
+		}
+	case Ascending:
+		switch typ {
+		case JSONNull, JSONNumber, JSONString, JSONFalse, JSONTrue, JSONArray,
+			JSONObject, JsonEmptyArray:
+			return buf[1:], typ, nil
+		default:
+			return nil, Unknown, errors.Newf("invalid type found %s", typ)
+		}
+	default:
+		return nil, Unknown, errors.Newf("invalid direction %s", dir)
+	}
+}
+
 // ValidateAndConsumeArrayKeyMarker checks that the marker at the front
 // of buf is valid for an array of the given direction, and consumes it
 // if so. It returns an error if the tag is invalid.
@@ -3117,4 +3949,73 @@ func IsArrayKeyDone(buf []byte, dir Direction) bool {
 		expected = arrayKeyDescendingTerminator
 	}
 	return buf[0] == expected
+}
+
+// isJSONKeyDone returns if the first byte in the input is the JSON
+// terminator for the input direction.
+func IsJSONKeyDone(buf []byte, dir Direction) bool {
+	expected := jsonKeyTerminator
+	if dir == Descending {
+		expected = jsonKeyDescendingTerminator
+	}
+	return buf[0] == expected
+}
+
+// BytesNext returns the next possible byte slice, using the extra capacity
+// of the provided slice if possible, and if not, appending an \x00.
+func BytesNext(b []byte) []byte {
+	if cap(b) > len(b) {
+		bNext := b[:len(b)+1]
+		if bNext[len(bNext)-1] == 0 {
+			return bNext
+		}
+	}
+	// TODO(spencer): Do we need to enforce KeyMaxLength here?
+	// Switched to "make and copy" pattern in #4963 for performance.
+	bn := make([]byte, len(b)+1)
+	copy(bn, b)
+	bn[len(bn)-1] = 0
+	return bn
+}
+
+// BytesPrevish returns a previous byte slice in lexicographical ordering. It is
+// impossible in general to find the exact previous byte slice, because it has
+// an infinite number of 0xff bytes at the end, so this returns the nearest
+// previous slice right-padded with 0xff up to length bytes. It may reuse the
+// given slice when possible.
+func BytesPrevish(b []byte, length int) []byte {
+	bLen := len(b)
+	// An empty slice has no previous slice.
+	if bLen == 0 {
+		return b
+	}
+	// If the last byte is 0, just remove it.
+	if b[bLen-1] == 0 {
+		return b[:bLen-1]
+	}
+	// Otherwise, decrement the last byte and right-pad with 0xff.
+	if bLen > length {
+		length = bLen
+	}
+	buf := make([]byte, length)
+	copy(buf, b)
+	buf[bLen-1]--
+	copy(buf[bLen:], bytes.Repeat([]byte{0xff}, length-bLen))
+	return buf
+}
+
+// unsafeWrapper is implementation of SafeFormatter. This is used to mark
+// arguments as unsafe for redaction. This would make sure that redact.Unsafe() is implementing SafeFormatter interface
+// without affecting invocations.
+// TODO(aa-joshi): This is a temporary solution to mark arguments as unsafe. We should move/update this into cockroachdb/redact package.
+type unsafeWrapper struct {
+	a any
+}
+
+func (uw unsafeWrapper) SafeFormat(w redact.SafePrinter, _ rune) {
+	w.Print(redact.Unsafe(uw.a))
+}
+
+func Unsafe(args any) any {
+	return unsafeWrapper{a: args}
 }

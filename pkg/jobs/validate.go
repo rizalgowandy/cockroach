@@ -1,16 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -18,9 +15,9 @@ import (
 )
 
 // JobMetadataGetter is an interface used during job validation.
-// It is similar in principle to catalog.DescGetter.
+// It is similar in principle to validate.ValidationDereferencer.
 type JobMetadataGetter interface {
-	GetJobMetadata(jobspb.JobID) (*JobMetadata, error)
+	GetJobMetadata(jobspb.JobID) (*DeprecatedJobMetadata, error)
 }
 
 // ValidateJobReferencesInDescriptor checks a catalog.Descriptor for
@@ -36,7 +33,7 @@ func ValidateJobReferencesInDescriptor(
 	}
 
 	for _, m := range tbl.GetMutationJobs() {
-		j, err := jmg.GetJobMetadata(jobspb.JobID(m.JobID))
+		j, err := jmg.GetJobMetadata(m.JobID)
 		if err != nil {
 			errorAccFn(errors.WithAssertionFailure(errors.Wrapf(err, "mutation job %d", m.JobID)))
 			continue
@@ -48,20 +45,24 @@ func ValidateJobReferencesInDescriptor(
 		if j.Payload.Type() != jobspb.TypeSchemaChange {
 			errorAccFn(errors.AssertionFailedf("mutation job %d is of type %q, expected schema change job", m.JobID, j.Payload.Type()))
 		}
-		if j.Status.Terminal() {
-			errorAccFn(errors.AssertionFailedf("mutation job %d has terminal status (%s)", m.JobID, j.Status))
+		if j.State.Terminal() {
+			errorAccFn(errors.AssertionFailedf("mutation job %d has terminal state (%s)", m.JobID, j.State))
 		}
 	}
 }
 
 // ValidateDescriptorReferencesInJob checks a job for inconsistencies relative
 // to system.descriptor and passes any validation failures in the form of errors
-// to an accumulator function.
+// to an accumulator function. We also have a second accumulator function for
+// keeping track of INFO level details that do not need to fail validation.
 func ValidateDescriptorReferencesInJob(
-	j JobMetadata, descMap map[descpb.ID]catalog.Descriptor, errorAccFn func(error),
+	j DeprecatedJobMetadata,
+	descLookupFn func(id descpb.ID) catalog.Descriptor,
+	errorAccFn func(error),
+	infoAccFn func(string),
 ) {
-	switch j.Status {
-	case StatusRunning, StatusPaused, StatusPauseRequested:
+	switch j.State {
+	case StateRunning, StatePaused, StatePauseRequested:
 		// Proceed.
 	default:
 		return
@@ -69,8 +70,7 @@ func ValidateDescriptorReferencesInJob(
 	existing := catalog.MakeDescriptorIDSet()
 	missing := catalog.MakeDescriptorIDSet()
 	for _, id := range collectDescriptorReferences(j).Ordered() {
-		_, exists := descMap[id]
-		if exists {
+		if descLookupFn(id) != nil {
 			existing.Add(id)
 		} else if id != descpb.InvalidID {
 			missing.Add(id)
@@ -82,19 +82,19 @@ func ValidateDescriptorReferencesInJob(
 	switch j.Payload.Type() {
 	case jobspb.TypeSchemaChange:
 		errorAccFn(errors.AssertionFailedf("%s schema change refers to missing descriptor(s) %+v",
-			j.Status, missing.Ordered()))
+			j.State, missing.Ordered()))
 	case jobspb.TypeSchemaChangeGC:
 		isSafeToDelete := existing.Len() == 0 && len(j.Progress.GetSchemaChangeGC().Indexes) == 0
-		errorAccFn(errors.AssertionFailedf("%s schema change GC refers to missing table descriptor(s) %+v; "+
-			"existing descriptors that still need to be dropped %+v; job safe to delete: %v",
-			j.Status, missing.Ordered(), existing.Ordered(), isSafeToDelete))
+		infoAccFn(fmt.Sprintf("%s schema change GC refers to missing table "+
+			"descriptor(s) %+v; existing descriptors that still need to be dropped %+v; job safe to "+
+			"delete: %v", j.State, missing.Ordered(), existing.Ordered(), isSafeToDelete))
 	case jobspb.TypeTypeSchemaChange:
 		errorAccFn(errors.AssertionFailedf("%s type schema change refers to missing type descriptor %v",
-			j.Status, missing.Ordered()))
+			j.State, missing.Ordered()))
 	}
 }
 
-func collectDescriptorReferences(j JobMetadata) (ids catalog.DescriptorIDSet) {
+func collectDescriptorReferences(j DeprecatedJobMetadata) (ids catalog.DescriptorIDSet) {
 	switch j.Payload.Type() {
 	case jobspb.TypeSchemaChange:
 		sc := j.Payload.GetSchemaChange()
@@ -111,7 +111,7 @@ func collectDescriptorReferences(j JobMetadata) (ids catalog.DescriptorIDSet) {
 		}
 	case jobspb.TypeSchemaChangeGC:
 		for _, table := range j.Progress.GetSchemaChangeGC().Tables {
-			if table.Status == jobspb.SchemaChangeGCProgress_DELETED {
+			if table.Status == jobspb.SchemaChangeGCProgress_CLEARED {
 				continue
 			}
 			ids.Add(table.ID)

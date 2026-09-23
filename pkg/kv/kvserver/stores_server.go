@@ -1,25 +1,21 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
 import (
-	"bytes"
 	"context"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/wag/wagpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/redact"
+	"github.com/cockroachdb/errors"
 )
 
 // Server implements PerReplicaServer.
@@ -53,30 +49,18 @@ func (is Server) execStoreCommand(
 func (is Server) CollectChecksum(
 	ctx context.Context, req *CollectChecksumRequest,
 ) (*CollectChecksumResponse, error) {
-	resp := &CollectChecksumResponse{}
+	var resp *CollectChecksumResponse
 	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
 		func(ctx context.Context, s *Store) error {
+			ctx, cancel := s.stopper.WithCancelOnQuiesce(ctx)
+			defer cancel()
 			r, err := s.GetReplica(req.RangeID)
 			if err != nil {
 				return err
 			}
-			c, err := r.getChecksum(ctx, req.ChecksumID)
+			ccr, err := r.getChecksum(ctx, req.ChecksumID)
 			if err != nil {
 				return err
-			}
-			ccr := c.CollectChecksumResponse
-			if !bytes.Equal(req.Checksum, ccr.Checksum) {
-				// If this check is false, then this request is the replica carrying out
-				// the consistency check. The message is spurious, but we want to leave the
-				// snapshot (if present) intact.
-				if len(req.Checksum) > 0 {
-					log.Errorf(ctx, "consistency check failed on range r%d: expected checksum %x, got %x",
-						req.RangeID, redact.Safe(req.Checksum), redact.Safe(ccr.Checksum))
-					// Leave resp.Snapshot alone so that the caller will receive what's
-					// in it (if anything).
-				}
-			} else {
-				ccr.Snapshot = nil
 			}
 			resp = &ccr
 			return nil
@@ -88,6 +72,8 @@ func (is Server) CollectChecksum(
 //
 // It is the caller's responsibility to cancel or set a timeout on the context.
 // If the context is never canceled, WaitForApplication will retry forever.
+//
+// TODO(erikgrinaker): consider using Replica.WaitForLeaseAppliedIndex().
 func (is Server) WaitForApplication(
 	ctx context.Context, req *WaitForApplicationRequest,
 ) (*WaitForApplicationResponse, error) {
@@ -104,29 +90,57 @@ func (is Server) WaitForApplication(
 				return err
 			}
 			repl.mu.RLock()
-			leaseAppliedIndex := repl.mu.state.LeaseAppliedIndex
+			leaseAppliedIndex := repl.shMu.state.LeaseAppliedIndex
 			repl.mu.RUnlock()
 			if leaseAppliedIndex >= req.LeaseIndex {
-				// For performance reasons, we don't sync to disk when
-				// applying raft commands. This means that if a node restarts
-				// after applying but before the next sync, its
-				// LeaseAppliedIndex could temporarily regress (until it
-				// reapplies its latest raft log entries).
-				//
-				// Merging relies on the monotonicity of the log applied
-				// index, so before returning ensure that rocksdb has synced
-				// everything up to this point to disk.
-				//
+				// Merging relies on the applied index monotonicity, so before returning
+				// ensure that the state machine synced everything up to this point.
 				// https://github.com/cockroachdb/cockroach/issues/33120
-				return storage.WriteSyncNoop(ctx, s.engine)
+				return syncAppliedState(repl)
 			}
 		}
 		if ctx.Err() == nil {
-			log.Fatal(ctx, "infinite retry loop exited but context has no error")
+			log.KvExec.Fatal(ctx, "infinite retry loop exited but context has no error")
 		}
 		return ctx.Err()
 	})
 	return resp, err
+}
+
+// syncAppliedState syncs the applied state of the given replica, with a
+// guarantee that it will never regress.
+//
+// NB: for performance reasons, we otherwise don't sync the state machine when
+// applying raft commands. This means that if a node restarts after applying but
+// before the next sync, its applied index could temporarily regress (until it
+// reapplies its latest raft log entries).
+func syncAppliedState(r *Replica) error {
+	s := r.store
+	// If engines are not separated, sync the entire engine.
+	if !s.EnginesSeparated() {
+		return storage.WriteSyncNoop(s.internalEngines.Engine())
+	}
+	// With separated engines, durably write a WAG node to the LogEngine
+	// instructing the replay to apply the replica up to its current index.
+	b := s.internalEngines.LogEngine().NewWriteBatch()
+	defer b.Close()
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	if r.shMu.destroyStatus.Removed() {
+		// Skip the replica if it has already been destroyed. There is already a WAG
+		// node committing to its removal.
+		return nil
+	}
+	if err := wag.Write(b, s.wagSeq.Next(), wagpb.Node{
+		Events: []wagpb.Event{{
+			Addr:     wagpb.MakeAddr(r.ID(), r.shMu.state.RaftAppliedIndex),
+			Type:     wagpb.EventApply,
+			StartKey: r.shMu.state.Desc.StartKey,
+		}},
+	}); err != nil {
+		return errors.Wrapf(err, "writing WAG node")
+	}
+	return b.Commit(true /* sync */)
 }
 
 // WaitForReplicaInit implements PerReplicaServer.
@@ -147,7 +161,7 @@ func (is Server) WaitForReplicaInit(
 			}
 		}
 		if ctx.Err() == nil {
-			log.Fatal(ctx, "infinite retry loop exited but context has no error")
+			log.KvExec.Fatal(ctx, "infinite retry loop exited but context has no error")
 		}
 		return ctx.Err()
 	})
@@ -162,7 +176,70 @@ func (is Server) CompactEngineSpan(
 	resp := &CompactEngineSpanResponse{}
 	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
 		func(ctx context.Context, s *Store) error {
-			return s.Engine().CompactRange(req.Span.Key, req.Span.EndKey, true /* forceBottommost */)
+			// TODO(sep-raft-log): this is likely only needed for StateEngine, but the
+			// API seems to be generic and may need to support both.
+			return s.TODOBothEngines().CompactRange(ctx, req.Span.Key, req.Span.EndKey)
+		})
+	return resp, err
+}
+
+// GetTableMetrics implements PerStoreServer. It retrieves metrics
+// SSTables for a given node and store id.
+func (is Server) GetTableMetrics(
+	ctx context.Context, req *GetTableMetricsRequest,
+) (*GetTableMetricsResponse, error) {
+	resp := &GetTableMetricsResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			metricsInfo, err := s.TODOBothEngines().GetTableMetrics(req.Span.Key, req.Span.EndKey)
+
+			if err != nil {
+				return err
+			}
+
+			resp.TableMetrics = metricsInfo
+			return nil
+		})
+	return resp, err
+}
+
+func (is Server) ScanStorageInternalKeys(
+	ctx context.Context, req *ScanStorageInternalKeysRequest,
+) (*ScanStorageInternalKeysResponse, error) {
+	resp := &ScanStorageInternalKeysResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			metrics, err := s.TODOBothEngines().ScanStorageInternalKeys(req.Span.Key, req.Span.EndKey, req.MegabytesPerSecond)
+
+			if err != nil {
+				return err
+			}
+
+			resp.AdvancedPebbleMetrics = metrics
+			return nil
+		})
+	return resp, err
+}
+
+// SetCompactionConcurrency implements PerStoreServer. It changes the compaction
+// concurrency of a store. While SetCompactionConcurrency is safe for concurrent
+// use, it adds uncertainty about the compaction concurrency actually set on
+// the store. We do guarantee that once all SetCompactionConcurrency requests
+// are finished (cancelled), the override is removed and the original
+// concurrency is restored.
+func (is Server) SetCompactionConcurrency(
+	ctx context.Context, req *CompactionConcurrencyRequest,
+) (*CompactionConcurrencyResponse, error) {
+	resp := &CompactionConcurrencyResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			s.TODOBothEngines().SetCompactionConcurrency(req.CompactionConcurrency)
+
+			// Wait for cancellation, and once cancelled, reset the compaction
+			// concurrency.
+			<-ctx.Done()
+			s.TODOBothEngines().SetCompactionConcurrency(0)
+			return nil
 		})
 	return resp, err
 }

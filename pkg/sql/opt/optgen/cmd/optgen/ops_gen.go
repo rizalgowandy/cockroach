@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -36,8 +31,10 @@ func (g *opsGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 
 	g.genOperatorEnum()
 	g.genOperatorNames()
+	g.genOperatorCamelCaseNames()
 	g.genOperatorSyntaxTags()
 	g.genOperatorsByTag()
+	g.genOperatorByCamelCase()
 }
 
 func (g *opsGen) genOperatorEnum() {
@@ -68,6 +65,25 @@ func (g *opsGen) genOperatorNames() {
 	fmt.Fprintf(g.w, "const opNames = \"%s\"\n\n", names.String())
 
 	fmt.Fprintf(g.w, "var opNameIndexes = [...]uint32{%s%d}\n\n", indexes.String(), names.Len())
+}
+
+func (g *opsGen) genOperatorCamelCaseNames() {
+	var names bytes.Buffer
+	var indexes bytes.Buffer
+
+	fmt.Fprint(&names, "Unknown")
+	fmt.Fprint(&indexes, "0, ")
+
+	for _, define := range g.sorted {
+		fmt.Fprintf(&indexes, "%d, ", names.Len())
+		fmt.Fprint(&names, define.Name)
+	}
+
+	fmt.Fprintf(g.w, "const opCamelCaseNames = \"%s\"\n\n", names.String())
+
+	fmt.Fprintf(
+		g.w, "var opCamelCaseNameIndexes = [...]uint32{%s%d}\n\n", indexes.String(), names.Len(),
+	)
 }
 
 func (g *opsGen) genOperatorSyntaxTags() {
@@ -116,6 +132,20 @@ func (g *opsGen) genOperatorsByTag() {
 	}
 }
 
+func (g *opsGen) genOperatorByCamelCase() {
+	fmt.Fprintf(g.w, "var opByCamelCase = map[string]Operator{\n")
+	for _, define := range g.sorted {
+		fmt.Fprintf(g.w, "  %q: %sOp,\n", define.Name, define.Name)
+	}
+	fmt.Fprintf(g.w, "}\n\n")
+
+	fmt.Fprintf(g.w, "// OperatorByCamelCase returns the Operator for the given CamelCase name.\n")
+	fmt.Fprintf(g.w, "func OperatorByCamelCase(name string) (Operator, bool) {\n")
+	fmt.Fprintf(g.w, "  op, ok := opByCamelCase[name]\n")
+	fmt.Fprintf(g.w, "  return op, ok\n")
+	fmt.Fprintf(g.w, "}\n\n")
+}
+
 // sortDefines returns a copy of the given expression definitions, sorted by
 // name.
 func sortDefines(defines lang.DefineSetExpr) lang.DefineSetExpr {
@@ -130,7 +160,8 @@ func sortDefines(defines lang.DefineSetExpr) lang.DefineSetExpr {
 // dashCase converts camel-case identifiers into "dash case", where uppercase
 // letters in the middle of the identifier are replaced by a dash followed
 // by the lowercase version the letter. Example:
-//   InnerJoinApply => inner-join-apply
+//
+//	InnerJoinApply => inner-join-apply
 func dashCase(s string) string {
 	var buf bytes.Buffer
 	for i, ch := range s {
@@ -150,7 +181,8 @@ func dashCase(s string) string {
 // syntaxCase converts camel-case identifiers into "syntax case", where
 // uppercase letters in the middle of the identifier are interpreted as new
 // words and separated by a space from the previous word. Example:
-//   InnerJoinApply => INNER JOIN APPLY
+//
+//	InnerJoinApply => INNER JOIN APPLY
 func syntaxCase(s string) string {
 	var buf bytes.Buffer
 	for i, ch := range s {

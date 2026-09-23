@@ -94,15 +94,27 @@ SELECT * FROM [$num_ref_id(4,3,1) AS num_ref_alias]
 200  20  2
 300  30  3
 
+let $num_ref_bc
+SELECT index_id
+  FROM crdb_internal.table_indexes
+ WHERE descriptor_id = $num_ref_id
+   AND index_name = 'bc';
+
+let $num_ref_pkey
+SELECT index_id
+  FROM crdb_internal.table_indexes
+ WHERE descriptor_id = $num_ref_id
+   AND index_name = 'num_ref_pkey';
+
 query I rowsort
-SELECT * FROM [$num_ref_id(4) AS num_ref_alias]@[2]
+SELECT * FROM [$num_ref_id(4) AS num_ref_alias]@[$num_ref_bc]
 ----
 101
 200
 300
 
 query I rowsort
-SELECT * FROM [$num_ref_id(1) AS num_ref_alias]@[1]
+SELECT * FROM [$num_ref_id(1) AS num_ref_alias]@[$num_ref_pkey]
 ----
 1
 2
@@ -116,10 +128,10 @@ col1  col2  col3
 2     20    200
 3     30    300
 
-statement OK
+statement ok
 UPSERT INTO [$num_ref_id AS num_ref_alias] VALUES (4, 40, 400)
 
-statement OK
+statement ok
 INSERT INTO [$num_ref_id(1) AS num_ref_alias] VALUES (5)
 
 query III rowsort
@@ -131,8 +143,8 @@ SELECT * FROM [$num_ref_id as num_ref_alias]
 4     40    400
 5     NULL  NULL
 
-statement OK
-DELETE FROM [$num_ref_id AS num_ref_alias]@bc WHERE @1=5
+statement count 1
+DELETE FROM [$num_ref_id AS num_ref_alias]@bc WHERE p=5
 
 query I
 DELETE FROM [$num_ref_id AS num_ref_alias] WHERE d=40 RETURNING num_ref_alias.c
@@ -146,7 +158,7 @@ SELECT * FROM [$num_ref_id AS num_ref_alias]
 2     20    200
 3     30    300
 
-statement OK
+statement ok
 INSERT INTO [$num_ref_id AS num_ref_alias] (p, c) VALUES (4, 400)
 
 query I

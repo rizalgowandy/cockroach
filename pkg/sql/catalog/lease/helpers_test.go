@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package lease
 
@@ -17,7 +12,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -118,9 +114,7 @@ func (m *Manager) ExpireLeases(clock *hlc.Clock) {
 	defer m.names.mu.Unlock()
 	_ = m.names.descriptors.IterateByID(func(entry catalog.NameEntry) error {
 		desc := entry.(*descriptorVersionState)
-		desc.mu.Lock()
-		defer desc.mu.Unlock()
-		desc.mu.expiration = past
+		desc.expiration.Store(&past)
 		return nil
 	})
 }
@@ -157,7 +151,7 @@ func (m *Manager) PublishMultiple(
 		// of the descriptors.
 		expectedVersions := make(map[descpb.ID]descpb.DescriptorVersion)
 		for _, id := range ids {
-			expected, err := m.WaitForOneVersion(ctx, id, base.DefaultRetryOptions())
+			expected, err := m.WaitForOneVersion(ctx, id, nil /* regions */, base.DefaultRetryOptions())
 			if err != nil {
 				return nil, err
 			}
@@ -165,36 +159,32 @@ func (m *Manager) PublishMultiple(
 		}
 
 		descs := make(map[descpb.ID]catalog.MutableDescriptor)
+		writeTimestamp := hlc.Timestamp{}
 		// There should be only one version of the descriptor, but it's
 		// a race now to update to the next version.
-		err := m.storage.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		err := m.storage.db.KV().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 			versions := make(map[descpb.ID]descpb.DescriptorVersion)
 			descsToUpdate := make(map[descpb.ID]catalog.MutableDescriptor)
 			for _, id := range ids {
 				// Re-read the current versions of the descriptor, this time
 				// transactionally.
-				desc, err := catalogkv.MustGetMutableDescriptorByID(ctx, txn, m.storage.codec, id)
+				desc, err := m.storage.mustGetDescriptorByID(ctx, txn, id)
 				// Due to details in #51417, it is possible for a user to request a
 				// descriptor which no longer exists. In that case, just return an error.
 				if err != nil {
 					return err
 				}
-				descsToUpdate[id] = desc
+				descsToUpdate[id] = desc.NewBuilder().BuildExistingMutable()
 				if expectedVersions[id] != desc.GetVersion() {
 					// The version changed out from under us. Someone else must be
 					// performing a schema change operation.
 					if log.V(3) {
-						log.Infof(ctx, "publish %d (version changed): %d != %d", id, expectedVersions[id], desc.GetVersion())
+						log.Dev.Infof(ctx, "publish %d (version changed): %d != %d", id, expectedVersions[id], desc.GetVersion())
 					}
 					return errLeaseVersionChanged
 				}
 
 				versions[id] = descsToUpdate[id].GetVersion()
-			}
-
-			// This is to write the updated descriptors if we're the system tenant.
-			if err := txn.SetSystemConfigTrigger(m.storage.codec.ForSystemTenant()); err != nil {
-				return err
 			}
 
 			// Run the update closure.
@@ -212,16 +202,16 @@ func (m *Manager) PublishMultiple(
 
 			b := txn.NewBatch()
 			for id, desc := range descs {
-				if err := catalogkv.WriteDescToBatch(ctx, false /* kvTrace */, m.storage.settings, b, m.storage.codec, id, desc); err != nil {
-					return err
-				}
+				descKey := catalogkeys.MakeDescMetadataKey(m.storage.codec, id)
+				descDesc := desc.DescriptorProto()
+				b.Put(descKey, descDesc)
 			}
 			if logEvent != nil {
 				// If an event log is required for this update, ensure that the
 				// descriptor change occurs first in the transaction. This is
 				// necessary to ensure that the System configuration change is
 				// gossiped. See the documentation for
-				// transaction.SetSystemConfigTrigger() for more information.
+				// transaction.DeprecatedSetSystemConfigTrigger() for more information.
 				if err := txn.Run(ctx, b); err != nil {
 					return err
 				}
@@ -232,14 +222,23 @@ func (m *Manager) PublishMultiple(
 			}
 			// More efficient batching can be used if no event log message
 			// is required.
-			return txn.CommitInBatch(ctx, b)
+			err := txn.CommitInBatch(ctx, b)
+			if err != nil {
+				return err
+			}
+			writeTimestamp = b.RawResponse().Txn.WriteTimestamp
+			return nil
 		})
 
 		switch {
 		case err == nil:
 			immutDescs := make(map[descpb.ID]catalog.Descriptor)
 			for id, desc := range descs {
-				immutDescs[id] = desc.ImmutableCopy()
+				mutDescWithTS, buildErr := descbuilder.BuildMutable(desc, desc.DescriptorProto(), writeTimestamp)
+				if buildErr != nil {
+					return nil, buildErr
+				}
+				immutDescs[id] = mutDescWithTS.ImmutableCopy()
 			}
 			return immutDescs, nil
 		case errors.Is(err, errLeaseVersionChanged):
@@ -288,4 +287,12 @@ func (m *Manager) Publish(
 		return nil, err
 	}
 	return results[id], nil
+}
+
+func (m *Manager) TestingRefreshSomeLeases(ctx context.Context) {
+	m.refreshSomeLeases(ctx, false /*refreshAndPurgeAllDescriptors*/)
+}
+
+func (m *Manager) TestingDescriptorStateIsNil(id descpb.ID) bool {
+	return m.findDescriptorState(id, false /* create */) == nil
 }

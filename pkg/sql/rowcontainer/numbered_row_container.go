@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowcontainer
 
@@ -19,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -51,19 +47,22 @@ type DiskBackedNumberedRowContainer struct {
 // NewDiskBackedNumberedRowContainer creates a DiskBackedNumberedRowContainer.
 //
 // Arguments:
-//  - deDup is true if it should de-duplicate.
-//  - types is the schema of rows that will be added to this container.
-//  - evalCtx defines the context.
-//  - engine is the underlying store that rows are stored on when the container
-//    spills to disk.
-//  - memoryMonitor is used to monitor this container's memory usage.
-//  - diskMonitor is used to monitor this container's disk usage.
+//   - deDup is true if it should de-duplicate.
+//   - types is the schema of rows that will be added to this container.
+//   - evalCtx defines the context. It will **not** be mutated.
+//   - engine is the underlying store that rows are stored on when the container
+//     spills to disk.
+//   - memoryMonitor is used to monitor this container's memory usage.
+//   - unlimitedMemMonitor is used to monitor the memory usage of the disk row
+//     containers if spilling to disk occurs.
+//   - diskMonitor is used to monitor this container's disk usage.
 func NewDiskBackedNumberedRowContainer(
 	deDup bool,
 	types []*types.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	engine diskmap.Factory,
 	memoryMonitor *mon.BytesMonitor,
+	unlimitedMemMonitor *mon.BytesMonitor,
 	diskMonitor *mon.BytesMonitor,
 ) *DiskBackedNumberedRowContainer {
 	d := &DiskBackedNumberedRowContainer{
@@ -72,7 +71,7 @@ func NewDiskBackedNumberedRowContainer(
 		rowIterMemAcc: memoryMonitor.MakeBoundAccount(),
 	}
 	d.rc = &DiskBackedRowContainer{}
-	d.rc.Init(nil /*ordering*/, types, evalCtx, engine, memoryMonitor, diskMonitor)
+	d.rc.Init(nil /* ordering */, types, evalCtx, engine, memoryMonitor, unlimitedMemMonitor, diskMonitor)
 	if deDup {
 		ordering := make(colinfo.ColumnOrdering, len(types))
 		for i := range types {
@@ -80,7 +79,7 @@ func NewDiskBackedNumberedRowContainer(
 			ordering[i].Direction = encoding.Ascending
 		}
 		deduper := &DiskBackedRowContainer{}
-		deduper.Init(ordering, types, evalCtx, engine, memoryMonitor, diskMonitor)
+		deduper.Init(ordering, types, evalCtx, engine, memoryMonitor, unlimitedMemMonitor, diskMonitor)
 		deduper.DoDeDuplicate()
 		d.deduper = deduper
 	}
@@ -98,20 +97,24 @@ func (d *DiskBackedNumberedRowContainer) Spilled() bool {
 	return d.rc.Spilled()
 }
 
-// testingSpillToDisk is for tests to spill the container(s)
-// to disk.
-func (d *DiskBackedNumberedRowContainer) testingSpillToDisk(ctx context.Context) error {
+// SpillToDisk spills the container(s) to disk. Boolean indicates whether at
+// least one container actually spilled.
+func (d *DiskBackedNumberedRowContainer) SpillToDisk(ctx context.Context) (bool, error) {
+	if d.rc.UsingDisk() && (!d.deDup || d.deduper.(*DiskBackedRowContainer).UsingDisk()) {
+		// All containers are already using disk, so there is nothing to spill.
+		return false, nil
+	}
 	if !d.rc.UsingDisk() {
 		if err := d.rc.SpillToDisk(ctx); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if d.deDup && !d.deduper.(*DiskBackedRowContainer).UsingDisk() {
 		if err := d.deduper.(*DiskBackedRowContainer).SpillToDisk(ctx); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // AddRow tries to add a row. It returns the position of the
@@ -182,7 +185,8 @@ func (d *DiskBackedNumberedRowContainer) GetRow(
 		if skip {
 			return nil, nil
 		}
-		return d.rc.mrc.EncRow(idx), nil
+		mrc := d.rc.mrc
+		return mrc.scratchEncRow, mrc.getEncRow(mrc.scratchEncRow, idx)
 	}
 	return d.rowIter.getRow(ctx, idx, skip)
 }
@@ -244,18 +248,18 @@ func (d *DiskBackedNumberedRowContainer) Close(ctx context.Context) {
 // the highest reuse distance currently in the cache. This optimality requires
 // some book-keeping overhead:
 //
-// - A map with O(R) entries where R is the number of unique rows that will be
-//   accessed and an overall size proportional to the total number of accesses.
-//   Overall this is within a constant factor of [][]int, but the constant could
-//   be high. Note that we need this map because when doing Next() on the iterator
-//   we encounter entries different from the ones that caused this cache miss
-//   and we need to decide whether to cache them -- if we had a random access
-//   iterator such that sequential access was the same cost as random
-//   access, then a single []int with the next reuse position for each access
-//   would have sufficed.
-// - A heap containing the rows in the cache that is updated on each cache hit,
-//   and whenever a row is evicted or added to the cache. This is O(log N) where
-//   N is the number of entries in the cache.
+//   - A map with O(R) entries where R is the number of unique rows that will be
+//     accessed and an overall size proportional to the total number of accesses.
+//     Overall this is within a constant factor of [][]int, but the constant could
+//     be high. Note that we need this map because when doing Next() on the iterator
+//     we encounter entries different from the ones that caused this cache miss
+//     and we need to decide whether to cache them -- if we had a random access
+//     iterator such that sequential access was the same cost as random
+//     access, then a single []int with the next reuse position for each access
+//     would have sufficed.
+//   - A heap containing the rows in the cache that is updated on each cache hit,
+//     and whenever a row is evicted or added to the cache. This is O(log N) where
+//     N is the number of entries in the cache.
 //
 // Overall, this may be too much memory and cpu overhead for not enough
 // benefit, but it will put an upper bound on what we can achieve with a
@@ -268,8 +272,8 @@ func (d *DiskBackedNumberedRowContainer) Close(ctx context.Context) {
 // cost of a cache miss is high.
 //
 // TODO(sumeer):
-// - Use some realistic inverted index workloads (including geospatial) to
-//   measure the effect of this cache.
+//   - Use some realistic inverted index workloads (including geospatial) to
+//     measure the effect of this cache.
 type numberedDiskRowIterator struct {
 	rowIter *numberedRowIterator
 	// After creation, the rowIter is not positioned. isPositioned transitions
@@ -294,7 +298,7 @@ type numberedDiskRowIterator struct {
 	// EncDatumRow. The top element has the highest nextAccess and is the
 	// best candidate to evict.
 	cacheHeap  cacheMaxNextAccessHeap
-	datumAlloc rowenc.DatumAlloc
+	datumAlloc tree.DatumAlloc
 	rowAlloc   rowenc.EncDatumRowAlloc
 
 	hitCount  int
@@ -528,7 +532,7 @@ func (n *numberedDiskRowIterator) ensureDecoded(row rowenc.EncDatumRow) error {
 func (n *numberedDiskRowIterator) tryAddCacheAndReturnRow(
 	ctx context.Context, elem *cacheElement,
 ) (rowenc.EncDatumRow, error) {
-	r, err := n.rowIter.Row()
+	r, err := n.rowIter.EncRow()
 	if err != nil {
 		return nil, err
 	}
@@ -542,16 +546,16 @@ func (n *numberedDiskRowIterator) tryAddCacheAndReturnRow(
 }
 
 func (n *numberedDiskRowIterator) tryAddCache(ctx context.Context, elem *cacheElement) error {
-	// We don't want to pay the cost of rowIter.Row() if the row will not be
+	// We don't want to pay the cost of rowIter.EncRow() if the row will not be
 	// added to the cache. But to do correct memory accounting, which is needed
 	// for the precise caching decision, we do need the EncDatumRow. So we do a
 	// cheap check that is a good predictor of whether the row will be cached,
-	// and then call rowIter.Row().
+	// and then call rowIter.EncRow().
 	cacheSize := len(n.cacheHeap)
 	if cacheSize == n.maxCacheSize && (cacheSize == 0 || n.cacheHeap[0].nextAccess <= elem.accesses[0]) {
 		return nil
 	}
-	row, err := n.rowIter.Row()
+	row, err := n.rowIter.EncRow()
 	if err != nil {
 		return err
 	}
@@ -562,7 +566,7 @@ func (n *numberedDiskRowIterator) tryAddCacheHelper(
 	ctx context.Context, elem *cacheElement, row rowenc.EncDatumRow, alreadyDecoded bool,
 ) error {
 	if elem.row != nil {
-		log.Fatalf(ctx, "adding row to cache when it is already in cache")
+		log.Dev.Fatalf(ctx, "adding row to cache when it is already in cache")
 	}
 	nextAccess := elem.accesses[0]
 	evict := func() (rowenc.EncDatumRow, error) {

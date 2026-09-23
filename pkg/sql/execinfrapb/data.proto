@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 // Data structures and basic infrastructure for distributed SQL APIs. See
 // docs/RFCS/distributed_sql.md.
@@ -17,28 +12,24 @@ syntax = "proto2";
 // the Go package name, because it defines the Protobuf message names which
 // can't be changed without breaking backward compatibility.
 package cockroach.sql.distsqlrun;
-option go_package = "execinfrapb";
+option go_package = "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb";
 
-import "jobs/jobspb/jobs.proto";
-import "roachpb/api.proto";
+import "kv/kvpb/api.proto";
 import "roachpb/data.proto";
-import "roachpb/errors.proto";
 import "errorspb/errors.proto";
-import "sql/pgwire/pgerror/errors.proto";
-import "sql/catalog/descpb/structured.proto";
-import "sql/catalog/descpb/encoded_datum.proto";
+import "jobs/jobspb/jobs.proto";
+import "sql/catalog/catenumpb/encoded_datum.proto";
 import "sql/types/types.proto";
 import "util/tracing/tracingpb/recorded_span.proto";
 import "gogoproto/gogo.proto";
 import "util/hlc/timestamp.proto";
 import "google/protobuf/any.proto";
-import "google/protobuf/timestamp.proto";
 
 // Error is a generic representation including a string message.
 message Error {
   option (gogoproto.goproto_stringer) = false;
 
-  reserved 1,2;
+  reserved 1, 2;
 
   // full_error contains a structured errors with possibly multiple
   // wrapping layers implementing the errors.Cause() interface.
@@ -50,12 +41,11 @@ message Expression {
   option (gogoproto.typedecl) = false;
   option (gogoproto.goproto_stringer) = false;
 
-  // TODO(radu): TBD how this will be used
-  optional string version = 1 [(gogoproto.nullable) = false];
-
   // SQL expressions are passed as a string, with ordinal references
   // (@1, @2, @3 ..) used for "input" variables.
   optional string expr = 2 [(gogoproto.nullable) = false];
+
+  reserved 1;
 }
 
 // Ordering defines an order - specifically a list of column indices and
@@ -103,16 +93,16 @@ message StreamEndpointSpec {
   //
   // For SYNC_RESPONSE streams, the ID is unused.
   optional int32 stream_id = 2 [(gogoproto.nullable) = false,
-                                (gogoproto.customname) = "StreamID",
-                                (gogoproto.casttype) = "StreamID"];
-  // Node ID of the target host, only used for outgoing REMOTE streams.
+    (gogoproto.customname) = "StreamID",
+    (gogoproto.casttype) = "StreamID"];
+  // SQLInstanceID of the target host, only used for outgoing REMOTE streams.
   optional int32 target_node_id = 4 [(gogoproto.nullable) = false,
-                                     (gogoproto.customname) = "TargetNodeID",
-                                     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
-  // Node ID of the origin node, only used for REMOTE streams.
+    (gogoproto.customname) = "TargetNodeID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
+  // SQLInstanceID of the origin node, only used for REMOTE streams.
   optional int32 origin_node_id = 5 [(gogoproto.nullable) = false,
-                                    (gogoproto.customname) = "OriginNodeID",
-                                    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/roachpb.NodeID"];
+    (gogoproto.customname) = "OriginNodeID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
   reserved 3;
 }
 
@@ -140,6 +130,18 @@ message InputSyncSpec {
 
   // Schema for the streams entering this synchronizer.
   repeated sql.sem.types.T column_types = 4;
+
+  // EnforceHomeRegionStreamExclusiveUpperBound is one greater than the maximum
+  // stream input index this synchronizer will read into. It is only used if
+  // non-zero. Attempts to read a stream input index greater than or equal to
+  // this value will cause the query to error out before the read attempt is
+  // made.
+  optional uint32 enforce_home_region_stream_exclusive_upper_bound = 5 [(gogoproto.nullable) = false];
+
+  // EnforceHomeRegionError is the error to return when
+  // EnforceHomeRegionStreamExclusiveUpperBound is exceeded. This error must be
+  // set when EnforceHomeRegionStreamExclusiveUpperBound is non-zero.
+  optional Error enforce_home_region_error = 6;
 }
 
 // OutputRouterSpec is the specification for the output router of a processor;
@@ -161,7 +163,7 @@ message OutputRouterSpec {
   repeated StreamEndpointSpec streams = 2 [(gogoproto.nullable) = false];
 
   // Only used for the BY_HASH type; these are the indexes of the columns we are
-  // hashing.
+  // hashing. Can be empty in which case the routing can be done arbitrarily.
   repeated uint32 hash_columns = 3;
 
   message RangeRouterSpec {
@@ -209,12 +211,16 @@ message DatumInfo {
 // ProducerHeader is a message that is sent once at the beginning of a stream.
 message ProducerHeader {
   optional bytes flow_id = 1 [(gogoproto.nullable) = false,
-                              (gogoproto.customname) = "FlowID",
-                              (gogoproto.customtype) = "FlowID"];
+    (gogoproto.customname) = "FlowID",
+    (gogoproto.customtype) = "FlowID"];
 
   optional int32 stream_id = 2 [(gogoproto.nullable) = false,
-                                (gogoproto.customname) = "StreamID",
-                                (gogoproto.casttype) = "StreamID"];
+    (gogoproto.customname) = "StreamID",
+    (gogoproto.casttype) = "StreamID"];
+
+  // The SQLInstanceID of the producer. Used for debugging.
+  optional int32 producer = 3 [(gogoproto.nullable) = false,
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
 }
 
 // ProducerData is a message that can be sent multiple times as part of a stream
@@ -236,16 +242,17 @@ message ProducerData {
 message ProducerMessage {
   optional ProducerHeader header = 1;
 
-  // Typing information. There will be one DatumInfo for each element in a row.
-  // This field has to be populated on, or before, a ProducerMessage with data
-  // in it, and can only be populated once. It can be nil if only zero length
-  // rows will be sent.
-  // TODO(andrei): It'd be nice if the typing information for streams would be
-  // configured statically at plan creation time, instead of being discovered
-  // dynamically through the first rows that flow.
-  repeated DatumInfo typing = 2 [(gogoproto.nullable) = false];
-
   optional ProducerData data = 3 [(gogoproto.nullable) = false];
+
+  // Encoding information. There will be one DatumEncoding for each element in a
+  // row. This field has to be populated on, or before, a ProducerMessage with
+  // data in it, and can only be populated once. It can be nil if only zero
+  // length rows will be sent.
+  // TODO(yuzefovich): it should be possible to determine this information
+  // statically instead of passing in the first message.
+  repeated sqlbase.DatumEncoding encoding = 4;
+
+  reserved 2;
 }
 
 // RemoteProducerMetadata represents records that a producer wants to pass to
@@ -264,7 +271,7 @@ message RemoteProducerMetadata {
   message RowNum {
     // The ID of the processor that is producing rows.
     optional string sender_id = 1 [(gogoproto.nullable) = false,
-                                   (gogoproto.customname) = "SenderID"];
+      (gogoproto.customname) = "SenderID"];
     // A running count of the number of rows emitted from the sender so far.
     optional int32 row_num = 2 [(gogoproto.nullable) = false];
     // When set, indicates that the row count contains the expected number of
@@ -286,15 +293,66 @@ message RemoteProducerMetadata {
     // Used to stream back progress to the coordinator of a bulk job.
     optional google.protobuf.Any progress_details = 4 [(gogoproto.nullable) = false];
     optional roachpb.BulkOpSummary bulk_summary = 5 [(gogoproto.nullable) = false];
+    repeated int32 completed_span_idx = 6;
+    // NodeID is the node from which the progress is being pushed to the
+    // coordinator of a bulk job.
+    optional int32 node_id = 7 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "NodeID",
+      (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
+    // FlowID is the unique identifier of the physical plan shared by all remote
+    // flows.
+    optional bytes flow_id = 8 [(gogoproto.nullable) = false,
+      (gogoproto.customname) = "FlowID",
+      (gogoproto.customtype) = "FlowID"];
+    optional bool drained = 9 [(gogoproto.nullable) = false];
+    // ProcessorID is the ID of the processor that published the metadata.
+    optional int32 processor_id = 10 [(gogoproto.nullable) = false, (gogoproto.customname) = "ProcessorID"];
+    // ProgressMessage is an opaque bytes field that job-specific DistSQL
+    // processors can use to marshal their own progress protos into. Prefer
+    // this over ProgressDetails, which uses google.protobuf.Any.
+    optional bytes progress_message = 11;
+    // NEXT ID: 12
   }
   // Metrics are unconditionally emitted by table readers.
   message Metrics {
-    // Total number of bytes read while executing a statement.
+    // BytesRead is the number of primary and secondary index bytes read while
+    // executing a statement.
     optional int64 bytes_read = 1 [(gogoproto.nullable) = false];
-    // Total number of rows read while executing a statement.
+    // RowsRead is the number of primary and secondary index rows read while
+    // executing a statement.
     optional int64 rows_read = 2 [(gogoproto.nullable) = false];
-    // Total number of rows modified while executing a statement.
+    // RowsWritten is the number of primary index rows modified while executing
+    // a statement. It does not include secondary index rows.
     optional int64 rows_written = 3 [(gogoproto.nullable) = false];
+    // IndexRowsWritten is the number of primary and secondary index rows
+    // modified while executing a statement. It is always >= RowsWritten.
+    optional int64 index_rows_written = 5 [(gogoproto.nullable) = false];
+    // IndexBytesWritten is the number of primary and secondary index bytes
+    // modified while executing a statement.
+    optional int64 index_bytes_written = 6 [(gogoproto.nullable) = false];
+    // Stage identifier that produced these metrics. This is used to aggregate
+    // row counts across distributed table reader processors for misestimate
+    // logging. Note that other disk-reading processors (index and lookup joins,
+    // inverted joins, zigzag joins) do not set this field. This is safe because
+    // we enumerate physical plan stages starting at 1, so the default value of
+    // 0 isn't conflated with any actual plan stage.
+    optional int32 stage_id = 4 [(gogoproto.nullable) = false, (gogoproto.customname) = "StageID"];
+    // KVCPUTime is the total cpu time reported by KV BatchResponses. This is
+    // representative of the "synchronous" portion of work performed by KV.
+    // See the CPUTime field in the kvpb.BatchResponse_Header.
+    optional int64 kv_cpu_time = 7 [(gogoproto.nullable) = false, (gogoproto.customname) = "KVCPUTime"];
+    // LocalKVCPUTime is the SQL goroutine CPU time (in nanoseconds) spent
+    // inside KV calls for this flow, as measured by the grunning library. This
+    // is the portion of SQL goroutine CPU that overlapped with KV work, not
+    // the CPU consumed on KV servers (see KVCPUTime for that). The gateway
+    // subtracts it from total goroutine CPU to derive SQL-only CPU.
+    optional int64 local_kv_cpu_time = 8 [(gogoproto.nullable) = false, (gogoproto.customname) = "LocalKVCPUTime"];
+    // RawSQLCPUTime carries raw goroutine CPU time (in nanoseconds) for this
+    // flow, before any correction. Remote flows send their accumulated
+    // grunning time here; the gateway subtracts total LocalKVCPUTime to
+    // derive SQL-only CPU.
+    optional int64 raw_sql_cpu_time = 9 [(gogoproto.nullable) = false, (gogoproto.customname) = "RawSQLCPUTime"];
+    // NEXT ID: 10
   }
   oneof value {
     RangeInfos range_info = 1;
@@ -305,22 +363,19 @@ message RemoteProducerMetadata {
     SamplerProgress sampler_progress = 7;
     Metrics metrics = 8;
     BulkProcessorProgress bulk_processor_progress = 9;
+    TracingAggregatorEvents tracing_aggregator_events= 12;
   }
-  reserved 6, 10;
+  reserved 6, 10, 11;
+  // NEXT ID: 13
 }
 
-// DistSQLVersionGossipInfo represents the DistSQL server version information
-// that gets gossiped for each node. This is used by planners to avoid planning
-// on nodes with incompatible version during rolling cluster updates.
-//
-// For the meaning of the fields, see the corresponding constants in
-// distsqlrun/server.go.
-message DistSQLVersionGossipInfo {
-  optional uint32 version = 1 [(gogoproto.nullable) = false,
-                               (gogoproto.casttype) = "DistSQLVersion"];
-
-  optional uint32 min_accepted_version = 2 [(gogoproto.nullable) = false,
-                                            (gogoproto.casttype) = "DistSQLVersion"];
+// MergeIterationProgress reports task completion progress during distributed
+// merge iterations. This message is passed via BulkProcessorProgress.progress_details.
+message MergeIterationProgress {
+  // Task ID that was completed.
+  optional int64 completed_task_id = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "CompletedTaskID"];
+  // Total number of tasks in the current merge iteration.
+  optional int64 tasks_total = 2 [(gogoproto.nullable) = false, (gogoproto.customname) = "TasksTotal"];
 }
 
 // DistSQLDrainingInfo represents the DistSQL draining state that gets gossiped
@@ -328,4 +383,23 @@ message DistSQLVersionGossipInfo {
 // known to be draining.
 message DistSQLDrainingInfo {
   optional bool draining = 1 [(gogoproto.nullable) = false];
+}
+
+// TracingAggregatorEvents represent a collection of events emitted by a tracing
+// aggregator. These events contain the execution details of the component being
+// monitored by the tracing aggregator.
+message TracingAggregatorEvents {
+  // SQLInstanceID is the node from which the aggregator event is being pushed
+  // to the coordinator of the job.
+  optional int32 sql_instance_id = 1 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "SQLInstanceID",
+    (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/base.SQLInstanceID"];
+  // FlowID is the unique identifier of the physical plan shared by all remote
+  // flows.
+  optional bytes flow_id = 2 [(gogoproto.nullable) = false,
+    (gogoproto.customname) = "FlowID",
+    (gogoproto.customtype) = "FlowID"];
+  map<string, bytes> events = 3;
+
+  map<string, util.tracing.tracingpb.OperationMetadata> span_totals = 4 [(gogoproto.nullable) = false];
 }

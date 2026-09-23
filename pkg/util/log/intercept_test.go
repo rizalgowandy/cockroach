@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package log
 
@@ -42,7 +37,7 @@ func TestManyInterceptors(t *testing.T) {
 		ctxgroup.GroupWorkers(context.Background(), 100, func(ctx context.Context, worker int) error {
 			defer addInterceptor(t, &devnull{})()
 			for i := 0; i < 10; i++ {
-				Infof(ctx, "hello worker %d: %d", worker, i)
+				Dev.Infof(ctx, "hello worker %d: %d", worker, i)
 			}
 			return nil
 		}))
@@ -88,7 +83,7 @@ func (c *captureInterceptor) verifyCaptures(t *testing.T) {
 }
 
 func infoWithCapture(msg string, interceptors ...*captureInterceptor) {
-	InfofDepth(context.Background(), 1, "%s", msg)
+	Dev.InfofDepth(context.Background(), 1, "%s", msg)
 	file, line, _ := caller.Lookup(1)
 	expectedRe := regexp.MustCompile(fmt.Sprintf(`.*"file":"%s","line":%d.*%s`, file, line, msg))
 

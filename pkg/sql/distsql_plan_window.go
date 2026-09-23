@@ -1,102 +1,37 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
-type windowPlanState struct {
-	// infos contains information about windowFuncHolders in the same order as
-	// they appear in n.funcs.
-	infos   []*windowFuncInfo
-	n       *windowNode
-	planCtx *PlanningCtx
-	plan    *PhysicalPlan
-}
-
-func createWindowPlanState(
-	n *windowNode, planCtx *PlanningCtx, plan *PhysicalPlan,
-) *windowPlanState {
-	infos := make([]*windowFuncInfo, 0, len(n.funcs))
-	for _, holder := range n.funcs {
-		infos = append(infos, &windowFuncInfo{holder: holder})
-	}
-	return &windowPlanState{
-		infos:   infos,
-		n:       n,
-		planCtx: planCtx,
-		plan:    plan,
-	}
-}
-
-// windowFuncInfo contains runtime information about a window function.
-type windowFuncInfo struct {
-	holder *windowFuncHolder
-	// isProcessed indicates whether holder has already been processed. It is set
-	// to true when holder is included in the set of window functions to be
-	// processed by findUnprocessedWindowFnsWithSamePartition.
-	isProcessed bool
-}
-
-// findUnprocessedWindowFnsWithSamePartition finds a set of unprocessed window
-// functions that use the same partitioning and updates their isProcessed flag
-// accordingly. It returns the set of unprocessed window functions and indices
-// of the columns in their PARTITION BY clause.
-func (s *windowPlanState) findUnprocessedWindowFnsWithSamePartition() (
-	samePartitionFuncs []*windowFuncHolder,
-	partitionIdxs []uint32,
-) {
-	windowFnToProcessIdx := -1
-	for windowFnIdx, windowFn := range s.infos {
-		if !windowFn.isProcessed {
-			windowFnToProcessIdx = windowFnIdx
-			break
-		}
-	}
-	if windowFnToProcessIdx == -1 {
-		panic("unexpected: no unprocessed window function")
-	}
-
-	windowFnToProcess := s.infos[windowFnToProcessIdx].holder
-	partitionIdxs = make([]uint32, len(windowFnToProcess.partitionIdxs))
-	for i, idx := range windowFnToProcess.partitionIdxs {
-		partitionIdxs[i] = uint32(idx)
-	}
-
-	samePartitionFuncs = make([]*windowFuncHolder, 0, len(s.infos)-windowFnToProcessIdx)
-	samePartitionFuncs = append(samePartitionFuncs, windowFnToProcess)
-	s.infos[windowFnToProcessIdx].isProcessed = true
-	for _, windowFn := range s.infos[windowFnToProcessIdx+1:] {
-		if windowFn.isProcessed {
-			continue
-		}
-		if windowFnToProcess.samePartition(windowFn.holder) {
-			samePartitionFuncs = append(samePartitionFuncs, windowFn.holder)
-			windowFn.isProcessed = true
-		}
-	}
-
-	return samePartitionFuncs, partitionIdxs
-}
-
-func (s *windowPlanState) createWindowFnSpec(
+func createWindowFnSpec(
+	ctx context.Context,
+	planCtx *PlanningCtx,
+	plan *PhysicalPlan,
 	funcInProgress *windowFuncHolder,
+	ordCols []execinfrapb.Ordering_Column,
 ) (execinfrapb.WindowerSpec_WindowFn, *types.T, error) {
 	for _, argIdx := range funcInProgress.argsIdxs {
-		if argIdx >= uint32(len(s.plan.GetResultTypes())) {
+		if argIdx >= uint32(len(plan.GetResultTypes())) {
 			return execinfrapb.WindowerSpec_WindowFn{}, nil, errors.Errorf("ColIdx out of range (%d)", argIdx)
 		}
 	}
@@ -107,21 +42,11 @@ func (s *windowPlanState) createWindowFnSpec(
 	}
 	argTypes := make([]*types.T, len(funcInProgress.argsIdxs))
 	for i, argIdx := range funcInProgress.argsIdxs {
-		argTypes[i] = s.plan.GetResultTypes()[argIdx]
+		argTypes[i] = plan.GetResultTypes()[argIdx]
 	}
-	_, outputType, err := execinfrapb.GetWindowFunctionInfo(funcSpec, argTypes...)
+	_, outputType, err := execagg.GetWindowFunctionInfo(funcSpec, argTypes...)
 	if err != nil {
 		return execinfrapb.WindowerSpec_WindowFn{}, outputType, err
-	}
-	// Populating column ordering from ORDER BY clause of funcInProgress.
-	ordCols := make([]execinfrapb.Ordering_Column, 0, len(funcInProgress.columnOrdering))
-	for _, column := range funcInProgress.columnOrdering {
-		ordCols = append(ordCols, execinfrapb.Ordering_Column{
-			ColIdx: uint32(column.ColIdx),
-			// We need this -1 because encoding.Direction has extra value "_"
-			// as zeroth "entry" which its proto equivalent doesn't have.
-			Direction: execinfrapb.Ordering_Column_Direction(column.Direction - 1),
-		})
 	}
 	funcInProgressSpec := execinfrapb.WindowerSpec_WindowFn{
 		Func:         funcSpec,
@@ -132,114 +57,213 @@ func (s *windowPlanState) createWindowFnSpec(
 	}
 	if funcInProgress.frame != nil {
 		// funcInProgress has a custom window frame.
-		frameSpec := execinfrapb.WindowerSpec_Frame{}
-		if err := frameSpec.InitFromAST(funcInProgress.frame, s.planCtx.EvalContext()); err != nil {
+		frameSpec := &execinfrapb.WindowerSpec_Frame{}
+		if err := initFrameFromAST(ctx, frameSpec, funcInProgress.frame, planCtx.EvalContext()); err != nil {
 			return execinfrapb.WindowerSpec_WindowFn{}, outputType, err
 		}
-		funcInProgressSpec.Frame = &frameSpec
+		funcInProgressSpec.Frame = frameSpec
 	}
 
 	return funcInProgressSpec, outputType, nil
 }
 
-// windowers currently cannot maintain the ordering (see #36310).
-var windowerMergeOrdering = execinfrapb.Ordering{}
+// initFrameFromAST initializes the spec based on tree.WindowFrame. It will
+// evaluate offset expressions if present in the frame.
+func initFrameFromAST(
+	ctx context.Context,
+	spec *execinfrapb.WindowerSpec_Frame,
+	f *tree.WindowFrame,
+	evalCtx *eval.Context,
+) error {
+	if err := initModeFromAST(&spec.Mode, f.Mode); err != nil {
+		return err
+	}
+	if err := initExclusionFromAST(&spec.Exclusion, f.Exclusion); err != nil {
+		return err
+	}
+	return initBoundsFromAST(ctx, &spec.Bounds, f.Bounds, f.Mode, evalCtx)
+}
 
-// addRenderingOrProjection checks whether any of the window functions' outputs
-// are used in another expression and, if they are, adds rendering to the plan.
-// If no rendering is required, it adds a projection to remove all columns that
-// were arguments to window functions or were used within OVER clauses.
-func (s *windowPlanState) addRenderingOrProjection() error {
-	// numWindowFuncsAsIs is the number of window functions output of which is
-	// used directly (i.e. simply as an output column). Note: the same window
-	// function might appear multiple times in the query, but its every
-	// occurrence is replaced by a different windowFuncHolder. For example, on
-	// query like 'SELECT avg(a) OVER (), avg(a) OVER () + 1 FROM t', only the
-	// first window function is used "as is."
-	numWindowFuncsAsIs := 0
-	for _, render := range s.n.windowRender {
-		if _, ok := render.(*windowFuncHolder); ok {
-			numWindowFuncsAsIs++
+func initModeFromAST(
+	spec *execinfrapb.WindowerSpec_Frame_Mode, w treewindow.WindowFrameMode,
+) error {
+	switch w {
+	case treewindow.RANGE:
+		*spec = execinfrapb.WindowerSpec_Frame_RANGE
+	case treewindow.ROWS:
+		*spec = execinfrapb.WindowerSpec_Frame_ROWS
+	case treewindow.GROUPS:
+		*spec = execinfrapb.WindowerSpec_Frame_GROUPS
+	default:
+		return errors.AssertionFailedf("unexpected WindowFrameMode")
+	}
+	return nil
+}
+
+func initExclusionFromAST(
+	spec *execinfrapb.WindowerSpec_Frame_Exclusion, e treewindow.WindowFrameExclusion,
+) error {
+	switch e {
+	case treewindow.NoExclusion:
+		*spec = execinfrapb.WindowerSpec_Frame_NO_EXCLUSION
+	case treewindow.ExcludeCurrentRow:
+		*spec = execinfrapb.WindowerSpec_Frame_EXCLUDE_CURRENT_ROW
+	case treewindow.ExcludeGroup:
+		*spec = execinfrapb.WindowerSpec_Frame_EXCLUDE_GROUP
+	case treewindow.ExcludeTies:
+		*spec = execinfrapb.WindowerSpec_Frame_EXCLUDE_TIES
+	default:
+		return errors.AssertionFailedf("unexpected WindowerFrameExclusion")
+	}
+	return nil
+}
+
+func initBoundTypeFromAST(
+	spec *execinfrapb.WindowerSpec_Frame_BoundType, bt treewindow.WindowFrameBoundType,
+) error {
+	switch bt {
+	case treewindow.UnboundedPreceding:
+		*spec = execinfrapb.WindowerSpec_Frame_UNBOUNDED_PRECEDING
+	case treewindow.OffsetPreceding:
+		*spec = execinfrapb.WindowerSpec_Frame_OFFSET_PRECEDING
+	case treewindow.CurrentRow:
+		*spec = execinfrapb.WindowerSpec_Frame_CURRENT_ROW
+	case treewindow.OffsetFollowing:
+		*spec = execinfrapb.WindowerSpec_Frame_OFFSET_FOLLOWING
+	case treewindow.UnboundedFollowing:
+		*spec = execinfrapb.WindowerSpec_Frame_UNBOUNDED_FOLLOWING
+	default:
+		return errors.AssertionFailedf("unexpected WindowFrameBoundType")
+	}
+	return nil
+}
+
+// If offset exprs are present, we evaluate them and save the encoded results
+// in the spec.
+func initBoundsFromAST(
+	ctx context.Context,
+	spec *execinfrapb.WindowerSpec_Frame_Bounds,
+	b tree.WindowFrameBounds,
+	m treewindow.WindowFrameMode,
+	evalCtx *eval.Context,
+) error {
+	if b.StartBound == nil {
+		return errors.Errorf("unexpected: Start Bound is nil")
+	}
+	spec.Start = execinfrapb.WindowerSpec_Frame_Bound{}
+	if err := initBoundTypeFromAST(&spec.Start.BoundType, b.StartBound.BoundType); err != nil {
+		return err
+	}
+	if b.StartBound.HasOffset() {
+		typedStartOffset := b.StartBound.OffsetExpr.(tree.TypedExpr)
+		dStartOffset, err := eval.Expr(ctx, evalCtx, typedStartOffset)
+		if err != nil {
+			return err
+		}
+		if dStartOffset == tree.DNull {
+			return pgerror.Newf(pgcode.NullValueNotAllowed, "frame starting offset must not be null")
+		}
+		switch m {
+		case treewindow.ROWS:
+			startOffset := int64(tree.MustBeDInt(dStartOffset))
+			if startOffset < 0 {
+				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame starting offset must not be negative")
+			}
+			spec.Start.IntOffset = uint64(startOffset)
+		case treewindow.RANGE:
+			if neg, err := isNegative(ctx, evalCtx, dStartOffset); err != nil {
+				return err
+			} else if neg {
+				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
+			}
+			typ := dStartOffset.ResolvedType()
+			spec.Start.OffsetType = execinfrapb.DatumInfo{Encoding: catenumpb.DatumEncoding_VALUE, Type: typ}
+			var buf []byte
+			var a tree.DatumAlloc
+			datum, err := rowenc.DatumToEncDatum(typ, dStartOffset)
+			if err != nil {
+				return err
+			}
+			buf, err = datum.Encode(typ, &a, catenumpb.DatumEncoding_VALUE, buf)
+			if err != nil {
+				return err
+			}
+			spec.Start.TypedOffset = buf
+		case treewindow.GROUPS:
+			startOffset := int64(tree.MustBeDInt(dStartOffset))
+			if startOffset < 0 {
+				return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame starting offset must not be negative")
+			}
+			spec.Start.IntOffset = uint64(startOffset)
 		}
 	}
-	if numWindowFuncsAsIs == len(s.infos) {
-		// All window functions' outputs are used directly, so there is no
-		// rendering to do and simple projection is sufficient.
-		columns := make([]uint32, len(s.n.windowRender))
-		passedThruColIdx := uint32(0)
-		for i, render := range s.n.windowRender {
-			if render == nil {
-				columns[i] = passedThruColIdx
-				passedThruColIdx++
-			} else {
-				// We have done the type introspection above, so all non-nil renders
-				// are windowFuncHolders.
-				holder := render.(*windowFuncHolder)
-				columns[i] = uint32(holder.outputColIdx)
+
+	if b.EndBound != nil {
+		spec.End = &execinfrapb.WindowerSpec_Frame_Bound{}
+		if err := initBoundTypeFromAST(&spec.End.BoundType, b.EndBound.BoundType); err != nil {
+			return err
+		}
+		if b.EndBound.HasOffset() {
+			typedEndOffset := b.EndBound.OffsetExpr.(tree.TypedExpr)
+			dEndOffset, err := eval.Expr(ctx, evalCtx, typedEndOffset)
+			if err != nil {
+				return err
+			}
+			if dEndOffset == tree.DNull {
+				return pgerror.Newf(pgcode.NullValueNotAllowed, "frame ending offset must not be null")
+			}
+			switch m {
+			case treewindow.ROWS:
+				endOffset := int64(tree.MustBeDInt(dEndOffset))
+				if endOffset < 0 {
+					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame ending offset must not be negative")
+				}
+				spec.End.IntOffset = uint64(endOffset)
+			case treewindow.RANGE:
+				if neg, err := isNegative(ctx, evalCtx, dEndOffset); err != nil {
+					return err
+				} else if neg {
+					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "invalid preceding or following size in window function")
+				}
+				typ := dEndOffset.ResolvedType()
+				spec.End.OffsetType = execinfrapb.DatumInfo{Encoding: catenumpb.DatumEncoding_VALUE, Type: typ}
+				var buf []byte
+				var a tree.DatumAlloc
+				datum, err := rowenc.DatumToEncDatum(typ, dEndOffset)
+				if err != nil {
+					return err
+				}
+				buf, err = datum.Encode(typ, &a, catenumpb.DatumEncoding_VALUE, buf)
+				if err != nil {
+					return err
+				}
+				spec.End.TypedOffset = buf
+			case treewindow.GROUPS:
+				endOffset := int64(tree.MustBeDInt(dEndOffset))
+				if endOffset < 0 {
+					return pgerror.Newf(pgcode.InvalidWindowFrameOffset, "frame ending offset must not be negative")
+				}
+				spec.End.IntOffset = uint64(endOffset)
 			}
 		}
-		s.plan.AddProjection(columns, windowerMergeOrdering)
-		return nil
 	}
 
-	// windowNode contains render expressions that might contain:
-	// 1) IndexedVars that refer to columns by their indices in the full table,
-	// 2) IndexedVars that replaced regular aggregates that are above
-	//    "windowing level."
-	// The mapping of both types IndexedVars is stored in s.n.colAndAggContainer.
-	renderExprs := make([]tree.TypedExpr, len(s.n.windowRender))
-	visitor := replaceWindowFuncsVisitor{
-		columnsMap: s.n.colAndAggContainer.idxMap,
+	return nil
+}
+
+// isNegative returns whether offset is negative.
+func isNegative(ctx context.Context, evalCtx *eval.Context, offset tree.Datum) (bool, error) {
+	switch o := offset.(type) {
+	case *tree.DInt:
+		return *o < 0, nil
+	case *tree.DDecimal:
+		return o.Negative, nil
+	case *tree.DFloat:
+		return *o < 0, nil
+	case *tree.DInterval:
+		cmp, err := o.Compare(ctx, evalCtx, &tree.DInterval{Duration: duration.Duration{}})
+		return cmp < 0, err
+	default:
+		panic("unexpected offset type")
 	}
-
-	// All passed through columns are contiguous and at the beginning of the
-	// output schema.
-	passedThruColIdx := 0
-	renderTypes := make([]*types.T, 0, len(s.n.windowRender))
-	for i, render := range s.n.windowRender {
-		if render != nil {
-			// render contains at least one reference to windowFuncHolder, so we need
-			// to walk over the render and replace all windowFuncHolders and (if found)
-			// IndexedVars using columnsMap and outputColIdx of windowFuncHolders.
-			renderExprs[i] = visitor.replace(render)
-		} else {
-			// render is nil meaning that a column is being passed through.
-			renderExprs[i] = tree.NewTypedOrdinalReference(passedThruColIdx, s.plan.GetResultTypes()[passedThruColIdx])
-			passedThruColIdx++
-		}
-		outputType := renderExprs[i].ResolvedType()
-		renderTypes = append(renderTypes, outputType)
-	}
-	return s.plan.AddRendering(renderExprs, s.planCtx, s.plan.PlanToStreamColMap, renderTypes, windowerMergeOrdering)
-}
-
-// replaceWindowFuncsVisitor is used to populate render expressions containing
-// the results of window functions. It recurses into all expressions except for
-// windowFuncHolders (which are replaced by the indices to the corresponding
-// output columns) and IndexedVars (which are replaced using columnsMap).
-type replaceWindowFuncsVisitor struct {
-	columnsMap map[int]int
-}
-
-var _ tree.Visitor = &replaceWindowFuncsVisitor{}
-
-// VisitPre satisfies the Visitor interface.
-func (v *replaceWindowFuncsVisitor) VisitPre(expr tree.Expr) (recurse bool, newExpr tree.Expr) {
-	switch t := expr.(type) {
-	case *windowFuncHolder:
-		return false, tree.NewTypedOrdinalReference(t.outputColIdx, t.ResolvedType())
-	case *tree.IndexedVar:
-		return false, tree.NewTypedOrdinalReference(v.columnsMap[t.Idx], t.ResolvedType())
-	}
-	return true, expr
-}
-
-// VisitPost satisfies the Visitor interface.
-func (v *replaceWindowFuncsVisitor) VisitPost(expr tree.Expr) tree.Expr {
-	return expr
-}
-
-func (v *replaceWindowFuncsVisitor) replace(typedExpr tree.TypedExpr) tree.TypedExpr {
-	expr, _ := tree.WalkExpr(v, typedExpr)
-	return expr.(tree.TypedExpr)
 }

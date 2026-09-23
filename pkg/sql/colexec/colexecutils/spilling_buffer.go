@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecutils
 
@@ -57,10 +52,11 @@ type SpillingBuffer struct {
 	// because it only provides a window into input data after disk spilling.
 	scratch coldata.Batch
 
-	diskQueueCfg colcontainer.DiskQueueCfg
-	diskQueue    colcontainer.RewindableQueue
-	fdSemaphore  semaphore.Semaphore
-	diskAcc      *mon.BoundAccount
+	diskQueueCfg    colcontainer.DiskQueueCfg
+	diskQueue       colcontainer.RewindableQueue
+	fdSemaphore     semaphore.Semaphore
+	diskAcc         *mon.BoundAccount
+	diskQueueMemAcc *mon.BoundAccount
 
 	dequeueScratch            coldata.Batch
 	lastDequeuedBatchMemUsage int64
@@ -103,8 +99,14 @@ func NewSpillingBuffer(
 	fdSemaphore semaphore.Semaphore,
 	inputTypes []*types.T,
 	diskAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 	colIdxs ...int,
 ) *SpillingBuffer {
+	if unlimitedAllocator.Acc() == diskQueueMemAcc {
+		colexecerror.InternalError(errors.AssertionFailedf(
+			"memory accounts for allocator and disk queue must be different",
+		))
+	}
 	if colIdxs == nil {
 		colIdxs = make([]int, len(inputTypes))
 		for i := range colIdxs {
@@ -136,6 +138,7 @@ func NewSpillingBuffer(
 		diskQueueCfg:       diskQueueCfg,
 		fdSemaphore:        fdSemaphore,
 		diskAcc:            diskAcc,
+		diskQueueMemAcc:    diskQueueMemAcc,
 	}
 }
 
@@ -175,11 +178,12 @@ func (b *SpillingBuffer) AppendTuples(
 	if b.diskQueue == nil {
 		if b.fdSemaphore != nil {
 			if err = b.fdSemaphore.Acquire(ctx, numSpillingBufferFDs); err != nil {
-				colexecerror.InternalError(err)
+				colexecerror.ExpectedError(err)
 			}
 		}
 		if b.diskQueue, err = colcontainer.NewRewindableDiskQueue(
-			ctx, b.storedTypes, b.diskQueueCfg, b.diskAcc); err != nil {
+			ctx, b.storedTypes, b.diskQueueCfg, b.diskAcc, b.diskQueueMemAcc,
+		); err != nil {
 			colexecerror.InternalError(err)
 		}
 		log.VEvent(ctx, 1, "spilled to disk")
@@ -216,9 +220,13 @@ func (b *SpillingBuffer) AppendTuples(
 // when tuples from a subsequent batch are accessed. If the index is less than
 // zero or greater than or equal to the buffer length, GetVecWithTuple will
 // panic.
+//
+// WARNING: the returned column vector is only valid until the next call to
+// GetVecWithTuple. If the caller wants to hold onto the vector, a copy must be
+// made.
 func (b *SpillingBuffer) GetVecWithTuple(
 	ctx context.Context, colIdx, idx int,
-) (_ coldata.Vec, rowIdx int, length int) {
+) (_ *coldata.Vec, rowIdx int, length int) {
 	var err error
 	if idx < 0 || idx >= b.Length() {
 		colexecerror.InternalError(
@@ -236,7 +244,7 @@ func (b *SpillingBuffer) GetVecWithTuple(
 		// The idx'th tuple is located before the current head of the queue, so we
 		// need to rewind. TODO(drewk): look for a more efficient way to handle
 		// spilling.
-		if err = b.diskQueue.Rewind(); err != nil {
+		if err = b.diskQueue.Rewind(ctx); err != nil {
 			colexecerror.InternalError(err)
 		}
 		b.numDequeued = 0
@@ -271,14 +279,14 @@ func (b *SpillingBuffer) GetVecWithTuple(
 			// it, then account for the current one.
 			b.unlimitedAllocator.ReleaseMemory(b.lastDequeuedBatchMemUsage)
 			b.lastDequeuedBatchMemUsage = colmem.GetBatchMemSize(b.dequeueScratch)
-			b.unlimitedAllocator.AdjustMemoryUsage(b.lastDequeuedBatchMemUsage)
+			b.unlimitedAllocator.AdjustMemoryUsageAfterAllocation(b.lastDequeuedBatchMemUsage)
 			return b.dequeueScratch.ColVec(colIdx), rowIdx, b.dequeueScratch.Length()
 		}
 		// The requested tuple must be located further into the disk queue.
 		var ok bool
 		b.numDequeued += b.dequeueScratch.Length()
 		if ok, err = b.diskQueue.Dequeue(ctx, b.dequeueScratch); err != nil {
-			colexecerror.InternalError(err)
+			HandleErrorFromDiskQueue(err)
 		}
 		if !ok || b.dequeueScratch.Length() == 0 {
 			colexecerror.InternalError(
@@ -295,7 +303,7 @@ func (b *SpillingBuffer) Length() int {
 func (b *SpillingBuffer) closeSpillingQueue(ctx context.Context) {
 	if b.diskQueue != nil {
 		if err := b.diskQueue.Close(ctx); err != nil {
-			colexecerror.InternalError(err)
+			HandleErrorFromDiskQueue(err)
 		}
 		if b.fdSemaphore != nil {
 			b.fdSemaphore.Release(numSpillingBufferFDs)
@@ -309,7 +317,7 @@ func (b *SpillingBuffer) Close(ctx context.Context) {
 	if b.closed {
 		return
 	}
-	b.unlimitedAllocator.ReleaseMemory(b.unlimitedAllocator.Used())
+	b.unlimitedAllocator.ReleaseAll()
 	b.closeSpillingQueue(ctx)
 
 	// Release all references so they can be garbage collected.

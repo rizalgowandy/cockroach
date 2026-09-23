@@ -1,17 +1,13 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage
 
 import (
 	"context"
+	"slices"
 	"sync/atomic"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
@@ -43,26 +39,33 @@ type pebbleMapBatchWriter struct {
 
 	// makeKey is a function that transforms a key into a byte slice with a prefix
 	// to be written to the underlying store.
-	makeKey           func(k []byte) []byte
-	batch             *pebble.Batch
-	numPutsSinceFlush int
-	store             *pebble.DB
+	makeKey func(k []byte) []byte
+	// makeKeyNoSeq is the makeKey function without sequence numbers, used for
+	// delete range operations.
+	makeKeyNoSeq func(k []byte) []byte
+	batch        *pebble.Batch
+	// onFlush will be called after every batch commit.
+	onFlush                func()
+	numMutationsSinceFlush int
 }
 
 // pebbleMapIterator iterates over the keys of a pebbleMap in sorted order.
 type pebbleMapIterator struct {
 	allowDuplicates bool
 	iter            *pebble.Iterator
-	// makeKey is a function that transforms a key into a byte slice with a prefix
-	// used to SeekGE() the underlying iterator.
-	makeKey func(k []byte) []byte
-	// prefix is the prefix of keys that this iterator iterates over.
-	prefix []byte
+	// prefixLen is the length of the prefix of keys that this iterator iterates
+	// over.
+	prefixLen int
+	// makeKeyScratch is a scratch space reused when transforming a key into a
+	// byte slice with a prefix used to SeekGE() the iterator. First prefixLen
+	// bytes are always the prefix of all keys touched by this iterator.
+	makeKeyScratch []byte
 }
 
-// pebbleMap is a SortedDiskMap, similar to rocksDBMap, that uses pebble as its
-// underlying storage engine.
+// pebbleMap is a SortedDiskMap that uses pebble as its underlying storage
+// engine.
 type pebbleMap struct {
+	// prefix always stores the unique prefix shared by all keys in the map.
 	prefix          []byte
 	store           *pebble.DB
 	allowDuplicates bool
@@ -112,13 +115,18 @@ func (r *pebbleMap) makeKeyWithSequence(k []byte) []byte {
 
 // NewIterator implements the SortedDiskMap interface.
 func (r *pebbleMap) NewIterator() diskmap.SortedDiskMapIterator {
+	iter, err := r.store.NewIter(&pebble.IterOptions{
+		UpperBound: roachpb.Key(r.prefix).PrefixEnd(),
+	})
+	if err != nil {
+		// TODO(bilal): Update all diskMap interfaces to allow returning errors here.
+		panic(err)
+	}
 	return &pebbleMapIterator{
 		allowDuplicates: r.allowDuplicates,
-		iter: r.store.NewIter(&pebble.IterOptions{
-			UpperBound: roachpb.Key(r.prefix).PrefixEnd(),
-		}),
-		makeKey: r.makeKey,
-		prefix:  r.prefix,
+		iter:            iter,
+		prefixLen:       len(r.prefix),
+		makeKeyScratch:  append([]byte{}, r.prefix...),
 	}
 }
 
@@ -133,11 +141,27 @@ func (r *pebbleMap) NewBatchWriterCapacity(capacityBytes int) diskmap.SortedDisk
 	if r.allowDuplicates {
 		makeKey = r.makeKeyWithSequence
 	}
-	return &pebbleMapBatchWriter{
-		capacity: capacityBytes,
-		makeKey:  makeKey,
-		batch:    r.store.NewBatch(),
-		store:    r.store,
+	b := &pebbleMapBatchWriter{
+		capacity:     capacityBytes,
+		makeKey:      makeKey,
+		makeKeyNoSeq: r.makeKey,
+		batch:        r.store.NewBatch(),
+	}
+	b.onFlush = func() {
+		// If we happened to have Put very large keys, we want to lose
+		// references to them.
+		r.gcPrefixSlice()
+		b.numMutationsSinceFlush = 0
+		b.batch = r.store.NewBatch()
+	}
+	return b
+}
+
+const maxPrefixCapReuse = 1 << 20 /* 1 MiB */
+
+func (r *pebbleMap) gcPrefixSlice() {
+	if cap(r.prefix) > maxPrefixCapReuse {
+		r.prefix = slices.Clone(r.prefix)
 	}
 }
 
@@ -160,8 +184,16 @@ func (r *pebbleMap) Clear() error {
 // Close implements the SortedDiskMap interface.
 func (r *pebbleMap) Close(ctx context.Context) {
 	if err := r.Clear(); err != nil {
-		log.Errorf(ctx, "%v", err)
+		log.Dev.Errorf(ctx, "%v", err)
 	}
+}
+
+// makeKey is a function that transforms a key into a byte slice with a prefix
+// used to SeekGE() the underlying iterator. This key is only valid until the
+// next call to makeKey and **cannot** be mutated.
+func (i *pebbleMapIterator) makeKey(k []byte) []byte {
+	i.makeKeyScratch = append(i.makeKeyScratch[:i.prefixLen], k...)
+	return i.makeKeyScratch
 }
 
 // SeekGE implements the SortedDiskMapIterator interface.
@@ -192,11 +224,14 @@ func (i *pebbleMapIterator) UnsafeKey() []byte {
 		// There are 8 bytes of sequence number at the end of the key, remove them.
 		end -= 8
 	}
-	return unsafeKey[len(i.prefix):end]
+	return unsafeKey[i.prefixLen:end]
 }
 
 // UnsafeValue implements the SortedDiskMapIterator interface.
 func (i *pebbleMapIterator) UnsafeValue() []byte {
+	// TODO(sumeer): switch to using ValueAndErr. Since error only happens for
+	// non in-place values, and temp engines only have in-place values, this
+	// change is not critical.
 	return i.iter.Value()
 }
 
@@ -211,7 +246,22 @@ func (b *pebbleMapBatchWriter) Put(k []byte, v []byte) error {
 	if err := b.batch.Set(key, v, nil); err != nil {
 		return err
 	}
-	b.numPutsSinceFlush++
+	b.numMutationsSinceFlush++
+	if len(b.batch.Repr()) >= b.capacity {
+		return b.Flush()
+	}
+	return nil
+}
+
+// DeleteRange implements the SortedDiskMapBatchWriter interface.
+// Deletes all keys in the range [start, end).
+func (b *pebbleMapBatchWriter) DeleteRange(start, end []byte) error {
+	startKey := slices.Clone(b.makeKeyNoSeq(start))
+	endKey := slices.Clone(b.makeKeyNoSeq(end))
+	if err := b.batch.DeleteRange(startKey, endKey, nil); err != nil {
+		return err
+	}
+	b.numMutationsSinceFlush++
 	if len(b.batch.Repr()) >= b.capacity {
 		return b.Flush()
 	}
@@ -223,14 +273,13 @@ func (b *pebbleMapBatchWriter) Flush() error {
 	if err := b.batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
-	b.numPutsSinceFlush = 0
-	b.batch = b.store.NewBatch()
+	b.onFlush()
 	return nil
 }
 
-// NumPutsSinceFlush implements the SortedDiskMapBatchWriter interface.
-func (b *pebbleMapBatchWriter) NumPutsSinceFlush() int {
-	return b.numPutsSinceFlush
+// NumMutationsSinceFlush implements the SortedDiskMapBatchWriter interface.
+func (b *pebbleMapBatchWriter) NumMutationsSinceFlush() int {
+	return b.numMutationsSinceFlush
 }
 
 // Close implements the SortedDiskMapBatchWriter interface.

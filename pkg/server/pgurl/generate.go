@@ -1,18 +1,14 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgurl
 
 import (
 	"net"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 )
@@ -103,6 +99,26 @@ func (u *URL) ToPQ() *url.URL {
 	return nu
 }
 
+// ToPQRedacted converts the URL to a connection string supported
+// by drivers using libpq or compatible, with the password redacted.
+func (u *URL) ToPQRedacted() *url.URL {
+	nu, opts := u.baseURL()
+
+	if u.username != "" {
+		nu.User = url.User(u.username)
+	}
+	switch u.authn {
+	case authnPassword, authnPasswordWithClientCert:
+		if u.hasPassword {
+			// Use '~' since it does not need to be escaped.
+			nu.User = url.UserPassword(u.username, "~~~~~~")
+		}
+	}
+
+	nu.RawQuery = opts.Encode()
+	return nu
+}
+
 // String makes URL printable.
 func (u *URL) String() string { return u.ToPQ().String() }
 
@@ -125,6 +141,62 @@ func (u *URL) ToJDBC() *url.URL {
 
 	nu.RawQuery = opts.Encode()
 	return nu
+}
+
+// ToCRDB converts the URL to a connection string for use with CRDB.
+// If sslinline is true, the certificate contents will be inlined
+// in the URL instead of the file paths.
+func (u *URL) ToCRDB() (*url.URL, error) {
+	nu, opts := u.baseURL()
+
+	if u.username != "" {
+		nu.User = url.User(u.username)
+	}
+	switch u.authn {
+	case authnPassword, authnPasswordWithClientCert:
+		if u.hasPassword {
+			nu.User = url.UserPassword(u.username, u.password)
+		}
+	}
+
+	if opts.Get("sslinline") != "true" {
+		nu.RawQuery = opts.Encode()
+		return nu, nil
+	}
+
+	getCert := func(path string) (string, error) {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return string(content), err
+	}
+
+	if caCert := opts.Get("sslrootcert"); caCert != "" {
+		caCertContent, err := getCert(caCert)
+		if err != nil {
+			return nil, err
+		}
+		opts.Set("sslrootcert", caCertContent)
+	}
+
+	if cert := opts.Get("sslcert"); cert != "" {
+		certContent, err := getCert(cert)
+		if err != nil {
+			return nil, err
+		}
+		opts.Set("sslcert", certContent)
+	}
+
+	if key := opts.Get("sslkey"); key != "" {
+		keyContent, err := getCert(key)
+		if err != nil {
+			return nil, err
+		}
+		opts.Set("sslkey", keyContent)
+	}
+	nu.RawQuery = opts.Encode()
+	return nu, nil
 }
 
 // baseURL constructs the URL fields common to both

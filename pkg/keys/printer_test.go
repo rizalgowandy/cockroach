@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package keys_test
 
@@ -21,8 +16,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -30,6 +26,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func lockTableKey(key roachpb.Key) roachpb.Key {
@@ -37,15 +36,183 @@ func lockTableKey(key roachpb.Key) roachpb.Key {
 	return k
 }
 
+func TestSafeFormatKey_SystemTenant(t *testing.T) {
+	tenSysCodec := keys.SystemSQLCodec
+	testCases := []struct {
+		name string
+		key  roachpb.Key
+		exp  string
+	}{
+		{
+			"table with string index key",
+			roachpb.Key(makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeVarintAscending(nil, 1222),
+				encoding.EncodeStringAscending(nil, "handsome man"))),
+			`/Table/42/1222/‹"handsome man"›`,
+		},
+		{
+			"multi-column value",
+			roachpb.Key(makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles"))),
+			`/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
+		{
+			"table with decimal index key",
+			roachpb.Key(makeKey(tenSysCodec.IndexPrefix(84, 2),
+				encoding.EncodeDecimalAscending(nil, apd.New(1234, -2)))),
+			`/Table/84/2/‹12.34›`,
+		},
+		{
+			"namespace table handled as standard system tenant table",
+			keys.NamespaceTableMin,
+			"/NamespaceTable/30",
+		},
+		{
+			"table index without index key",
+			tenSysCodec.IndexPrefix(42, 5),
+			"/Table/42/5",
+		},
+		{
+			"handles infinity values",
+			makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeFloatAscending(nil, math.Inf(1))),
+			"/Table/42/‹+Inf›",
+		},
+		{
+			"handles null values",
+			makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeNullAscending(nil)),
+			"/Table/42/‹NULL›",
+		},
+		{
+			"handles PrefixEnd",
+			roachpb.Key(makeKey(tenSysCodec.TablePrefix(42),
+				encoding.EncodeBitArrayAscending(nil, bitarray.MakeZeroBitArray(64)),
+			)).PrefixEnd(),
+			"/Table/42/‹B0000000000000000000000000000000000000000000000000000000000000000›/‹PrefixEnd›",
+		},
+		{
+			"handles /Table/Max",
+			keys.TableDataMax,
+			"/Table/Max",
+		},
+		{
+			"handles unknowns",
+			makeKey(tenSysCodec.TablePrefix(42), []byte{0x12, 'a', 0x00, 0x03}),
+			`/Table/42/‹???›`,
+		},
+		{
+			"marks safe reserved key prefix",
+			makeKey(keys.Meta1Prefix,
+				tenSysCodec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles")),
+			`/Meta1/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, redact.RedactableString(test.exp), redact.Sprint(test.key))
+		})
+	}
+}
+
+func TestSafeFormatKey_Basic(t *testing.T) {
+	testCases := []struct {
+		name string
+		key  roachpb.Key
+		exp  string
+	}{
+		{
+			"ensure constants get redacted",
+			makeKey(keys.Meta2Prefix, roachpb.Key("foo")),
+			`/Meta2/‹"foo"›`,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, redact.RedactableString(test.exp), redact.Sprint(test.key))
+		})
+	}
+}
+
+func TestSafeFormatKey_AppTenant(t *testing.T) {
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
+	testCases := []struct {
+		name string
+		key  roachpb.Key
+		exp  string
+	}{
+		{
+			"table with string index key",
+			roachpb.Key(makeKey(ten5Codec.IndexPrefix(42, 122),
+				encoding.EncodeStringAscending(nil, "handsome man"))),
+			`/Tenant/5/Table/42/122/‹"handsome man"›`,
+		},
+		{
+			"table with decimal index key",
+			roachpb.Key(makeKey(ten5Codec.IndexPrefix(84, 2),
+				encoding.EncodeDecimalAscending(nil, apd.New(1234, -2)))),
+			`/Tenant/5/Table/84/2/‹12.34›`,
+		},
+		{
+			"multi-column value",
+			roachpb.Key(makeKey(ten5Codec.TablePrefix(42),
+				encoding.EncodeStringAscending(nil, "California"),
+				encoding.EncodeStringAscending(nil, "Los Angeles"))),
+			`/Tenant/5/Table/42/‹"California"›/‹"Los Angeles"›`,
+		},
+		{
+			"table index without index key",
+			ten5Codec.IndexPrefix(42, 5),
+			"/Tenant/5/Table/42/5",
+		},
+		{
+			"handles infinity values",
+			makeKey(ten5Codec.TablePrefix(42),
+				encoding.EncodeFloatAscending(nil, math.Inf(1))),
+			"/Tenant/5/Table/42/‹+Inf›",
+		},
+		{
+			"handles null values",
+			makeKey(ten5Codec.IndexPrefix(42, 2),
+				encoding.EncodeNullAscending(nil)),
+			"/Tenant/5/Table/42/2/‹NULL›",
+		},
+		{
+			"handles PrefixEnd",
+			roachpb.Key(makeKey(ten5Codec.TablePrefix(42),
+				encoding.EncodeBitArrayAscending(nil, bitarray.MakeZeroBitArray(64)),
+			)).PrefixEnd(),
+			"/Tenant/5/Table/42/‹B0000000000000000000000000000000000000000000000000000000000000000›/‹PrefixEnd›",
+		},
+		{
+			"handles unknowns",
+			makeKey(ten5Codec.TablePrefix(42), []byte{0x12, 'a', 0x00, 0x03}),
+			`/Tenant/5/Table/42/‹???›`,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, redact.RedactableString(test.exp), redact.Sprint(test.key))
+		})
+	}
+}
+
 func TestPrettyPrint(t *testing.T) {
 	tenSysCodec := keys.SystemSQLCodec
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	tm, _ := time.Parse(time.RFC3339Nano, "2016-03-30T13:40:35.053725008Z")
 	duration := duration.MakeDuration(1*time.Second.Nanoseconds(), 1, 1)
 	durationAsc, _ := encoding.EncodeDurationAscending(nil, duration)
 	durationDesc, _ := encoding.EncodeDurationDescending(nil, duration)
 	bitArray := bitarray.MakeBitArrayFromInt64(8, 58, 7)
 	txnID := uuid.MakeV4()
+	loqRecoveryID := uuid.MakeV4()
 
 	// Support for asserting that the ugly printer supports a key was added after
 	// most of the tests here were written.
@@ -63,21 +230,25 @@ func TestPrettyPrint(t *testing.T) {
 		// local
 		{keys.StoreIdentKey(), "/Local/Store/storeIdent", revertSupportUnknown},
 		{keys.StoreGossipKey(), "/Local/Store/gossipBootstrap", revertSupportUnknown},
-		{keys.StoreClusterVersionKey(), "/Local/Store/clusterVersion", revertSupportUnknown},
 		{keys.StoreNodeTombstoneKey(123), "/Local/Store/nodeTombstone/n123", revertSupportUnknown},
 		{keys.StoreCachedSettingsKey(roachpb.Key("a")), `/Local/Store/cachedSettings/"a"`, revertSupportUnknown},
+		{keys.StoreUnsafeReplicaRecoveryKey(loqRecoveryID), fmt.Sprintf(`/Local/Store/lossOfQuorumRecovery/applied/%s`, loqRecoveryID), revertSupportUnknown},
+		{keys.StoreLossOfQuorumRecoveryStatusKey(), "/Local/Store/lossOfQuorumRecovery/status", revertSupportUnknown},
+		{keys.StoreLossOfQuorumRecoveryCleanupActionsKey(), "/Local/Store/lossOfQuorumRecovery/cleanup", revertSupportUnknown},
 
 		{keys.AbortSpanKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/AbortSpan/%q`, txnID), revertSupportUnknown},
+		{keys.ReplicatedSharedLocksTransactionLatchingKey(roachpb.RangeID(1000001), txnID), fmt.Sprintf(`/Local/RangeID/1000001/r/ReplicatedSharedLocksTransactionLatch/%q`, txnID), revertSupportUnknown},
 		{keys.RangeAppliedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeAppliedState", revertSupportUnknown},
 		{keys.RaftTruncatedStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftTruncatedState", revertSupportUnknown},
 		{keys.RangeLeaseKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeLease", revertSupportUnknown},
 		{keys.RangePriorReadSummaryKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangePriorReadSummary", revertSupportUnknown},
 		{keys.RangeGCThresholdKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeGCThreshold", revertSupportUnknown},
 		{keys.RangeVersionKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeVersion", revertSupportUnknown},
+		{keys.RangeGCHintKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/r/RangeGCHint", revertSupportUnknown},
 
 		{keys.RaftHardStateKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RaftHardState", revertSupportUnknown},
 		{keys.RangeTombstoneKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeTombstone", revertSupportUnknown},
-		{keys.RaftLogKey(roachpb.RangeID(1000001), uint64(200001)), "/Local/RangeID/1000001/u/RaftLog/logIndex:200001", revertSupportUnknown},
+		{keys.RaftLogKey(roachpb.RangeID(1000001), kvpb.RaftIndex(200001)), "/Local/RangeID/1000001/u/RaftLog/logIndex:200001", revertSupportUnknown},
 		{keys.RangeLastReplicaGCTimestampKey(roachpb.RangeID(1000001)), "/Local/RangeID/1000001/u/RangeLastReplicaGCTimestamp", revertSupportUnknown},
 
 		{keys.MakeRangeKeyPrefix(roachpb.RKey(tenSysCodec.TablePrefix(42))), `/Local/Range/Table/42`, revertSupportUnknown},
@@ -85,16 +256,16 @@ func TestPrettyPrint(t *testing.T) {
 		{keys.TransactionKey(tenSysCodec.TablePrefix(42), txnID), fmt.Sprintf(`/Local/Range/Table/42/Transaction/%q`, txnID), revertSupportUnknown},
 		{keys.RangeProbeKey(roachpb.RKey(tenSysCodec.TablePrefix(42))), `/Local/Range/Table/42/RangeProbe`, revertSupportUnknown},
 		{keys.QueueLastProcessedKey(roachpb.RKey(tenSysCodec.TablePrefix(42)), "foo"), `/Local/Range/Table/42/QueueLastProcessed/"foo"`, revertSupportUnknown},
-		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(tenSysCodec.TablePrefix(42)))), `/Local/Lock/Intent/Local/Range/Table/42/RangeDescriptor`, revertSupportUnknown},
-		{lockTableKey(tenSysCodec.TablePrefix(111)), "/Local/Lock/Intent/Table/111", revertSupportUnknown},
+		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(tenSysCodec.TablePrefix(42)))), `/Local/Lock/Local/Range/Table/42/RangeDescriptor`, revertSupportUnknown},
+		{lockTableKey(tenSysCodec.TablePrefix(111)), "/Local/Lock/Table/111", revertSupportUnknown},
 
 		{keys.MakeRangeKeyPrefix(roachpb.RKey(ten5Codec.TenantPrefix())), `/Local/Range/Tenant/5`, revertSupportUnknown},
 		{keys.MakeRangeKeyPrefix(roachpb.RKey(ten5Codec.TablePrefix(42))), `/Local/Range/Tenant/5/Table/42`, revertSupportUnknown},
 		{keys.RangeDescriptorKey(roachpb.RKey(ten5Codec.TablePrefix(42))), `/Local/Range/Tenant/5/Table/42/RangeDescriptor`, revertSupportUnknown},
 		{keys.TransactionKey(ten5Codec.TablePrefix(42), txnID), fmt.Sprintf(`/Local/Range/Tenant/5/Table/42/Transaction/%q`, txnID), revertSupportUnknown},
 		{keys.QueueLastProcessedKey(roachpb.RKey(ten5Codec.TablePrefix(42)), "foo"), `/Local/Range/Tenant/5/Table/42/QueueLastProcessed/"foo"`, revertSupportUnknown},
-		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(ten5Codec.TablePrefix(42)))), `/Local/Lock/Intent/Local/Range/Tenant/5/Table/42/RangeDescriptor`, revertSupportUnknown},
-		{lockTableKey(ten5Codec.TablePrefix(111)), "/Local/Lock/Intent/Tenant/5/Table/111", revertSupportUnknown},
+		{lockTableKey(keys.RangeDescriptorKey(roachpb.RKey(ten5Codec.TablePrefix(42)))), `/Local/Lock/Local/Range/Tenant/5/Table/42/RangeDescriptor`, revertSupportUnknown},
+		{lockTableKey(ten5Codec.TablePrefix(111)), "/Local/Lock/Tenant/5/Table/111", revertSupportUnknown},
 
 		{keys.LocalMax, `/Meta1/""`, revertSupportUnknown}, // LocalMax == Meta1Prefix
 
@@ -114,8 +285,6 @@ func TestPrettyPrint(t *testing.T) {
 		{keys.RangeMetaKey(roachpb.RKey(makeKey(keys.Meta2Prefix, roachpb.Key("foo")))).AsRawKey(), `/Meta1/"foo"`, revertSupportUnknown},
 
 		// table
-		{keys.SystemConfigSpan.Key, "/Table/SystemConfigSpan/Start", revertSupportUnknown},
-		{keys.UserTableDataMin, "/Table/50", revertMustSupport},
 		{tenSysCodec.TablePrefix(111), "/Table/111", revertMustSupport},
 		{makeKey(tenSysCodec.TablePrefix(42), encoding.EncodeUvarintAscending(nil, 1)), `/Table/42/1`, revertMustSupport},
 		{makeKey(tenSysCodec.TablePrefix(42), roachpb.RKey("foo")), `/Table/42/"foo"`, revertSupportUnknown},
@@ -192,8 +361,8 @@ func TestPrettyPrint(t *testing.T) {
 
 		// tenant table
 		{ten5Codec.TenantPrefix(), "/Tenant/5", revertMustSupport},
-		{ten5Codec.TablePrefix(0), "/Tenant/5/Table/SystemConfigSpan/Start", revertSupportUnknown},
-		{ten5Codec.TablePrefix(keys.MinUserDescID), "/Tenant/5/Table/50", revertMustSupport},
+		{ten5Codec.TablePrefix(0), "/Tenant/5/Table/0", revertSupportUnknown},
+		{ten5Codec.TablePrefix(50), "/Tenant/5/Table/50", revertMustSupport},
 		{ten5Codec.TablePrefix(111), "/Tenant/5/Table/111", revertMustSupport},
 		{makeKey(ten5Codec.TablePrefix(42), encoding.EncodeUvarintAscending(nil, 1)), `/Tenant/5/Table/42/1`, revertMustSupport},
 		{makeKey(ten5Codec.TablePrefix(42), roachpb.RKey("foo")), `/Tenant/5/Table/42/"foo"`, revertSupportUnknown},
@@ -310,7 +479,7 @@ exp:    %s
 				t.Errorf("%d: from string expected %s, got %s", i, exp, test.key.String())
 			}
 
-			scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+			scanner := keysutil.MakePrettyScanner(nil /* tableParser */, nil /* tenantParser */)
 			parsed, err := scanner.Scan(keyInfo)
 			if err != nil {
 				if !errors.HasType(err, (*keys.ErrUglifyUnsupported)(nil)) {
@@ -380,7 +549,7 @@ func massagePrettyPrintedSpanForTest(span string, dirs []encoding.Direction) str
 
 func TestPrettyPrintRange(t *testing.T) {
 	tenSysCodec := keys.SystemSQLCodec
-	ten5Codec := keys.MakeSQLCodec(roachpb.MakeTenantID(5))
+	ten5Codec := keys.MakeSQLCodec(roachpb.MustMakeTenantID(5))
 	key := makeKey([]byte("a"))
 	key2 := makeKey([]byte("z"))
 	tableKey := makeKey(tenSysCodec.TablePrefix(61), encoding.EncodeVarintAscending(nil, 4))
@@ -394,16 +563,16 @@ func TestPrettyPrintRange(t *testing.T) {
 	testCases := []struct {
 		start, end roachpb.Key
 		maxChars   int
-		expected   string
+		expected   redact.RedactableString
 	}{
-		{key, nil, 20, "a"},
+		{key, nil, 20, "‹a›"},
 		{tableKey, nil, 10, "/Table/61…"},
-		{tableKey, specialBytesKeyB, 20, `/Table/61/{4-"\xe2…}`},
-		{tableKey, specialBytesKeyB, 30, `/Table/61/{4-"☃️…}`},
-		{tableKey, specialBytesKeyB, 50, `/Table/61/{4-"☃️⚠"}`},
-		{specialBytesKeyA, specialBytesKeyB, 20, `/Table/61/"☃️…`},
-		{specialBytesKeyA, specialBytesKeyB, 25, `/Table/61/"☃️{"-\xe2…}`},
-		{specialBytesKeyA, specialBytesKeyB, 30, `/Table/61/"☃️{"-⚠"}`},
+		{tableKey, specialBytesKeyB, 20, `/Table/61/{4-‹"☃›…}`},
+		{tableKey, specialBytesKeyB, 30, `/Table/61/{4-‹"☃️⚠"›}`},
+		{tableKey, specialBytesKeyB, 50, `/Table/61/{4-‹"☃️⚠"›}`},
+		{specialBytesKeyA, specialBytesKeyB, 20, `/Table/61/‹"☃️›…`},
+		{specialBytesKeyA, specialBytesKeyB, 25, `/Table/61/‹"☃️›{‹"›-‹⚠"›}`},
+		{specialBytesKeyA, specialBytesKeyB, 30, `/Table/61/‹"☃️›{‹"›-‹⚠"›}`},
 		// Note: the PrettyPrintRange() algorithm operates on the result
 		// of PrettyPrint(), which already turns special characters into
 		// hex sequences. Therefore, it can merge and truncate the hex
@@ -413,13 +582,13 @@ func TestPrettyPrintRange(t *testing.T) {
 		//
 		// Since all of this is best-effort, we'll accept the status quo
 		// for now.
-		{specialBytesKeyC, specialBytesKeyD, 20, `/Table/61/"\xff\x…`},
-		{specialBytesKeyC, specialBytesKeyD, 30, `/Table/61/"\xff\x{00"-fe"}`},
-		{specialBytesKeyB, specialBytesKeyD, 20, `/Table/61/"{\xe2\x98…-\x…}`},
-		{specialBytesKeyB, specialBytesKeyD, 30, `/Table/61/"{☃️\xe2…-\xff\xf…}`},
-		{specialBytesKeyB, specialBytesKeyD, 50, `/Table/61/"{☃️⚠"-\xff\xfe"}`},
+		{specialBytesKeyC, specialBytesKeyD, 20, `/Table/61/‹"\xff\x›…`},
+		{specialBytesKeyC, specialBytesKeyD, 30, `/Table/61/‹"\xff\x›{‹00"›-‹fe"›}`},
+		{specialBytesKeyB, specialBytesKeyD, 20, `/Table/61/‹"›{‹☃›…-‹\›…}`},
+		{specialBytesKeyB, specialBytesKeyD, 30, `/Table/61/‹"›{‹☃️⚠"›-‹\xff\x›…}`},
+		{specialBytesKeyB, specialBytesKeyD, 50, `/Table/61/‹"›{‹☃️⚠"›-‹\xff\xfe"›}`},
 		{tenTableKey, nil, 20, "/Tenant/5/Table/61/…"},
-		{key, key2, 20, "{a-z}"},
+		{key, key2, 20, "{‹a›-‹z›}"},
 		{keys.MinKey, tableKey, 8, "/{M…-T…}"},
 		{keys.MinKey, tableKey, 15, "/{Min-Tabl…}"},
 		{keys.MinKey, tableKey, 20, "/{Min-Table/6…}"},
@@ -449,6 +618,79 @@ func TestPrettyPrintRange(t *testing.T) {
 	}
 }
 
+func TestPrettyPrintBounded(t *testing.T) {
+	// Synthesize keys of arbitrary length by encoding a single STRING value
+	// after a small table/index prefix.
+	tableID := uint32(52)
+	indexID := uint32(1)
+	makeKey := func(payload []byte) roachpb.Key {
+		k := keys.SystemSQLCodec.IndexPrefix(tableID, indexID)
+		return encoding.EncodeStringAscending(k, string(payload))
+	}
+
+	const maxRawBytes = 1 << 10
+	// Generous bound: with a 1 KiB raw cap and ~4x worst-case PrettyPrint
+	// expansion (escape-heavy bytes), output stays well under this.
+	const generousOutputBound = 16 << 10
+
+	tests := []struct {
+		name         string
+		payload      []byte
+		expectMarker bool
+	}{
+		{
+			name:    "short key passes through verbatim",
+			payload: []byte("hello"),
+		},
+		{
+			// Raw input still under maxRawBytes — no truncation.
+			name:    "near-cap raw input passes through",
+			payload: bytes.Repeat([]byte("a"), maxRawBytes-64),
+		},
+		{
+			// Raw input well over maxRawBytes — must slice the input and
+			// append the truncation marker. PrettyPrint expansion is bounded
+			// by a small constant, so the output stays small even though the
+			// input is huge.
+			name:         "oversize raw input is sliced before PrettyPrint",
+			payload:      bytes.Repeat([]byte("a"), 1<<20), // 1 MiB
+			expectMarker: true,
+		},
+		{
+			// Non-printable bytes encode to \xNN under PrettyPrint, expanding
+			// each input byte to 4 chars. Verifies the input slice keeps even
+			// the worst-case expansion bounded.
+			name:         "escape-heavy bytes stay bounded",
+			payload:      bytes.Repeat([]byte{0}, 1<<20),
+			expectMarker: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key := makeKey(tc.payload)
+			rawLen := len(key)
+
+			pretty := keys.PrettyPrintBounded(nil /* valDirs */, key, maxRawBytes)
+
+			require.True(t, utf8.ValidString(pretty), "result must be valid UTF-8")
+			require.True(t, strings.HasPrefix(pretty, fmt.Sprintf("/Table/%d/%d/", tableID, indexID)),
+				"expected /Table/<id>/<index>/ prefix; got %q", pretty[:min(80, len(pretty))])
+			require.LessOrEqual(t, len(pretty), generousOutputBound,
+				"pretty-printed output exceeded generous bound (raw key was %d bytes)", rawLen)
+
+			if tc.expectMarker {
+				require.Contains(t, pretty, "(truncated", "expected truncation marker")
+				require.Contains(t, pretty, fmt.Sprintf("%d bytes", rawLen),
+					"truncation marker should report raw key length %d", rawLen)
+			} else {
+				require.NotContains(t, pretty, "(truncated",
+					"unexpected truncation marker on small key")
+			}
+		})
+	}
+}
+
 func TestFormatHexKey(t *testing.T) {
 	// Verify that we properly handling the 'x' formatting verb in
 	// roachpb.Key.Format.
@@ -464,4 +706,59 @@ func TestFormatHexKey(t *testing.T) {
 
 func makeKey(keys ...[]byte) []byte {
 	return bytes.Join(keys, nil)
+}
+
+func TestCopyEscape(t *testing.T) {
+	invalidUTF8 := []byte("🪳")[:2]
+	expectEscaped := "\\xf0\\x9f"
+
+	tt := []struct {
+		input    string
+		expected redact.RedactableString
+		maxChars int
+	}{
+		{"abc", "abc", math.MaxInt32},
+		{"abc", "abc", 3},
+		{"abc", "a…", 2},
+
+		// should handle redaction markers
+		{"abc‹cde›", redact.Sprintf("abc%s", "cde"), math.MaxInt32},
+		{"abc‹def›ghi", redact.Sprintf("abc%sghi", "def"), math.MaxInt32},
+		{"abc‹cde›", redact.Sprint(redact.SafeString("abc…")), 4},
+
+		// should handle other valid UTF-8 characters
+		{"abc🪳‹def›ghi", redact.Sprintf("abc🪳%sghi", "def"), math.MaxInt32},
+		{"abc🪳def", redact.Sprint(redact.SafeString("abc🪳def")), math.MaxInt32},
+		{"abc‹de🪳f›ghi", redact.Sprintf("abc%sghi", "de🪳f"), math.MaxInt32},
+		{"abc‹de🪳f›ghi", redact.Sprintf("abc%s…", "de"), 6},
+
+		// should handle partial redaction markers
+		{"abc‹cd", redact.Sprintf("abc%s", "cd"), math.MaxInt32},
+		{"abc‹cd", redact.Sprintf("ab…"), 3},
+		{"abc‹cd", redact.Sprintf("abc…"), 4},
+		{"abc›cd", redact.Sprintf("%scd", "abc"), math.MaxInt32},
+		{"abc›cd", redact.Sprintf("%s…", "a"), 2},
+		{"abc›cd", redact.Sprintf("%s…", "abc"), 4},
+
+		// should handle invalid UTF-8 characters
+		{string(append([]byte("abc"), invalidUTF8...)), redact.Sprintf("abc%s", redact.SafeString(expectEscaped)), math.MaxInt32},
+		{string(append(invalidUTF8, []byte("abc")...)), redact.Sprintf("%sabc", redact.SafeString(expectEscaped)), math.MaxInt32},
+		{string(append([]byte("abc‹"), invalidUTF8...)), redact.Sprintf("abc%s", expectEscaped), math.MaxInt32},
+		{string(append([]byte("abc‹"), append(invalidUTF8, []byte("›def")...)...)), redact.Sprintf("abc%sdef", expectEscaped), math.MaxInt32},
+		{string(append(invalidUTF8, []byte("abc")...)), redact.Sprintf("%s…", redact.SafeString(expectEscaped)[:4]), 2}, // the 1st escaped char is 4 bytes
+
+		// should handle control characters (code points < 0x20)
+		{"abc\x01\x02def", redact.Sprintf("abc\\x01\\x02def"), math.MaxInt32},
+		{"abc‹\x00\x1F›def", redact.Sprintf("abc%sdef", "\\x00\\x1f"), math.MaxInt32},
+		{"\x00abc\x1f", redact.Sprintf("\\x00abc\\x1f"), math.MaxInt32},
+		{"\x00abc\x1f", redact.Sprintf("\\x00a…"), 3},
+	}
+
+	for _, tc := range tt {
+		t.Run("", func(t *testing.T) {
+			var b redact.StringBuilder
+			keys.CopyEscapeTrunc(&b, tc.input, tc.maxChars)
+			assert.Equal(t, tc.expected, b.RedactableString())
+		})
+	}
 }

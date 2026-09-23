@@ -11,8 +11,6 @@ statement ok
 CREATE TABLE c (c_id INT PRIMARY KEY, bill TEXT);
 CREATE TABLE o (o_id INT PRIMARY KEY, c_id INT, ship TEXT);
 
-# We can't decorrelate cases which don't use a scalar type in the
-# ARRAY(...) operator.
 query T
 EXPLAIN SELECT
   c_id,
@@ -20,7 +18,6 @@ EXPLAIN SELECT
 FROM c ORDER BY c_id
 ----
 distribution: local
-vectorized: true
 ·
 • sort
 │ order: +c_id

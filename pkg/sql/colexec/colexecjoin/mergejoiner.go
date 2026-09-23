@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colexecjoin
 
@@ -24,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
@@ -233,7 +228,7 @@ type mjBuilderCrossProductState struct {
 type mjBufferedGroupState struct {
 	// leftFirstTuple is the first tuple of the left buffered group. It is set
 	// only in case the left buffered group spans more than one input batch.
-	leftFirstTuple []coldata.Vec
+	leftFirstTuple []*coldata.Vec
 	// leftGroupStartIdx is the position within the current left batch where the
 	// left buffered group starts. If the group spans multiple batches, this
 	// will be set to 0 on all consecutive batches.
@@ -246,7 +241,7 @@ type mjBufferedGroupState struct {
 	leftBatchDone bool
 	// rightFirstTuple is the first tuple of the right buffered group. It is set
 	// only in case the right buffered group spans more than one input batch.
-	rightFirstTuple []coldata.Vec
+	rightFirstTuple []*coldata.Vec
 	// scratchSel is a scratch selection vector initialized only when needed.
 	scratchSel []int
 
@@ -296,9 +291,6 @@ type mergeJoinInput struct {
 	distincterInput *colexecop.FeedOperator
 	distincter      colexecop.Operator
 	distinctOutput  []bool
-
-	// source specifies the input operator to the merge join.
-	source colexecop.Operator
 }
 
 // NewMergeJoinOp returns a new merge join operator with the given spec that
@@ -308,6 +300,7 @@ type mergeJoinInput struct {
 //
 // evalCtx will not be mutated.
 func NewMergeJoinOp(
+	ctx context.Context,
 	unlimitedAllocator *colmem.Allocator,
 	memoryLimit int64,
 	diskQueueCfg colcontainer.DiskQueueCfg,
@@ -320,8 +313,9 @@ func NewMergeJoinOp(
 	leftOrdering []execinfrapb.Ordering_Column,
 	rightOrdering []execinfrapb.Ordering_Column,
 	diskAcc *mon.BoundAccount,
-	evalCtx *tree.EvalContext,
-) colexecop.ResettableOperator {
+	diskQueueMemAcc *mon.BoundAccount,
+	evalCtx *eval.Context,
+) (colexecop.ResettableOperator, colexecop.MetadataSource) {
 	// Merge joiner only supports the case when the physical types in the
 	// equality columns in both inputs are the same. We, however, also need to
 	// support joining on numeric columns of different types or widths. If we
@@ -370,7 +364,7 @@ func NewMergeJoinOp(
 			}
 			if castLeftToRight {
 				castColumnIdx := len(actualLeftTypes)
-				left, err = colexecbase.GetCastOperator(unlimitedAllocator, left, int(leftColIdx), castColumnIdx, leftType, rightType, evalCtx)
+				left, err = colexecbase.GetCastOperator(ctx, unlimitedAllocator, left, int(leftColIdx), castColumnIdx, leftType, rightType, evalCtx)
 				if err != nil {
 					colexecerror.InternalError(err)
 				}
@@ -378,7 +372,7 @@ func NewMergeJoinOp(
 				actualLeftOrdering[i].ColIdx = uint32(castColumnIdx)
 			} else {
 				castColumnIdx := len(actualRightTypes)
-				right, err = colexecbase.GetCastOperator(unlimitedAllocator, right, int(rightColIdx), castColumnIdx, rightType, leftType, evalCtx)
+				right, err = colexecbase.GetCastOperator(ctx, unlimitedAllocator, right, int(rightColIdx), castColumnIdx, rightType, leftType, evalCtx)
 				if err != nil {
 					colexecerror.InternalError(err)
 				}
@@ -390,7 +384,7 @@ func NewMergeJoinOp(
 	}
 	base := newMergeJoinBase(
 		unlimitedAllocator, memoryLimit, diskQueueCfg, fdSemaphore, joinType, left, right,
-		actualLeftTypes, actualRightTypes, actualLeftOrdering, actualRightOrdering, diskAcc,
+		actualLeftTypes, actualRightTypes, actualLeftOrdering, actualRightOrdering, diskAcc, diskQueueMemAcc,
 	)
 	var mergeJoinerOp colexecop.ResettableOperator
 	switch joinType {
@@ -417,10 +411,11 @@ func NewMergeJoinOp(
 	default:
 		colexecerror.InternalError(errors.AssertionFailedf("merge join of type %s not supported", joinType))
 	}
+	ms := mergeJoinerOp.(colexecop.MetadataSource)
 	if !needProjection {
 		// We didn't add any cast operators, so we can just return the operator
 		// right away.
-		return mergeJoinerOp
+		return mergeJoinerOp, ms
 	}
 	// We need to add a projection to remove all the cast columns we have added
 	// above. Note that all extra columns were appended to the corresponding
@@ -451,7 +446,7 @@ func NewMergeJoinOp(
 	}
 	return colexecbase.NewSimpleProjectOp(
 		mergeJoinerOp, numActualLeftTypes+numActualRightTypes, projection,
-	).(colexecop.ResettableOperator)
+	).(colexecop.ResettableOperator), ms
 }
 
 // Const declarations for the merge joiner cross product (MJCP) zero state.
@@ -494,6 +489,7 @@ func newMergeJoinBase(
 	leftOrdering []execinfrapb.Ordering_Column,
 	rightOrdering []execinfrapb.Ordering_Column,
 	diskAcc *mon.BoundAccount,
+	diskQueueMemAcc *mon.BoundAccount,
 ) *mergeJoinBase {
 	lEqCols := make([]uint32, len(leftOrdering))
 	lDirections := make([]execinfrapb.Ordering_Column_Direction, len(leftOrdering))
@@ -510,28 +506,30 @@ func newMergeJoinBase(
 	}
 
 	base := &mergeJoinBase{
-		joinHelper:         newJoinHelper(left, right),
+		metadataHelper: metadataHelper{
+			TwoInputInitHelper: colexecop.MakeTwoInputInitHelper(left, right),
+		},
 		unlimitedAllocator: unlimitedAllocator,
 		memoryLimit:        memoryLimit,
 		diskQueueCfg:       diskQueueCfg,
 		fdSemaphore:        fdSemaphore,
 		joinType:           joinType,
 		left: mergeJoinInput{
-			source:                left,
 			sourceTypes:           leftTypes,
 			canonicalTypeFamilies: typeconv.ToCanonicalTypeFamilies(leftTypes),
 			eqCols:                lEqCols,
 			directions:            lDirections,
 		},
 		right: mergeJoinInput{
-			source:                right,
 			sourceTypes:           rightTypes,
 			canonicalTypeFamilies: typeconv.ToCanonicalTypeFamilies(rightTypes),
 			eqCols:                rEqCols,
 			directions:            rDirections,
 		},
-		diskAcc: diskAcc,
+		diskAcc:         diskAcc,
+		diskQueueMemAcc: diskQueueMemAcc,
 	}
+	base.helper.Init(unlimitedAllocator, memoryLimit)
 	base.left.distincterInput = &colexecop.FeedOperator{}
 	base.left.distincter, base.left.distinctOutput = colexecbase.OrderedDistinctColsToOperators(
 		base.left.distincterInput, lEqCols, leftTypes, false, /* nullsAreDistinct */
@@ -545,10 +543,11 @@ func newMergeJoinBase(
 
 // mergeJoinBase extracts the common logic between all merge join operators.
 type mergeJoinBase struct {
-	*joinHelper
+	metadataHelper
 	colexecop.CloserHelper
 
 	unlimitedAllocator *colmem.Allocator
+	helper             colmem.AccountingHelper
 	memoryLimit        int64
 	diskQueueCfg       colcontainer.DiskQueueCfg
 	fdSemaphore        semaphore.Semaphore
@@ -556,10 +555,15 @@ type mergeJoinBase struct {
 	left               mergeJoinInput
 	right              mergeJoinInput
 
+	cancelChecker colexecutils.CancelChecker
+
 	// Output buffer definition.
 	output         coldata.Batch
 	outputCapacity int
 	outputTypes    []*types.T
+	// continueBatch, if set, indicates that the current output batch should be
+	// continued.
+	continueBatch bool
 
 	// Local buffer for the "working" repeated groups.
 	groups circularGroupsBuffer
@@ -569,19 +573,18 @@ type mergeJoinBase struct {
 	proberState   mjProberState
 	builderState  mjBuilderState
 
-	diskAcc *mon.BoundAccount
+	diskAcc         *mon.BoundAccount
+	diskQueueMemAcc *mon.BoundAccount
 }
 
 var _ colexecop.Resetter = &mergeJoinBase{}
 var _ colexecop.Closer = &mergeJoinBase{}
+var _ colexecop.MetadataSource = &mergeJoinBase{}
 
 func (o *mergeJoinBase) Reset(ctx context.Context) {
-	if r, ok := o.left.source.(colexecop.Resetter); ok {
-		r.Reset(ctx)
-	}
-	if r, ok := o.right.source.(colexecop.Resetter); ok {
-		r.Reset(ctx)
-	}
+	o.TwoInputInitHelper.Reset(ctx)
+	o.cancelChecker.Init(ctx)
+	o.continueBatch = false
 	o.state = mjEntry
 	o.bufferedGroup.helper.Reset(ctx)
 	o.proberState.lBatch = nil
@@ -590,7 +593,7 @@ func (o *mergeJoinBase) Reset(ctx context.Context) {
 }
 
 func (o *mergeJoinBase) Init(ctx context.Context) {
-	if !o.init(ctx) {
+	if !o.TwoInputInitHelper.Init(ctx) {
 		return
 	}
 	o.outputTypes = o.joinType.MakeOutputTypes(o.left.sourceTypes, o.right.sourceTypes)
@@ -602,9 +605,10 @@ func (o *mergeJoinBase) Init(ctx context.Context) {
 	).ColVecs()
 	o.bufferedGroup.helper = newCrossJoinerBase(
 		o.unlimitedAllocator, o.joinType, o.left.sourceTypes, o.right.sourceTypes,
-		o.memoryLimit, o.diskQueueCfg, o.fdSemaphore, o.diskAcc,
+		o.memoryLimit, o.diskQueueCfg, o.fdSemaphore, o.diskAcc, o.diskQueueMemAcc,
 	)
 	o.bufferedGroup.helper.init(o.Ctx)
+	o.cancelChecker.Init(o.Ctx)
 
 	o.builderState.lGroups = make([]group, 1)
 	o.builderState.rGroups = make([]group, 1)
@@ -747,7 +751,8 @@ func (o *mergeJoinBase) sourceFinished() bool {
 // and updates the probing and buffered group states accordingly.
 func (o *mergeJoinBase) continueLeftBufferedGroup() {
 	// Get the next batch from the left.
-	o.proberState.lIdx, o.proberState.lBatch = 0, o.left.source.Next()
+	o.cancelChecker.CheckEveryCall()
+	o.proberState.lIdx, o.proberState.lBatch = 0, o.inputOneNext()
 	o.proberState.lLength = o.proberState.lBatch.Length()
 	o.bufferedGroup.leftGroupStartIdx = 0
 	if o.proberState.lLength == 0 {
@@ -770,7 +775,7 @@ func (o *mergeJoinBase) continueLeftBufferedGroup() {
 	groupLength := 1
 	var sel []int
 	o.left.distincterInput.SetBatch(o.proberState.lBatch)
-	o.left.distincter.Next()
+	colexecop.NextNoMeta(o.left.distincter)
 
 	sel = o.proberState.lBatch.Selection()
 	if sel != nil {
@@ -813,7 +818,8 @@ func (o *mergeJoinBase) finishRightBufferedGroup() {
 // (or until we exhaust the right input).
 func (o *mergeJoinBase) completeRightBufferedGroup() {
 	// Get the next batch from the right.
-	o.proberState.rIdx, o.proberState.rBatch = 0, o.right.source.Next()
+	o.cancelChecker.CheckEveryCall()
+	o.proberState.rIdx, o.proberState.rBatch = 0, o.inputTwoNext()
 	o.proberState.rLength = o.proberState.rBatch.Length()
 	// The right input has been fully exhausted.
 	if o.proberState.rLength == 0 {
@@ -844,7 +850,7 @@ func (o *mergeJoinBase) completeRightBufferedGroup() {
 		// so the distincter - in a sense - compares the incoming tuples to the
 		// first tuple of the first iteration (which we know is the same group).
 		o.right.distincterInput.SetBatch(o.proberState.rBatch)
-		o.right.distincter.Next()
+		colexecop.NextNoMeta(o.right.distincter)
 
 		sel = o.proberState.rBatch.Selection()
 		var groupLength int
@@ -878,7 +884,8 @@ func (o *mergeJoinBase) completeRightBufferedGroup() {
 			// The buffered group is still not complete which means that we have
 			// just appended all the tuples from batch to it, so we need to get a
 			// fresh batch from the input.
-			o.proberState.rIdx, o.proberState.rBatch = 0, o.right.source.Next()
+			o.cancelChecker.CheckEveryCall()
+			o.proberState.rIdx, o.proberState.rBatch = 0, o.inputTwoNext()
 			o.proberState.rLength = o.proberState.rBatch.Length()
 			if o.proberState.rLength == 0 {
 				// The input has been exhausted, so the buffered group is now complete.
@@ -889,20 +896,20 @@ func (o *mergeJoinBase) completeRightBufferedGroup() {
 	o.finishRightBufferedGroup()
 }
 
-func (o *mergeJoinBase) Close() error {
+func (o *mergeJoinBase) Close(ctx context.Context) error {
 	if !o.CloserHelper.Close() {
 		return nil
 	}
 	var lastErr error
-	for _, op := range []colexecop.Operator{o.left.source, o.right.source} {
+	for _, op := range []colexecop.Operator{o.InputOne, o.InputTwo} {
 		if c, ok := op.(colexecop.Closer); ok {
-			if err := c.Close(); err != nil {
+			if err := c.Close(ctx); err != nil {
 				lastErr = err
 			}
 		}
 	}
 	if h := o.bufferedGroup.helper; h != nil {
-		if err := h.Close(); err != nil {
+		if err := h.Close(ctx); err != nil {
 			lastErr = err
 		}
 	}

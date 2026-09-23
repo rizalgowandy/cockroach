@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
@@ -15,7 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -27,7 +22,7 @@ import (
 // nodeTombstoneStorage maintains a local (i.e. unreplicated)
 // registry of which nodes were permanently removed from the cluster.
 type nodeTombstoneStorage struct {
-	engs []storage.Engine
+	engs []kvstorage.Engines
 	mu   struct {
 		syncutil.RWMutex
 		// cache contains both positive and negative hits. Positive hits
@@ -59,16 +54,16 @@ func (s *nodeTombstoneStorage) IsDecommissioned(
 	// No cache hit.
 	k := s.key(nodeID)
 	for _, eng := range s.engs {
-		v, _, err := storage.MVCCGet(ctx, eng, k, hlc.Timestamp{}, storage.MVCCGetOptions{})
+		valRes, err := storage.MVCCGet(ctx, eng.LogEngine(), k, hlc.Timestamp{}, storage.MVCCGetOptions{})
 		if err != nil {
 			return time.Time{}, err
 		}
-		if v == nil {
+		if !valRes.Value.Exists() {
 			// Not found.
 			continue
 		}
 		var tsp hlc.Timestamp
-		if err := v.GetProto(&tsp); err != nil {
+		if err := valRes.Value.Value.GetProto(&tsp); err != nil {
 			return time.Time{}, err
 		}
 		// Found, offer to cache and return.
@@ -124,8 +119,8 @@ func (s *nodeTombstoneStorage) SetDecommissioned(
 		//
 		// One initialized engine is always available when this method
 		// is called, so we're still persisting on at least one engine.
-		if _, err := kvserver.ReadStoreIdent(ctx, eng); err != nil {
-			if errors.Is(err, &kvserver.NotBootstrappedError{}) {
+		if _, err := kvstorage.ReadStoreIdent(ctx, eng.LogEngine()); err != nil {
+			if errors.Is(err, &kvstorage.NotBootstrappedError{}) {
 				continue
 			}
 			return err
@@ -135,8 +130,8 @@ func (s *nodeTombstoneStorage) SetDecommissioned(
 			return err
 		}
 
-		if err := storage.MVCCPut(
-			ctx, eng, nil /* MVCCStats */, k, hlc.Timestamp{}, v, nil, /* txn */
+		if _, err := storage.MVCCPut(
+			ctx, eng.LogEngine(), k, hlc.Timestamp{}, v, storage.MVCCWriteOptions{},
 		); err != nil {
 			return err
 		}

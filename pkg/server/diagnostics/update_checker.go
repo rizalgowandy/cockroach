@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package diagnostics
 
@@ -14,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"time"
@@ -28,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -53,9 +48,12 @@ type UpdateChecker struct {
 	Config     *base.Config
 	Settings   *cluster.Settings
 
-	// ClusterID is not yet available at the time the updater is created, so
-	// instead initialize with a function to get it.
-	ClusterID func() uuid.UUID
+	// StorageClusterID is the cluster ID of the underlying storage
+	// cluster. It is not yet available at the time the updater is
+	// created, so instead initialize with a function to get it.
+	StorageClusterID func() uuid.UUID
+	// LogicalClusterID is the tenant-specific logical cluster ID.
+	LogicalClusterID func() uuid.UUID
 
 	// NodeID is not yet available at the time the updater is created, so
 	// instead initialize with a function to get it.
@@ -77,6 +75,7 @@ func (u *UpdateChecker) PeriodicallyCheckForUpdates(ctx context.Context, stopper
 		SpanOpt:  stop.SterileRootSpan,
 	}, func(ctx context.Context) {
 		defer logcrash.RecoverAndReportNonfatalPanic(ctx, &u.Settings.SV)
+		rng, _ := randutil.NewPseudoRand()
 		nextUpdateCheck := u.StartTime
 
 		var timer timeutil.Timer
@@ -87,12 +86,11 @@ func (u *UpdateChecker) PeriodicallyCheckForUpdates(ctx context.Context, stopper
 
 			nextUpdateCheck = u.maybeCheckForUpdates(ctx, now, nextUpdateCheck, runningTime)
 
-			timer.Reset(addJitter(nextUpdateCheck.Sub(timeutil.Now())))
+			timer.Reset(addJitter(nextUpdateCheck.Sub(timeutil.Now()), rng))
 			select {
 			case <-stopper.ShouldQuiesce():
 				return
 			case <-timer.C:
-				timer.Read = true
 			}
 		}
 	})
@@ -120,8 +118,8 @@ func (u *UpdateChecker) CheckForUpdates(ctx context.Context) bool {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		b, err := ioutil.ReadAll(res.Body)
-		log.Infof(ctx, "failed to check for updates: status: %s, body: %s, error: %v",
+		b, err := io.ReadAll(res.Body)
+		log.Dev.Infof(ctx, "failed to check for updates: status: %s, body: %s, error: %v",
 			res.Status, b, err)
 		return false
 	}
@@ -133,7 +131,7 @@ func (u *UpdateChecker) CheckForUpdates(ctx context.Context) bool {
 
 	err = decoder.Decode(&r)
 	if err != nil && err != io.EOF {
-		log.Warningf(ctx, "error decoding updates info: %v", err)
+		log.Dev.Warningf(ctx, "error decoding updates info: %v", err)
 		return false
 	}
 
@@ -144,7 +142,7 @@ func (u *UpdateChecker) CheckForUpdates(ctx context.Context) bool {
 		r.Details = r.Details[len(r.Details)-updateMaxVersionsToReport:]
 	}
 	for _, v := range r.Details {
-		log.Infof(ctx, "a new version is available: %s, details: %s", v.Version, v.Details)
+		log.Dev.Infof(ctx, "a new version is available: %s, details: %s", v.Version, v.Details)
 	}
 	return true
 }
@@ -185,10 +183,11 @@ func (u *UpdateChecker) maybeCheckForUpdates(
 // If an empty updates URL is set (via empty environment variable), returns nil.
 func (u *UpdateChecker) buildUpdatesURL(ctx context.Context) *url.URL {
 	clusterInfo := ClusterInfo{
-		ClusterID:  u.ClusterID(),
-		TenantID:   roachpb.SystemTenantID,
-		IsInsecure: u.Config.Insecure,
-		IsInternal: sql.ClusterIsInternal(&u.Settings.SV),
+		StorageClusterID: u.StorageClusterID(),
+		LogicalClusterID: u.LogicalClusterID(),
+		TenantID:         roachpb.SystemTenantID,
+		IsInsecure:       u.Config.Insecure,
+		IsInternal:       sql.ClusterIsInternal(&u.Settings.SV),
 	}
 
 	var env diagnosticspb.Environment

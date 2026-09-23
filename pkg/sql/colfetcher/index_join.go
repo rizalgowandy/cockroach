@@ -1,36 +1,39 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colfetcher
 
 import (
 	"context"
+	"math"
 	"sort"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
+	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecspan"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
+	"github.com/cockroachdb/cockroach/pkg/sql/row"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
@@ -48,6 +51,10 @@ type ColIndexJoin struct {
 	// spanAssembler is used to construct the lookup spans for each input batch.
 	spanAssembler colexecspan.ColSpanAssembler
 
+	// rowCount tracks the number of rows that we've already buffered spans for
+	// in the spanAssembler.
+	rowCount int64
+
 	// batch keeps track of the input batch currently being processed; if we only
 	// generate spans for a portion of the batch on one iteration, we need to keep
 	// a reference to it for the next iteration.
@@ -59,11 +66,32 @@ type ColIndexJoin struct {
 	// and may not correspond to batch boundaries.
 	startIdx int
 
+	// scanRowCounts contains the expected and actual number of rows fetched for
+	// the current lookup scan. The expected row count is equal to the number of
+	// input rows that have been consumed to create the spans. These counts are
+	// used to make assertions that prevent returning incorrect results due to
+	// index corruption. See assertScanRowCounts() for more details.
+	scanRowCounts struct {
+		expected int64
+		actual   int64
+	}
+
+	// limitHintHelper is used in limiting batches of input rows in the presence
+	// of hard and soft limits.
+	limitHintHelper execinfra.LimitHintHelper
+
 	mem struct {
 		// inputBatchSize tracks the size of the rows that have been used to
 		// generate spans so far. This is used to prevent memory usage from growing
 		// too large.
 		inputBatchSize int64
+
+		// inputBatchSizeLimit is a batch size limit for the number of input
+		// rows that will be used to form lookup spans for each scan. It is
+		// usually equal to the inputBatchSizeLimit metamorphic variable, but it
+		// might be lower than that value when low distsql_workmem limit is
+		// used.
+		inputBatchSizeLimit int64
 
 		// currentBatchSize tracks the size of the current input batch. This
 		// provides a shortcut when the entire batch fits in the memory limit.
@@ -76,19 +104,25 @@ type ColIndexJoin struct {
 
 		// Fields that deal with variable-size types.
 		hasVarSizeCols bool
-		varSizeVecIdxs util.FastIntSet
+		varSizeVecIdxs intsets.Fast
 		byteLikeCols   []*coldata.Bytes
 		decimalCols    []coldata.Decimals
 		datumCols      []coldata.DatumVec
 	}
 
-	flowCtx *execinfra.FlowCtx
-	rf      *cFetcher
+	flowCtx     *execinfra.FlowCtx
+	processorID int32
+	cf          *cFetcher
+	// txn is the transaction used by the index joiner.
+	txn *kv.Txn
 
 	// tracingSpan is created when the stats should be collected for the query
 	// execution, and it will be finished when closing the operator.
 	tracingSpan *tracing.Span
-	mu          struct {
+	execstats.ContentionEventsListener
+	execstats.ScanStatsListener
+	execstats.TenantConsumptionListener
+	mu struct {
 		syncutil.Mutex
 		// rowsRead contains the number of total rows this ColIndexJoin has
 		// returned so far.
@@ -99,25 +133,30 @@ type ColIndexJoin struct {
 	// table because the scan might synthesize additional implicit system columns.
 	ResultTypes []*types.T
 
+	// lockingWaitPolicy is the wait policy for the cFetcher's underlying
+	// row.KVFetcher.
+	lockingWaitPolicy descpb.ScanLockingWaitPolicy
+
 	// maintainOrdering is true when the index join is required to maintain its
 	// input ordering, in which case the ordering of the spans cannot be changed.
 	maintainOrdering bool
+
+	// usesStreamer indicates whether the ColIndexJoin is using the Streamer
+	// API.
+	usesStreamer bool
 }
 
-var _ colexecop.KVReader = &ColIndexJoin{}
-var _ execinfra.Releasable = &ColIndexJoin{}
-var _ colexecop.ClosableOperator = &ColIndexJoin{}
+var _ ScanOperator = &ColIndexJoin{}
 
 // Init initializes a ColIndexJoin.
 func (s *ColIndexJoin) Init(ctx context.Context) {
 	if !s.InitHelper.Init(ctx) {
 		return
 	}
-	// If tracing is enabled, we need to start a child span so that the only
-	// contention events present in the recording would be because of this
-	// cFetcher. Note that ProcessorSpan method itself will check whether
-	// tracing is enabled.
-	s.Ctx, s.tracingSpan = execinfra.ProcessorSpan(s.Ctx, "colindexjoin")
+	s.Ctx, s.tracingSpan = execinfra.ProcessorSpan(
+		s.Ctx, s.flowCtx, "colindexjoin", s.processorID,
+		&s.ContentionEventsListener, &s.ScanStatsListener, &s.TenantConsumptionListener,
+	)
 	s.Input.Init(s.Ctx)
 }
 
@@ -130,65 +169,83 @@ const (
 )
 
 // Next is part of the Operator interface.
-func (s *ColIndexJoin) Next() coldata.Batch {
+func (s *ColIndexJoin) Next() (coldata.Batch, *execinfrapb.ProducerMetadata) {
 	for {
 		switch s.state {
 		case indexJoinConstructingSpans:
-			var rowCount int
-			var spans roachpb.Spans
-			s.mem.inputBatchSize = 0
-			for s.next() {
+			for {
+				if readMore, meta := s.next(); meta != nil {
+					return nil, meta
+				} else if !readMore {
+					break
+				}
 				// Because index joins discard input rows, we do not have to maintain a
 				// reference to input tuples after span generation. So, we can discard
 				// the input batch reference on each iteration.
-				endIdx := s.findEndIndex(len(spans) > 0)
-				rowCount += endIdx - s.startIdx
+				endIdx := s.findEndIndex(s.rowCount > 0)
+				// If we have a limit hint, make sure we don't include more rows
+				// than needed.
+				if l := s.limitHintHelper.LimitHint(); l != 0 && s.rowCount+int64(endIdx-s.startIdx) > l {
+					endIdx = s.startIdx + int(l-s.rowCount)
+				}
+				s.rowCount += int64(endIdx - s.startIdx)
 				s.spanAssembler.ConsumeBatch(s.batch, s.startIdx, endIdx)
 				s.startIdx = endIdx
+				if l := s.limitHintHelper.LimitHint(); l != 0 && s.rowCount == l {
+					// Reached the limit hint. Note that rowCount cannot be
+					// larger than l because we chopped the former off above.
+					break
+				}
 				if endIdx < s.batch.Length() {
 					// Reached the memory limit.
 					break
 				}
 			}
-			spans = s.spanAssembler.GetSpans()
+			if err := s.limitHintHelper.ReadSomeRows(s.rowCount); err != nil {
+				colexecerror.InternalError(err)
+			}
+			spans := s.spanAssembler.GetSpans()
 			if len(spans) == 0 {
 				// No lookups left to perform.
 				s.state = indexJoinDone
 				continue
 			}
 
-			if !s.maintainOrdering {
+			if !s.usesStreamer && !s.maintainOrdering {
 				// Sort the spans when !maintainOrdering. This allows lower layers to
 				// optimize iteration over the data. Note that the looked up rows are
 				// output unchanged, in the retrieval order, so it is not safe to do
 				// this when maintainOrdering is true (the ordering to be maintained
 				// may be different than the ordering in the index).
+				//
+				// We don't want to sort the spans here if we're using the
+				// Streamer since it will perform the sort on its own.
 				sort.Sort(spans)
 			}
 
-			// Index joins will always return exactly one output row per input row.
-			s.rf.setEstimatedRowCount(uint64(rowCount))
+			// For memory accounting, we assume the index join will return
+			// exactly one output row per input row. This is true most of the
+			// time, except when the locking wait policy is SKIP LOCKED.
+			s.cf.setEstimatedRowCount(uint64(s.rowCount))
+			s.scanRowCounts.expected = s.rowCount
 			// Note that the fetcher takes ownership of the spans slice - it
 			// will modify it and perform the memory accounting. We don't care
 			// about the modification here, but we want to be conscious about
 			// the memory accounting - we don't double count for any memory of
 			// spans because the spanAssembler released all of the relevant
 			// memory from its account in GetSpans().
-			if err := s.rf.StartScan(
+			if err := s.cf.StartScan(
 				s.Ctx,
-				s.flowCtx.Txn,
 				spans,
-				nil,   /* bsHeader */
-				false, /* limitBatches */
+				true, /* parallelize */
 				rowinfra.NoBytesLimit,
 				rowinfra.NoRowLimit,
-				s.flowCtx.EvalCtx.TestingKnobs.ForceProductionBatchSizes,
 			); err != nil {
 				colexecerror.InternalError(err)
 			}
 			s.state = indexJoinScanning
 		case indexJoinScanning:
-			batch, err := s.rf.NextBatch(s.Ctx)
+			batch, err := s.cf.NextBatch(s.Ctx)
 			if err != nil {
 				colexecerror.InternalError(err)
 			}
@@ -204,33 +261,25 @@ func (s *ColIndexJoin) Next() coldata.Batch {
 				// still has the references to it.
 				s.spanAssembler.AccountForSpans()
 				s.state = indexJoinConstructingSpans
+				s.mem.inputBatchSize = 0
+				s.rowCount = 0
+				s.assertScanRowCounts()
+				s.scanRowCounts.actual = 0
 				continue
 			}
+			s.scanRowCounts.actual += int64(n)
 			s.mu.Lock()
 			s.mu.rowsRead += int64(n)
 			s.mu.Unlock()
-			return batch
+			return batch, nil
 		case indexJoinDone:
 			// Eagerly close the index joiner. Note that closeInternal() is
 			// idempotent, so it's ok if it'll be closed again.
 			s.closeInternal()
-			return coldata.ZeroBatch
+			return coldata.ZeroBatch, nil
 		}
 	}
 }
-
-// inputBatchSizeLimit is a batch size limit for the number of input rows that
-// will be used to form lookup spans for each scan. This is used as a proxy for
-// result batch size in order to prevent OOMs, because index joins do not limit
-// result batches. TODO(drewk): once the Streamer work is finished, the fetcher
-// logic will be able to control result size without sacrificing parallelism, so
-// we can remove this limit.
-var inputBatchSizeLimit = int64(util.ConstantWithMetamorphicTestRange(
-	"ColIndexJoin-batch-size",
-	4<<20, /* 4 MB */
-	1,     /* min */
-	4<<20, /* max */
-))
 
 // findEndIndex returns an index endIdx into s.batch such that generating spans
 // for rows in the interval [s.startIdx, endIdx) will get as close to the memory
@@ -240,23 +289,23 @@ var inputBatchSizeLimit = int64(util.ConstantWithMetamorphicTestRange(
 // for the current iteration, endIdx == s.startIdx.
 func (s *ColIndexJoin) findEndIndex(hasSpans bool) (endIdx int) {
 	n := s.batch.Length()
-	if n == 0 || s.startIdx >= n || s.mem.inputBatchSize >= inputBatchSizeLimit {
+	if n == 0 || s.startIdx >= n || s.mem.inputBatchSize >= s.mem.inputBatchSizeLimit {
 		// No more spans should be generated.
 		return s.startIdx
 	}
-	if s.mem.inputBatchSize+s.mem.currentBatchSize <= inputBatchSizeLimit {
+	if s.mem.inputBatchSize+s.mem.currentBatchSize <= s.mem.inputBatchSizeLimit {
 		// The entire batch fits within the memory limit.
 		s.mem.inputBatchSize += s.mem.currentBatchSize
 		return n
 	}
 	for endIdx = s.startIdx; endIdx < n; endIdx++ {
 		s.mem.inputBatchSize += s.getRowSize(endIdx)
-		if s.mem.inputBatchSize > inputBatchSizeLimit {
+		if s.mem.inputBatchSize > s.mem.inputBatchSizeLimit {
 			// The current row (but not the previous) brings us to or over the memory
 			// limit, so use it as the exclusive end index.
 			break
 		}
-		if s.mem.inputBatchSize == inputBatchSizeLimit {
+		if s.mem.inputBatchSize == s.mem.inputBatchSizeLimit {
 			// The current row exactly meets the memory limit. Increment idx in order
 			// to make it exclusive.
 			endIdx++
@@ -280,7 +329,7 @@ func (s *ColIndexJoin) getRowSize(idx int) int64 {
 			rowSize += adjustMemEstimate(s.mem.byteLikeCols[i].ElemSize(idx))
 		}
 		for i := range s.mem.decimalCols {
-			rowSize += adjustMemEstimate(int64(tree.SizeOfDecimal(&s.mem.decimalCols[i][idx])))
+			rowSize += adjustMemEstimate(int64(s.mem.decimalCols[i][idx].Size()))
 		}
 		for i := range s.mem.datumCols {
 			memEstimate := int64(s.mem.datumCols[i].Get(idx).(tree.Datum).Size()) + memsize.DatumOverhead
@@ -288,6 +337,30 @@ func (s *ColIndexJoin) getRowSize(idx int) int64 {
 		}
 	}
 	return rowSize
+}
+
+// assertScanRowCounts performs assertions to prevent silently returning
+// incorrect results, e.g., if an index is corrupt. In the common case, the
+// number of fetched rows in an index join should be equal to the number of
+// input rows. The only exception is when the locking wait policy is
+// SKIP LOCKED, in which case the number of fetched rows may be less than
+// the number of input rows, but never greater.
+func (s *ColIndexJoin) assertScanRowCounts() {
+	if s.lockingWaitPolicy == descpb.ScanLockingWaitPolicy_SKIP_LOCKED {
+		if s.scanRowCounts.actual > s.scanRowCounts.expected {
+			colexecerror.InternalError(errors.AssertionFailedf(
+				"expected to fetch no more than %d rows, found %d",
+				s.scanRowCounts.expected, s.scanRowCounts.actual,
+			))
+		}
+	} else {
+		if s.scanRowCounts.actual != s.scanRowCounts.expected {
+			colexecerror.InternalError(errors.AssertionFailedf(
+				"expected to fetch %d rows, found %d",
+				s.scanRowCounts.expected, s.scanRowCounts.actual,
+			))
+		}
+	}
 }
 
 // getBatchSize calculates the size of the entire current batch. Note that it
@@ -307,18 +380,22 @@ func (s *ColIndexJoin) getBatchSize() int64 {
 // and performs initial processing of the batch. This includes performing
 // interface conversions up front and retrieving the overall memory footprint of
 // the data. next returns false once the input is finished, and otherwise true.
-func (s *ColIndexJoin) next() bool {
+func (s *ColIndexJoin) next() (bool, *execinfrapb.ProducerMetadata) {
 	if s.batch == nil || s.startIdx >= s.batch.Length() {
 		// The current batch is finished.
+		var meta *execinfrapb.ProducerMetadata
+		s.batch, meta = s.Input.Next()
+		if meta != nil {
+			return false, meta
+		}
 		s.startIdx = 0
-		s.batch = s.Input.Next()
 		if s.batch.Length() == 0 {
-			return false
+			return false, nil
 		}
 		s.mem.currentBatchSize = s.getBatchSize()
 	}
 	if !s.mem.hasVarSizeCols {
-		return true
+		return true, nil
 	}
 	s.mem.byteLikeCols = s.mem.byteLikeCols[:0]
 	s.mem.decimalCols = s.mem.decimalCols[:0]
@@ -336,22 +413,26 @@ func (s *ColIndexJoin) next() bool {
 			s.mem.datumCols = append(s.mem.datumCols, vec.Datum())
 		}
 	}
-	return true
+	return true, nil
 }
 
 // DrainMeta is part of the colexecop.MetadataSource interface.
 func (s *ColIndexJoin) DrainMeta() []execinfrapb.ProducerMetadata {
 	var trailingMeta []execinfrapb.ProducerMetadata
-	if tfs := execinfra.GetLeafTxnFinalState(s.Ctx, s.flowCtx.Txn); tfs != nil {
+	if tfs := execinfra.GetLeafTxnFinalState(s.Ctx, s.txn); tfs != nil {
 		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{LeafTxnFinalState: tfs})
 	}
 	meta := execinfrapb.GetProducerMeta()
 	meta.Metrics = execinfrapb.GetMetricsMeta()
 	meta.Metrics.BytesRead = s.GetBytesRead()
 	meta.Metrics.RowsRead = s.GetRowsRead()
+	meta.Metrics.KVCPUTime = s.GetKVResponseCPUTime()
+	meta.Metrics.LocalKVCPUTime = s.GetLocalKVCPUTime()
 	trailingMeta = append(trailingMeta, *meta)
-	if trace := execinfra.GetTraceData(s.Ctx); trace != nil {
-		trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
+	if !s.flowCtx.Gateway {
+		if trace := tracing.SpanFromContext(s.Ctx).GetConfiguredRecording(); trace != nil {
+			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
+		}
 	}
 	return trailingMeta
 }
@@ -360,11 +441,21 @@ func (s *ColIndexJoin) DrainMeta() []execinfrapb.ProducerMetadata {
 func (s *ColIndexJoin) GetBytesRead() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Note that if Init() was never called, s.rf.fetcher will remain nil, and
-	// GetBytesRead() will return 0. We are also holding the mutex, so a
-	// concurrent call to Init() will have to wait, and the fetcher will remain
-	// uninitialized until we return.
-	return s.rf.fetcher.GetBytesRead()
+	return s.cf.getBytesRead()
+}
+
+// GetKVPairsRead is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetKVPairsRead() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cf.getKVPairsRead()
+}
+
+// GetKVResponseCPUTime is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetKVResponseCPUTime() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cf.getKVCPUTime()
 }
 
 // GetRowsRead is part of the colexecop.KVReader interface.
@@ -374,9 +465,83 @@ func (s *ColIndexJoin) GetRowsRead() int64 {
 	return s.mu.rowsRead
 }
 
-// GetCumulativeContentionTime is part of the colexecop.KVReader interface.
-func (s *ColIndexJoin) GetCumulativeContentionTime() time.Duration {
-	return execinfra.GetCumulativeContentionTime(s.Ctx)
+// GetBatchRequestsIssued is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetBatchRequestsIssued() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cf.getBatchRequestsIssued()
+}
+
+// GetLocalKVCPUTime is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) GetLocalKVCPUTime() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cf.getLocalKVCPUTime()
+}
+
+// UsedStreamer is part of the colexecop.KVReader interface.
+func (s *ColIndexJoin) UsedStreamer() bool {
+	return s.usesStreamer
+}
+
+// inputBatchSizeLimit is a batch size limit for the number of input rows that
+// will be used to form lookup spans for each scan. This is used as a proxy for
+// result batch size in order to prevent OOMs, because index joins do not limit
+// result batches. TODO(drewk): once the Streamer work is finished, the fetcher
+// logic will be able to control result size without sacrificing parallelism, so
+// we can remove this limit.
+var inputBatchSizeLimit = int64(metamorphic.ConstantWithTestRange(
+	"ColIndexJoin-batch-size",
+	productionIndexJoinBatchSize, /* defaultValue */
+	1,                            /* min */
+	productionIndexJoinBatchSize, /* max */
+))
+
+// This number was copy-pasted from
+// execinfra.joinReaderIndexJoinStrategyBatchSizeDefault.
+const productionIndexJoinBatchSize = 4 << 20 /* 4MiB */
+
+var usingStreamerInputBatchSizeLimit = int64(metamorphic.ConstantWithTestRange(
+	"ColIndexJoin-using-streamer-batch-size",
+	productionIndexJoinUsingStreamerBatchSize, /* defaultValue */
+	1, /* min */
+	productionIndexJoinUsingStreamerBatchSize, /* max */
+))
+
+// This number was chosen with running tpchvec/bench roachtest using TPCH
+// queries 4, 5, 6, 10, 12, 14, 15, 16.
+const productionIndexJoinUsingStreamerBatchSize = 8 << 20 /* 8MiB */
+
+// IndexJoinStreamerBatchSize determines the size of input batches used to
+// construct a single lookup KV batch by the ColIndexJoin when it is using the
+// Streamer API.
+var IndexJoinStreamerBatchSize = settings.RegisterByteSizeSetting(
+	settings.ApplicationLevel,
+	"sql.distsql.index_join_streamer.batch_size",
+	"size limit on the input rows to construct a single lookup KV batch "+
+		"(by the ColIndexJoin operator when using the Streamer API)",
+	productionIndexJoinUsingStreamerBatchSize,
+	settings.PositiveInt,
+)
+
+func getIndexJoinBatchSize(
+	useStreamer bool, forceProductionValue bool, sd *sessiondata.SessionData,
+) int64 {
+	if useStreamer {
+		if forceProductionValue {
+			if sd.IndexJoinStreamerBatchSize == 0 {
+				// In some tests the session data might not be set - use the
+				// default value then.
+				return productionIndexJoinUsingStreamerBatchSize
+			}
+			return sd.IndexJoinStreamerBatchSize
+		}
+		return usingStreamerInputBatchSizeLimit
+	}
+	if forceProductionValue {
+		return execinfra.GetIndexJoinBatchSize(sd)
+	}
+	return inputBatchSizeLimit
 }
 
 // NewColIndexJoin creates a new ColIndexJoin operator.
@@ -385,16 +550,19 @@ func NewColIndexJoin(
 	allocator *colmem.Allocator,
 	fetcherAllocator *colmem.Allocator,
 	kvFetcherMemAcc *mon.BoundAccount,
+	streamerBudgetAcc *mon.BoundAccount,
 	flowCtx *execinfra.FlowCtx,
-	helper *colexecargs.ExprHelper,
+	processorID int32,
 	input colexecop.Operator,
 	spec *execinfrapb.JoinReaderSpec,
 	post *execinfrapb.PostProcessSpec,
 	inputTypes []*types.T,
+	diskMonitor *mon.BytesMonitor,
+	typeResolver *descs.DistSQLTypeResolver,
 ) (*ColIndexJoin, error) {
 	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
 	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); nodeID == 0 && ok {
-		return nil, errors.Errorf("attempting to create a ColIndexJoin with uninitialized NodeID")
+		return nil, errors.AssertionFailedf("attempting to create a ColIndexJoin with uninitialized NodeID")
 	}
 	if !spec.LookupExpr.Empty() {
 		return nil, errors.AssertionFailedf("non-empty lookup expressions are not supported for index joins")
@@ -406,84 +574,155 @@ func NewColIndexJoin(
 		return nil, errors.AssertionFailedf("non-empty ON expressions are not supported for index joins")
 	}
 
-	// TODO(ajwerner): The need to construct an immutable here
-	// indicates that we're probably doing this wrong. Instead we should be
-	// just setting the ID and Version in the spec or something like that and
-	// retrieving the hydrated immutable from cache.
-	table := spec.BuildTableDescriptor()
-	index := table.ActiveIndexes()[spec.IndexIdx]
-	tableArgs, idxMap, err := populateTableArgs(
-		ctx, flowCtx, table, index, nil, /* invertedCol */
-		spec.Visibility, spec.HasSystemColumns, post, helper,
-	)
+	tableArgs, err := populateTableArgs(ctx, &spec.FetchSpec, typeResolver, false /* allowUnhydratedEnums */)
 	if err != nil {
 		return nil, err
 	}
-	if idxMap != nil {
-		// The index join is fetching from the primary index, so there should be
-		// no mapping needed.
-		return nil, errors.AssertionFailedf("unexpectedly non-nil idx map for the index join")
-	}
 
-	// Retrieve the set of columns that the index join needs to fetch.
-	var neededColumns []uint32
-	var neededColOrdsInWholeTable util.FastIntSet
-	if post.OutputColumns != nil {
-		neededColumns = post.OutputColumns
-		for _, neededColOrd := range neededColumns {
-			neededColOrdsInWholeTable.Add(int(neededColOrd))
-		}
-	} else {
-		proc := &execinfra.ProcOutputHelper{}
-		// It is ok to use the evalCtx of the flowCtx here since we only use the
-		// ProcOutputHelper to get a set of the needed columns and will not be
-		// evaluating any expressions.
-		if err = proc.Init(post, tableArgs.typs, helper.SemaCtx, flowCtx.EvalCtx); err != nil {
-			return nil, err
-		}
-		neededColOrdsInWholeTable = proc.NeededColumns()
-		neededColumns = make([]uint32, 0, neededColOrdsInWholeTable.Len())
-		for i, ok := neededColOrdsInWholeTable.Next(0); ok; i, ok = neededColOrdsInWholeTable.Next(i + 1) {
-			neededColumns = append(neededColumns, uint32(i))
-		}
-	}
+	totalMemoryLimit := execinfra.GetWorkMemLimit(flowCtx)
+	cFetcherMemoryLimit := totalMemoryLimit
 
-	if err = keepOnlyNeededColumns(
-		flowCtx, tableArgs, idxMap, neededColumns, post, helper,
-	); err != nil {
+	var kvFetcher *row.KVFetcher
+	useStreamer, txn, err := flowCtx.UseStreamer(ctx)
+	if err != nil {
 		return nil, err
 	}
+	if useStreamer {
+		if streamerBudgetAcc == nil {
+			return nil, errors.AssertionFailedf("streamer budget account is nil when the Streamer API is desired")
+		}
+		// Keep 1/16th of the memory limit for the output batch of the cFetcher,
+		// another 1/16th of the limit for the input tuples buffered by the index
+		// joiner, and we'll give the remaining memory to the streamer budget
+		// below.
+		cFetcherMemoryLimit = int64(math.Ceil(float64(totalMemoryLimit) / 16.0))
+		streamerBudgetLimit := 14 * cFetcherMemoryLimit
+		// When we have SplitFamilyIDs with more than one family ID, then it's
+		// possible for a single lookup span to be split into multiple "family"
+		// spans, and in order to preserve the invariant that all KVs for a
+		// single SQL row are contiguous we must ask the streamer to preserve
+		// the ordering. See #113013 for an example.
+		maintainOrdering := spec.MaintainOrdering || len(spec.SplitFamilyIDs) > 1
+		if flowCtx.EvalCtx.SessionData().StreamerAlwaysMaintainOrdering {
+			maintainOrdering = true
+		}
+		var diskBuffer kvstreamer.ResultDiskBuffer
+		if maintainOrdering {
+			if diskMonitor == nil {
+				return nil, errors.AssertionFailedf("diskMonitor is nil when ordering needs to be maintained")
+			}
+			// Explicitly create a separate memory account bound to the
+			// unlimited monitor here - this passes ownership to the disk buffer
+			// which will close the acc.
+			diskBufferMemAcc := streamerBudgetAcc.Monitor().MakeBoundAccount()
+			diskBuffer = rowcontainer.NewKVStreamerResultDiskBuffer(
+				flowCtx.Cfg.TempStorage, diskBufferMemAcc, diskMonitor, false, /* reverse */
+			)
+		}
+		kvFetcher = row.NewStreamingKVFetcher(
+			flowCtx.Cfg.DistSender,
+			flowCtx.Cfg.KVStreamerMetrics,
+			flowCtx.Stopper(),
+			txn,
+			flowCtx.Cfg.Settings,
+			flowCtx.EvalCtx.SessionData(),
+			spec.LockingWaitPolicy,
+			spec.LockingStrength,
+			spec.LockingDurability,
+			streamerBudgetLimit,
+			streamerBudgetAcc,
+			maintainOrdering,
+			true, /* singleRowLookup */
+			int(spec.FetchSpec.MaxKeysPerRow),
+			false, /* reverse */
+			diskBuffer,
+			kvFetcherMemAcc,
+			spec.FetchSpec.External,
+			tableArgs.RequiresRawMVCCValues(),
+			flowCtx.EvalCtx.WorkloadID,
+			flowCtx.EvalCtx.WorkloadType,
+		)
+	} else {
+		kvFetcher = row.NewKVFetcher(
+			txn,
+			nil,   /* bsHeader */
+			false, /* reverse */
+			tableArgs.RequiresRawMVCCValues(),
+			spec.LockingStrength,
+			spec.LockingWaitPolicy,
+			spec.LockingDurability,
+			flowCtx.EvalCtx.SessionData().LockTimeout,
+			flowCtx.EvalCtx.SessionData().DeadlockTimeout,
+			kvFetcherMemAcc,
+			flowCtx.EvalCtx.TestingKnobs.ForceProductionValues,
+			spec.FetchSpec.External,
+			flowCtx.EvalCtx.WorkloadID,
+			flowCtx.EvalCtx.WorkloadType,
+		)
+	}
 
+	shouldCollectStats := execstats.ShouldCollectStats(ctx, flowCtx.CollectStats)
 	fetcher := cFetcherPool.Get().(*cFetcher)
 	fetcher.cFetcherArgs = cFetcherArgs{
-		spec.LockingStrength,
-		spec.LockingWaitPolicy,
-		flowCtx.EvalCtx.SessionData().LockTimeout,
-		execinfra.GetWorkMemLimit(flowCtx),
+		cFetcherMemoryLimit,
 		// Note that the correct estimated row count will be set by the index
 		// joiner for each set of spans to read.
-		0,     /* estimatedRowCount */
-		false, /* reverse */
+		0, /* estimatedRowCount */
 		flowCtx.TraceKV,
+		false, /* singleUse */
+		shouldCollectStats,
+		false, /* alwaysReallocate */
+		txn,
+		flowCtx.Codec().TenantID,
+		flowCtx.EvalCtx.WorkloadID,
+		flowCtx.EvalCtx.WorkloadType,
 	}
-	if err = fetcher.Init(flowCtx.Codec(), fetcherAllocator, kvFetcherMemAcc, tableArgs, spec.HasSystemColumns); err != nil {
+	if err = fetcher.Init(
+		fetcherAllocator, kvFetcher, tableArgs,
+	); err != nil {
 		fetcher.Release()
 		return nil, err
 	}
 
 	spanAssembler := colexecspan.NewColSpanAssembler(
-		flowCtx.Codec(), allocator, table, index, inputTypes, neededColOrdsInWholeTable,
+		flowCtx.Codec(), allocator, &spec.FetchSpec, spec.SplitFamilyIDs, inputTypes,
 	)
 
 	op := &ColIndexJoin{
-		OneInputNode:     colexecop.NewOneInputNode(input),
-		flowCtx:          flowCtx,
-		rf:               fetcher,
-		spanAssembler:    spanAssembler,
-		ResultTypes:      tableArgs.typs,
-		maintainOrdering: spec.MaintainOrdering,
+		OneInputNode:      colexecop.NewOneInputNode(input),
+		flowCtx:           flowCtx,
+		processorID:       processorID,
+		cf:                fetcher,
+		spanAssembler:     spanAssembler,
+		ResultTypes:       tableArgs.typs,
+		maintainOrdering:  spec.MaintainOrdering,
+		txn:               txn,
+		usesStreamer:      useStreamer,
+		limitHintHelper:   execinfra.MakeLimitHintHelper(spec.LimitHint, post),
+		lockingWaitPolicy: spec.LockingWaitPolicy,
 	}
+	op.mem.inputBatchSizeLimit = getIndexJoinBatchSize(
+		useStreamer, flowCtx.EvalCtx.TestingKnobs.ForceProductionValues, flowCtx.EvalCtx.SessionData(),
+	)
 	op.prepareMemLimit(inputTypes)
+	if useStreamer && cFetcherMemoryLimit < op.mem.inputBatchSizeLimit {
+		// If we have a low workmem limit, then we want to reduce the input
+		// batch size limit.
+		//
+		// The Streamer gets most of workmem as its budget which accounts for
+		// two usages - for the footprint of the spans themselves in the
+		// enqueued requests as well as the footprint of the responses received
+		// by the Streamer. If we don't reduce the input batch size limit here,
+		// then 8MiB value will be used, and the constructed spans (i.e. the
+		// enqueued requests) alone might exceed the budget leading to the
+		// Streamer erroring out in Enqueue().
+		op.mem.inputBatchSizeLimit = cFetcherMemoryLimit
+	}
+	if shouldCollectStats {
+		if flowTxn := flowCtx.EvalCtx.Txn; flowTxn != nil {
+			op.ContentionEventsListener.Init(flowTxn.ID())
+		}
+	}
 
 	return op, nil
 }
@@ -536,20 +775,15 @@ func adjustMemEstimate(estimate int64) int64 {
 	return estimate*memEstimateMultiplier + memEstimateAdditive
 }
 
-// GetScanStats is part of the colexecop.KVReader interface.
-func (s *ColIndexJoin) GetScanStats() execinfra.ScanStats {
-	return execinfra.GetScanStats(s.Ctx)
-}
-
 // Release implements the execinfra.Releasable interface.
 func (s *ColIndexJoin) Release() {
-	s.rf.Release()
+	s.cf.Release()
 	s.spanAssembler.Release()
 	*s = ColIndexJoin{}
 }
 
 // Close implements the colexecop.Closer interface.
-func (s *ColIndexJoin) Close() error {
+func (s *ColIndexJoin) Close(context.Context) error {
 	s.closeInternal()
 	if s.tracingSpan != nil {
 		s.tracingSpan.Finish()
@@ -561,10 +795,11 @@ func (s *ColIndexJoin) Close() error {
 // closeInternal is a subset of Close() which doesn't finish the operator's
 // span.
 func (s *ColIndexJoin) closeInternal() {
-	s.rf.Close(s.EnsureCtx())
-	if s.spanAssembler != nil {
-		// spanAssembler can be nil if Release() has already been called.
-		s.spanAssembler.Close()
-	}
+	// Note that we're using the context of the ColIndexJoin rather than the
+	// argument of Close() because the ColIndexJoin derives its own tracing
+	// span.
+	ctx := s.EnsureCtx()
+	s.cf.Close(ctx)
+	s.spanAssembler.Close()
 	s.batch = nil
 }

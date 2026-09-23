@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Copyright 2021 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
+
 set -euo pipefail
 
 dir="$(dirname $(dirname $(dirname $(dirname $(dirname "${0}")))))"
@@ -7,10 +13,16 @@ dir="$(dirname $(dirname $(dirname $(dirname $(dirname "${0}")))))"
 source "$dir/teamcity-support.sh"  # For $root, changed_go_pkgs
 source "$dir/teamcity-bazel-support.sh"  # For run_bazel
 
+# The full race suite takes >4h and is only suitable for nightlies. On release
+# branches, run just the `server` package which (at the time of writing)
+# takes <30m to run and exercises most of the code in the system at least
+# rudimentarily. This (hopefully) causes obvious races to fail early,
+# before spraying failures over the nightly stress suite.
+canaryspec=./pkg/server
 tc_start_block "Determine changed packages"
-if tc_release_branch; then
-  pkgspec=./pkg/...
-  echo "On release branch ($TC_BUILD_BRANCH), so running testrace on all packages ($pkgspec)"
+if tc_release_branch || is_trunk_branch; then
+  pkgspec="${canaryspec}"
+  echo "On release/trunk branch ($TC_BUILD_BRANCH), so running canary testrace ($pkgspec)"
 else
   pkgspec=$(changed_go_pkgs)
   if [[ $(echo "$pkgspec" | wc -w) -gt 10 ]]; then

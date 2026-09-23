@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package install
 
@@ -15,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,12 +26,11 @@ type Nodes []Node
 // node ranges. Nodes are 1-indexed.
 //
 // Examples:
-//  - "all"
-//  - "1"
-//  - "1-3"
-//  - "1,3,5"
-//  - "1,2-4,7-8"
-//
+//   - "all"
+//   - "1"
+//   - "1-3"
+//   - "1,3,5"
+//   - "1,2-4,7-8"
 func ListNodes(s string, numNodesInCluster int) (Nodes, error) {
 	if s == "" {
 		return nil, errors.AssertionFailedf("empty node selector")
@@ -49,7 +43,7 @@ func ListNodes(s string, numNodesInCluster int) (Nodes, error) {
 		return allNodes(numNodesInCluster), nil
 	}
 
-	var set util.FastIntSet
+	var set intsets.Fast
 	for _, p := range strings.Split(s, ",") {
 		parts := strings.Split(p, "-")
 		switch len(parts) {
@@ -99,4 +93,13 @@ func allNodes(numNodesInCluster int) Nodes {
 		r[i] = Node(i + 1)
 	}
 	return r
+}
+
+func (n Nodes) Contains(node Node) bool {
+	for _, v := range n {
+		if v == node {
+			return true
+		}
+	}
+	return false
 }

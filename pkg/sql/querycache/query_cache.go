@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package querycache
 
@@ -14,6 +9,7 @@ import (
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/prep"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
 )
@@ -53,18 +49,15 @@ const maxCachedSize = 128 * 1024
 type CachedData struct {
 	SQL  string
 	Memo *memo.Memo
-	// PrepareMetadata is set for prepare queries. In this case the memo contains
+	// Metadata is set for prepare queries. In this case the memo contains
 	// unassigned placeholders. For non-prepared queries, it is nil.
-	PrepareMetadata *PrepareMetadata
-	// IsCorrelated memoizes whether the query contained correlated
-	// subqueries during planning (prior to de-correlation).
-	IsCorrelated bool
+	Metadata *prep.Metadata
 }
 
 func (cd *CachedData) memoryEstimate() int64 {
 	res := int64(len(cd.SQL)) + cd.Memo.MemoryEstimate()
-	if cd.PrepareMetadata != nil {
-		res += cd.PrepareMetadata.MemoryEstimate()
+	if cd.Metadata != nil {
+		res += cd.Metadata.MemoryEstimate()
 	}
 	return res
 }
@@ -134,7 +127,7 @@ func New(memorySize int64) *C {
 // Find returns the entry for the given query, if it is in the cache.
 //
 // If any cached data needs to be updated, it must be done via Add. In
-// particular, PrepareMetadata in the returned CachedData must not be modified.
+// particular, Metadata in the returned CachedData must not be modified.
 func (c *C) Find(session *Session, sql string) (_ CachedData, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -153,7 +146,7 @@ func (c *C) Find(session *Session, sql string) (_ CachedData, ok bool) {
 
 // Add adds an entry to the cache (possibly evicting some other entry). If the
 // cache already has a corresponding entry for d.SQL, it is updated.
-// Note: d.PrepareMetadata cannot be modified once this method is called.
+// Note: d.Metadata cannot be modified once this method is called.
 func (c *C) Add(session *Session, d *CachedData) {
 	if session.highMissRatio() {
 		// If the recent miss ratio in this session is high, we want to avoid the

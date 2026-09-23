@@ -1,7 +1,13 @@
+// Copyright 2021 The Cockroach Authors.
+//
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
+
 @import "src/core/index.module";
 
 .timescale {
   display: flex;
+  width: 590px;
 }
 
 .trigger {
@@ -11,7 +17,6 @@
   text-transform: uppercase;
   letter-spacing: 2px;
   line-height: 17px;
-
 }
 
 .time-range {
@@ -19,7 +24,34 @@
   color: $button-border-color;
   font-size: 12px;
   font-family: $font-family--base;
-  &__time, &__date {
+  &__time,
+  &__date {
     color: $body-color;
   }
+}
+
+.time-label {
+  font-family: $font-family--base;
+  font-size: $font-size--medium;
+  padding: 0px;
+  margin: 0px;
+  color: $colors--neutral-6;
+  line-height: $line-height--large;
+  letter-spacing: 0.1px;
+  .bold {
+    font-family: $font-family--bold;
+    color: $colors--neutral-7;
+  }
+  .warning-icon-area {
+    margin-bottom: -3px;
+    margin-right: 2px;
+  }
+}
+
+.label-margin {
+  margin-top: 5px;
+}
+
+.label-no-margin-bottom {
+  margin-bottom: -10px;
 }

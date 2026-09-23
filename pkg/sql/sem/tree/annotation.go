@@ -1,14 +1,11 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
+
+import "github.com/cockroachdb/cockroach/pkg/util/buildutil"
 
 // AnnotationIdx is the 1-based index of an annotation. AST nodes that can
 // be annotated store such an index (unique within that AST).
@@ -25,6 +22,12 @@ type AnnotatedNode struct {
 // GetAnnotation retrieves the annotation associated with this node.
 func (n AnnotatedNode) GetAnnotation(ann *Annotations) interface{} {
 	if n.AnnIdx == NoAnnotation {
+		return nil
+	}
+	if (len(*ann) < int(n.AnnIdx) || int(n.AnnIdx) < 1) && !buildutil.CrdbTestBuild {
+		// Avoid index-out-of bounds panics in production builds. The impact is
+		// that the node will be treated as if it doesn't have the annotation,
+		// which is better than the process crash.
 		return nil
 	}
 	return ann.Get(n.AnnIdx)
@@ -50,5 +53,8 @@ func (a *Annotations) Set(idx AnnotationIdx, annotation interface{}) {
 
 // Get an annotation from the container.
 func (a *Annotations) Get(idx AnnotationIdx) interface{} {
+	if len(*a) < int(idx) {
+		return nil
+	}
 	return (*a)[idx-1]
 }

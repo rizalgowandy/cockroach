@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -15,10 +10,9 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -34,8 +28,9 @@ import (
 func TestRenameTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
-	defer s.Stopper().Stop(context.Background())
+	srv, db, kvDB := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	if _, err := db.Exec(`CREATE DATABASE test`); err != nil {
 		t.Fatal(err)
@@ -50,7 +45,7 @@ func TestRenameTable(t *testing.T) {
 	}
 
 	// Check the table descriptor.
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "foo")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "foo")
 	if tableDesc.GetName() != oldName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", oldName, tableDesc)
 	}
@@ -64,7 +59,7 @@ func TestRenameTable(t *testing.T) {
 	}
 
 	// Check the table descriptor again.
-	renamedDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "bar")
+	renamedDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "bar")
 	if renamedDesc.GetName() != newName {
 		t.Fatalf("Wrong table name, expected %s, got: %+v", newName, tableDesc)
 	}
@@ -112,7 +107,7 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 		func(descriptor *descpb.Descriptor) {
 			mu.Lock()
 			defer mu.Unlock()
-			id, version, name, _, _, err := descpb.GetDescriptorMetadata(descriptor)
+			id, version, name, _, err := descpb.GetDescriptorMetadata(descriptor)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -124,8 +119,9 @@ func TestTxnCanStillResolveOldName(t *testing.T) {
 				waitTableID = 0
 			}
 		}
-	s, db, kvDB := serverutils.StartServer(t, serverParams)
-	defer s.Stopper().Stop(context.Background())
+	srv, db, kvDB := serverutils.StartServer(t, serverParams)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sql := `
 CREATE DATABASE test;
@@ -136,7 +132,7 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "test", "t")
 	mu.Lock()
 	waitTableID = tableDesc.GetID()
 	mu.Unlock()
@@ -215,6 +211,7 @@ func TestTxnCanUseNewNameAfterRename(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	sql := `
+SET autocommit_before_ddl=off;
 CREATE DATABASE test;
 CREATE TABLE test.t (a INT PRIMARY KEY);
 `
@@ -284,6 +281,9 @@ CREATE TABLE test.t (a INT PRIMARY KEY);
 
 	txn, err := db.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.Exec("SET LOCAL autocommit_before_ddl = false"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := txn.Exec("ALTER TABLE test.t RENAME TO test.t2"); err != nil {

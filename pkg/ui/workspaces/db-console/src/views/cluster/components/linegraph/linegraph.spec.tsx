@@ -1,178 +1,169 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import { assert } from "chai";
-import { shallow } from "enzyme";
-import React from "react";
-import "src/enzymeInit";
-import * as sinon from "sinon";
-import uPlot from "uplot";
-import _ from "lodash";
-
-import { fillGaps, LineGraph, LineGraphProps } from "./index";
-import * as timewindow from "src/redux/timewindow";
-import * as protos from "src/js/protos";
-import { Axis } from "src/views/shared/components/metricQuery";
-import {
-  calculateXAxisDomain,
-  calculateYAxisDomain,
-  configureUPlotLineChart,
-} from "src/views/cluster/util/graphs";
+import { render } from "@testing-library/react";
 import Long from "long";
+import React from "react";
+import uPlot from "uplot";
 
-describe("<LineGraph>", function() {
-  let spy: sinon.SinonSpy;
+import * as timewindow from "src/redux/timeScale";
+import { Axis } from "src/views/shared/components/metricQuery";
+
+import { fillGaps, InternalLineGraph, LineGraphProps } from "./index";
+
+// Mock uPlot — JSDOM can't render real charts, so we verify the
+// component drives uPlot correctly via constructor and method calls.
+jest.mock("uplot", () => {
+  return jest.fn().mockImplementation(() => ({
+    setData: jest.fn(),
+    destroy: jest.fn(),
+    axes: [{}, { label: "" }],
+  }));
+});
+
+// Mock chart helpers to avoid needing the full metrics pipeline.
+// formatMetricData returns a stable key (".0") so the effect can
+// distinguish "same series, new data" from "new series".
+jest.mock("src/views/cluster/util/graphs", () => ({
+  ...jest.requireActual("src/views/cluster/util/graphs"),
+  configureUPlotLineChart: jest.fn().mockReturnValue({}),
+  formatMetricData: jest.fn().mockReturnValue([{ key: ".0", values: [] }]),
+}));
+
+const MockUPlot = uPlot as unknown as jest.Mock;
+
+describe("<LineGraph>", function () {
   let mockProps: LineGraphProps;
-  const linegraph = (props: LineGraphProps) =>
-    shallow(
-      <LineGraph {...props}>
-        <Axis />
-      </LineGraph>,
-    );
 
   beforeEach(() => {
+    MockUPlot.mockClear();
+
     mockProps = {
       title: "Test Title",
       subtitle: "Test Subtitle",
       legend: false,
       xAxis: true,
-      data: { results: [], toJSON: sinon.spy },
+      data: { results: [] },
       timeInfo: {
         start: new Long(12345),
         end: new Long(2346),
         sampleDuration: new Long(1),
       },
-      setTimeRange: timewindow.setTimeRange,
+      setMetricsFixedWindow: timewindow.setMetricsFixedWindow,
       setTimeScale: timewindow.setTimeScale,
+      timezone: "UTC",
       history: {
         length: 0,
-        action: "PUSH",
+        action: "PUSH" as const,
         location: {
           pathname: "",
           search: "",
-          state: sinon.spy,
+          state: jest.fn(),
           hash: "",
         },
-        push: () => {},
-        replace: () => {},
-        go: () => {},
-        goBack: () => {},
-        goForward: () => {},
-        block: sinon.spy,
-        listen: sinon.spy,
-        createHref: () => {
-          return "";
-        },
+        push: jest.fn(),
+        replace: jest.fn(),
+        go: jest.fn(),
+        goBack: jest.fn(),
+        goForward: jest.fn(),
+        block: jest.fn(),
+        listen: jest.fn(),
+        createHref: () => "",
       },
     };
-    spy = sinon.spy();
   });
 
   it("should render a root component on mount", () => {
-    const wrapper = linegraph({ ...mockProps });
-    const root = wrapper.find(".linegraph");
-    assert.equal(root.length, 1);
-  });
-
-  it("should set new history", () => {
-    const wrapper = linegraph({
-      ...mockProps,
-      history: { ...mockProps.history, push: spy },
-    });
-    const instance = (wrapper.instance() as any) as LineGraph;
-    instance.setNewTimeRange(111111, 222222);
-    assert.isTrue(
-      spy.calledWith({ pathname: "", search: "start=111&end=222" }),
+    const { container } = render(
+      <InternalLineGraph {...mockProps}>
+        <Axis />
+      </InternalLineGraph>,
     );
+    expect(container.querySelector(".linegraph")).not.toBeNull();
   });
 
-  it("should set a new chart on update", () => {
-    const wrapper = linegraph({ ...mockProps });
-    const instance = (wrapper.instance() as any) as LineGraph;
-    wrapper.setProps({
-      data: {
-        results: [
-          {
-            datapoints: [
-              {
-                timestamp_nanos: {
-                  high: 999999,
-                  low: 111111,
-                  unsigned: false,
+  it("should display an empty state if viewing a virtual cluster and there is no data", () => {
+    const { container } = render(
+      <InternalLineGraph {...mockProps} tenantSource="demoapp">
+        <Axis />
+      </InternalLineGraph>,
+    );
+    expect(container.querySelector(".linegraph-empty")).not.toBeNull();
+  });
+
+  it("should create a chart when data with datapoints arrives", () => {
+    render(
+      <InternalLineGraph
+        {...mockProps}
+        data={{
+          results: [
+            {
+              datapoints: [
+                {
+                  timestamp_nanos: new Long(111111, 999999),
+                  value: 123456,
                 },
-                value: 123456,
-              },
-            ],
-          },
-        ],
-      },
-    });
-    const result = _.isEmpty(instance.u);
-    assert.equal(result, false);
+              ],
+            },
+          ],
+        }}
+      >
+        <Axis />
+      </InternalLineGraph>,
+    );
+
+    expect(MockUPlot).toHaveBeenCalled();
   });
 
-  it("should update the existing chart", () => {
-    // test setup
-    const wrapper = linegraph({
-      ...mockProps,
-      data: { results: [{}], toJSON: sinon.spy },
-    });
-    const instance = (wrapper.instance() as unknown) as LineGraph;
-    const mockFn = sinon.spy();
-    const mockMetrics = [
-      {
-        key: ".0",
-        props: { name: "test", nonNegativeRate: true, title: "Selects" },
-        type: mockFn,
-        _owner: {},
-        _store: { validated: false },
-      },
-    ];
-    const mockAxis = {
-      type: "AxisProps",
-      key: ".0",
-      props: { label: "queries", children: [{}], units: 3 },
-      _owner: {},
-      _store: { validated: false },
+  it("should update the existing chart when data changes", () => {
+    const initialData = {
+      results: [
+        {
+          datapoints: [
+            {
+              timestamp_nanos: new Long(111111, 999999),
+              value: 100,
+            },
+          ],
+        },
+      ],
     };
-    const mockData: protos.cockroach.ts.tspb.TimeSeriesQueryResponse = new protos.cockroach.ts.tspb.TimeSeriesQueryResponse();
-    const mockOptions = configureUPlotLineChart(
-      mockMetrics,
-      mockAxis,
-      mockData,
-      instance.setNewTimeRange,
-      () => calculateYAxisDomain(0, mockData),
-      () => calculateXAxisDomain(mockProps.timeInfo),
+
+    const { rerender } = render(
+      <InternalLineGraph {...mockProps} data={initialData}>
+        <Axis />
+      </InternalLineGraph>,
     );
-    instance.u = new uPlot(mockOptions);
-    const setDataSpy = sinon.spy(instance.u, "setData");
-    // run test
-    wrapper.setProps({
-      data: {
-        results: [
-          {
-            datapoints: [
-              {
-                timestamp_nanos: {
-                  high: 999999,
-                  low: 111111,
-                  unsigned: false,
+
+    // First render should create the chart.
+    expect(MockUPlot).toHaveBeenCalledTimes(1);
+    const chartInstance = MockUPlot.mock.results[0].value;
+
+    // Rerender with a new data object (same series structure).
+    rerender(
+      <InternalLineGraph
+        {...mockProps}
+        data={{
+          results: [
+            {
+              datapoints: [
+                {
+                  timestamp_nanos: new Long(222222, 999999),
+                  value: 200,
                 },
-                value: 123456,
-              },
-            ],
-          },
-        ],
-      },
-    });
-    assert.isTrue(setDataSpy.called);
+              ],
+            },
+          ],
+        }}
+      >
+        <Axis />
+      </InternalLineGraph>,
+    );
+
+    // Should update existing chart via setData, not create a new one.
+    expect(chartInstance.setData).toHaveBeenCalled();
   });
 });
 
@@ -194,6 +185,6 @@ describe("fillGaps", () => {
       1634735810000,
     ];
     const result = fillGaps(data, sampleDuration);
-    assert.equal(result.length, 50);
+    expect(result.length).toBe(50);
   });
 });

@@ -1,95 +1,70 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rel
 
-import (
-	"math"
-	"sync"
-
-	"github.com/google/btree"
-)
-
-// item is implemented by all members of the tree as well as by the valuesItem
-// used at query time.
-type item interface {
-	btree.Item
-	getIndexSpec() *indexSpec
-	compareAttrs() ordinalSet
-	getValues() *valuesMap
-}
-
-var _ item = (*containerItem)(nil)
-var _ item = (*valuesItem)(nil)
-
-func compareItems(a, b item) (less bool) {
-	// Compare on the index attributes first.
-	index := a.getIndexSpec()
-	toCompare := a.compareAttrs().intersection(b.compareAttrs())
-	for _, at := range index.attrs {
-		if !toCompare.contains(at) {
-			break
-		}
-
-		var eq bool
-		if less, eq = compareOn(
-			at, a.getValues(), b.getValues(),
-		); !eq {
-			return less
-		}
-	}
-	// If this is A query, respect the bounds.
-	if aValuesItem, ok := a.(*valuesItem); ok {
-		return !aValuesItem.end
-	}
-	if bValuesItem, ok := b.(*valuesItem); ok {
-		return bValuesItem.end
-	}
-
-	// Compare the entities across all the attributes.
-	less, _ = compareEntities(
-		a.(*containerItem).entity,
-		b.(*containerItem).entity,
-	)
-	return less
-}
-
-type containerItem struct {
-	*indexSpec
-	*entity
-}
-
-func (c *containerItem) getValues() *valuesMap { return c.asMap() }
-
-// TODO(ajwerner): We are returning MaxUint64 here to say that we do
-// store nil valuesMap in the index. I don't think there's any value in this
-// so we should go back and stop storing entries for entities which do not
-// have valuesMap for all of the attributes of the index.
-func (c *containerItem) compareAttrs() ordinalSet { return math.MaxUint64 }
-func (c *containerItem) getIndexSpec() *indexSpec { return c.indexSpec }
-
-func (c *containerItem) Less(than btree.Item) bool {
-	return compareItems(c, than.(item))
-}
+import "sync"
 
 // valuesItem is used to construct query bounds from the tree.
 type valuesItem struct {
-	*indexSpec
-	*valuesMap
-	m   ordinalSet
-	end bool
+	isQuery bool
+	end     bool
+	values
+	idx *indexSpec
 }
 
-func (v *valuesItem) getIndexSpec() *indexSpec { return v.indexSpec }
-func (v *valuesItem) compareAttrs() ordinalSet { return v.m }
-func (v *valuesItem) getValues() *valuesMap    { return v.valuesMap }
+func (v *valuesItem) less(than *valuesItem) bool {
+	return v.idx.compareItems(v, than) < 0
+}
+
+func (index *indexSpec) compareItems(a, b *valuesItem) (ret int) {
+	// Compare on the index attributes first.
+	var queryAttrs ordinalSet
+	if a.isQuery {
+		queryAttrs = a.values.attrs
+	} else if b.isQuery {
+		queryAttrs = b.values.attrs
+	} else {
+		queryAttrs = index.mask
+	}
+
+	for _, at := range index.attrs {
+		if !queryAttrs.contains(at) {
+			break
+		}
+
+		if less, eq := index.s.compareOn(at, &a.values, &b.values); !eq {
+			return lessToCmp(less)
+		}
+	}
+	// If this is a query, respect the bounds.
+	if a.isQuery {
+		return lessToCmp(!a.end)
+	}
+	if b.isQuery {
+		return lessToCmp(b.end)
+	}
+
+	// Compare the entities across all the attributes as the primary key
+	// to distinguish ordering between items.
+	less, eq := index.s.compareOnAttrs(
+		a.values.attrs.union(b.values.attrs),
+		&a.values, &b.values,
+	)
+	if eq {
+		return 0
+	}
+	return lessToCmp(less)
+}
+
+func lessToCmp(less bool) int {
+	if less {
+		return -1
+	}
+	return 1
+}
 
 var valuesItemPool = sync.Pool{
 	New: func() interface{} { return new(valuesItem) },
@@ -98,11 +73,11 @@ var valuesItemPool = sync.Pool{
 // getValuesItems uses the valuesItemPool to get the bounding valuesItems for
 // A given where clause and indexSpec. The valuesItems have A well defined
 // lifetime which is bound to A query so we may as well pool them.
-func getValuesItems(idx *indexSpec, values *valuesMap, m ordinalSet) (from, to *valuesItem) {
+func getValuesItems(idx *indexSpec, v values) (from, to *valuesItem) {
 	from = valuesItemPool.Get().(*valuesItem)
 	to = valuesItemPool.Get().(*valuesItem)
-	*from = valuesItem{indexSpec: idx, valuesMap: values, m: m, end: false}
-	*to = valuesItem{indexSpec: idx, valuesMap: values, m: m, end: true}
+	*from = valuesItem{isQuery: true, values: v, end: false, idx: idx}
+	*to = valuesItem{isQuery: true, values: v, end: true, idx: idx}
 	return from, to
 }
 
@@ -111,8 +86,4 @@ func putValuesItems(from, to *valuesItem) {
 	*to = valuesItem{}
 	valuesItemPool.Put(from)
 	valuesItemPool.Put(to)
-}
-
-func (v *valuesItem) Less(than btree.Item) bool {
-	return compareItems(v, than.(item))
 }

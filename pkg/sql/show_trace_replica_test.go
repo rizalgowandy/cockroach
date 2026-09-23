@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql_test
 
@@ -15,10 +10,10 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -34,7 +29,8 @@ func TestShowTraceReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 34213)
+	skip.UnderRace(t)     // too slow
+	skip.UnderDeadlock(t) // too slow
 
 	const numNodes = 4
 
@@ -44,13 +40,14 @@ func TestShowTraceReplica(t *testing.T) {
 	ctx := context.Background()
 	tsArgs := func(node string) base.TestServerArgs {
 		return base.TestServerArgs{
+			ScanMaxIdleTime: 10 * time.Millisecond, // speed up replicate queue
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
 					DefaultZoneConfigOverride:       &zoneConfig,
 					DefaultSystemZoneConfigOverride: &zoneConfig,
 				},
 			},
-			StoreSpecs: []base.StoreSpec{{InMemory: true, Attributes: roachpb.Attributes{Attrs: []string{node}}}},
+			StoreSpecs: []base.StoreSpec{{InMemory: true, Attributes: []string{node}}},
 		}
 	}
 	tcArgs := base.TestClusterArgs{ServerArgsPerNode: map[int]base.TestServerArgs{

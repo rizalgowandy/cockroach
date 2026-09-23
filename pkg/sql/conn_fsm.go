@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 //
 //
 //
@@ -17,13 +12,17 @@
 package sql
 
 import (
+	"math/rand"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlfsm"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // Constants for the String() representation of the session states. Shared with
@@ -36,7 +35,7 @@ const (
 	InternalErrorStateStr = sqlfsm.InternalErrorStateStr
 )
 
-/// States.
+// States.
 
 type stateNoTxn struct{}
 
@@ -47,7 +46,11 @@ func (stateNoTxn) String() string {
 }
 
 type stateOpen struct {
+	// ImplicitTxn is false if the txn included a BEGIN command.
 	ImplicitTxn fsm.Bool
+	// WasUpgraded is true if the txn started as implicit, but a BEGIN made it
+	// become explicit.
+	WasUpgraded fsm.Bool
 }
 
 var _ fsm.State = &stateOpen{}
@@ -56,9 +59,14 @@ func (stateOpen) String() string {
 	return OpenStateStr
 }
 
-// stateAborted is entered on errors (retriable and non-retriable). A ROLLBACK
+// stateAborted is entered on errors (retryable and non-retryable). A ROLLBACK
 // TO SAVEPOINT can move the transaction back to stateOpen.
-type stateAborted struct{}
+type stateAborted struct {
+	// WasUpgraded is true if the txn started as implicit, but a BEGIN made it
+	// become explicit. This is needed so that when ROLLBACK TO SAVEPOINT moves
+	// to stateOpen, we keep tracking WasUpgraded correctly.
+	WasUpgraded fsm.Bool
+}
 
 var _ fsm.State = &stateAborted{}
 
@@ -93,7 +101,7 @@ func (stateAborted) State()       {}
 func (stateCommitWait) State()    {}
 func (stateInternalError) State() {}
 
-/// Events.
+// Events.
 
 type eventTxnStart struct {
 	ImplicitTxn fsm.Bool
@@ -108,6 +116,16 @@ type eventTxnStartPayload struct {
 	txnSQLTimestamp     time.Time
 	readOnly            tree.ReadWriteMode
 	historicalTimestamp *hlc.Timestamp
+	// qualityOfService denotes the user-level admission queue priority to use for
+	// any new Txn started using this payload.
+	qualityOfService sessiondatapb.QoSLevel
+	// resourceGroupID is the resource group to bind any new Txn started using
+	// this payload to for admission control. Zero means unbound.
+	resourceGroupID       uint64
+	isoLevel              isolation.Level
+	omitInRangefeeds      bool
+	bufferedWritesEnabled bool
+	rng                   *rand.Rand
 }
 
 // makeEventTxnStartPayload creates an eventTxnStartPayload.
@@ -117,18 +135,39 @@ func makeEventTxnStartPayload(
 	txnSQLTimestamp time.Time,
 	historicalTimestamp *hlc.Timestamp,
 	tranCtx transitionCtx,
+	qualityOfService sessiondatapb.QoSLevel,
+	resourceGroupID uint64,
+	isoLevel isolation.Level,
+	omitInRangefeeds bool,
+	bufferedWritesEnabled bool,
+	rng *rand.Rand,
 ) eventTxnStartPayload {
 	return eventTxnStartPayload{
-		pri:                 pri,
-		readOnly:            readOnly,
-		txnSQLTimestamp:     txnSQLTimestamp,
-		historicalTimestamp: historicalTimestamp,
-		tranCtx:             tranCtx,
+		pri:                   pri,
+		readOnly:              readOnly,
+		txnSQLTimestamp:       txnSQLTimestamp,
+		historicalTimestamp:   historicalTimestamp,
+		tranCtx:               tranCtx,
+		qualityOfService:      qualityOfService,
+		resourceGroupID:       resourceGroupID,
+		isoLevel:              isoLevel,
+		omitInRangefeeds:      omitInRangefeeds,
+		bufferedWritesEnabled: bufferedWritesEnabled,
+		rng:                   rng,
 	}
 }
 
+type eventTxnUpgradeToExplicit struct{}
+
 type eventTxnFinishCommitted struct{}
 type eventTxnFinishAborted struct{}
+
+// eventTxnFinishCommittedPLpgSQL and eventTxnFinishAbortedPLpgSQL are generated
+// when a PL/pgSQL stored procedure executes a COMMIT or ROLLBACK statement. The
+// current transaction is finished, but the statement buffer is not advanced,
+// since the current stored procedure resumes execution in the new transaction.
+type eventTxnFinishCommittedPLpgSQL struct{}
+type eventTxnFinishAbortedPLpgSQL struct{}
 
 // eventSavepointRollback is generated when we want to move from Aborted to Open
 // through a ROLLBACK TO SAVEPOINT <not cockroach_restart>. Note that it is not
@@ -136,31 +175,48 @@ type eventTxnFinishAborted struct{}
 // that case no event is necessary.
 type eventSavepointRollback struct{}
 
-type eventNonRetriableErr struct {
+// eventTxnFinishPrepared is generated when a PREPARE TRANSACTION statement is
+// executed. The current transaction is dissociated with the current session.
+type eventTxnFinishPrepared struct{}
+
+// eventTxnFinishPreparedErrPayload represents the payload for
+// eventTxnFinishPrepared, if the PREPARE TRANSACTION statement encountered an
+// error. No payload is used if the statement was successful.
+type eventTxnFinishPreparedErrPayload struct {
+	// err is the error encountered during the prepare.
+	err error
+}
+
+// errorCause implements the payloadWithError interface.
+func (p eventTxnFinishPreparedErrPayload) errorCause() error {
+	return p.err
+}
+
+type eventNonRetryableErr struct {
 	IsCommit fsm.Bool
 }
 
-// eventNonRetriableErrPayload represents the payload for eventNonRetriableErr.
-type eventNonRetriableErrPayload struct {
+// eventNonRetryableErrPayload represents the payload for eventNonRetryableErr.
+type eventNonRetryableErrPayload struct {
 	// err is the error that caused the event.
 	err error
 }
 
 // errorCause implements the payloadWithError interface.
-func (p eventNonRetriableErrPayload) errorCause() error {
+func (p eventNonRetryableErrPayload) errorCause() error {
 	return p.err
 }
 
-// eventNonRetriableErrorPayload implements payloadWithError.
-var _ payloadWithError = eventNonRetriableErrPayload{}
+// eventNonRetryableErrorPayload implements payloadWithError.
+var _ payloadWithError = eventNonRetryableErrPayload{}
 
-type eventRetriableErr struct {
+type eventRetryableErr struct {
 	CanAutoRetry fsm.Bool
 	IsCommit     fsm.Bool
 }
 
-// eventRetriableErrPayload represents the payload for eventRetriableErr.
-type eventRetriableErrPayload struct {
+// eventRetryableErrPayload represents the payload for eventRetryableErr.
+type eventRetryableErrPayload struct {
 	// err is the error that caused the event
 	err error
 	// rewCap must be set if CanAutoRetry is set on the event. It will be passed
@@ -169,12 +225,12 @@ type eventRetriableErrPayload struct {
 }
 
 // errorCause implements the payloadWithError interface.
-func (p eventRetriableErrPayload) errorCause() error {
+func (p eventRetryableErrPayload) errorCause() error {
 	return p.err
 }
 
-// eventRetriableErrPayload implements payloadWithError.
-var _ payloadWithError = eventRetriableErrPayload{}
+// eventRetryableErrPayload implements payloadWithError.
+var _ payloadWithError = eventRetryableErrPayload{}
 
 // eventTxnRestart is generated by a rollback to a savepoint placed at the
 // beginning of the transaction (commonly SAVEPOINT cockroach_restart).
@@ -185,24 +241,40 @@ type eventTxnRestart struct{}
 // generated by releasing regular savepoints.
 type eventTxnReleased struct{}
 
+// eventTxnCommittedWithShowCommitTimestamp is generated after a successful
+// SHOW COMMIT TIMESTAMP in an explicit transaction. It moves the state to
+// CommitWait.
+type eventTxnCommittedWithShowCommitTimestamp struct{}
+
+// eventTxnCommittedDueToDDL is generated when a DDL statement is received
+// in an explicit transaction, and the autocommit_before_ddl session variable
+// is enabled. It moves the state to NoTxn.
+type eventTxnCommittedDueToDDL struct{}
+
 // payloadWithError is a common interface for the payloads that wrap an error.
 type payloadWithError interface {
 	errorCause() error
 }
 
-func (eventTxnStart) Event()           {}
-func (eventTxnFinishCommitted) Event() {}
-func (eventTxnFinishAborted) Event()   {}
-func (eventSavepointRollback) Event()  {}
-func (eventNonRetriableErr) Event()    {}
-func (eventRetriableErr) Event()       {}
-func (eventTxnRestart) Event()         {}
-func (eventTxnReleased) Event()        {}
+func (eventTxnStart) Event()                            {}
+func (eventTxnFinishCommitted) Event()                  {}
+func (eventTxnFinishAborted) Event()                    {}
+func (eventTxnFinishPrepared) Event()                   {}
+func (eventTxnFinishCommittedPLpgSQL) Event()           {}
+func (eventTxnFinishAbortedPLpgSQL) Event()             {}
+func (eventSavepointRollback) Event()                   {}
+func (eventNonRetryableErr) Event()                     {}
+func (eventRetryableErr) Event()                        {}
+func (eventTxnRestart) Event()                          {}
+func (eventTxnReleased) Event()                         {}
+func (eventTxnCommittedWithShowCommitTimestamp) Event() {}
+func (eventTxnUpgradeToExplicit) Event()                {}
+func (eventTxnCommittedDueToDDL) Event()                {}
 
 // TxnStateTransitions describe the transitions used by a connExecutor's
 // fsm.Machine. Args.Extended is a txnState, which is muted by the Actions.
 //
-// This state machine accepts the eventNonRetriableErr{IsCommit: fsm.True} in all
+// This state machine accepts the eventNonRetryableErr{IsCommit: fsm.True} in all
 // states. This contract is in place to support the cleanup of connExecutor ->
 // this event can always be sent when the connExecutor is tearing down.
 //
@@ -221,31 +293,31 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 	stateNoTxn{}: {
 		eventTxnStart{fsm.Var("implicitTxn")}: {
 			Description: "BEGIN, or before a statement running as an implicit txn",
-			Next:        stateOpen{ImplicitTxn: fsm.Var("implicitTxn")},
+			Next:        stateOpen{ImplicitTxn: fsm.Var("implicitTxn"), WasUpgraded: fsm.False},
 			Action:      noTxnToOpen,
 		},
-		eventNonRetriableErr{IsCommit: fsm.Any}: {
+		eventNonRetryableErr{IsCommit: fsm.Any}: {
 			// This event doesn't change state, but it produces a skipBatch advance
 			// code.
 			Description: "anything but BEGIN or extended protocol command error",
 			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
 				ts := args.Extended.(*txnState)
-				ts.setAdvanceInfo(skipBatch, noRewind, noEvent)
+				ts.setAdvanceInfo(skipBatch, noRewind, txnEvent{eventType: noEvent})
 				return nil
 			},
 		},
 	},
 
-	/// Open
-	stateOpen{ImplicitTxn: fsm.Any}: {
+	// Open
+	stateOpen{ImplicitTxn: fsm.Any, WasUpgraded: fsm.Any}: {
 		eventTxnFinishCommitted{}: {
 			Description: "COMMIT, or after a statement running as an implicit txn",
 			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
 				// Note that the KV txn has been committed by the statement execution by
 				// this point.
-				return args.Extended.(*txnState).finishTxn(txnCommit)
+				return args.Extended.(*txnState).finishTxn(txnCommit, advanceOne)
 			},
 		},
 		eventTxnFinishAborted{}: {
@@ -254,96 +326,159 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Action: func(args fsm.Args) error {
 				// Note that the KV txn has been rolled back by the statement execution
 				// by this point.
-				return args.Extended.(*txnState).finishTxn(txnRollback)
+				return args.Extended.(*txnState).finishTxn(txnRollback, advanceOne)
 			},
 		},
 		// Handle the error on COMMIT cases: we move to NoTxn as per Postgres error
 		// semantics.
-		eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.True}: {
-			Description: "Retriable err on COMMIT",
+		eventRetryableErr{CanAutoRetry: fsm.False, IsCommit: fsm.True}: {
+			Description: "Retryable err on COMMIT",
 			Next:        stateNoTxn{},
 			Action:      cleanupAndFinishOnError,
 		},
-		eventNonRetriableErr{IsCommit: fsm.True}: {
+		eventNonRetryableErr{IsCommit: fsm.True}: {
 			Next:   stateNoTxn{},
 			Action: cleanupAndFinishOnError,
 		},
-	},
-	stateOpen{ImplicitTxn: fsm.Var("implicitTxn")}: {
-		// This is the case where we auto-retry.
-		eventRetriableErr{CanAutoRetry: fsm.True, IsCommit: fsm.Any}: {
-			// We leave the transaction in Open. In particular, we don't move to
-			// RestartWait, as there'd be nothing to move us back from RestartWait to
-			// Open.
-			// Note: Preparing the KV txn for restart has already happened by this
-			// point.
-			Description: "Retriable err; will auto-retry",
-			Next:        stateOpen{ImplicitTxn: fsm.Var("implicitTxn")},
+		eventTxnCommittedDueToDDL{}: {
+			Description: "auto-commit before DDL",
+			Next:        stateNoTxn{},
 			Action: func(args fsm.Args) error {
-				// The caller will call rewCap.rewindAndUnlock().
-				args.Extended.(*txnState).setAdvanceInfo(
-					rewind,
-					args.Payload.(eventRetriableErrPayload).rewCap,
-					txnRestart)
+				ts := args.Extended.(*txnState)
+				finishedTxnID, commitTimestamp := ts.finishSQLTxn()
+				ts.setAdvanceInfo(stayInPlace, noRewind, txnEvent{
+					eventType: txnCommit, txnID: finishedTxnID, commitTimestamp: commitTimestamp,
+				})
 				return nil
 			},
 		},
 	},
-	// Handle the errors in implicit txns. They move us to NoTxn.
-	stateOpen{ImplicitTxn: fsm.True}: {
-		eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}: {
+	stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False}: {
+		// This is the case where we auto-retry.
+		eventRetryableErr{CanAutoRetry: fsm.True, IsCommit: fsm.Any}: {
+			// Rewind and auto-retry - the transaction should stay in the Open state
+			Description: "Retryable err; will auto-retry",
+			Next:        stateOpen{ImplicitTxn: fsm.True, WasUpgraded: fsm.False},
+			Action:      prepareTxnForRetryWithRewind,
+		},
+		// Handle the errors in implicit txns. They move us to NoTxn.
+		eventRetryableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}: {
 			Next:   stateNoTxn{},
 			Action: cleanupAndFinishOnError,
 		},
-		eventNonRetriableErr{IsCommit: fsm.False}: {
+		eventNonRetryableErr{IsCommit: fsm.False}: {
 			Next:   stateNoTxn{},
 			Action: cleanupAndFinishOnError,
+		},
+		// Handle a txn getting upgraded to an explicit txn.
+		eventTxnUpgradeToExplicit{}: {
+			Next: stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.True},
+			Action: func(args fsm.Args) error {
+				args.Extended.(*txnState).setAdvanceInfo(
+					advanceOne,
+					noRewind,
+					txnEvent{eventType: txnUpgradeToExplicit},
+				)
+				return nil
+			},
+		},
+		// Handle transaction management from PL/pgSQL. Note that these statements
+		// are not valid within the context of an explicit transaction, so we only
+		// have to handle implicit transactions.
+		//
+		// Use stayInPlace so that the statement buffer doesn't advance. This will
+		// allow the stored procedure to resume execution.
+		eventTxnFinishCommittedPLpgSQL{}: {
+			Description: "COMMIT statement called via PL/pgSQL",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				return args.Extended.(*txnState).finishTxn(txnCommit, stayInPlace)
+			},
+		},
+		eventTxnFinishAbortedPLpgSQL{}: {
+			Description: "ROLLBACK statement called via PL/pgSQL",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				return args.Extended.(*txnState).finishTxn(txnRollback, stayInPlace)
+			},
 		},
 	},
-	// Handle the errors in explicit txns. They move us to Aborted.
-	stateOpen{ImplicitTxn: fsm.False}: {
-		eventNonRetriableErr{IsCommit: fsm.False}: {
-			Next: stateAborted{},
+	stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.Var("wasUpgraded")}: {
+		// Handle prepared transactions. Note that this statement is only valid in
+		// the context of an explicit transaction, so we don't need to handle
+		// implicit transactions.
+		eventTxnFinishPrepared{}: {
+			Description: "PREPARE TRANSACTION",
+			Next:        stateNoTxn{},
+			Action: func(args fsm.Args) error {
+				// Note that the KV txn has been prepared by the statement execution by
+				// this point and is being dissociated from the session.
+				return args.Extended.(*txnState).finishTxn(txnPrepare, advanceOne)
+			},
+		},
+		// Handle the errors in explicit txns.
+		eventNonRetryableErr{IsCommit: fsm.False}: {
+			Next: stateAborted{WasUpgraded: fsm.Var("wasUpgraded")},
 			Action: func(args fsm.Args) error {
 				ts := args.Extended.(*txnState)
-				ts.setAdvanceInfo(skipBatch, noRewind, noEvent)
+				func() {
+					ts.mu.Lock()
+					defer ts.mu.Unlock()
+					if !ts.mu.hasSavepoints {
+						_ = ts.mu.txn.Rollback(ts.Ctx)
+					}
+				}()
+				ts.setAdvanceInfo(skipBatch, noRewind, txnEvent{eventType: noEvent})
 				return nil
 			},
 		},
 		// ROLLBACK TO SAVEPOINT cockroach. There's not much to do other than generating a
 		// txnRestart output event.
+		// The next state must be an explicit txn, since the SAVEPOINT
+		// creation can only happen in an explicit txn.
 		eventTxnRestart{}: {
 			Description: "ROLLBACK TO SAVEPOINT cockroach_restart",
-			Next:        stateOpen{ImplicitTxn: fsm.False},
+			Next:        stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.Var("wasUpgraded")},
+			Action:      prepareTxnForRetry,
+		},
+		eventRetryableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}: {
+			Next: stateAborted{WasUpgraded: fsm.Var("wasUpgraded")},
 			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(advanceOne, noRewind, txnRestart)
+				args.Extended.(*txnState).setAdvanceInfo(
+					skipBatch,
+					noRewind,
+					txnEvent{eventType: noEvent},
+				)
 				return nil
 			},
 		},
-		eventRetriableErr{CanAutoRetry: fsm.False, IsCommit: fsm.False}: {
-			Next: stateAborted{},
-			Action: func(args fsm.Args) error {
-				// Note: Preparing the KV txn for restart has already happened by this
-				// point.
-				args.Extended.(*txnState).setAdvanceInfo(skipBatch, noRewind, noEvent)
-				return nil
-			},
+		eventTxnCommittedWithShowCommitTimestamp{}: {
+			Description: "SHOW COMMIT TIMESTAMP",
+			Next:        stateCommitWait{},
+			Action:      moveToCommitWaitAfterInternalCommit,
+		},
+		// This is the case where we auto-retry explicit transactions.
+		eventRetryableErr{CanAutoRetry: fsm.True, IsCommit: fsm.Any}: {
+			// Rewind and auto-retry - the transaction should stay in the Open state.
+			// Retrying can cause the transaction to become implicit if we see that
+			// the transaction was previously upgraded. During the retry, BEGIN
+			// will be executed again and upgrade the transaction back to explicit.
+			Description: "Retryable err; will auto-retry",
+			Next:        stateOpen{ImplicitTxn: fsm.Var("wasUpgraded"), WasUpgraded: fsm.False},
+			Action:      prepareTxnForRetryWithRewind,
 		},
 		eventTxnReleased{}: {
 			Description: "RELEASE SAVEPOINT cockroach_restart",
 			Next:        stateCommitWait{},
-			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(advanceOne, noRewind, txnCommit)
-				return nil
-			},
+			Action:      moveToCommitWaitAfterInternalCommit,
 		},
 	},
 
-	/// Aborted
+	// Aborted
 	//
 	// Note that we don't handle any error events here. Any statement but a
 	// ROLLBACK (TO SAVEPOINT) is expected to not be passed to the state machine.
-	stateAborted{}: {
+	stateAborted{WasUpgraded: fsm.Var("wasUpgraded")}: {
 		eventTxnFinishAborted{}: {
 			Description: "ROLLBACK",
 			Next:        stateNoTxn{},
@@ -352,57 +487,70 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 				ts.txnAbortCount.Inc(1)
 				// Note that the KV txn has been rolled back by now by statement
 				// execution.
-				return ts.finishTxn(txnRollback)
+				return ts.finishTxn(txnRollback, advanceOne)
 			},
 		},
 		// Any statement.
-		eventNonRetriableErr{IsCommit: fsm.False}: {
+		eventNonRetryableErr{IsCommit: fsm.False}: {
 			// This event doesn't change state, but it returns a skipBatch code.
 			Description: "any other statement",
-			Next:        stateAborted{},
+			Next:        stateAborted{WasUpgraded: fsm.Var("wasUpgraded")},
 			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(skipBatch, noRewind, noEvent)
+				args.Extended.(*txnState).setAdvanceInfo(
+					skipBatch,
+					noRewind,
+					txnEvent{eventType: noEvent},
+				)
 				return nil
 			},
 		},
 		// ConnExecutor closing.
-		eventNonRetriableErr{IsCommit: fsm.True}: {
+		eventNonRetryableErr{IsCommit: fsm.True}: {
 			// This event doesn't change state, but it returns a skipBatch code.
 			Description: "ConnExecutor closing",
-			Next:        stateAborted{},
+			Next:        stateAborted{WasUpgraded: fsm.Var("wasUpgraded")},
 			Action:      cleanupAndFinishOnError,
 		},
 		// ROLLBACK TO SAVEPOINT <not cockroach_restart> success.
+		// The next state must be an explicit txn, since the SAVEPOINT
+		// creation can only happen in an explicit txn.
 		eventSavepointRollback{}: {
 			Description: "ROLLBACK TO SAVEPOINT (not cockroach_restart) success",
-			Next:        stateOpen{ImplicitTxn: fsm.False},
+			Next:        stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.Var("wasUpgraded")},
 			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(advanceOne, noRewind, noEvent)
+				args.Extended.(*txnState).setAdvanceInfo(
+					advanceOne,
+					noRewind,
+					txnEvent{eventType: noEvent},
+				)
 				return nil
 			},
 		},
 		// ROLLBACK TO SAVEPOINT <not cockroach_restart> failed because the txn needs to restart.
-		eventRetriableErr{CanAutoRetry: fsm.Any, IsCommit: fsm.Any}: {
+		eventRetryableErr{CanAutoRetry: fsm.Any, IsCommit: fsm.Any}: {
 			// This event doesn't change state, but it returns a skipBatch code.
 			Description: "ROLLBACK TO SAVEPOINT (not cockroach_restart) failed because txn needs restart",
-			Next:        stateAborted{},
+			Next:        stateAborted{WasUpgraded: fsm.Var("wasUpgraded")},
 			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(skipBatch, noRewind, noEvent)
+				args.Extended.(*txnState).setAdvanceInfo(
+					skipBatch,
+					noRewind,
+					txnEvent{eventType: noEvent},
+				)
 				return nil
 			},
 		},
 		// ROLLBACK TO SAVEPOINT cockroach_restart.
+		// The next state must be an explicit txn, since the SAVEPOINT
+		// creation can only happen in an explicit txn.
 		eventTxnRestart{}: {
 			Description: "ROLLBACK TO SAVEPOINT cockroach_restart",
-			Next:        stateOpen{ImplicitTxn: fsm.False},
-			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(advanceOne, noRewind, txnRestart)
-				return nil
-			},
+			Next:        stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.Var("wasUpgraded")},
+			Action:      prepareTxnForRetry,
 		},
 	},
 
-	/// Commit Wait
+	// Commit Wait
 	stateCommitWait{}: {
 		eventTxnFinishCommitted{}: {
 			Description: "COMMIT",
@@ -410,10 +558,10 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Action: func(args fsm.Args) error {
 				// A txnCommit event has been previously generated when we entered
 				// stateCommitWait.
-				return args.Extended.(*txnState).finishTxn(noEvent)
+				return args.Extended.(*txnState).finishTxn(noEvent, advanceOne)
 			},
 		},
-		eventNonRetriableErr{IsCommit: fsm.Any}: {
+		eventNonRetryableErr{IsCommit: fsm.Any}: {
 			// This event doesn't change state, but it returns a skipBatch code.
 			//
 			// Note that we don't expect any errors from error on COMMIT in this
@@ -421,7 +569,11 @@ var TxnStateTransitions = fsm.Compile(fsm.Pattern{
 			Description: "any other statement",
 			Next:        stateCommitWait{},
 			Action: func(args fsm.Args) error {
-				args.Extended.(*txnState).setAdvanceInfo(skipBatch, noRewind, noEvent)
+				args.Extended.(*txnState).setAdvanceInfo(
+					skipBatch,
+					noRewind,
+					txnEvent{eventType: noEvent},
+				)
 				return nil
 			},
 		},
@@ -445,7 +597,7 @@ func noTxnToOpen(args fsm.Args) error {
 		advCode = stayInPlace
 	}
 
-	ts.resetForNewSQLTxn(
+	newTxnID := ts.resetForNewSQLTxn(
 		connCtx,
 		txnTyp,
 		payload.txnSQLTimestamp,
@@ -454,25 +606,113 @@ func noTxnToOpen(args fsm.Args) error {
 		payload.readOnly,
 		nil, /* txn */
 		payload.tranCtx,
+		payload.qualityOfService,
+		payload.resourceGroupID,
+		payload.isoLevel,
+		payload.omitInRangefeeds,
+		payload.bufferedWritesEnabled,
+		payload.rng,
 	)
-	ts.setAdvanceInfo(advCode, noRewind, txnStart)
+	ts.setAdvanceInfo(
+		advCode,
+		noRewind,
+		txnEvent{eventType: txnStart, txnID: newTxnID},
+	)
 	return nil
 }
 
 // finishTxn finishes the transaction. It also calls setAdvanceInfo() with the
 // given event.
-func (ts *txnState) finishTxn(ev txnEvent) error {
-	ts.finishSQLTxn()
-	ts.setAdvanceInfo(advanceOne, noRewind, ev)
+//
+// - advance indicates what action the statement buffer should take. This allows
+// normal COMMIT/ROLLBACK to move to the next statement, and PL/pgSQL
+// COMMIT/ROLLBACK to resume execution of the calling stored procedure.
+func (ts *txnState) finishTxn(ev txnEventType, advance advanceCode) error {
+	finishedTxnID, commitTimestamp := ts.finishSQLTxn()
+	ts.setAdvanceInfo(advance, noRewind, txnEvent{
+		eventType: ev, txnID: finishedTxnID, commitTimestamp: commitTimestamp,
+	})
 	return nil
 }
 
 // cleanupAndFinishOnError rolls back the KV txn and finishes the SQL txn.
 func cleanupAndFinishOnError(args fsm.Args) error {
 	ts := args.Extended.(*txnState)
-	ts.mu.txn.CleanupOnError(ts.Ctx, args.Payload.(payloadWithError).errorCause())
-	ts.finishSQLTxn()
-	ts.setAdvanceInfo(skipBatch, noRewind, txnRollback)
+	func() {
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
+		_ = ts.mu.txn.Rollback(ts.Ctx)
+	}()
+	finishedTxnID, _ := ts.finishSQLTxn()
+	ts.setAdvanceInfo(
+		skipBatch,
+		noRewind,
+		txnEvent{eventType: txnRollback, txnID: finishedTxnID},
+	)
+	return nil
+}
+
+func prepareTxnForRetry(args fsm.Args) error {
+	ts := args.Extended.(*txnState)
+	err := func() error {
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
+		return ts.mu.txn.PrepareForRetry(ts.Ctx)
+	}()
+	if err != nil {
+		return err
+	}
+	ts.setAdvanceInfo(
+		advanceOne,
+		noRewind,
+		txnEvent{eventType: txnRestart},
+	)
+	return nil
+}
+
+func moveToCommitWaitAfterInternalCommit(args fsm.Args) error {
+	ts := args.Extended.(*txnState)
+	txnID, commitTimestamp, err := func() (uuid.UUID, hlc.Timestamp, error) {
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
+		txnID := ts.mu.txn.ID()
+		commitTimestamp, err := ts.mu.txn.CommitTimestamp()
+		return txnID, commitTimestamp, err
+	}()
+	if err != nil {
+		return err
+	}
+	ts.setAdvanceInfo(
+		advanceOne,
+		noRewind,
+		txnEvent{
+			eventType:       txnCommit,
+			txnID:           txnID,
+			commitTimestamp: commitTimestamp,
+		},
+	)
+	return nil
+}
+
+func prepareTxnForRetryWithRewind(args fsm.Args) error {
+	pl := args.Payload.(eventRetryableErrPayload)
+	ts := args.Extended.(*txnState)
+	err := func() error {
+		ts.mu.Lock()
+		defer ts.mu.Unlock()
+		ts.mu.autoRetryReason = pl.err
+		ts.mu.autoRetryCounter++
+		return ts.mu.txn.PrepareForRetry(ts.Ctx)
+	}()
+	if err != nil {
+		return err
+	}
+	// The caller will call rewCap.rewindAndUnlock().
+	ts.setAdvanceInfo(
+		rewind,
+		pl.rewCap,
+		txnEvent{eventType: txnRestart},
+	)
 	return nil
 }
 
@@ -480,25 +720,33 @@ func cleanupAndFinishOnError(args fsm.Args) error {
 // when running SQL inside a higher-level txn. It's a very limited state
 // machine: it doesn't allow starting or finishing txns, auto-retries, etc.
 var BoundTxnStateTransitions = fsm.Compile(fsm.Pattern{
-	stateOpen{ImplicitTxn: fsm.False}: {
-		// We accept eventNonRetriableErr with both IsCommit={True, fsm.False}, even
+	stateOpen{ImplicitTxn: fsm.False, WasUpgraded: fsm.False}: {
+		// We accept eventNonRetryableErr with both IsCommit={True, fsm.False}, even
 		// though this state machine does not support COMMIT statements because
-		// connExecutor.close() sends an eventNonRetriableErr{IsCommit: fsm.True} event.
-		eventNonRetriableErr{IsCommit: fsm.Any}: {
+		// connExecutor.close() sends an eventNonRetryableErr{IsCommit: fsm.True} event.
+		eventNonRetryableErr{IsCommit: fsm.Any}: {
 			Next: stateInternalError{},
 			Action: func(args fsm.Args) error {
 				ts := args.Extended.(*txnState)
-				ts.finishSQLTxn()
-				ts.setAdvanceInfo(skipBatch, noRewind, txnRollback)
+				finishedTxnID, _ := ts.finishSQLTxn()
+				ts.setAdvanceInfo(
+					skipBatch,
+					noRewind,
+					txnEvent{eventType: txnRollback, txnID: finishedTxnID},
+				)
 				return nil
 			},
 		},
-		eventRetriableErr{CanAutoRetry: fsm.Any, IsCommit: fsm.False}: {
+		eventRetryableErr{CanAutoRetry: fsm.Any, IsCommit: fsm.False}: {
 			Next: stateInternalError{},
 			Action: func(args fsm.Args) error {
 				ts := args.Extended.(*txnState)
-				ts.finishSQLTxn()
-				ts.setAdvanceInfo(skipBatch, noRewind, txnRollback)
+				finishedTxnID, _ := ts.finishSQLTxn()
+				ts.setAdvanceInfo(
+					skipBatch,
+					noRewind,
+					txnEvent{eventType: txnRollback, txnID: finishedTxnID},
+				)
 				return nil
 			},
 		},

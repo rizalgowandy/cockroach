@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -15,9 +10,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -27,15 +21,15 @@ import (
 
 type statusTrackingExecutor struct {
 	numExec int
-	counts  map[Status]int
+	counts  map[State]int
 }
 
 func (s *statusTrackingExecutor) ExecuteJob(
-	_ context.Context,
-	_ *scheduledjobs.JobExecutionConfig,
-	_ scheduledjobs.JobSchedulerEnv,
-	_ *ScheduledJob,
-	_ *kv.Txn,
+	ctx context.Context,
+	txn isql.Txn,
+	cfg *scheduledjobs.JobExecutionConfig,
+	env scheduledjobs.JobSchedulerEnv,
+	schedule *ScheduledJob,
 ) error {
 	s.numExec++
 	return nil
@@ -43,15 +37,14 @@ func (s *statusTrackingExecutor) ExecuteJob(
 
 func (s *statusTrackingExecutor) NotifyJobTermination(
 	ctx context.Context,
+	txn isql.Txn,
 	jobID jobspb.JobID,
-	jobStatus Status,
-	_ jobspb.Details,
+	jobState State,
+	details jobspb.Details,
 	env scheduledjobs.JobSchedulerEnv,
 	schedule *ScheduledJob,
-	ex sqlutil.InternalExecutor,
-	txn *kv.Txn,
 ) error {
-	s.counts[jobStatus]++
+	s.counts[jobState]++
 	return nil
 }
 
@@ -60,11 +53,7 @@ func (s *statusTrackingExecutor) Metrics() metric.Struct {
 }
 
 func (s *statusTrackingExecutor) GetCreateScheduleStatement(
-	ctx context.Context,
-	env scheduledjobs.JobSchedulerEnv,
-	txn *kv.Txn,
-	sj *ScheduledJob,
-	ex sqlutil.InternalExecutor,
+	ctx context.Context, txn isql.Txn, env scheduledjobs.JobSchedulerEnv, sj *ScheduledJob,
 ) (string, error) {
 	return "", errors.AssertionFailedf("unimplemented method: 'GetCreateScheduleStatement'")
 }
@@ -72,7 +61,7 @@ func (s *statusTrackingExecutor) GetCreateScheduleStatement(
 var _ ScheduledJobExecutor = &statusTrackingExecutor{}
 
 func newStatusTrackingExecutor() *statusTrackingExecutor {
-	return &statusTrackingExecutor{counts: make(map[Status]int)}
+	return &statusTrackingExecutor{counts: make(map[State]int)}
 }
 
 func TestScheduledJobExecutorRegistration(t *testing.T) {
@@ -101,14 +90,18 @@ func TestJobTerminationNotification(t *testing.T) {
 	// Create a single job.
 	schedule := h.newScheduledJobForExecutor("test_job", executorName, nil)
 	ctx := context.Background()
-	require.NoError(t, schedule.Create(ctx, h.cfg.InternalExecutor, nil))
+	schedules := ScheduledJobDB(h.cfg.DB)
+	require.NoError(t, schedules.Create(ctx, schedule))
 
 	// Pretend it completes multiple runs with terminal statuses.
-	for _, s := range []Status{StatusCanceled, StatusFailed, StatusSucceeded} {
-		require.NoError(t, NotifyJobTermination(
-			ctx, h.env, 123, s, nil, schedule.ScheduleID(), h.cfg.InternalExecutor, nil))
+	for _, s := range []State{StateCanceled, StateFailed, StateSucceeded} {
+		require.NoError(t, h.cfg.DB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+			return NotifyJobTermination(
+				ctx, txn, h.env, 123, s, nil, schedule.ScheduleID(),
+			)
+		}))
 	}
 
 	// Verify counts.
-	require.Equal(t, map[Status]int{StatusSucceeded: 1, StatusFailed: 1, StatusCanceled: 1}, ex.counts)
+	require.Equal(t, map[State]int{StateSucceeded: 1, StateFailed: 1, StateCanceled: 1}, ex.counts)
 }

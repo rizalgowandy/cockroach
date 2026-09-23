@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tree
 
@@ -16,6 +11,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/pretty"
 	"github.com/cockroachdb/errors"
 )
@@ -68,24 +64,27 @@ const (
 	// EXPLAIN ANALYZE.
 	ExplainDebug
 
-	// ExplainDDL generates a DDL plan diagram for the statement. Not allowed with
-	//
+	// ExplainDDL generates a DDL plan diagram for the statement.
 	ExplainDDL
 
 	// ExplainGist generates a plan "gist".
 	ExplainGist
 
+	// ExplainFingerprint returns the statement fingerprint.
+	ExplainFingerprint
+
 	numExplainModes = iota
 )
 
 var explainModeStrings = [...]string{
-	ExplainPlan:    "PLAN",
-	ExplainDistSQL: "DISTSQL",
-	ExplainOpt:     "OPT",
-	ExplainVec:     "VEC",
-	ExplainDebug:   "DEBUG",
-	ExplainDDL:     "DDL",
-	ExplainGist:    "GIST",
+	ExplainPlan:        "PLAN",
+	ExplainDistSQL:     "DISTSQL",
+	ExplainOpt:         "OPT",
+	ExplainVec:         "VEC",
+	ExplainDebug:       "DEBUG",
+	ExplainDDL:         "DDL",
+	ExplainGist:        "GIST",
+	ExplainFingerprint: "FINGERPRINT",
 }
 
 var explainModeStringMap = func() map[string]ExplainMode {
@@ -103,6 +102,11 @@ func (m ExplainMode) String() string {
 	return explainModeStrings[m]
 }
 
+// ExplainModes returns a map from EXPLAIN mode strings to ExplainMode.
+func ExplainModes() map[string]ExplainMode {
+	return explainModeStringMap
+}
+
 // ExplainFlag is a modifier in an EXPLAIN statement (like VERBOSE).
 type ExplainFlag uint8
 
@@ -113,10 +117,10 @@ const (
 	ExplainFlagEnv
 	ExplainFlagCatalog
 	ExplainFlagJSON
-	ExplainFlagStages
-	ExplainFlagDeps
 	ExplainFlagMemo
 	ExplainFlagShape
+	ExplainFlagViz
+	ExplainFlagRedact
 	numExplainFlags = iota
 )
 
@@ -126,10 +130,10 @@ var explainFlagStrings = [...]string{
 	ExplainFlagEnv:     "ENV",
 	ExplainFlagCatalog: "CATALOG",
 	ExplainFlagJSON:    "JSON",
-	ExplainFlagStages:  "STAGES",
-	ExplainFlagDeps:    "DEPS",
 	ExplainFlagMemo:    "MEMO",
 	ExplainFlagShape:   "SHAPE",
+	ExplainFlagViz:     "VIZ",
+	ExplainFlagRedact:  "REDACT",
 }
 
 var explainFlagStringMap = func() map[string]ExplainFlag {
@@ -145,6 +149,11 @@ func (f ExplainFlag) String() string {
 		panic(errors.AssertionFailedf("invalid ExplainFlag %d", f))
 	}
 	return explainFlagStrings[f]
+}
+
+// ExplainFlags returns a map from EXPLAIN flag strings to ExplainFlag.
+func ExplainFlags() map[string]ExplainFlag {
+	return explainFlagStringMap
 }
 
 // Format implements the NodeFormatter interface.
@@ -164,8 +173,8 @@ func (node *Explain) Format(ctx *FmtCtx) {
 	ctx.FormatNode(node.Statement)
 }
 
-// doc is part of the docer interface.
-func (node *Explain) doc(p *PrettyCfg) pretty.Doc {
+// Doc is part of the Docer interface.
+func (node *Explain) Doc(p *PrettyCfg) pretty.Doc {
 	d := pretty.Keyword("EXPLAIN")
 	var opts []pretty.Doc
 	if node.Mode != ExplainPlan {
@@ -202,8 +211,8 @@ func (node *ExplainAnalyze) Format(ctx *FmtCtx) {
 	ctx.FormatNode(node.Statement)
 }
 
-// doc is part of the docer interface.
-func (node *ExplainAnalyze) doc(p *PrettyCfg) pretty.Doc {
+// Doc is part of the Docer interface.
+func (node *ExplainAnalyze) Doc(p *PrettyCfg) pretty.Doc {
 	d := pretty.Keyword("EXPLAIN ANALYZE")
 	var opts []pretty.Doc
 	if node.Mode != ExplainPlan {
@@ -263,6 +272,32 @@ func MakeExplain(options []string, stmt Statement) (Statement, error) {
 		}
 	}
 
+	if opts.Flags[ExplainFlagEnv] {
+		if opts.Mode != ExplainOpt {
+			return nil, pgerror.Newf(pgcode.Syntax, "the ENV flag can only be used with OPT")
+		}
+	}
+
+	if opts.Flags[ExplainFlagRedact] {
+		// TODO(michae2): Support redaction of other EXPLAIN modes.
+		switch opts.Mode {
+		case ExplainPlan:
+		case ExplainOpt:
+		case ExplainVec:
+		case ExplainDebug:
+		default:
+			return nil, unimplemented.Newf(
+				"EXPLAIN (REDACT)", "the REDACT flag cannot be used with %s", opts.Mode,
+			)
+		}
+
+		if opts.Flags[ExplainFlagEnv] {
+			return nil, unimplemented.Newf(
+				"EXPLAIN (REDACT)", "the REDACT flag cannot be used with %s, ENV", opts.Mode,
+			)
+		}
+	}
+
 	if analyze {
 		if opts.Mode != ExplainDistSQL && opts.Mode != ExplainDebug && opts.Mode != ExplainPlan {
 			return nil, pgerror.Newf(pgcode.Syntax, "EXPLAIN ANALYZE cannot be used with %s", opts.Mode)
@@ -271,6 +306,15 @@ func MakeExplain(options []string, stmt Statement) (Statement, error) {
 			ExplainOptions: opts,
 			Statement:      stmt,
 		}, nil
+	}
+
+	if opts.Mode == ExplainFingerprint {
+		// FINGERPRINT mode doesn't support any flags
+		for f := ExplainFlag(1); f <= numExplainFlags; f++ {
+			if opts.Flags[f] {
+				return nil, pgerror.Newf(pgcode.Syntax, "EXPLAIN (FINGERPRINT) cannot be used with %s", f)
+			}
+		}
 	}
 
 	if opts.Mode == ExplainDebug {

@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package status
 
@@ -17,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/redact"
 )
 
 type threshold struct {
@@ -43,12 +39,13 @@ var (
 // large backlog but show no sign of processing times.
 var trackedMetrics = map[string]threshold{
 	// Gauges.
-	"ranges.unavailable":          gaugeZero,
-	"ranges.underreplicated":      gaugeZero,
-	"requests.backpressure.split": gaugeZero,
-	"requests.slow.latch":         gaugeZero,
-	"requests.slow.lease":         gaugeZero,
-	"requests.slow.raft":          gaugeZero,
+	"ranges.unavailable":             gaugeZero,
+	"ranges.underreplicated":         gaugeZero,
+	"requests.backpressure.split":    gaugeZero,
+	"requests.slow.latch":            gaugeZero,
+	"requests.slow.lease":            gaugeZero,
+	"requests.slow.raft":             gaugeZero,
+	"admission.raft.paused_replicas": gaugeZero,
 	// TODO(tbg): this fires too eagerly. On a large machine that can handle many
 	// concurrent requests, we'll blow a limit that would be disastrous to a smaller
 	// machine. This will be hard to fix. We could track the max goroutine count
@@ -171,10 +168,10 @@ func (h *HealthChecker) CheckHealth(
 	for storeID, storeDiff := range diffs {
 		for name, value := range storeDiff {
 			alerts = append(alerts, statuspb.HealthAlert{
-				StoreID:     storeID,
-				Category:    statuspb.HealthAlert_METRICS,
-				Description: name,
-				Value:       value,
+				StoreID:         storeID,
+				Category:        statuspb.HealthAlert_METRICS,
+				SafeDescription: redact.SafeString(name), // metrics names are not PII
+				Value:           value,
 			})
 		}
 	}

@@ -1,19 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package spanconfigmanager
 
-import "context"
+import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+)
 
 // TestingCreateAndStartJobIfNoneExists is a wrapper around
 // createAndStartJobIfNoneExists for testing it.
-func (m *Manager) TestingCreateAndStartJobIfNoneExists(ctx context.Context) (bool, error) {
-	return m.createAndStartJobIfNoneExists(ctx)
+func (m *Manager) TestingCreateAndStartJobIfNoneExists(
+	ctx context.Context, cs *cluster.Settings,
+) (bool, error) {
+	return m.createAndStartJobIfNoneExists(ctx, cs)
 }

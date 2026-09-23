@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -25,6 +20,7 @@ import (
 var errEmptyIndexName = pgerror.New(pgcode.Syntax, "empty index name")
 
 type renameIndexNode struct {
+	zeroInputPlanNode
 	n         *tree.RenameIndex
 	tableDesc *tabledesc.Mutable
 	idx       catalog.Index
@@ -32,8 +28,9 @@ type renameIndexNode struct {
 
 // RenameIndex renames the index.
 // Privileges: CREATE on table.
-//   notes: postgres requires CREATE on the table.
-//          mysql requires ALTER, CREATE, INSERT on the table.
+//
+//	notes: postgres requires CREATE on the table.
+//	       mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
@@ -52,7 +49,7 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 		return newZeroNode(nil /* columns */), nil
 	}
 
-	idx, err := tableDesc.FindIndexWithName(string(n.Index.Index))
+	idx, err := catalog.MustFindIndexByName(tableDesc, string(n.Index.Index))
 	if err != nil {
 		if n.IfExists {
 			// Noop.
@@ -63,6 +60,11 @@ func (p *planner) RenameIndex(ctx context.Context, n *tree.RenameIndex) (planNod
 	}
 
 	if err := p.CheckPrivilege(ctx, tableDesc, privilege.CREATE); err != nil {
+		return nil, err
+	}
+
+	// Disallow schema changes if this table's schema is locked.
+	if err := p.checkSchemaChangeIsAllowed(ctx, tableDesc, n); err != nil {
 		return nil, err
 	}
 
@@ -84,8 +86,8 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		if tableRef.IndexID != idx.GetID() {
 			continue
 		}
-		return p.dependentViewError(
-			ctx, "index", n.n.Index.Index.String(), tableDesc.ParentID, tableRef.ID, "rename",
+		return p.dependentError(
+			ctx, "index", n.n.Index.Index.String(), tableDesc.ParentID, tableRef.ID, tableDesc.ID, "rename",
 		)
 	}
 
@@ -98,7 +100,7 @@ func (n *renameIndexNode) startExec(params runParams) error {
 		return nil
 	}
 
-	if foundIndex, _ := tableDesc.FindIndexWithName(string(n.n.NewName)); foundIndex != nil {
+	if foundIndex := catalog.FindIndexByName(tableDesc, string(n.n.NewName)); foundIndex != nil {
 		return pgerror.Newf(pgcode.DuplicateRelation, "index name %q already exists", string(n.n.NewName))
 	}
 

@@ -1,13 +1,8 @@
 // Copyright 2013 Google Inc. All Rights Reserved.
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This code originated in the github.com/golang/glog package.
 
@@ -18,7 +13,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	stdLog "log"
 	"os"
 	"path/filepath"
@@ -27,6 +21,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log/channel"
@@ -34,6 +29,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,12 +83,39 @@ func capture() func() {
 
 // resetCaptured erases the logging output captured so far.
 func resetCaptured() {
-	debugLog.getFileSink().mu.file.(*flushBuffer).Buffer.Reset()
+	fs := debugLog.getFileSink()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.mu.file.(*flushBuffer).Buffer.Reset()
 }
 
 // contents returns the specified log value as a string.
 func contents() string {
-	return debugLog.getFileSink().mu.file.(*flushBuffer).Buffer.String()
+	fs := debugLog.getFileSink()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.mu.file.(*flushBuffer).Buffer.String()
+}
+
+func (l *fileSink) getDir() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mu.logDir
+}
+
+func getDebugLogFileName(t *testing.T) string {
+	fs := debugLog.getFileSink()
+	return fs.getFileName(t)
+}
+
+func (l *fileSink) getFileName(t *testing.T) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	sb, ok := l.mu.file.(*syncBuffer)
+	if !ok {
+		t.Fatalf("buffer wasn't created")
+	}
+	return sb.file.Name()
 }
 
 // contains reports whether the string is contained in the log.
@@ -104,12 +130,26 @@ func TestInfo(t *testing.T) {
 	defer ScopeWithoutShowLogs(t).Close(t)
 
 	defer capture()()
-	Info(context.Background(), "test")
+	Dev.Info(context.Background(), "test")
 	if !contains("I", t) {
 		t.Errorf("Info has wrong character: %q", contents())
 	}
 	if !contains("test", t) {
 		t.Error("Info failed")
+	}
+}
+
+// Test that error hints are included.
+func TestUnstructuredEntryEmbedsErrorHints(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer ScopeWithoutShowLogs(t).Close(t)
+
+	defer capture()()
+	err := errors.WithHint(errors.New("hello"), "world")
+	Dev.Infof(context.Background(), "hello %v", err)
+	t.Logf("log contents:\n%s", contents())
+	if !contains("HINT: "+startRedactable+"world"+endRedactable, t) {
+		t.Error("hint failed")
 	}
 }
 
@@ -150,7 +190,7 @@ func TestError(t *testing.T) {
 
 	defer capture()()
 
-	Error(context.Background(), "test")
+	Dev.Error(context.Background(), "test")
 	if !contains("E", t) {
 		t.Errorf("Error has wrong character: %q", contents())
 	}
@@ -168,7 +208,7 @@ func TestWarning(t *testing.T) {
 
 	defer capture()()
 
-	Warning(context.Background(), "test")
+	Dev.Warning(context.Background(), "test")
 	if !contains("W", t) {
 		t.Errorf("Warning has wrong character: %q", contents())
 	}
@@ -286,19 +326,16 @@ func TestListLogFiles(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer ScopeWithoutShowLogs(t).Close(t)
 
-	Info(context.Background(), "x")
+	Dev.Info(context.Background(), "x")
 
-	sb, ok := debugLog.getFileSink().mu.file.(*syncBuffer)
-	if !ok {
-		t.Fatalf("buffer wasn't created")
-	}
+	fileName := getDebugLogFileName(t)
 
 	results, err := ListLogFiles()
 	if err != nil {
 		t.Fatalf("error in ListLogFiles: %v", err)
 	}
 
-	expectedName := filepath.Base(sb.file.Name())
+	expectedName := filepath.Base(fileName)
 	foundExpected := false
 	for i := range results {
 		if results[i].Name == expectedName {
@@ -321,19 +358,16 @@ func TestFilePermissions(t *testing.T) {
 	defer func(p os.FileMode) { fs.filePermissions = p }(fs.filePermissions)
 	fs.filePermissions = fileMode
 
-	Info(context.Background(), "x")
+	Dev.Info(context.Background(), "x")
 
-	sb, ok := debugLog.getFileSink().mu.file.(*syncBuffer)
-	if !ok {
-		t.Fatalf("buffer wasn't created")
-	}
+	fileName := fs.getFileName(t)
 
 	results, err := ListLogFiles()
 	if err != nil {
 		t.Fatalf("error in ListLogFiles: %v", err)
 	}
 
-	expectedName := filepath.Base(sb.file.Name())
+	expectedName := filepath.Base(fileName)
 	foundExpected := false
 	for _, r := range results {
 		if r.Name != expectedName {
@@ -370,8 +404,7 @@ func TestGetLogReader(t *testing.T) {
 
 	// Validate and apply the config.
 	require.NoError(t, config.Validate(&sc.logDir))
-	TestingResetActive()
-	cleanupFn, err := ApplyConfig(config)
+	cleanupFn, err := ApplyConfigForReconfig(config, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	require.NoError(t, err)
 	defer cleanupFn()
 
@@ -379,13 +412,9 @@ func TestGetLogReader(t *testing.T) {
 		strings.TrimSpace(strings.ReplaceAll(DescribeAppliedConfig(), "\n", "\n  ")))
 
 	// Force creation of a file on the default sink.
-	Info(context.Background(), "x")
-	fs := debugLog.getFileSink()
-	info, ok := fs.mu.file.(*syncBuffer)
-	if !ok {
-		t.Fatalf("buffer wasn't created")
-	}
-	infoName := filepath.Base(info.file.Name())
+	Dev.Info(context.Background(), "x")
+	fileName := getDebugLogFileName(t)
+	infoName := filepath.Base(fileName)
 
 	// Create some relative path. We'll check below these cannot be
 	// accessed.
@@ -393,19 +422,19 @@ func TestGetLogReader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relPathFromCurDir, err := filepath.Rel(curDir, info.file.Name())
+	relPathFromCurDir, err := filepath.Rel(curDir, fileName)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Directory for the default sink.
-	dir := fs.mu.logDir
+	dir := debugLog.getFileSink().getDir()
 	if dir == "" {
 		t.Fatal(errDirectoryNotSet)
 	}
 
 	// Some arbitrary non-log file.
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "other.txt"), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "other.txt"), nil, 0644))
 	relPathFromLogDir := strings.Join([]string{"..", filepath.Base(dir), infoName}, string(os.PathSeparator))
 
 	cntr := 0
@@ -416,14 +445,14 @@ func TestGetLogReader(t *testing.T) {
 
 	// A log file in a non-default directory.
 	fname1 := genFileName("-g1")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir1, fname1), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir1, fname1), nil, 0644))
 
 	// A log file that matches the file pattern for the default sink,
 	// in a non-default directory.
 	fname2 := genFileName("")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir1, fname2), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir1, fname2), nil, 0644))
 	fname3 := genFileName("-g1")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, fname3), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, fname3), nil, 0644))
 
 	// Fake symlink to check the symlink error below.
 	fname4 := genFileName("")
@@ -443,7 +472,7 @@ func TestGetLogReader(t *testing.T) {
 		// File is not specified (trying to open a directory instead).
 		{dir, "pathnames must be basenames"},
 		// Absolute filename is specified.
-		{info.file.Name(), "pathnames must be basenames"},
+		{fileName, "pathnames must be basenames"},
 		// Symlink to a log file.
 		{filepath.Join(dir, fileNameConstants.program+".log"), "pathnames must be basenames"},
 		// Symlink relative to logDir.
@@ -493,16 +522,12 @@ func TestRollover(t *testing.T) {
 	defer func(previous int64) { debugFileSink.logFileMaxSize = previous }(debugFileSink.logFileMaxSize)
 	debugFileSink.logFileMaxSize = 2048
 
-	Info(context.Background(), "x") // Be sure we have a file.
-	info, ok := debugFileSink.mu.file.(*syncBuffer)
-	if !ok {
-		t.Fatal("info wasn't created")
-	}
+	Dev.Info(context.Background(), "x") // Be sure we have a file.
 	if err != nil {
 		t.Fatalf("info has initial error: %v", err)
 	}
-	fname0 := info.file.Name()
-	Infof(context.Background(), "%s", strings.Repeat("x", int(debugFileSink.logFileMaxSize))) // force a rollover
+	fname0 := debugFileSink.getFileName(t)
+	Dev.Infof(context.Background(), "%s", strings.Repeat("x", int(debugFileSink.logFileMaxSize))) // force a rollover
 	if err != nil {
 		t.Fatalf("info has error after big write: %v", err)
 	}
@@ -510,10 +535,16 @@ func TestRollover(t *testing.T) {
 	// Make sure the next log file gets a file name with a different
 	// time stamp.
 
-	Info(context.Background(), "x") // create a new file
+	Dev.Info(context.Background(), "x") // create a new file
 	if err != nil {
 		t.Fatalf("error after rotation: %v", err)
 	}
+
+	fs := debugLog.getFileSink()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	info := fs.mu.file.(*syncBuffer)
+
 	fname1 := info.file.Name()
 	if fname0 == fname1 {
 		t.Errorf("info.f.Name did not change: %v", fname0)
@@ -541,7 +572,7 @@ func TestFatalStacktraceStderr(t *testing.T) {
 			defer capture()()
 
 			traceback = level
-			Fatalf(context.Background(), "cinap")
+			Dev.Fatalf(context.Background(), "cinap")
 			cont := contents()
 			if !strings.Contains(cont, " cinap") {
 				t.Fatalf("panic output does not contain cinap:\n%s", cont)
@@ -549,17 +580,23 @@ func TestFatalStacktraceStderr(t *testing.T) {
 			if !strings.Contains(cont, "clog_test") {
 				t.Fatalf("stack trace does not contain file name: %s", cont)
 			}
+
+			// NB: the string "!goroutine" is used here in order to match the
+			// goroutine headers in the formatted output. The stacktrace
+			// itself can sometimes contain the string `goroutine` if one
+			// goroutine is spawned from another due to
+			// https://github.com/golang/go/commit/51225f6fc648ba3e833f3493700c2996a816bdaa
 			switch traceback {
 			case tracebackNone:
-				if strings.Count(cont, "goroutine ") > 0 {
+				if strings.Count(cont, "!goroutine ") > 0 {
 					t.Fatalf("unexpected stack trace:\n%s", cont)
 				}
 			case tracebackSingle:
-				if strings.Count(cont, "goroutine ") != 1 {
+				if strings.Count(cont, "!goroutine ") != 1 {
 					t.Fatalf("stack trace contains too many goroutines: %s", cont)
 				}
 			case tracebackAll:
-				if strings.Count(cont, "goroutine ") < 2 {
+				if strings.Count(cont, "!goroutine ") < 2 {
 					t.Fatalf("stack trace contains less than two goroutines: %s", cont)
 				}
 			}
@@ -578,19 +615,18 @@ func TestFd2Capture(t *testing.T) {
 	if err := cfg.Validate(&s.logDir); err != nil {
 		t.Fatal(err)
 	}
-	TestingResetActive()
-	cleanupFn, err := ApplyConfig(cfg)
+	cleanupFn, err := ApplyConfigForReconfig(cfg, nil /* fileSinkMetricsForDir */, nil /* fatalOnLogStall */)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanupFn()
 
-	Infof(context.Background(), "test")
+	Dev.Infof(context.Background(), "test")
 
 	const stderrText = "hello stderr"
 	fmt.Fprint(os.Stderr, stderrText)
 
-	contents, err := ioutil.ReadFile(logging.testingFd2CaptureLogger.getFileSink().mu.file.(*syncBuffer).file.Name())
+	contents, err := os.ReadFile(logging.testingFd2CaptureLogger.getFileSink().getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,13 +647,13 @@ func TestFileSeverityFilter(t *testing.T) {
 		}
 	}
 
-	Infof(context.Background(), "test1")
-	Errorf(context.Background(), "test2")
+	Dev.Infof(context.Background(), "test1")
+	Dev.Errorf(context.Background(), "test2")
 
-	Flush()
+	FlushFiles()
 
 	debugFileSink := debugFileSinkInfo.sink.(*fileSink)
-	contents, err := ioutil.ReadFile(debugFileSink.mu.file.(*syncBuffer).file.Name())
+	contents, err := os.ReadFile(debugFileSink.getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +685,7 @@ func TestExitOnFullDisk(t *testing.T) {
 	fs := &fileSink{}
 	l := &loggerT{sinkInfos: []*sinkInfo{{
 		sink:        fs,
-		editor:      func(r redactablePackage) redactablePackage { return r },
+		editor:      getEditor(SelectEditMode(false /* redact */, true /* redactable */)),
 		criticality: true,
 	}}}
 	fs.mu.file = &syncBuffer{
@@ -706,8 +742,8 @@ func TestLogEntryPropagation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = f.Close() }()
-	defer func(prevStderr *os.File) { OrigStderr = prevStderr }(OrigStderr)
-	OrigStderr = f
+	require.NoError(t, hijackStderr(f))
+	defer func() { require.NoError(t, hijackStderr(OrigStderr)) }()
 
 	const specialMessage = `CAPTAIN KIRK`
 
@@ -728,9 +764,82 @@ func TestLogEntryPropagation(t *testing.T) {
 	// failure to write on stderr is graceful and the message gets
 	// printed on the file output (and can be picked up by the contains
 	// function). If it is not, the test runner will stop abruptly.
-	Error(context.Background(), specialMessage)
+	Dev.Error(context.Background(), specialMessage)
 
 	if !contains(specialMessage, t) {
 		t.Fatalf("expected special message in file, got:\n%s", contents())
+	}
+}
+
+func BenchmarkLogEntry_String(b *testing.B) {
+	ctxtags := logtags.AddTag(context.Background(), "foo", "bar")
+	entry := &logEntry{
+		IDPayload: serverident.IDPayload{
+			ClusterID:     "fooo",
+			NodeID:        "10",
+			TenantID:      "12",
+			TenantName:    "vc42",
+			SQLInstanceID: "9",
+		},
+		ts:         timeutil.Now().UnixNano(),
+		header:     false,
+		sev:        logpb.Severity_INFO,
+		ch:         1,
+		gid:        2,
+		file:       "foo.go",
+		line:       192,
+		counter:    12,
+		stacks:     nil,
+		structured: false,
+		payload: entryPayload{
+			tags:       makeFormattableTags(ctxtags, false),
+			redactable: false,
+			message:    "hello there",
+		},
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = entry.String()
+	}
+}
+
+func BenchmarkEventf_WithVerboseTraceSpan(b *testing.B) {
+	for _, redactable := range []bool{false, true} {
+		b.Run(fmt.Sprintf("redactable=%t", redactable), func(b *testing.B) {
+			b.ReportAllocs()
+			tagbuf := logtags.SingleTagBuffer("hello", "there")
+			ctx := logtags.WithTags(context.Background(), tagbuf)
+			tracer := tracing.NewTracer()
+			tracer.SetRedactable(redactable)
+			ctx, sp := tracer.StartSpanCtx(ctx, "benchspan", tracing.WithForceRealSpan())
+			defer sp.Finish()
+			sp.SetRecordingType(tracingpb.RecordingVerbose)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				Eventf(ctx, "%s %s %s", "foo", "bar", "baz")
+			}
+		})
+	}
+}
+
+// BenchmarkExpensiveLogEnabled measures the overhead of checking whether
+// expensive logging is enabled.
+//
+// Results with go1.21.4 on a Mac with an Apple M1 Pro processor:
+//
+// name                    time/op
+// ExpensiveLogEnabled-10  13.5ns ± 1%
+func BenchmarkExpensiveLogEnabled(b *testing.B) {
+	ctx := context.Background()
+	// Add a few values to the context, to make sure ctx.Value is not
+	// unrealistically cheap.
+	for i := 0; i < 10; i++ {
+		type key int // avoid lint warning
+		ctx = context.WithValue(ctx, key(i), i)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ExpensiveLogEnabled(ctx, 2)
 	}
 }

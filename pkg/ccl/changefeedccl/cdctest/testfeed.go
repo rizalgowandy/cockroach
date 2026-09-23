@@ -1,27 +1,53 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cdctest
 
 import (
 	"fmt"
+	"slices"
+	"strings"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // TestFeedFactory is an interface to create changefeeds.
 type TestFeedFactory interface {
 	// Feed creates a new TestFeed.
 	Feed(create string, args ...interface{}) (TestFeed, error)
-	// Server returns the raw underlying TestServer, if applicable.
-	Server() serverutils.TestServerInterface
+
+	// AsUser connects to the database as the specified user, calls fn() with the
+	// user's connection, then goes back to using the same root connection. Will
+	// return an error if the initial connection to the database fails, but fn is
+	// responsible for failing the test on other errors.
+	AsUser(user string, fn func(runner *sqlutils.SQLRunner)) error
+}
+
+type Header struct {
+	K string
+	V []byte
+}
+
+type Headers []Header
+
+func (h Headers) String() string {
+	if len(h) == 0 {
+		return ""
+	}
+	s := "("
+	sorted := slices.SortedFunc(slices.Values(h), func(a, b Header) int {
+		return strings.Compare(a.K, b.K)
+	})
+	for _, v := range sorted {
+		s += fmt.Sprintf("%s: %s, ", v.K, v.V)
+	}
+	return s[:len(s)-2] + ")"
 }
 
 // TestFeedMessage represents one row update or resolved timestamp message from
@@ -30,13 +56,17 @@ type TestFeedMessage struct {
 	Topic, Partition string
 	Key, Value       []byte
 	Resolved         []byte
+	Headers          Headers
+
+	// RawMessage is the sink-specific message type.
+	RawMessage interface{}
 }
 
 func (m TestFeedMessage) String() string {
 	if m.Resolved != nil {
 		return string(m.Resolved)
 	}
-	return fmt.Sprintf(`%s: %s->%s`, m.Topic, m.Key, m.Value)
+	return fmt.Sprintf(`%s: %s%s->%s`, m.Topic, m.Key, m.Headers.String(), m.Value)
 }
 
 // TestFeed abstracts over reading from the various types of
@@ -68,12 +98,27 @@ type EnterpriseTestFeed interface {
 	Pause() error
 	// Resume restarts the feed from the last changefeed-wide resolved timestamp.
 	Resume() error
-	// WaitForStatus waits for the provided func to return true, or returns an error.
-	WaitForStatus(func(s jobs.Status) bool) error
+	// WaitForState waits for the provided func to return true, or returns an error.
+	WaitForState(func(s jobs.State) bool) error
+	// WaitDurationForState waits for a specified time for the provided func to return true, or returns an error.
+	WaitDurationForState(dur time.Duration, statusPred func(state jobs.State) bool) error
 	// FetchTerminalJobErr retrieves the error message from changefeed job.
 	FetchTerminalJobErr() error
-	// FetchRunningStatus retrieves running status from changefeed job.
-	FetchRunningStatus() (string, error)
+	// FetchStatus retrieves running status from changefeed job.
+	FetchStatusMessage() (string, error)
 	// Details returns changefeed details for this feed.
 	Details() (*jobspb.ChangefeedDetails, error)
+	// Progress returns the changefeed progress for this feed.
+	Progress() (*jobspb.ChangefeedProgress, error)
+	// HighWaterMark returns feed highwatermark.
+	HighWaterMark() (hlc.Timestamp, error)
+	// WaitForHighWaterMark waits until job highwatermark progresses beyond specified threshold.
+	WaitForHighWaterMark(minHWM hlc.Timestamp) error
+
+	// ForcedEnriched returns true if the feed was metamorphically forced to use
+	// the enriched envelopes.
+	ForcedEnriched() bool
+
+	// SetForcedEnriched sets the forced enriched flag.
+	SetForcedEnriched(forced bool)
 }

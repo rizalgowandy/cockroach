@@ -1,70 +1,27 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import { connect } from "react-redux";
-import { createSelector } from "reselect";
-import { withRouter } from "react-router-dom";
-import moment from "moment";
-import { refreshStatements } from "src/redux/apiReducers";
-import { resetSQLStatsAction } from "src/redux/sqlStats";
-import { CachedDataReducerState } from "src/redux/cachedDataReducer";
-import { AdminUIState } from "src/redux/state";
-import { StatementsResponseMessage } from "src/util/api";
-
-import { TimestampToMoment } from "src/util/convert";
-import { PrintTime } from "src/views/reports/containers/range/print";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import {
-  TransactionsPage,
   Filters,
   defaultFilters,
+  TransactionsPageStateProps,
+  TransactionsPageDispatchProps,
+  TransactionsPageRoot,
+  TransactionsPageRootProps,
+  TimeScale,
+  api,
 } from "@cockroachlabs/cluster-ui";
-import { nodeRegionsByIDSelector } from "src/redux/nodes";
-import { statementsDateRangeLocalSetting } from "src/redux/statementsDateRange";
-import { setCombinedStatementsDateRangeAction } from "src/redux/statements";
+import { connect } from "react-redux";
+import { RouteComponentProps, withRouter } from "react-router-dom";
+import { bindActionCreators } from "redux";
+
+import { analytics } from "src/redux/analytics";
 import { LocalSetting } from "src/redux/localsettings";
-
-// selectStatements returns the array of AggregateStatistics to show on the
-// TransactionsPage, based on if the appAttr route parameter is set.
-export const selectData = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data || state.inFlight || !state.valid) return null;
-    return state.data;
-  },
-);
-
-// selectLastReset returns a string displaying the last time the statement
-// statistics were reset.
-export const selectLastReset = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => {
-    if (!state.data) {
-      return "unknown";
-    }
-
-    return PrintTime(TimestampToMoment(state.data.last_reset));
-  },
-);
-
-const selectLastError = createSelector(
-  (state: AdminUIState) => state.cachedData.statements,
-  (state: CachedDataReducerState<StatementsResponseMessage>) => state.lastError,
-);
-
-export const selectDateRange = createSelector(
-  statementsDateRangeLocalSetting.selector,
-  (state: { start: number; end: number }): [moment.Moment, moment.Moment] => {
-    return [moment.unix(state.start), moment.unix(state.end)];
-  },
-);
+import { AdminUIState } from "src/redux/state";
+import { setGlobalTimeScaleAction } from "src/redux/statements";
+import { selectTimeScale } from "src/redux/timeScale";
 
 export const sortSettingLocalSetting = new LocalSetting(
   "sortSetting/TransactionsPage",
@@ -72,7 +29,13 @@ export const sortSettingLocalSetting = new LocalSetting(
   { ascending: false, columnTitle: "executionCount" },
 );
 
-export const filtersLocalSetting = new LocalSetting(
+export const requestTimeLocalSetting = new LocalSetting(
+  "requestTime/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  null,
+);
+
+export const filtersLocalSetting = new LocalSetting<AdminUIState, Filters>(
   "filters/TransactionsPage",
   (state: AdminUIState) => state.localSettings,
   defaultFilters,
@@ -90,45 +53,99 @@ export const transactionColumnsLocalSetting = new LocalSetting(
   null,
 );
 
-const TransactionsPageConnected = withRouter(
-  connect(
-    (state: AdminUIState) => ({
-      columns: transactionColumnsLocalSetting.selectorToArray(state),
-      data: selectData(state),
-      dateRange: selectDateRange(state),
-      error: selectLastError(state),
-      filters: filtersLocalSetting.selector(state),
-      lastReset: selectLastReset(state),
-      nodeRegions: nodeRegionsByIDSelector(state),
-      search: searchLocalSetting.selector(state),
-      sortSetting: sortSettingLocalSetting.selector(state),
-      statementsError: state.cachedData.statements.lastError,
+export const reqSortSetting = new LocalSetting(
+  "reqSortSetting/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.sortTxn,
+);
+
+export const limitSetting = new LocalSetting(
+  "reqLimitSetting/TransactionsPage",
+  (state: AdminUIState) => state.localSettings,
+  api.DEFAULT_STATS_REQ_OPTIONS.limit,
+);
+
+const fingerprintsPageActions = {
+  onTimeScaleChange: setGlobalTimeScaleAction,
+  // We use `null` when the value was never set and it will show all columns.
+  // If the user modifies the selection and no columns are selected,
+  // the function will save the value as a blank space, otherwise
+  // it gets saved as `null`.
+  onColumnsChange: (value: string[]) =>
+    transactionColumnsLocalSetting.set(
+      value.length === 0 ? " " : value.join(","),
+    ),
+  onSortingChange: (
+    _tableName: string,
+    columnName: string,
+    ascending: boolean,
+  ) =>
+    sortSettingLocalSetting.set({
+      ascending: ascending,
+      columnTitle: columnName,
     }),
-    {
-      refreshData: refreshStatements,
-      resetSQLStats: resetSQLStatsAction,
-      onDateRangeChange: setCombinedStatementsDateRangeAction,
-      // We use `null` when the value was never set and it will show all columns.
-      // If the user modifies the selection and no columns are selected,
-      // the function will save the value as a blank space, otherwise
-      // it gets saved as `null`.
-      onColumnsChange: (value: string[]) =>
-        transactionColumnsLocalSetting.set(
-          value.length === 0 ? " " : value.join(","),
-        ),
-      onSortingChange: (
-        _tableName: string,
-        columnName: string,
-        ascending: boolean,
-      ) =>
-        sortSettingLocalSetting.set({
-          ascending: ascending,
-          columnTitle: columnName,
-        }),
-      onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
-      onSearchComplete: (query: string) => searchLocalSetting.set(query),
-    },
-  )(TransactionsPage),
+  onFilterChange: (filters: Filters) => filtersLocalSetting.set(filters),
+  onSearchComplete: (query: string) => searchLocalSetting.set(query),
+  onChangeLimit: (newLimit: number) => limitSetting.set(newLimit),
+  onChangeReqSort: (sort: api.SqlStatsSortType) => reqSortSetting.set(sort),
+  onApplySearchCriteria: (ts: TimeScale, limit: number, sort: string) => {
+    return () => {
+      analytics?.track({
+        event: "Apply Search Criteria",
+        properties: {
+          page: "Transactions",
+          tsValue: ts.key,
+          limit,
+          sort,
+        },
+      });
+    };
+  },
+  onRequestTimeChange: (t: moment.Moment) => requestTimeLocalSetting.set(t),
+};
+
+type StateProps = {
+  fingerprintsPageProps: TransactionsPageStateProps & RouteComponentProps;
+};
+
+type DispatchProps = {
+  fingerprintsPageProps: TransactionsPageDispatchProps;
+};
+
+const TransactionsPageConnected = withRouter(
+  connect<
+    StateProps,
+    DispatchProps,
+    RouteComponentProps,
+    TransactionsPageRootProps,
+    AdminUIState
+  >(
+    (state: AdminUIState, props: RouteComponentProps) => ({
+      fingerprintsPageProps: {
+        ...props,
+        columns: transactionColumnsLocalSetting.selectorToArray(state),
+        timeScale: selectTimeScale(state),
+        filters: filtersLocalSetting.selector(state),
+        search: searchLocalSetting.selector(state),
+        sortSetting: sortSettingLocalSetting.selector(state),
+        limit: limitSetting.selector(state),
+        reqSortSetting: reqSortSetting.selector(state),
+        requestTime: requestTimeLocalSetting.selector(state),
+      },
+    }),
+    dispatch => ({
+      fingerprintsPageProps: bindActionCreators(
+        fingerprintsPageActions,
+        dispatch,
+      ),
+    }),
+    (stateProps, dispatchProps) => ({
+      fingerprintsPageProps: {
+        ...stateProps.fingerprintsPageProps,
+        ...dispatchProps.fingerprintsPageProps,
+      },
+    }),
+  )(TransactionsPageRoot),
 );
 
 export default TransactionsPageConnected;

@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -14,12 +9,12 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 )
 
 // distinctNode de-duplicates rows returned by a wrapped planNode.
 type distinctNode struct {
-	plan planNode
+	singleInputPlanNode
 
 	// distinctOnColIdxs are the column indices of the child planNode and
 	// is what defines the distinct key.
@@ -28,11 +23,11 @@ type distinctNode struct {
 	// Otherwise, distinctOnColIdxs is a strict subset of the child
 	// planNode's column indices indicating which columns are specified in
 	// the DISTINCT ON (<exprs>) clause.
-	distinctOnColIdxs util.FastIntSet
+	distinctOnColIdxs intsets.Fast
 
 	// Subset of distinctOnColIdxs on which the input guarantees an ordering.
 	// All rows that are equal on these columns appear contiguously in the input.
-	columnsInOrder util.FastIntSet
+	columnsInOrder intsets.Fast
 
 	reqOrdering ReqOrdering
 
@@ -71,5 +66,5 @@ func (n *distinctNode) Values() tree.Datums {
 }
 
 func (n *distinctNode) Close(ctx context.Context) {
-	n.plan.Close(ctx)
+	n.input.Close(ctx)
 }

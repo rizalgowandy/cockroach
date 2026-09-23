@@ -1,77 +1,114 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
+import * as clusterUi from "@cockroachlabs/cluster-ui";
+import { render, screen } from "@testing-library/react";
 import React from "react";
-import { assert } from "chai";
-import { shallow, mount } from "enzyme";
 import { MemoryRouter as Router } from "react-router-dom";
 
-import { ClusterNodeTotalsComponent } from "./summaryBar";
-import { SummaryStatBreakdown } from "src/views/shared/components/summaryBar";
+import { renderWithProviders } from "src/test-utils/renderWithProviders";
+
+import { ClusterNodeTotals } from "./summaryBar";
+
+jest.mock("@cockroachlabs/cluster-ui", () => ({
+  ...jest.requireActual("@cockroachlabs/cluster-ui"),
+  useNodesSummary: jest.fn(),
+}));
+
+const mockedUseNodesSummary = clusterUi.useNodesSummary as jest.MockedFunction<
+  typeof clusterUi.useNodesSummary
+>;
 
 describe("<ClusterNodeTotals>", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   it("hidden when no data", () => {
-    const wrapper = shallow(
-      <Router>
-        <ClusterNodeTotalsComponent
-          nodesSummary={null}
-          nodesSummaryEmpty={true}
-        />
-      </Router>,
+    mockedUseNodesSummary.mockReturnValue({
+      nodeStatuses: [],
+      nodeIDs: [],
+      nodeStatusByID: {},
+      nodeDisplayNameByID: {},
+      livenessStatusByNodeID: {},
+      livenessByNodeID: {},
+      storeIDsByNodeID: {},
+      isLoading: false,
+      error: undefined,
+    });
+    const { container } = render(
+      renderWithProviders(
+        <Router>
+          <ClusterNodeTotals />
+        </Router>,
+      ),
     );
-    assert.isTrue(wrapper.html() === "");
+    expect(container.innerHTML).toBe("");
   });
 
   it("renders", () => {
-    const nodesSummary = {
-      nodeSums: {
-        nodeCounts: {
-          total: 1,
-          healthy: 1,
-          suspect: 0,
-          dead: 0,
-          decommissioned: 0,
+    mockedUseNodesSummary.mockReturnValue({
+      nodeStatuses: [
+        {
+          desc: { node_id: 1 },
+          metrics: {},
         },
-      },
-    };
-    const wrapper = shallow(
-      <Router>
-        <ClusterNodeTotalsComponent
-          nodesSummary={nodesSummary as any}
-          nodesSummaryEmpty={false}
-        />
-      </Router>,
+      ] as any,
+      nodeIDs: ["1"],
+      nodeStatusByID: {},
+      nodeDisplayNameByID: { "1": "n1" },
+      livenessStatusByNodeID: {
+        "1": 3, // NODE_STATUS_LIVE
+      } as any,
+      livenessByNodeID: {},
+      storeIDsByNodeID: {},
+      isLoading: false,
+      error: undefined,
+    });
+    render(
+      renderWithProviders(
+        <Router>
+          <ClusterNodeTotals />
+        </Router>,
+      ),
     );
-    assert.isTrue(wrapper.find(ClusterNodeTotalsComponent).exists());
+    expect(screen.getByText("Total Nodes")).toBeTruthy();
   });
 
   it("renders dead nodes", () => {
-    const nodesSummary = {
-      nodeSums: {
-        nodeCounts: {
-          total: 2,
-          healthy: 0,
-          suspect: 1,
-          dead: 1,
-          decommissioned: 0,
+    mockedUseNodesSummary.mockReturnValue({
+      nodeStatuses: [
+        {
+          desc: { node_id: 1 },
+          metrics: {},
         },
-      },
-    };
-    const wrapper = mount(
-      <Router>
-        <ClusterNodeTotalsComponent
-          nodesSummary={nodesSummary as any}
-          nodesSummaryEmpty={false}
-        />
-      </Router>,
+        {
+          desc: { node_id: 2 },
+          metrics: {},
+        },
+      ] as any,
+      nodeIDs: ["1", "2"],
+      nodeStatusByID: {},
+      nodeDisplayNameByID: { "1": "n1", "2": "n2" },
+      livenessStatusByNodeID: {
+        "1": 1, // NODE_STATUS_DEAD
+        "2": 2, // NODE_STATUS_UNAVAILABLE (suspect)
+      } as any,
+      livenessByNodeID: {},
+      storeIDsByNodeID: {},
+      isLoading: false,
+      error: undefined,
+    });
+    render(
+      renderWithProviders(
+        <Router>
+          <ClusterNodeTotals />
+        </Router>,
+      ),
     );
-    assert.isTrue(wrapper.find(SummaryStatBreakdown).exists());
+    expect(screen.getByText("Dead")).toBeTruthy();
+    expect(screen.getByText("Suspect")).toBeTruthy();
   });
 });

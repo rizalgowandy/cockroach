@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -29,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/acceptance/localcluster/tc"
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -171,7 +166,7 @@ func (a *allocSim) runWithConfig(config Configuration) {
 func (a *allocSim) setup() {
 	db := a.Nodes[0].DB()
 	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS allocsim"); err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		log.Dev.Fatalf(context.Background(), "%v", err)
 	}
 
 	blocks := `
@@ -183,7 +178,7 @@ CREATE TABLE IF NOT EXISTS blocks (
 )
 `
 	if _, err := db.Exec(blocks); err != nil {
-		log.Fatalf(context.Background(), "%v", err)
+		log.Dev.Fatalf(context.Background(), "%v", err)
 	}
 }
 
@@ -191,7 +186,7 @@ func (a *allocSim) maybeLogError(err error) {
 	if localcluster.IsUnavailableError(err) {
 		return
 	}
-	log.Errorf(context.Background(), "%v", err)
+	log.Dev.Errorf(context.Background(), "%v", err)
 	atomic.AddUint64(&a.stats.errors, 1)
 }
 
@@ -243,7 +238,7 @@ func (a *allocSim) rangeInfo() allocStats {
 	for i := 0; i < len(a.Nodes); i++ {
 		go func(i int) {
 			defer wg.Done()
-			status := a.Nodes[i].StatusClient()
+			status := a.Nodes[i].StatusClient(context.Background())
 			if status == nil {
 				// Cluster is shutting down.
 				return
@@ -252,11 +247,11 @@ func (a *allocSim) rangeInfo() allocStats {
 				NodeId: "local",
 			})
 			if err != nil {
-				log.Fatalf(context.Background(), "%v", err)
+				log.Dev.Fatalf(context.Background(), "%v", err)
 			}
 			var metrics map[string]interface{}
 			if err := json.Unmarshal(resp.Data, &metrics); err != nil {
-				log.Fatalf(context.Background(), "%v", err)
+				log.Dev.Fatalf(context.Background(), "%v", err)
 			}
 			stores := metrics["stores"].(map[string]interface{})
 			for _, v := range stores {
@@ -403,7 +398,7 @@ func handleStart() bool {
 	// in the few minutes after allocsim starts up causes it to take a long time
 	// for leases to settle onto other nodes even when requests are skewed heavily
 	// onto them.
-	kvserver.MinLeaseTransferStatsDuration = 10 * time.Second
+	allocatorimpl.MinLeaseTransferStatsDuration = 10 * time.Second
 
 	cli.Main()
 	return true
@@ -421,7 +416,7 @@ func main() {
 		var err error
 		config, err = loadConfig(*configFile)
 		if err != nil {
-			log.Fatalf(context.Background(), "%v", err)
+			log.Dev.Fatalf(context.Background(), "%v", err)
 		}
 	}
 
@@ -434,7 +429,7 @@ func main() {
 		if len(locality.OutgoingLatencies) != 0 {
 			separateAddrs = true
 			if runtime.GOOS != "linux" {
-				log.Fatal(context.Background(),
+				log.Dev.Fatal(context.Background(),
 					"configs that set per-locality outgoing latencies are only supported on linux")
 			}
 			break
@@ -480,11 +475,11 @@ func main() {
 			// set up tc rules on the loopback device.
 			tcController = tc.NewController("lo")
 			if err := tcController.Init(); err != nil {
-				log.Fatalf(context.Background(), "%v", err)
+				log.Dev.Fatalf(context.Background(), "%v", err)
 			}
 			defer func() {
 				if err := tcController.CleanUp(); err != nil {
-					log.Errorf(context.Background(), "%v", err)
+					log.Dev.Errorf(context.Background(), "%v", err)
 				}
 			}()
 		}
@@ -496,7 +491,7 @@ func main() {
 							if err := tcController.AddLatency(
 								perNodeCfg[srcNodeIdx].Addr, perNodeCfg[dstNodeIdx].Addr, time.Duration(outgoing.Latency/2),
 							); err != nil {
-								log.Fatalf(context.Background(), "%v", err)
+								log.Dev.Fatalf(context.Background(), "%v", err)
 							}
 						}
 					}
@@ -528,23 +523,25 @@ func main() {
 		var exitStatus int
 		select {
 		case s := <-signalCh:
-			log.Infof(context.Background(), "signal received: %v", s)
+			log.Dev.Infof(context.Background(), "signal received: %v", s)
 			exitStatus = 1
 		case <-time.After(*duration):
-			log.Infof(context.Background(), "finished run of: %s", *duration)
+			log.Dev.Infof(context.Background(), "finished run of: %s", *duration)
 		}
 		c.Close()
 		a.finalStatus()
 		os.Exit(exitStatus)
 	}()
 
+	for i := 0; i < c.Cfg.NumNodes; i++ {
+		cfg := c.Cfg.PerNodeCfg[i]
+		cfg.ExtraEnv = append(cfg.ExtraEnv, "COCKROACH_DISABLE_RAFT_LOG_SYNCHRONIZATION_UNSAFE=true")
+		c.Cfg.PerNodeCfg[i] = cfg
+	}
+
 	c.Start(context.Background())
 	defer c.Close()
 	c.UpdateZoneConfig(1, 1<<20)
-	_, err := c.Nodes[0].DB().Exec("SET CLUSTER SETTING kv.raft_log.disable_synchronization_unsafe = true")
-	if err != nil {
-		log.Fatalf(context.Background(), "%v", err)
-	}
 	if len(config.Localities) != 0 {
 		a.runWithConfig(config)
 	} else {

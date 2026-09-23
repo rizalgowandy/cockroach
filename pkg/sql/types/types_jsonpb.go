@@ -1,12 +1,7 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package types
 
@@ -24,8 +19,12 @@ import (
 // this field will be lost to the crdb_internal.pb_to_json and the likes.
 func (t *T) MarshalJSONPB(marshaler *jsonpb.Marshaler) ([]byte, error) {
 	temp := *t
-	if err := temp.downgradeType(); err != nil {
-		return nil, err
+	// Map empty locale to nil so empty string does not appear in the JSON result.
+	// TODO(rafi): When we upgrade to go1.24, we can modify the proto definition
+	//  of the locale field to use `[(gogoproto.jsontag) = ",omitzero"]` instead of
+	//  this workaround.
+	if temp.InternalType.Locale != nil && len(*temp.InternalType.Locale) == 0 {
+		temp.InternalType.Locale = nil
 	}
 	var buf bytes.Buffer
 	if err := marshaler.Marshal(&buf, &temp.InternalType); err != nil {

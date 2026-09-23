@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package logconfig
 
@@ -29,8 +24,7 @@ import (
 // specified in a configuration.
 const DefaultFileFormat = `crdb-v2`
 
-// DefaultStderrFormat is the entry format for stderr sinks
-// when not specified in a configuration.
+// DefaultStderrFormat is the entry format for stderr sinks.
 const DefaultStderrFormat = `crdb-v2-tty`
 
 // DefaultFluentFormat is the entry format for fluent sinks
@@ -40,6 +34,14 @@ const DefaultFluentFormat = `json-fluent-compact`
 // DefaultHTTPFormat is the entry format for HTTP sinks
 // when not specified in a configuration.
 const DefaultHTTPFormat = `json-compact`
+
+// DefaultOTLPFormat is the entry format for OpenTelemetry sinks
+// when not specified in a configuration.
+const DefaultOTLPFormat = `json`
+
+// DefaultFilePerms is the default permissions used in file-defaults. It
+// is applied literally via os.Chmod, without considering the umask.
+const DefaultFilePerms = FilePermissions(0o640)
 
 // DefaultConfig returns a suitable default configuration when logging
 // is meant to primarily go to files.
@@ -60,6 +62,29 @@ fluent-defaults:
     format: ` + DefaultFluentFormat + `
     redactable: true
     exit-on-error: false
+    buffering:
+      max-staleness: 5s
+      flush-trigger-size: 1mib
+      max-buffer-size: 50mib
+http-defaults:
+    filter: INFO
+    format: ` + DefaultHTTPFormat + `
+    redactable: true
+    exit-on-error: false
+    timeout: 2s
+    buffering:
+      max-staleness: 5s
+      flush-trigger-size: 1mib
+      max-buffer-size: 50mib
+otlp-defaults:
+    filter: INFO
+    format: ` + DefaultOTLPFormat + `
+    redactable: true
+    exit-on-error: false
+    buffering:
+      max-staleness: 5s
+      flush-trigger-size: 1mib
+      max-buffer-size: 50mib
 sinks:
   stderr:
     filter: NONE
@@ -113,13 +138,36 @@ type Config struct {
 	// configuration value.
 	HTTPDefaults HTTPDefaults `yaml:"http-defaults,omitempty"`
 
+	// OTLPDefaults represents the default configuration for OpenTelemetry sinks,
+	// inherited when a specific OpenTelemetry sink config does not provide a
+	// configuration value.
+	OTLPDefaults OTLPDefaults `yaml:"otlp-defaults,omitempty"`
+
 	// Sinks represents the sink configurations.
 	Sinks SinkConfig `yaml:",omitempty"`
+
+	// Redaction configures process-global redaction behavior.
+	Redaction RedactionConfig `yaml:"redaction,omitempty"`
 
 	// CaptureFd2 represents the configuration for the redirection of
 	// internal writes to file descriptor 2 (incl that done internally
 	// by the go runtime).
 	CaptureFd2 CaptureFd2Config `yaml:"capture-stray-errors,omitempty"`
+}
+
+// RedactionConfig represents process-global redaction behavior.
+type RedactionConfig struct {
+	// Hashing configures hash-based redaction behavior.
+	Hashing HashingConfig `yaml:"hashing,omitempty"`
+}
+
+// HashingConfig represents hash-based redaction behavior.
+type HashingConfig struct {
+	// Enabled determines whether hash-based redaction is enabled.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Salt is an optional inline salt used for hash-based redaction.
+	Salt string `yaml:"salt,omitempty"`
 }
 
 // CaptureFd2Config represents the configuration for the fd2 capture sink.
@@ -145,32 +193,42 @@ type CaptureFd2Config struct {
 // Buffering may be configured with the following fields. It may also be explicitly
 // set to "NONE" to disable buffering. Example configuration:
 //
-//     file-defaults:
-//        dir: logs
-//        buffering:
-//           max-staleness: 20s
-//           flush-trigger-size: 25KB
-//     sinks:
-//        file-groups:
-//           health:
-//              channels: HEALTH
-//              buffering:
-//                 max-staleness: 5s  # Override max-staleness for this sink.
-//           ops:
-//              channels: OPS
-//              buffering: NONE  # Disable buffering for this sink.
+//	file-defaults:
+//	   dir: logs
+//	   buffering:
+//	      max-staleness: 20s
+//	      flush-trigger-size: 25KB
+//	      max-buffer-size: 10MB
+//	sinks:
+//	   file-groups:
+//	      health:
+//	         channels: HEALTH
+//	         buffering:
+//	            max-staleness: 5s  # Override max-staleness for this sink.
+//	      ops:
+//	         channels: OPS
+//	         buffering: NONE  # Disable buffering for this sink.
 type CommonBufferSinkConfig struct {
 	// MaxStaleness is the maximum time a log message will sit in the buffer
 	// before a flush is triggered.
-	MaxStaleness *time.Duration `yaml:"max-staleness,omitempty"`
+	MaxStaleness *time.Duration `yaml:"max-staleness"`
 
 	// FlushTriggerSize is the number of bytes that will trigger the buffer
 	// to flush.
-	FlushTriggerSize *ByteSize `yaml:"flush-trigger-size,omitempty"`
+	FlushTriggerSize *ByteSize `yaml:"flush-trigger-size"`
 
-	// MaxInFlight is the maximum number of buffered flushes before messages
-	// start being dropped.
-	MaxInFlight *int `yaml:"max-in-flight,omitempty"`
+	// MaxBufferSize is the limit on the size of the messages that are buffered.
+	// If this limit is exceeded, messages are dropped. The limit is expected to
+	// be higher than FlushTriggerSize. A buffer is flushed as soon as
+	// FlushTriggerSize is reached, and a new buffer is created once the flushing
+	// is started. Only one flushing operation is active at a time.
+	MaxBufferSize *ByteSize `yaml:"max-buffer-size"`
+
+	// Format describes how the buffer output should be formatted.
+	// Currently 2 options:
+	// newline: default option - separates buffer entries with newline char
+	// json-array: separates entries with ',' and wraps buffer contents in square brackets
+	Format *BufferFormat `yaml:",omitempty"`
 }
 
 // CommonBufferSinkConfigWrapper is a BufferSinkConfig with a special value represented in YAML by
@@ -191,6 +249,9 @@ type CommonSinkConfig struct {
 
 	// Format indicates the entry format to use.
 	Format *string `yaml:",omitempty"`
+
+	// FormatOptions indicates additional options for the format.
+	FormatOptions map[string]string `yaml:"format-options,omitempty"`
 
 	// Redact indicates whether to strip sensitive information before
 	// log events are emitted to this sink.
@@ -224,6 +285,8 @@ type SinkConfig struct {
 	FluentServers map[string]*FluentSinkConfig `yaml:"fluent-servers,omitempty"`
 	// HTTPServers represents the list of configured http sinks.
 	HTTPServers map[string]*HTTPSinkConfig `yaml:"http-servers,omitempty"`
+	// OTLPServers represents the list of configured opentelemetry sinks.
+	OTLPServers map[string]*OTLPSinkConfig `yaml:"otlp-servers,omitempty"`
 	// Stderr represents the configuration for the stderr sink.
 	Stderr StderrSinkConfig `yaml:",omitempty"`
 }
@@ -239,9 +302,9 @@ type SinkConfig struct {
 // The configuration key under the `sinks` key in the YAML configuration
 // is `stderr`. Example configuration:
 //
-//     sinks:
-//        stderr:           # standard error sink configuration starts here
-//           channels: DEV
+//	sinks:
+//	   stderr:           # standard error sink configuration starts here
+//	      channels: DEV
 //
 // {{site.data.alerts.callout_info}}
 // The server start-up messages are still emitted at the start of the standard error
@@ -262,13 +325,13 @@ type SinkConfig struct {
 // For a similar reason, no guarantee of parsability of the output format is available
 // when `capture-stray-errors` is disabled, since the standard error stream can then
 // contain an arbitrary interleaving of non-formatted error data.
-//
 type StderrSinkConfig struct {
 	// Channels is the list of logging channels that use this sink.
 	Channels ChannelFilters `yaml:",omitempty,flow"`
 
 	// NoColor forces the omission of VT color codes in the output even
-	// when stderr is a terminal.
+	// when stderr is a terminal. This option is deprecated; its effects
+	// are equivalent to 'format-options: {colors: none}'.
 	NoColor bool `yaml:"no-color,omitempty"`
 
 	// CommonSinkConfig is the configuration common to all sinks. Note
@@ -313,25 +376,25 @@ type FluentDefaults struct {
 // The configuration key under the `sinks` key in the YAML
 // configuration is `fluent-servers`. Example configuration:
 //
-//     sinks:
-//        fluent-servers:        # fluent configurations start here
-//           health:             # defines one sink called "health"
-//              channels: HEALTH
-//              address: 127.0.0.1:5170
+//	sinks:
+//	   fluent-servers:        # fluent configurations start here
+//	      health:             # defines one sink called "health"
+//	         channels: HEALTH
+//	         address: 127.0.0.1:5170
 //
 // Every new server sink configured automatically inherits the configurations set in the `fluent-defaults` section.
 //
 // For example:
 //
-//      fluent-defaults:
-//          redactable: false # default: disable redaction markers
-//      sinks:
-//        fluent-servers:
-//          health:
-//             channels: HEALTH
-//             # This sink has redactable set to false,
-//             # as the setting is inherited from fluent-defaults
-//             # unless overridden here.
+//	fluent-defaults:
+//	    redactable: false # default: disable redaction markers
+//	sinks:
+//	  fluent-servers:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from fluent-defaults
+//	       # unless overridden here.
 //
 // The default output format for Fluent sinks is
 // `json-fluent-compact`. The `fluent` variants of the JSON formats
@@ -341,7 +404,6 @@ type FluentDefaults struct {
 // {{site.data.alerts.callout_info}}
 // Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
 // {{site.data.alerts.end}}
-//
 type FluentSinkConfig struct {
 	// Channels is the list of logging channels that use this sink.
 	Channels ChannelFilters `yaml:",omitempty,flow"`
@@ -406,10 +468,10 @@ type FileDefaults struct {
 // The configuration key under the `sinks` key in the YAML
 // configuration is `file-groups`. Example configuration:
 //
-//     sinks:
-//        file-groups:           # file group configurations start here
-//           health:             # defines one group called "health"
-//              channels: HEALTH
+//	sinks:
+//	   file-groups:           # file group configurations start here
+//	      health:             # defines one group called "health"
+//	         channels: HEALTH
 //
 // Each generated log file is prefixed by the name of the process,
 // followed by the name of the group, separated by a hyphen. For example,
@@ -427,24 +489,23 @@ type FileDefaults struct {
 //
 // For example:
 //
-//      file-defaults:
-//          redactable: false # default: disable redaction markers
-//          dir: logs
-//      sinks:
-//        file-groups:
-//          health:
-//             channels: HEALTH
-//             # This sink has redactable set to false,
-//             # as the setting is inherited from file-defaults
-//             # unless overridden here.
-//             #
-//             # Example override:
-//             dir: health-logs # override the default 'logs'
+//	file-defaults:
+//	    redactable: false # default: disable redaction markers
+//	    dir: logs
+//	sinks:
+//	  file-groups:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from file-defaults
+//	       # unless overridden here.
+//	       #
+//	       # Example override:
+//	       dir: health-logs # override the default 'logs'
 //
 // {{site.data.alerts.callout_success}}
 // Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
 // {{site.data.alerts.end}}
-//
 type FileSinkConfig struct {
 	// Channels is the list of logging channels that use this sink.
 	Channels ChannelFilters `yaml:",omitempty,flow"`
@@ -455,6 +516,9 @@ type FileSinkConfig struct {
 	// prefix is populated during validation.
 	prefix string
 }
+
+var GzipCompression = "gzip"
+var NoneCompression = "none"
 
 // HTTPDefaults refresents the configuration defaults for HTTP sinks.
 type HTTPDefaults struct {
@@ -482,6 +546,17 @@ type HTTPDefaults struct {
 	// overhead in production systems.
 	DisableKeepAlives *bool `yaml:"disable-keep-alives,omitempty"`
 
+	// Headers is a list of headers to attach to each HTTP request
+	Headers map[string]string `yaml:",omitempty,flow"`
+
+	// FileBasedHeaders is a list of headers with filepaths whose contents are
+	// attached to each HTTP request
+	FileBasedHeaders map[string]string `yaml:"file-based-headers,omitempty,flow"`
+
+	// Compression can be "none" or "gzip" to enable gzip compression.
+	// Set to "gzip" by default.
+	Compression *string `yaml:",omitempty"`
+
 	CommonSinkConfig `yaml:",inline"`
 }
 
@@ -496,25 +571,25 @@ type HTTPDefaults struct {
 // The configuration key under the `sinks` key in the YAML
 // configuration is `http-servers`. Example configuration:
 //
-//      sinks:
-//         http-servers:
-//            health:
-//               channels: HEALTH
-//               address: http://127.0.0.1
+//	sinks:
+//	   http-servers:
+//	      health:
+//	         channels: HEALTH
+//	         address: http://127.0.0.1
 //
 // Every new server sink configured automatically inherits the configuration set in the `http-defaults` section.
 //
 // For example:
 //
-//      http-defaults:
-//          redactable: false # default: disable redaction markers
-//      sinks:
-//        http-servers:
-//          health:
-//             channels: HEALTH
-//             # This sink has redactable set to false,
-//             # as the setting is inherited from fluent-defaults
-//             # unless overridden here.
+//	http-defaults:
+//	    redactable: false # default: disable redaction markers
+//	sinks:
+//	  http-servers:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from fluent-defaults
+//	       # unless overridden here.
 //
 // The default output format for HTTP sinks is
 // `json-compact`. [Other supported formats.](log-formats.html)
@@ -522,7 +597,6 @@ type HTTPDefaults struct {
 // {{site.data.alerts.callout_info}}
 // Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
 // {{site.data.alerts.end}}
-//
 type HTTPSinkConfig struct {
 	// Channels is the list of logging channels that use this sink.
 	Channels ChannelFilters `yaml:",omitempty,flow"`
@@ -531,6 +605,78 @@ type HTTPSinkConfig struct {
 
 	// sinkName is populated during validation.
 	sinkName string
+}
+
+var OTLPModeGRPC = "grpc"
+var OTLPModeHTTP = "http"
+
+type OTLPDefaults struct {
+	// Mode decides which protocol to use for exporting logs, can be "grpc" or "http".
+	// Set to "grpc" by default.
+	Mode *string `yaml:",omitempty"`
+
+	// Headers is a list of headers to attach to each gRPC or HTTP request depending
+	// on the mode selected, the sink adds the standard headers so this option should
+	// only be used for specific headers like api keys which the downstream app expects.
+	Headers map[string]string `yaml:",omitempty,flow"`
+
+	// Compression can be "none" or "gzip" to enable gzip compression.
+	// Set to "gzip" by default.
+	Compression *string `yaml:",omitempty"`
+
+	CommonSinkConfig `yaml:",inline"`
+}
+
+// OTLPSinkConfig represents the configuration for one OpenTelemetry sink.
+//
+// User-facing documentation follows.
+// TITLE: Output to OpenTelemetry compatible collectors.
+//
+// This sink type causes logging data to be sent over the network through gRPC to
+// a collector that can ingest log data in an [OTLP](https://opentelemetry.io) format.
+//
+// The configuration key under the `sinks` key in the YAML
+// configuration is `otlp-servers`. Example configuration:
+//
+//	sinks:
+//	   otlp-servers:
+//	      health:
+//	         channels: HEALTH
+//	         address: 127.0.0.1:4317
+//
+// Every new server sink configured automatically inherits the configuration set in the `otlp-defaults` section.
+//
+// For example:
+//
+//	otlp-defaults:
+//	    redactable: false # default: disable redaction markers
+//	sinks:
+//	  otlp-servers:
+//	    health:
+//	       channels: HEALTH
+//	       # This sink has redactable set to false,
+//	       # as the setting is inherited from fluent-defaults
+//	       # unless overridden here.
+//
+// The default output format for OTLP sinks is
+// `json`. [Other supported formats.](log-formats.html)
+//
+// {{site.data.alerts.callout_info}}
+// Run `cockroach debug check-log-config` to verify the effect of defaults inheritance.
+// {{site.data.alerts.end}}
+type OTLPSinkConfig struct {
+	// Channels is the list of logging channels that use this sink.
+	Channels ChannelFilters `yaml:",omitempty,flow"`
+
+	// Address is the network address of the gRPC endpoint for
+	// ingestion of logs on your OpenTelemetry Collector/Platform.
+	// The host/address and port parts are separated with a colon.
+	Address string `yaml:""`
+
+	OTLPDefaults `yaml:",inline"`
+
+	// SinkName is populated during validation.
+	SinkName string
 }
 
 // IterateDirectories calls the provided fn on every directory linked to
@@ -658,12 +804,13 @@ func (c *ChannelList) Sort() {
 }
 
 // parseChannelList recognizes the following formats:
-//     all
-//     X,Y,Z
-//     [all]
-//     [X,Y,Z]
-//     all except X,Y,Z
-//     all except [X,Y,Z]
+//
+//	all
+//	X,Y,Z
+//	[all]
+//	[X,Y,Z]
+//	all except X,Y,Z
+//	all except [X,Y,Z]
 func parseChannelList(s string) ([]logpb.Channel, error) {
 	// We accept mixed case -- normalize everything.
 	s = strings.ToUpper(strings.TrimSpace(s))
@@ -1008,6 +1155,15 @@ func (x *FilePermissions) UnmarshalYAML(fn func(interface{}) error) (err error) 
 	return nil
 }
 
+func init() {
+	// Use FutureLineWrap to avoid wrapping long lines. This is required for cases
+	// where one of the logging or zone config fields is longer than 80
+	// characters. In that case, without FutureLineWrap, the output will have `\n`
+	// characters interspersed every 80 characters. FutureLineWrap ensures that
+	// the whole field shows up as a single line.
+	yaml.FutureLineWrap()
+}
+
 // String implements the fmt.Stringer interface.
 func (c *Config) String() string {
 	b, err := yaml.Marshal(c)
@@ -1056,9 +1212,12 @@ func (w *CommonBufferSinkConfigWrapper) UnmarshalYAML(fn func(interface{}) error
 		if strings.ToUpper(v) == "NONE" {
 			d := time.Duration(0)
 			s := ByteSize(0)
+			format := BufferFmtNewline
 			w.CommonBufferSinkConfig = CommonBufferSinkConfig{
 				MaxStaleness:     &d,
 				FlushTriggerSize: &s,
+				MaxBufferSize:    &s,
+				Format:           &format,
 			}
 			return nil
 		}
@@ -1071,7 +1230,8 @@ func (w *CommonBufferSinkConfigWrapper) UnmarshalYAML(fn func(interface{}) error
 // After default propagation, buffering is disabled iff IsNone().
 func (w CommonBufferSinkConfigWrapper) IsNone() bool {
 	return (w.MaxStaleness != nil && *w.MaxStaleness == 0) &&
-		(w.FlushTriggerSize != nil && *w.FlushTriggerSize == 0)
+		(w.FlushTriggerSize != nil && *w.FlushTriggerSize == 0) &&
+		(w.MaxBufferSize != nil && *w.MaxBufferSize == 0)
 }
 
 // HTTPSinkMethod is a string restricted to "POST" and "GET"
@@ -1113,6 +1273,42 @@ type constrainedString interface {
 	Accept(string)
 	Canonicalize(string) string
 	AllowedSet() []string
+}
+
+const (
+	BufferFmtJsonArray BufferFormat = "json-array"
+	BufferFmtNewline   BufferFormat = "newline"
+	BufferFmtNone      BufferFormat = "none"
+)
+
+// BufferFormat is a string restricted to "json-array" and "newline".
+type BufferFormat string
+
+var _ constrainedString = (*BufferFormat)(nil)
+
+// Accept implements the constrainedString interface.
+func (hsm *BufferFormat) Accept(s string) {
+	*hsm = BufferFormat(s)
+}
+
+// Canonicalize implements the constrainedString interface.
+func (BufferFormat) Canonicalize(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// AllowedSet implements the constrainedString interface.
+func (BufferFormat) AllowedSet() []string {
+	return []string{string(BufferFmtJsonArray), string(BufferFmtNewline), "unknown"}
+}
+
+// MarshalYAML implements yaml.Marshaler interface.
+func (hsm BufferFormat) MarshalYAML() (interface{}, error) {
+	return string(hsm), nil
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (hsm *BufferFormat) UnmarshalYAML(fn func(interface{}) error) error {
+	return unmarshalYAMLConstrainedString(hsm, fn)
 }
 
 // unmarshalYAMLConstrainedString is a utility function to unmarshal

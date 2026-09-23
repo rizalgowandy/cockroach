@@ -1,20 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgwire
 
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/security/password"
+	"github.com/go-ldap/ldap/v3"
 )
 
 // Authenticator is a component of an AuthMethod that determines if the
@@ -22,16 +17,17 @@ import (
 // username, etc) is who it claims to be.
 type Authenticator = func(
 	ctx context.Context,
-	systemIdentity security.SQLUsername,
+	systemIdentity string,
 	clientConnection bool,
 	pwRetrieveFn PasswordRetrievalFn,
+	roleSubject *ldap.DN,
 ) error
 
 // PasswordRetrievalFn defines a method to retrieve a hashed password
 // and expiration time for a user logging in with password-based
 // authentication.
 type PasswordRetrievalFn = func(context.Context) (
-	pwHash []byte,
-	pwExpiration *tree.DTimestamp,
+	expired bool,
+	pwHash password.PasswordHash,
 	_ error,
 )

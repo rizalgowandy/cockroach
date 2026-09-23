@@ -1,18 +1,15 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -21,10 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -39,6 +40,7 @@ import (
 // interactions and reject the rest. This test exercises these scenarios.
 func TestTruncateWithConcurrentMutations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	type blockType int
@@ -63,7 +65,8 @@ func TestTruncateWithConcurrentMutations(t *testing.T) {
 		var (
 			blocked = make(chan struct{})
 			unblock = make(chan error)
-			tc      *testcluster.TestCluster
+			s       serverutils.TestServerInterface
+			db      *gosql.DB
 		)
 		{
 			settings := cluster.MakeTestingClusterSettings()
@@ -83,19 +86,21 @@ func TestTruncateWithConcurrentMutations(t *testing.T) {
 			case blockBeforeResume:
 				scKnobs.RunBeforeResume = blockFunc
 			}
-			tc = testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
-				ServerArgs: base.TestServerArgs{
-					Settings: settings,
-					Knobs: base.TestingKnobs{
-						SQLSchemaChanger: scKnobs,
-					},
+			s, db, _ = serverutils.StartServer(t, base.TestServerArgs{
+				Settings: settings,
+				Knobs: base.TestingKnobs{
+					SQLSchemaChanger: scKnobs,
 				},
 			})
-			defer tc.Stopper().Stop(ctx)
+			defer s.Stopper().Stop(ctx)
 		}
 
-		db := tc.ServerConn(0)
 		tdb := sqlutils.MakeSQLRunner(db)
+		tdb.ExecMultiple(t, strings.Split(`
+SET create_table_with_schema_locked=false;
+SET use_declarative_schema_changer = 'off';
+SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';
+`, `;`)...)
 
 		// Support setup schema changes.
 		close(unblock)
@@ -115,6 +120,11 @@ func TestTruncateWithConcurrentMutations(t *testing.T) {
 			}
 			tx, err := db.BeginTx(ctx, nil)
 			if err != nil {
+				return err
+			}
+			_, err = tx.Exec("SET LOCAL autocommit_before_ddl = false")
+			if err != nil {
+				_ = tx.Rollback()
 				return err
 			}
 			for _, stmt := range testC.stmts {
@@ -337,19 +347,6 @@ func TestTruncateWithConcurrentMutations(t *testing.T) {
 			},
 			validations: commonValidations,
 		},
-		{
-			name: "alter column type",
-			setupStmts: []string{
-				commonCreateTable,
-				commonPopulateData,
-				`SET enable_experimental_alter_column_type_general = true`,
-			},
-			truncateStmt: "TRUNCATE TABLE t",
-			stmts: []string{
-				`ALTER TABLE t ALTER COLUMN j TYPE STRING`,
-			},
-			expErrRE: `pq: unimplemented: cannot perform TRUNCATE on "t" which has an ongoing column type change`,
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) { run(t, tc) })
@@ -358,6 +355,8 @@ func TestTruncateWithConcurrentMutations(t *testing.T) {
 
 func TestTruncatePreservesSplitPoints(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	skip.UnderRace(t)
 
 	ctx := context.Background()
@@ -385,39 +384,64 @@ func TestTruncatePreservesSplitPoints(t *testing.T) {
 				},
 			})
 			defer tc.Stopper().Stop(ctx)
+			s := tc.ApplicationLayer(0)
+			conn := s.SQLConn(t, serverutils.DBName("defaultdb"))
+
+			{
+				// This test asserts on KV-internal effects (i.e. range splits
+				// and their boundaries) as a result of configs and manually
+				// installed splits. To ensure it works with the span configs
+				// infrastructure quickly enough, we set a low closed timestamp
+				// target duration.
+				sysDB := sqlutils.MakeSQLRunner(tc.SystemLayer(0).SQLConn(t))
+				sysDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
+			}
 
 			var err error
-			_, err = tc.Conns[0].ExecContext(ctx, `
-CREATE TABLE a(a INT PRIMARY KEY, b INT, INDEX(b));
+			_, err = conn.ExecContext(ctx, `
+CREATE TABLE a(a INT PRIMARY KEY, b INT, INDEX(b)) WITH (schema_locked=false);
 INSERT INTO a SELECT g,g FROM generate_series(1,10000) g(g);
 ALTER TABLE a SPLIT AT VALUES(1000), (2000), (3000), (4000), (5000), (6000), (7000), (8000), (9000);
 ALTER INDEX a_b_idx SPLIT AT VALUES(1000), (2000), (3000), (4000), (5000), (6000), (7000), (8000), (9000);
 `)
 			assert.NoError(t, err)
 
-			row := tc.Conns[0].QueryRowContext(ctx, `
-SELECT count(*) FROM crdb_internal.ranges_no_leases WHERE table_id = 'a'::regclass`)
-			assert.NoError(t, row.Err())
-			var nRanges int
-			assert.NoError(t, row.Scan(&nRanges))
-
 			const origNRanges = 19
-			assert.Equal(t, origNRanges, nRanges)
 
-			_, err = tc.Conns[0].ExecContext(ctx, `TRUNCATE a`)
+			// Range split decisions happen asynchronously, hence the
+			// succeeds-soon block here and below.
+			testutils.SucceedsSoon(t, func() error {
+				row := conn.QueryRowContext(ctx, `
+SELECT count(*) FROM [SHOW RANGES FROM TABLE a]`)
+				assert.NoError(t, row.Err())
+
+				var nRanges int
+				assert.NoError(t, row.Scan(&nRanges))
+				if nRanges != origNRanges {
+					return errors.Newf("expected %d ranges, found %d", origNRanges, nRanges)
+				}
+				return nil
+			})
+
+			_, err = conn.ExecContext(ctx, `TRUNCATE a`)
 			assert.NoError(t, err)
 
-			row = tc.Conns[0].QueryRowContext(ctx, `
-SELECT count(*) FROM crdb_internal.ranges_no_leases WHERE table_id = 'a'::regclass`)
-			assert.NoError(t, row.Err())
-			assert.NoError(t, row.Scan(&nRanges))
+			// Since the table is too small, we don't expect additional split points
+			// created during the truncate.
+			expRanges := origNRanges
 
-			// We subtract 1 from the original n ranges because the first range can't
-			// be migrated to the new keyspace, as its prefix doesn't include an
-			// index ID.
-			assert.Equal(t, origNRanges+testCase.nodes*int(sql.PreservedSplitCountMultiple.Get(&tc.Servers[0].Cfg.
-				Settings.SV)),
-				nRanges)
+			testutils.SucceedsSoon(t, func() error {
+				row := conn.QueryRowContext(ctx, `
+SELECT count(*) FROM [SHOW RANGES FROM TABLE a]`)
+				assert.NoError(t, row.Err())
+
+				var nRanges int
+				assert.NoError(t, row.Scan(&nRanges))
+				if nRanges != expRanges {
+					return errors.Newf("expected %d ranges, found %d", expRanges, nRanges)
+				}
+				return nil
+			})
 		})
 	}
 }

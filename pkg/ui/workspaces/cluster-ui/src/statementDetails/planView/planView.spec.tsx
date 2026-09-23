@@ -1,23 +1,20 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
-
-import { assert } from "chai";
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+
 import {
   FlatPlanNode,
   FlatPlanNodeAttribute,
   flattenTreeAttributes,
   flattenAttributes,
   standardizeKey,
+  planNodeToString,
+  planNodeAttrsToString,
 } from "./planView";
+
 import IAttr = cockroach.sql.ExplainTreePlanNode.IAttr;
 
 type IExplainTreePlanNode = cockroach.sql.IExplainTreePlanNode;
@@ -114,7 +111,7 @@ describe("planView", () => {
           ],
         };
 
-        assert.deepEqual(flattenTreeAttributes(node), nodeFlattened);
+        expect(flattenTreeAttributes(node)).toEqual(nodeFlattened);
       });
     });
     describe("when there are nodes with multiple attributes with the same key", () => {
@@ -155,7 +152,7 @@ describe("planView", () => {
           ],
         };
 
-        assert.deepEqual(flattenTreeAttributes(node), nodeFlattened);
+        expect(flattenTreeAttributes(node)).toEqual(nodeFlattened);
       });
     });
   });
@@ -163,16 +160,14 @@ describe("planView", () => {
   describe("flattenAttributes", () => {
     describe("when all attributes have different keys", () => {
       it("creates array with exactly one value for each attribute", () => {
-        assert.deepEqual(
-          flattenAttributes(testAttrsDistinctKeys),
+        expect(flattenAttributes(testAttrsDistinctKeys)).toEqual(
           expectedTestAttrsDistinctKeys,
         );
       });
     });
     describe("when there are multiple attributes with same key", () => {
       it("collects values into one array for same key", () => {
-        assert.deepEqual(
-          flattenAttributes(testAttrsDuplicatedKeys),
+        expect(flattenAttributes(testAttrsDuplicatedKeys)).toEqual(
           expectedTestAttrsFlattened,
         );
       });
@@ -202,7 +197,7 @@ describe("planView", () => {
           },
         ];
 
-        assert.deepEqual(flattenAttributes(testAttrs), expectedTestAttrs);
+        expect(flattenAttributes(testAttrs)).toEqual(expectedTestAttrs);
       });
     });
     describe("when keys are unsorted", () => {
@@ -243,21 +238,111 @@ describe("planView", () => {
           },
         ];
 
-        assert.deepEqual(flattenAttributes(testAttrs), expectedTestAttrs);
+        expect(flattenAttributes(testAttrs)).toEqual(expectedTestAttrs);
       });
     });
   });
 
   describe("standardizeKey", () => {
     it("should convert strings to camel case", () => {
-      assert.equal(standardizeKey("hello world"), "helloWorld");
-      assert.equal(standardizeKey("camels-are-cool"), "camelsAreCool");
-      assert.equal(standardizeKey("cockroach"), "cockroach");
+      expect(standardizeKey("hello world")).toBe("helloWorld");
+      expect(standardizeKey("camels-are-cool")).toBe("camelsAreCool");
+      expect(standardizeKey("cockroach")).toBe("cockroach");
     });
 
     it("should remove '(anti)' from the key", () => {
-      assert.equal(standardizeKey("lookup join (anti)"), "lookupJoin");
-      assert.equal(standardizeKey("(anti) hello world"), "helloWorld");
+      expect(standardizeKey("lookup join (anti)")).toBe("lookupJoin");
+      expect(standardizeKey("(anti) hello world")).toBe("helloWorld");
+    });
+  });
+
+  describe("planNodeAttrsToString", () => {
+    it("should convert an array of FlatPlanNodeAttribute[] into a string", () => {
+      const testNodeAttrs: FlatPlanNodeAttribute[] = [
+        {
+          key: "Into",
+          values: ["users(id, city, name, address, credit_card)"],
+          warn: false,
+        },
+        {
+          key: "Size",
+          values: ["5 columns, 3 rows"],
+          warn: false,
+        },
+      ];
+
+      const expectedString =
+        "Into users(id, city, name, address, credit_card) Size 5 columns, 3 rows";
+
+      expect(planNodeAttrsToString(testNodeAttrs)).toBe(expectedString);
+    });
+  });
+
+  describe("planNodeToString", () => {
+    it("should recursively convert a FlatPlanNode into a string.", () => {
+      const testPlanNode: FlatPlanNode = {
+        name: "insert fast path",
+        attrs: [
+          {
+            key: "Into",
+            values: ["users(id, city, name, address, credit_card)"],
+            warn: false,
+          },
+          {
+            key: "Size",
+            values: ["5 columns, 3 rows"],
+            warn: false,
+          },
+        ],
+        children: [],
+      };
+
+      const expectedString =
+        "insert fast path Into users(id, city, name, address, credit_card) Size 5 columns, 3 rows";
+
+      expect(planNodeToString(testPlanNode)).toBe(expectedString);
+    });
+
+    it("should recursively convert a FlatPlanNode (with children) into a string.", () => {
+      const testPlanNode: FlatPlanNode = {
+        name: "render",
+        attrs: [],
+        children: [
+          {
+            name: "group (scalar)",
+            attrs: [],
+            children: [
+              {
+                name: "filter",
+                attrs: [
+                  {
+                    key: "filter",
+                    values: ["variable = _"],
+                    warn: false,
+                  },
+                ],
+                children: [
+                  {
+                    name: "virtual table",
+                    attrs: [
+                      {
+                        key: "table",
+                        values: ["cluster_settings@primary"],
+                        warn: false,
+                      },
+                    ],
+                    children: [],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+
+      const expectedString =
+        "render  group (scalar)  filter filter variable = _ virtual table table cluster_settings@primary";
+      expect(planNodeToString(testPlanNode)).toBe(expectedString);
     });
   });
 });

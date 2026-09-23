@@ -1,19 +1,13 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"text/template"
@@ -21,6 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/gostdlib/go/format"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 func main() {
@@ -97,7 +93,7 @@ type info struct {
 }
 
 func readInput(protoName string) (chans []info, sevs []info, err error) {
-	protoData, err := ioutil.ReadFile(protoName)
+	protoData, err := os.ReadFile(protoName)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -137,7 +133,8 @@ func readInput(protoName string) (chans []info, sevs []info, err error) {
 			continue
 		}
 		key := strings.Split(line, " ")[0]
-		title := strings.ReplaceAll(strings.Title(strings.ReplaceAll(strings.ToLower(key), "_", " ")), " ", "")
+		title := strings.ReplaceAll(cases.Title(language.English, cases.NoLower).String(
+			strings.ReplaceAll(strings.ToLower(key), "_", " ")), " ", "")
 		if inSevs {
 			comment := "// The `" + key + "` severity" + strings.TrimPrefix(rawComment, "// "+key)
 			sevs = append(sevs, info{
@@ -262,6 +259,20 @@ type ChannelLogger interface {
   // logging is currently redirected to a file. Arguments are handled in
   // the manner of fmt.Printf.
   Shoutf(ctx context.Context, sev Severity, format string, args ...interface{})
+
+  // VEvent either logs a message to the channel (which also outputs to the
+  // active trace) or to the trace alone, depending on whether the specified
+  // verbosity level is active.
+  VEvent(ctx context.Context, level Level, msg string)
+
+  // VEventf either logs a message to the channel (which also outputs to the
+  // active trace) or to the trace alone, depending on whether the specified
+  // verbosity level is active.
+  VEventf(ctx context.Context, level Level, format string, args ...interface{})
+
+  // VEventfDepth performs the same as VEventf but checks the verbosity level
+  // at the given depth in the call stack.
+  VEventfDepth(ctx context.Context, depth int, level Level, format string, args ...interface{})
 }
 
 {{$sevs := .Severities}}
@@ -331,56 +342,6 @@ func (logger{{.Name}}) {{with $sev}}{{.Name}}{{end}}fDepth(ctx context.Context, 
   logfDepth(ctx, depth+1, severity.{{with $sev}}{{.NAME}}{{end}}, channel.{{.NAME}}, format, args...)
 }
 
-{{if .NAME|eq "DEV"}}
-// {{with $sev}}{{.Name}}{{end}}f logs to the {{.NAME}} channel with severity {{with $sev}}{{.NAME}}{{end}},
-// if logging has been enabled for the source file where the call is
-// performed at the provided verbosity level, via the vmodule setting.
-// It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Printf.
-//
-{{.Comment -}}
-//
-{{with $sev}}{{.Comment}}{{end -}}
-func {{with $sev}}{{.Name}}{{end}}f(ctx context.Context, format string, args ...interface{}) {
-  logfDepth(ctx, 1, severity.{{with $sev}}{{.NAME}}{{end}}, channel.{{.NAME}}, format, args...)
-}
-
-// V{{with $sev}}{{.Name}}{{end}}f logs to the {{.NAME}} channel with severity {{with $sev}}{{.NAME}}{{end}}.
-// It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Printf.
-//
-{{.Comment -}}
-//
-{{with $sev}}{{.Comment}}{{end -}}
-func V{{with $sev}}{{.Name}}{{end}}f(ctx context.Context, level Level, format string, args ...interface{}) {
-  if VDepth(level, 1) {
-    logfDepth(ctx, 1, severity.{{with $sev}}{{.NAME}}{{end}}, channel.{{.NAME}}, format, args...)
-  }
-}
-
-// {{with $sev}}{{.Name}}{{end}} logs to the {{.NAME}} channel with severity {{with $sev}}{{.NAME}}{{end}}.
-// It extracts log tags from the context and logs them along with the given
-// message.
-//
-{{.Comment -}}
-//
-{{with $sev}}{{.Comment}}{{end -}}
-func {{with $sev}}{{.Name}}{{end}}(ctx context.Context, msg string) {
-  logfDepth(ctx, 1, severity.{{with $sev}}{{.NAME}}{{end}}, channel.{{.NAME}}, msg)
-}
-
-// {{with $sev}}{{.Name}}{{end}}fDepth logs to the {{.NAME}} channel with severity {{with $sev}}{{.NAME}}{{end}},
-// offsetting the caller's stack frame by 'depth'.
-// It extracts log tags from the context and logs them along with the given
-// message. Arguments are handled in the manner of fmt.Printf.
-//
-{{.Comment -}}
-//
-{{with $sev}}{{.Comment}}{{end -}}
-func {{with $sev}}{{.Name}}{{end}}fDepth(ctx context.Context, depth int, format string, args ...interface{}) {
-  logfDepth(ctx, depth+1, severity.{{with $sev}}{{.NAME}}{{end}}, channel.{{.NAME}}, format, args...)
-}
-{{end}}{{- /* end channel name = DEV */ -}}
 
 {{end}}{{end}}{{end}}{{- /* end range severities */ -}}
 
@@ -401,26 +362,29 @@ func (logger{{.Name}}) Shoutf(ctx context.Context, sev Severity, format string, 
   shoutfDepth(ctx, 1, sev, channel.{{.NAME}}, format, args...)
 }
 
-{{if .NAME|eq "DEV"}}
-
-// Shout logs to channel {{.NAME}}, and also to the real stderr if logging
-// is currently redirected to a file.
-//
+// VEvent either logs a message to the channel (which also outputs to the
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 {{.Comment -}}
-func Shout(ctx context.Context, sev Severity, msg string) {
-  shoutfDepth(ctx, 1, sev, channel.{{.NAME}}, msg)
+func (logger{{.Name}}) VEvent(ctx context.Context, level Level, msg string) {
+	vEvent(ctx, false /* isErr */, 1, level, channel.{{.NAME}}, msg)
 }
 
-// Shoutf logs to channel {{.NAME}}, and also to the real stderr if
-// logging is currently redirected to a file. Arguments are handled in
-// the manner of fmt.Printf.
-//
+// VEventf either logs a message to the channel (which also outputs to the
+// active trace) or to the trace alone, depending on whether the specified
+// verbosity level is active.
 {{.Comment -}}
-func Shoutf(ctx context.Context, sev Severity, format string, args ...interface{}) {
-  shoutfDepth(ctx, 1, sev, channel.{{.NAME}}, format, args...)
+func (logger{{.Name}}) VEventf(ctx context.Context, level Level, format string, args ...interface{}) {
+	vEventf(ctx, false /* isErr */, 1, level, channel.{{.NAME}}, format, args...)
 }
 
-{{end}}{{- /* end channel name = DEV */ -}}
+// VEventfDepth performs the same as VEventf but checks the verbosity level
+// at the given depth in the call stack.
+{{.Comment -}}
+func (logger{{.Name}}) VEventfDepth(ctx context.Context, depth int, level Level, format string, args ...interface{}) {
+	vEventf(ctx, false /* isErr */, 1+depth, level, channel.{{.NAME}}, format, args...)
+}
+
 
 {{end}}{{- /* end range channels */ -}}
 `,

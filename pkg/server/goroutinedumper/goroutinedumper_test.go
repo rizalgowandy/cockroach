@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package goroutinedumper
 
@@ -14,7 +9,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -183,11 +178,52 @@ func TestNewGoroutineDumper(t *testing.T) {
 	})
 }
 
+func TestDumpNowRateLimit(t *testing.T) {
+	const dumpDir = "dump_dir"
+	st := &cluster.Settings{}
+
+	ctx := context.Background()
+	onDemandMinInterval.Override(ctx, &st.SV, 10*time.Second)
+
+	baseTime := time.Date(2019, time.January, 1, 0, 0, 0, 0, time.UTC)
+	now := baseTime
+	dumpsTaken := 0
+
+	gd := GoroutineDumper{
+		currentTime: func() time.Time {
+			return now
+		},
+		takeGoroutineDump: func(string) error {
+			dumpsTaken++
+			return nil
+		},
+		store: dumpstore.NewStore(dumpDir, nil, nil),
+		st:    st,
+	}
+
+	didDump, err := gd.DumpNow(ctx, "first")
+	assert.NoError(t, err)
+	assert.True(t, didDump)
+	assert.Equal(t, 1, dumpsTaken)
+
+	now = baseTime.Add(9 * time.Second)
+	didDump, err = gd.DumpNow(ctx, "second")
+	assert.NoError(t, err)
+	assert.False(t, didDump)
+	assert.Equal(t, 1, dumpsTaken)
+
+	now = baseTime.Add(10 * time.Second)
+	didDump, err = gd.DumpNow(ctx, "third")
+	assert.NoError(t, err)
+	assert.True(t, didDump)
+	assert.Equal(t, 2, dumpsTaken)
+}
+
 func TestTakeGoroutineDump(t *testing.T) {
 	t.Run("fails because dump already exists as a directory", func(t *testing.T) {
 		tempDir, dirCleanupFn := testutils.TempDir(t)
 		defer dirCleanupFn()
-		path := filepath.Join(tempDir, "goroutine_dump.txt.gz")
+		path := filepath.Join(tempDir, "goroutine_dump.pb.gz")
 		err := os.Mkdir(path, 0755)
 		assert.NoError(t, err, "failed to make dump directory %s", path)
 
@@ -209,7 +245,7 @@ func TestTakeGoroutineDump(t *testing.T) {
 		err := takeGoroutineDump(path)
 		assert.NoError(t, err, "unexpected error when dumping goroutines")
 
-		expectedFile := filepath.Join(tempDir, "goroutine_dump.txt.gz")
+		expectedFile := filepath.Join(tempDir, "goroutine_dump.pb.gz")
 		f, err := os.Open(expectedFile)
 		if err != nil {
 			t.Fatalf("could not open goroutine dump file %s: %s", expectedFile, err)
@@ -220,7 +256,7 @@ func TestTakeGoroutineDump(t *testing.T) {
 		if err != nil {
 			t.Fatalf("could not create gzip reader for file %s: %s", expectedFile, err)
 		}
-		if _, err = ioutil.ReadAll(r); err != nil {
+		if _, err = io.ReadAll(r); err != nil {
 			t.Fatalf("could not read goroutine dump file %s with gzip: %s", expectedFile, err)
 		}
 		if err = r.Close(); err != nil {

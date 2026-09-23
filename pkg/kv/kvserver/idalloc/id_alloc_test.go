@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package idalloc_test
 
@@ -19,6 +14,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/idalloc"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	// Import to set ZoneConfigHook.
@@ -40,7 +36,7 @@ func newTestAllocator(t testing.TB) (*localtestcluster.LocalTestCluster, *idallo
 		DisableLivenessHeartbeat: true,
 		DontCreateSystemRanges:   true,
 	}
-	s.Start(t, testutils.NewNodeTestBaseContext(), kvcoord.InitFactoryForLocalTestCluster)
+	s.Start(t, kvcoord.InitFactoryForLocalTestCluster)
 	idAlloc, err := idalloc.NewAllocator(idalloc.Options{
 		AmbientCtx:  s.Cfg.AmbientCtx,
 		Key:         keys.RangeIDGenerator,
@@ -237,9 +233,9 @@ func TestAllocateWithStopper(t *testing.T) {
 	s, idAlloc := newTestAllocator(t)
 	s.Stop() // not deferred.
 
-	if _, err := idAlloc.Allocate(context.Background()); !testutils.IsError(err, "system is draining") {
-		t.Errorf("unexpected error: %+v", err)
-	}
+	_, err := idAlloc.Allocate(context.Background())
+	require.Error(t, err)
+	require.ErrorIs(t, err, &kvpb.NodeUnavailableError{})
 }
 
 // TestLostWriteAssertion makes sure that the Allocator performs a best-effort

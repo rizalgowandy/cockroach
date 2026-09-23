@@ -1,19 +1,13 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package faker
 
 import (
 	"fmt"
-
-	"golang.org/x/exp/rand"
+	"math/rand/v2"
 )
 
 type nameFaker struct {
@@ -26,7 +20,7 @@ type nameFaker struct {
 
 // Name returns a random en_US person name.
 func (f *nameFaker) Name(rng *rand.Rand) string {
-	if rng.Intn(2) == 0 {
+	if rng.IntN(2) == 0 {
 		return f.formatsFemale.Rand(rng).(func(rng *rand.Rand) string)(rng)
 	}
 	return f.formatsMale.Rand(rng).(func(rng *rand.Rand) string)(rng)

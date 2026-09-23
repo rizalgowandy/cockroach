@@ -1,17 +1,13 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package encoding
 
 import (
 	"bytes"
+	crypto_rand "crypto/rand"
 	"fmt"
 	"math"
 	"math/rand"
@@ -20,19 +16,23 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/apd/v2"
+	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	// Blank import so projections are initialized correctly.
+	_ "github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
+	"github.com/cockroachdb/cockroach/pkg/util/ltree"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -323,6 +323,42 @@ func TestEncodeDecodeUvarint(t *testing.T) {
 	testCustomEncodeUint64(testCases, EncodeUvarintAscending, t)
 }
 
+func TestEncodedLengthUvarintAscending(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		v := rand.Uint64()
+		exp := len(EncodeUvarintAscending(nil, v))
+		actual := EncodedLengthUvarintAscending(v)
+		if actual != exp {
+			t.Fatalf("incorrect encoded length for %d: %d (expected %d)", v, actual, exp)
+		}
+	}
+}
+
+func TestGetUvarintLen(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		v := rand.Uint64()
+		enc := EncodeUvarintAscending(nil, v)
+		exp := len(enc)
+		actual, err := GetUvarintLen(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual != exp {
+			t.Fatalf("incorrect encoded length for %d: %d (expected %d)", v, actual, exp)
+		}
+		b, dec, err := DecodeUvarintAscending(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dec != v {
+			t.Fatalf("incorrect decoded value: %d (expected %d)", dec, v)
+		}
+		if len(b) != 0 {
+			t.Fatalf("incorrect decoded length for %d: %d (expected %d)", v, exp-len(b), exp)
+		}
+	}
+}
+
 func TestEncodeDecodeUvarintDescending(t *testing.T) {
 	testBasicEncodeDecodeUint64(EncodeUvarintDescending, DecodeUvarintDescending, true, true, true, t)
 	testCases := []testCaseUint64{
@@ -338,10 +374,11 @@ func TestEncodeDecodeUvarintDescending(t *testing.T) {
 // TestDecodeInvalid tests that decoding invalid bytes panics.
 func TestDecodeInvalid(t *testing.T) {
 	tests := []struct {
-		name    string             // name printed with errors.
-		buf     []byte             // buf contains an invalid uvarint to decode.
-		pattern string             // pattern matches the panic string.
-		decode  func([]byte) error // decode is called with buf.
+		name     string             // name printed with errors.
+		buf      []byte             // buf contains an invalid uvarint to decode.
+		pattern  string             // pattern matches the panic string.
+		decode   func([]byte) error // decode is called with buf.
+		validate func([]byte) error // validate is called with buf; may be nil
 	}{
 		{
 			name:    "DecodeVarint, overflows int64",
@@ -350,40 +387,46 @@ func TestDecodeInvalid(t *testing.T) {
 			decode:  func(b []byte) error { _, _, err := DecodeVarintAscending(b); return err },
 		},
 		{
-			name:    "Bytes, no marker",
-			buf:     []byte{'a'},
-			pattern: "did not find marker",
-			decode:  func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			name:     "Bytes, no marker",
+			buf:      []byte{'a'},
+			pattern:  "did not find marker",
+			decode:   func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			validate: func(b []byte) error { _, err := ValidateDecodeBytesAscending(b); return err },
 		},
 		{
-			name:    "Bytes, no terminator",
-			buf:     []byte{bytesMarker, 'a'},
-			pattern: "did not find terminator",
-			decode:  func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			name:     "Bytes, no terminator",
+			buf:      []byte{bytesMarker, 'a'},
+			pattern:  "did not find terminator",
+			decode:   func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			validate: func(b []byte) error { _, err := ValidateDecodeBytesAscending(b); return err },
 		},
 		{
-			name:    "Bytes, malformed escape",
-			buf:     []byte{bytesMarker, 'a', 0x00},
-			pattern: "malformed escape",
-			decode:  func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			name:     "Bytes, malformed escape",
+			buf:      []byte{bytesMarker, 'a', 0x00},
+			pattern:  "malformed escape",
+			decode:   func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			validate: func(b []byte) error { _, err := ValidateDecodeBytesAscending(b); return err },
 		},
 		{
-			name:    "Bytes, invalid escape 1",
-			buf:     []byte{bytesMarker, 'a', 0x00, 0x00},
-			pattern: "unknown escape",
-			decode:  func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			name:     "Bytes, invalid escape 1",
+			buf:      []byte{bytesMarker, 'a', 0x00, 0x00},
+			pattern:  "unknown escape",
+			decode:   func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			validate: func(b []byte) error { _, err := ValidateDecodeBytesAscending(b); return err },
 		},
 		{
-			name:    "Bytes, invalid escape 2",
-			buf:     []byte{bytesMarker, 'a', 0x00, 0x02},
-			pattern: "unknown escape",
-			decode:  func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			name:     "Bytes, invalid escape 2",
+			buf:      []byte{bytesMarker, 'a', 0x00, 0x02},
+			pattern:  "unknown escape",
+			decode:   func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			validate: func(b []byte) error { _, err := ValidateDecodeBytesAscending(b); return err },
 		},
 		{
-			name:    "BytesDescending, no marker",
-			buf:     []byte{'a'},
-			pattern: "did not find marker",
-			decode:  func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			name:     "BytesDescending, no marker",
+			buf:      []byte{'a'},
+			pattern:  "did not find marker",
+			decode:   func(b []byte) error { _, _, err := DecodeBytesAscending(b, nil); return err },
+			validate: func(b []byte) error { _, err := ValidateDecodeBytesAscending(b); return err },
 		},
 		{
 			name:    "BytesDescending, no terminator",
@@ -427,6 +470,12 @@ func TestDecodeInvalid(t *testing.T) {
 		if !regexp.MustCompile(test.pattern).MatchString(err.Error()) {
 			t.Errorf("%q, pattern %q doesn't match %q", test.name, test.pattern, err)
 		}
+		if test.validate != nil {
+			err := test.validate(test.buf)
+			if !regexp.MustCompile(test.pattern).MatchString(err.Error()) {
+				t.Errorf("%q, pattern %q doesn't match %q", test.name, test.pattern, err)
+			}
+		}
 	}
 }
 
@@ -435,7 +484,7 @@ func TestDecodeInvalid(t *testing.T) {
 func testPeekLength(t *testing.T, encoded []byte) {
 	gLen := rand.Intn(10)
 	garbage := make([]byte, gLen)
-	_, _ = rand.Read(garbage)
+	_, _ = crypto_rand.Read(garbage)
 
 	var buf []byte
 	buf = append(buf, encoded...)
@@ -448,7 +497,7 @@ func testPeekLength(t *testing.T, encoded []byte) {
 	}
 }
 
-func TestEncodeDecodeBytes(t *testing.T) {
+func TestEncodeDecodeBytesAscending(t *testing.T) {
 	testCases := []struct {
 		value   []byte
 		encoded []byte
@@ -476,6 +525,16 @@ func TestEncodeDecodeBytes(t *testing.T) {
 					c.value, testCases[i-1].encoded, enc)
 			}
 		}
+		expSize := EncodeBytesSize(c.value)
+		if len(enc) != expSize {
+			t.Errorf("expected encoded size %d, got %d", expSize, len(enc))
+		}
+
+		if _, err := ValidateDecodeBytesAscending(enc); err != nil {
+			t.Error(err)
+			continue
+		}
+
 		remainder, dec, err := DecodeBytesAscending(enc, nil)
 		if err != nil {
 			t.Error(err)
@@ -491,13 +550,68 @@ func TestEncodeDecodeBytes(t *testing.T) {
 		testPeekLength(t, enc)
 
 		enc = append(enc, []byte("remainder")...)
-		remainder, _, err = DecodeBytesAscending(enc, nil)
-		if err != nil {
+
+		if remainder, err = ValidateDecodeBytesAscending(enc); err != nil {
 			t.Error(err)
 			continue
-		}
-		if string(remainder) != "remainder" {
+		} else if string(remainder) != "remainder" {
 			t.Errorf("unexpected remaining bytes: %v", remainder)
+		}
+		if remainder, _, err = DecodeBytesAscending(enc, nil); err != nil {
+			t.Error(err)
+			continue
+		} else if string(remainder) != "remainder" {
+			t.Errorf("unexpected remaining bytes: %v", remainder)
+		}
+	}
+}
+
+func TestEncodeNextBytesAscending_Equivalence(t *testing.T) {
+	for _, b := range [][]byte{
+		{0, 1, 'a'},
+		{0, 'a'},
+		{0, 0xff, 'a'},
+		{'a'},
+		{'b'},
+		{'b', 0},
+		{'b', 0, 0},
+		{'b', 0, 0, 'a'},
+		{'b', 0xff},
+		{'h', 'e', 'l', 'l', 'o'},
+	} {
+		next := append(b, 0x00)
+
+		gotSz := EncodeNextBytesSize(b)
+		wantSz := EncodeBytesSize(next)
+		if gotSz != wantSz {
+			t.Errorf("EncodeNextBytesSize(%q) = %d; want %d", b, gotSz, wantSz)
+		}
+		gotV := EncodeNextBytesAscending(nil, b)
+		wantV := EncodeBytesAscending(nil, next)
+		if !bytes.Equal(gotV, wantV) {
+			t.Errorf("EncodeNextBytesAscending(%q) = %q; want %q", b, gotV, wantV)
+		}
+	}
+}
+
+func TestEncodeNextBytesAscending_Equivalence_Randomized(t *testing.T) {
+	rnd, _ := randutil.NewTestRand()
+	var buf [10]byte
+	var nextBuf [10 + 1]byte
+	for i := 0; i < 1000; i++ {
+		b := buf[:randutil.RandIntInRange(rnd, 1, cap(buf))]
+		randutil.ReadTestdataBytes(rnd, b)
+		next := append(append(nextBuf[:0], b...), 0x00)
+
+		gotSz := EncodeNextBytesSize(b)
+		wantSz := EncodeBytesSize(next)
+		if gotSz != wantSz {
+			t.Errorf("EncodeNextBytesSize(%q) = %d; want %d", b, gotSz, wantSz)
+		}
+		gotV := EncodeNextBytesAscending(nil, b)
+		wantV := EncodeBytesAscending(nil, next)
+		if !bytes.Equal(gotV, wantV) {
+			t.Errorf("EncodeNextBytesAscending(%q) = %q; want %q", b, gotV, wantV)
 		}
 	}
 }
@@ -530,6 +644,11 @@ func TestEncodeDecodeBytesDescending(t *testing.T) {
 					c.value, testCases[i-1].encoded, enc)
 			}
 		}
+		expSize := EncodeBytesSize(c.value)
+		if len(enc) != expSize {
+			t.Errorf("expected encoded size %d, got %d", expSize, len(enc))
+		}
+
 		remainder, dec, err := DecodeBytesDescending(enc, nil)
 		if err != nil {
 			t.Error(err)
@@ -708,7 +827,7 @@ func TestEncodeBitArray(t *testing.T) {
 				0, 0xba}},
 		{bitarray.MakeZeroBitArray(62),
 			[]byte{0x3a,
-				0x88, //word 0
+				0x88, // word 0
 				0, 0xc6}},
 		{bitarray.Not(bitarray.MakeZeroBitArray(62)),
 			[]byte{0x3a,
@@ -838,8 +957,8 @@ func TestKeyEncodeDecodeBitArrayRand(t *testing.T) {
 				buf = EncodeBitArrayAscending(nil, test)
 				remainder, x, err = DecodeBitArrayAscending(buf)
 			} else {
-				buf = EncodeBitArrayAscending(nil, test)
-				remainder, x, err = DecodeBitArrayAscending(buf)
+				buf = EncodeBitArrayDescending(nil, test)
+				remainder, x, err = DecodeBitArrayDescending(buf)
 			}
 			if err != nil {
 				t.Fatalf("%+v", err)
@@ -874,7 +993,9 @@ func TestPrettyPrintValue(t *testing.T) {
 			dirStr = "Desc"
 		}
 		t.Run(test.exp[1:]+"/"+dirStr, func(t *testing.T) {
-			got := PrettyPrintValue([]Direction{test.dir}, test.key, "/")
+			var buf redact.StringBuilder
+			PrettyPrintValue(&buf, []Direction{test.dir}, test.key, "/")
+			got := buf.String()
 			if got != test.exp {
 				t.Errorf("expected %q, got %q", test.exp, got)
 			}
@@ -1428,6 +1549,84 @@ func TestEncodeDecodeDescending(t *testing.T) {
 	testCustomEncodeDuration(testCases, EncodeDurationDescending, DecodeDurationDescending, t)
 }
 
+func TestEncodeDecodeLTreeAscending(t *testing.T) {
+	testCases := []struct {
+		value  string
+		expEnc []byte
+	}{
+		{
+			value:  "",
+			expEnc: []byte{0x55, 0x00},
+		},
+		{
+			value:  "a",
+			expEnc: []byte{0x55, 0x61, 0x01, 0x00},
+		},
+		{
+			value:  "a.b.c",
+			expEnc: []byte{0x55, 0x61, 0x01, 0x62, 0x01, 0x63, 0x01, 0x00},
+		},
+		{
+			value:  "foo-bar.baz_bop",
+			expEnc: []byte{0x55, 0x66, 0x6f, 0x6f, 0x2d, 0x62, 0x61, 0x72, 0x01, 0x62, 0x61, 0x7a, 0x5f, 0x62, 0x6f, 0x70, 0x01, 0x00},
+		},
+	}
+	for i, tc := range testCases {
+		lt, err := ltree.ParseLTree(tc.value)
+		require.NoError(t, err)
+		enc := EncodeLTreeAscending(nil, lt)
+		if !bytes.Equal(enc, tc.expEnc) {
+			t.Errorf("%d expected [% x]; got [% x] (value: %s)", i, tc.expEnc, enc, tc.value)
+		}
+		_, decoded, err := DecodeLTreeAscending(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lt.Compare(decoded) != 0 {
+			t.Errorf("%d ltree changed during roundtrip [%s] vs [%s]", i, lt.String(), decoded.String())
+		}
+	}
+}
+
+func TestEncodeDecodeLTreeDescending(t *testing.T) {
+	testCases := []struct {
+		value  string
+		expEnc []byte
+	}{
+		{
+			value:  "",
+			expEnc: []byte{0x56, 0xff},
+		},
+		{
+			value:  "a",
+			expEnc: []byte{0x56, 0x9e, 0xfe, 0xff},
+		},
+		{
+			value:  "a.b.c",
+			expEnc: []byte{0x56, 0x9e, 0xfe, 0x9d, 0xfe, 0x9c, 0xfe, 0xff},
+		},
+		{
+			value:  "foo-bar.baz_bop",
+			expEnc: []byte{0x56, 0x99, 0x90, 0x90, 0xd2, 0x9d, 0x9e, 0x8d, 0xfe, 0x9d, 0x9e, 0x85, 0xa0, 0x9d, 0x90, 0x8f, 0xfe, 0xff},
+		},
+	}
+	for i, tc := range testCases {
+		lt, err := ltree.ParseLTree(tc.value)
+		require.NoError(t, err)
+		enc := EncodeLTreeDescending(nil, lt)
+		if !bytes.Equal(enc, tc.expEnc) {
+			t.Errorf("%d expected [% x]; got [% x] (value: %s)", i, tc.expEnc, enc, tc.value)
+		}
+		_, decoded, err := DecodeLTreeDescending(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lt.Compare(decoded) != 0 {
+			t.Errorf("%d ltree changed during roundtrip [%s] vs [%s]", i, lt.String(), decoded.String())
+		}
+	}
+}
+
 func TestPeekType(t *testing.T) {
 	encodedDurationAscending, err := EncodeDurationAscending(nil, duration.Duration{})
 	require.NoError(t, err)
@@ -1465,6 +1664,8 @@ func TestPeekType(t *testing.T) {
 		{encodedDurationDescending, Duration},
 		{EncodeBitArrayAscending(nil, bitarray.BitArray{}), BitArray},
 		{EncodeBitArrayDescending(nil, bitarray.BitArray{}), BitArrayDesc},
+		{EncodeLTreeAscending(nil, ltree.Empty), LTree},
+		{EncodeLTreeDescending(nil, ltree.Empty), LTreeDesc},
 	}
 	for i, c := range testCases {
 		typ := PeekType(c.enc)
@@ -1522,6 +1723,10 @@ func (rd randData) duration() duration.Duration {
 
 func (rd randData) ipAddr() ipaddr.IPAddr {
 	return ipaddr.RandIPAddr(rd.Rand)
+}
+
+func (rd randData) ltree() ltree.T {
+	return ltree.RandLTree(rd.Rand)
 }
 
 func BenchmarkEncodeUint32(b *testing.B) {
@@ -2050,6 +2255,25 @@ func TestValueEncodeDecodeDuration(t *testing.T) {
 	}
 }
 
+func TestValueEncodeDecodeLTree(t *testing.T) {
+	rng, seed := randutil.NewTestRand()
+	rd := randData{rng}
+	tests := make([]ltree.T, 1000)
+	for i := range tests {
+		tests[i] = rd.ltree()
+	}
+	for _, test := range tests {
+		buf := EncodeLTreeValue(nil, NoColumnID, test)
+		_, x, err := DecodeLTreeValue(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if x.Compare(test) != 0 {
+			t.Errorf("seed %d: expected %s got %s", seed, test.String(), x.String())
+		}
+	}
+}
+
 func BenchmarkEncodeNonsortingVarint(b *testing.B) {
 	bytes := make([]byte, 0, b.N*MaxNonsortingVarintLen)
 	rng, _ := randutil.NewTestRand()
@@ -2255,6 +2479,9 @@ func randValueEncode(rd randData, buf []byte, colID uint32, typ Type) ([]byte, i
 	case IPAddr:
 		x := rd.ipAddr()
 		return EncodeIPAddrValue(buf, colID, x), x, true
+	case LTree:
+		x := rd.ltree()
+		return EncodeLTreeValue(buf, colID, x), x, true
 	default:
 		return buf, nil, false
 	}
@@ -2410,6 +2637,8 @@ func TestValueEncodingRand(t *testing.T) {
 			buf, decoded, err = DecodeBitArrayValue(buf)
 		case IPAddr:
 			buf, decoded, err = DecodeIPAddrValue(buf)
+		case LTree:
+			buf, decoded, err = DecodeLTreeValue(buf)
 		default:
 			err = errors.Errorf("unknown type %s", typ)
 		}
@@ -2440,6 +2669,12 @@ func TestValueEncodingRand(t *testing.T) {
 			if bitarray.Compare(d, val) != 0 {
 				t.Fatalf("seed %d: %s got %v expected %v", seed, typ, decoded, value)
 			}
+		case LTree:
+			d := decoded.(ltree.T)
+			val := value.(ltree.T)
+			if d.Compare(val) != 0 {
+				t.Fatalf("seed %d: %s got %v expected %v", seed, typ, decoded, value)
+			}
 		default:
 			if decoded != value {
 				t.Fatalf("seed %d: %s got %v expected %v", seed, typ, decoded, value)
@@ -2448,53 +2683,38 @@ func TestValueEncodingRand(t *testing.T) {
 	}
 }
 
-func TestPrettyPrintValueEncoded(t *testing.T) {
-	uuidStr := "63616665-6630-3064-6465-616462656562"
-	u, err := uuid.FromString(uuidStr)
-	if err != nil {
-		t.Fatalf("Bad test case. Attempted uuid.FromString(%q) got err: %d", uuidStr, err)
-	}
-	ip := "192.168.0.1/10"
-	var ipAddr ipaddr.IPAddr
-	err = ipaddr.ParseINet(ip, &ipAddr)
-	if err != nil {
-		t.Fatalf("Bad test case. Attempted ipaddr.ParseINet(%q) got err: %d", ip, err)
-	}
-	ba := bitarray.MakeBitArrayFromInt64(6, 9, 5)
-	tests := []struct {
-		buf      []byte
-		expected string
+func TestUnsafeConvertStringToBytes(t *testing.T) {
+	// Large input runs slowly.
+	skip.UnderStress(t)
+
+	testCases := []struct {
+		desc           string
+		input          string
+		expectNil      bool
+		expectedLength int
 	}{
-		{EncodeNullValue(nil, NoColumnID), "NULL"},
-		{EncodeBoolValue(nil, NoColumnID, true), "true"},
-		{EncodeBoolValue(nil, NoColumnID, false), "false"},
-		{EncodeIntValue(nil, NoColumnID, 7), "7"},
-		{EncodeFloatValue(nil, NoColumnID, 6.28), "6.28"},
-		{EncodeDecimalValue(nil, NoColumnID, apd.New(628, -2)), "6.28"},
-		{EncodeTimeValue(nil, NoColumnID,
-			time.Date(2016, 6, 29, 16, 2, 50, 5, time.UTC)), "2016-06-29T16:02:50.000000005Z"},
-		{EncodeTimeTZValue(nil, NoColumnID,
-			timetz.MakeTimeTZ(timeofday.New(10, 11, 12, 0), 5*60*60+24)), "10:11:12-05:00:24"},
-		{EncodeDurationValue(nil, NoColumnID,
-			duration.DecodeDuration(1, 2, 3)), "1 mon 2 days 00:00:00+3ns"},
-		{EncodeBytesValue(nil, NoColumnID, []byte{0x1, 0x2, 0xF, 0xFF}), "0x01020fff"},
-		{EncodeBytesValue(nil, NoColumnID, []byte("foo")), "foo"}, // printable bytes
-		{EncodeBytesValue(nil, NoColumnID, []byte{0x89}), "0x89"}, // non-printable bytes
-		{EncodeIPAddrValue(nil, NoColumnID, ipAddr), ip},
-		{EncodeUUIDValue(nil, NoColumnID, u), uuidStr},
-		{EncodeBitArrayValue(nil, NoColumnID, ba), "B001001"},
+		{
+			desc:      "empty",
+			input:     "",
+			expectNil: true,
+		},
+		{
+			// Previous impl could not handle strings longer than math.MaxInt32.
+			// See https://github.com/cockroachdb/cockroach/issues/111626
+			desc:           "large input",
+			input:          string(make([]byte, math.MaxInt32+1)),
+			expectedLength: math.MaxInt32 + 1,
+		},
 	}
-	for i, test := range tests {
-		remaining, str, err := PrettyPrintValueEncoded(test.buf)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(remaining) != 0 {
-			t.Errorf("%d: expected all bytes to be consumed but was left with %s", i, remaining)
-		}
-		if str != test.expected {
-			t.Errorf("%d: got %q expected %q", i, str, test.expected)
-		}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			actual := UnsafeConvertStringToBytes(tc.input)
+			if tc.expectNil {
+				require.Nil(t, actual)
+			} else {
+				require.Equal(t, len(actual), tc.expectedLength)
+			}
+		})
 	}
 }
 

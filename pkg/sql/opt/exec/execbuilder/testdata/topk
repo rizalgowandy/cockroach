@@ -12,7 +12,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (k, v, w)
-│ ordering: +w
 │ estimated row count: 10 (missing stats)
 │ order: +w
 │ k: 10
@@ -36,6 +35,7 @@ vectorized: true
 │ estimated row count: 10 (missing stats)
 │ table: t@t_pkey
 │ key columns: k
+│ parallel
 │
 └── • scan
       columns: (k, v)
@@ -54,7 +54,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (k, v, w)
-│ ordering: -w
 │ estimated row count: 10 (missing stats)
 │ order: -w
 │ k: 10
@@ -74,11 +73,9 @@ vectorized: true
 ·
 • project
 │ columns: (k)
-│ estimated row count: 2 (missing stats)
 │
 └── • top-k
     │ columns: (k, w)
-    │ ordering: +w
     │ estimated row count: 2 (missing stats)
     │ order: +w
     │ k: 2
@@ -98,7 +95,6 @@ vectorized: true
 ·
 • top-k
 │ columns: (k, v, w)
-│ ordering: +w
 │ estimated row count: 10 (missing stats)
 │ order: +w
 │ k: 10
@@ -123,19 +119,21 @@ vectorized: true
 ·
 • top-k
 │ columns: (k, v, w)
-│ ordering: +v,+w
 │ estimated row count: 10 (missing stats)
 │ order: +v,+w
 │ k: 10
 │
 └── • index join
     │ columns: (k, v, w)
+    │ ordering: +v
     │ estimated row count: 1,000 (missing stats)
     │ table: t@t_pkey
     │ key columns: k
+    │ parallel
     │
     └── • scan
           columns: (k, v)
+          ordering: +v
           estimated row count: 1,000 (missing stats)
           table: t@v
-          spans: FULL SCAN
+          spans: FULL SCAN (SOFT LIMIT)

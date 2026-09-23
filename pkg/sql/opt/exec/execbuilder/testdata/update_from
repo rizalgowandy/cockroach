@@ -8,7 +8,6 @@ query T
 EXPLAIN UPDATE abc SET b = other.b + 1, c = other.c + 1 FROM abc AS other WHERE abc.a = other.a
 ----
 distribution: local
-vectorized: true
 ·
 • update
 │ table: abc
@@ -17,20 +16,13 @@ vectorized: true
 │
 └── • render
     │
-    └── • merge join
-        │ equality: (a) = (a)
-        │ left cols are key
-        │ right cols are key
-        │
-        ├── • scan
-        │     missing stats
-        │     table: abc@abc_pkey
-        │     spans: FULL SCAN
+    └── • render
         │
         └── • scan
               missing stats
               table: abc@abc_pkey
               spans: FULL SCAN
+              locking strength: for update
 
 # Update from another table.
 statement ok
@@ -40,7 +32,6 @@ query T
 EXPLAIN UPDATE abc SET b = other.b, c = other.c FROM new_abc AS other WHERE abc.a = other.a
 ----
 distribution: local
-vectorized: true
 ·
 • update
 │ table: abc
@@ -50,14 +41,10 @@ vectorized: true
 └── • distinct
     │ distinct on: a
     │
-    └── • hash join
+    └── • lookup join
+        │ table: abc@abc_pkey
         │ equality: (a) = (a)
-        │ left cols are key
-        │
-        ├── • scan
-        │     missing stats
-        │     table: abc@abc_pkey
-        │     spans: FULL SCAN
+        │ equality cols are key
         │
         └── • scan
               missing stats
@@ -77,7 +64,6 @@ RETURNING
   abc.a, abc.b AS new_b, old.b as old_b, abc.c as new_c, old.c as old_c
 ----
 distribution: local
-vectorized: true
 ·
 • update
 │ table: abc
@@ -86,20 +72,13 @@ vectorized: true
 │
 └── • render
     │
-    └── • merge join
-        │ equality: (a) = (a)
-        │ left cols are key
-        │ right cols are key
-        │
-        ├── • scan
-        │     missing stats
-        │     table: abc@abc_pkey
-        │     spans: FULL SCAN
+    └── • render
         │
         └── • scan
               missing stats
               table: abc@abc_pkey
               spans: FULL SCAN
+              locking strength: for update
 
 # Check if RETURNING * returns everything
 query T
@@ -117,7 +96,6 @@ vectorized: true
 │
 └── • render
     │ columns: (a, b, c, b_new, c_new, a, b, c)
-    │ estimated row count: 1,000 (missing stats)
     │ render b_new: b + 1
     │ render c_new: c + 2
     │ render a: a
@@ -127,34 +105,27 @@ vectorized: true
     │ render b: b
     │ render c: c
     │
-    └── • merge join (inner)
+    └── • render
         │ columns: (a, b, c, a, b, c)
-        │ estimated row count: 1,000 (missing stats)
-        │ equality: (a) = (a)
-        │ left cols are key
-        │ right cols are key
-        │ merge ordering: +"(a=a)"
-        │
-        ├── • scan
-        │     columns: (a, b, c)
-        │     ordering: +a
-        │     estimated row count: 1,000 (missing stats)
-        │     table: abc@abc_pkey
-        │     spans: FULL SCAN
+        │ render a: a
+        │ render b: b
+        │ render c: c
+        │ render a: a
+        │ render b: b
+        │ render c: c
         │
         └── • scan
               columns: (a, b, c)
-              ordering: +a
               estimated row count: 1,000 (missing stats)
               table: abc@abc_pkey
               spans: FULL SCAN
+              locking strength: for update
 
 # Update values of table from values expression
 query T
 EXPLAIN UPDATE abc SET b = other.b, c = other.c FROM (values (1, 2, 3), (2, 3, 4)) as other ("a", "b", "c") WHERE abc.a = other.a
 ----
 distribution: local
-vectorized: true
 ·
 • update
 │ table: abc
@@ -183,7 +154,6 @@ query T
 EXPLAIN UPDATE abc SET b = ab.b, c = ac.c FROM ab, ac WHERE abc.a = ab.a AND abc.a = ac.a
 ----
 distribution: local
-vectorized: true
 ·
 • update
 │ table: abc
@@ -201,14 +171,10 @@ vectorized: true
         │     table: ab@ab_pkey
         │     spans: FULL SCAN
         │
-        └── • hash join
+        └── • lookup join
+            │ table: abc@abc_pkey
             │ equality: (a) = (a)
-            │ left cols are key
-            │
-            ├── • scan
-            │     missing stats
-            │     table: abc@abc_pkey
-            │     spans: FULL SCAN
+            │ equality cols are key
             │
             └── • scan
                   missing stats
@@ -229,7 +195,6 @@ RETURNING
   *
 ----
 distribution: local
-vectorized: true
 ·
 • update
 │ table: abc
@@ -247,14 +212,10 @@ vectorized: true
         │     table: ab@ab_pkey
         │     spans: FULL SCAN
         │
-        └── • hash join
+        └── • lookup join
+            │ table: abc@abc_pkey
             │ equality: (a) = (a)
-            │ left cols are key
-            │
-            ├── • scan
-            │     missing stats
-            │     table: abc@abc_pkey
-            │     spans: FULL SCAN
+            │ equality cols are key
             │
             └── • scan
                   missing stats

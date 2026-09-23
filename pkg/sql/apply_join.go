@@ -1,26 +1,27 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // applyJoinNode implements apply join: the execution component of correlated
@@ -36,7 +37,11 @@ type applyJoinNode struct {
 	joinType descpb.JoinType
 
 	// The data source with no outer columns.
-	input planDataSource
+	singleInputPlanNode
+
+	// forwarder allows propagating the ProducerMetadata towards the
+	// DistSQLReceiver.
+	forwarder metadataForwarder
 
 	// pred represents the join predicate.
 	pred *joinPredicate
@@ -50,6 +55,10 @@ type applyJoinNode struct {
 	rightTypes []*types.T
 
 	planRightSideFn exec.ApplyJoinPlanRightSideFn
+	// iterationCount tracks the number of times planRightSideFn has been
+	// invoked (in other words, the number of left rows for which we have
+	// performed the apply join so far).
+	iterationCount int
 
 	run struct {
 		// emptyRight is a cached, all-NULL slice that's used for left outer joins
@@ -74,27 +83,27 @@ type applyJoinNode struct {
 
 func newApplyJoinNode(
 	joinType descpb.JoinType,
-	left planDataSource,
+	left planNode,
 	rightCols colinfo.ResultColumns,
 	pred *joinPredicate,
 	planRightSideFn exec.ApplyJoinPlanRightSideFn,
 ) (planNode, error) {
 	switch joinType {
 	case descpb.RightOuterJoin, descpb.FullOuterJoin:
-		return nil, errors.AssertionFailedf("unsupported right outer apply join: %d", log.Safe(joinType))
+		return nil, errors.AssertionFailedf("unsupported right outer apply join: %d", redact.Safe(joinType))
 	case descpb.ExceptAllJoin, descpb.IntersectAllJoin:
-		return nil, errors.AssertionFailedf("unsupported apply set op: %d", log.Safe(joinType))
+		return nil, errors.AssertionFailedf("unsupported apply set op: %d", redact.Safe(joinType))
 	case descpb.RightSemiJoin, descpb.RightAntiJoin:
-		return nil, errors.AssertionFailedf("unsupported right semi/anti apply join: %d", log.Safe(joinType))
+		return nil, errors.AssertionFailedf("unsupported right semi/anti apply join: %d", redact.Safe(joinType))
 	}
 
 	return &applyJoinNode{
-		joinType:        joinType,
-		input:           left,
-		pred:            pred,
-		rightTypes:      getTypesFromResultColumns(rightCols),
-		planRightSideFn: planRightSideFn,
-		columns:         pred.cols,
+		joinType:            joinType,
+		singleInputPlanNode: singleInputPlanNode{left},
+		pred:                pred,
+		rightTypes:          getTypesFromResultColumns(rightCols),
+		planRightSideFn:     planRightSideFn,
+		columns:             pred.cols,
 	}, nil
 }
 
@@ -108,7 +117,7 @@ func (a *applyJoinNode) startExec(params runParams) error {
 		}
 	}
 	a.run.out = make(tree.Datums, len(a.columns))
-	a.run.rightRows.Init(a.rightTypes, params.extendedEvalCtx, "apply-join" /* opName */)
+	a.run.rightRows.Init(params.ctx, a.rightTypes, params.extendedEvalCtx, "apply-join" /* opName */)
 	return nil
 }
 
@@ -132,7 +141,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 					break
 				}
 				// Compute join.
-				predMatched, err := a.pred.eval(params.EvalContext(), a.run.leftRow, rrow)
+				predMatched, err := a.pred.eval(params.ctx, params.EvalContext(), a.run.leftRow, rrow)
 				if err != nil {
 					return false, err
 				}
@@ -192,7 +201,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 		}
 
 		// We need a new row on the left.
-		ok, err := a.input.plan.Next(params)
+		ok, err := a.input.Next(params)
 		if err != nil {
 			return false, err
 		}
@@ -204,20 +213,15 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 
 		// Extract the values of the outer columns of the other side of the apply
 		// from the latest input row.
-		leftRow := a.input.plan.Values()
+		leftRow := a.input.Values()
 		a.run.leftRow = leftRow
+		a.iterationCount++
 
 		// At this point, it's time to do the major lift of apply join: re-planning
 		// the right side of the join using the optimizer, with all outer columns
 		// in the right side replaced by the bindings that were defined by the most
 		// recently read left row.
-		p, err := a.planRightSideFn(newExecFactory(params.p), leftRow)
-		if err != nil {
-			return false, err
-		}
-		plan := p.(*planComponents)
-
-		if err := a.runRightSidePlan(params, plan); err != nil {
+		if err := a.runNextRightSideIteration(params, leftRow); err != nil {
 			return false, err
 		}
 
@@ -227,7 +231,7 @@ func (a *applyJoinNode) Next(params runParams) (bool, error) {
 }
 
 // clearRightRows clears rightRows and resets rightRowsIterator. This function
-// must be called before reusing rightRows and rightRowIterator.
+// must be called before reusing rightRows and rightRowsIterator.
 func (a *applyJoinNode) clearRightRows(params runParams) error {
 	if err := a.run.rightRows.Clear(params.ctx); err != nil {
 		return err
@@ -237,86 +241,176 @@ func (a *applyJoinNode) clearRightRows(params runParams) error {
 	return nil
 }
 
-// runRightSidePlan runs a planTop that's been generated based on the
-// re-optimized right hand side of the apply join, stashing the result in
-// a.run.rightRows, ready for retrieval. An error indicates that something went
-// wrong during execution of the right hand side of the join, and that we should
-// completely give up on the outer join.
-func (a *applyJoinNode) runRightSidePlan(params runParams, plan *planComponents) error {
-	rowResultWriter := NewRowResultWriter(&a.run.rightRows)
-	if err := runPlanInsidePlan(params, plan, rowResultWriter); err != nil {
+// runNextRightSideIteration generates a planTop based on the re-optimized right
+// hand side of the apply join given the next left row and runs the plan to
+// completion, stashing the result in a.run.rightRows, ready for retrieval. An
+// error indicates that something went wrong during execution of the right hand
+// side of the join, and that we should completely give up on the outer join.
+func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree.Datums) error {
+	opName := "apply-join-iteration-" + strconv.Itoa(a.iterationCount)
+	ctx, sp := tracing.ChildSpan(params.ctx, opName)
+	defer sp.Finish()
+	p, err := a.planRightSideFn(ctx, newExecFactory(ctx, params.p), leftRow)
+	if err != nil {
 		return err
 	}
-	a.run.rightRowsIterator = newRowContainerIterator(params.ctx, a.run.rightRows, a.rightTypes)
+	plan := p.(*planComponents)
+	rowResultWriter := NewRowResultWriter(&a.run.rightRows)
+	queryStats, err := runPlanInsidePlan(
+		ctx, params, plan, rowResultWriter, nil /* deferredRoutineSender */, "", /* stmtForDistSQLDiagram */
+		nil, /* sqlStatsBuilder */
+	)
+	if err != nil {
+		return err
+	}
+	forwardInnerQueryStats(a.forwarder, queryStats)
+	a.run.rightRowsIterator = newRowContainerIterator(ctx, a.run.rightRows)
 	return nil
 }
 
 // runPlanInsidePlan is used to run a plan and gather the results in the
 // resultWriter, as part of the execution of an "outer" plan.
-func runPlanInsidePlan(params runParams, plan *planComponents, resultWriter rowResultWriter) error {
+func runPlanInsidePlan(
+	ctx context.Context,
+	params runParams,
+	plan *planComponents,
+	resultWriter rowResultWriter,
+	deferredRoutineSender eval.DeferredRoutineSender,
+	stmtForDistSQLDiagram string,
+	sqlStatsBuilder *sqlstats.RecordedStatementStatsBuilder,
+) (stats topLevelQueryStats, retErr error) {
+	defer plan.close(ctx)
+	execCfg := params.ExecCfg()
 	recv := MakeDistSQLReceiver(
-		params.ctx, resultWriter, tree.Rows,
-		params.ExecCfg().RangeDescriptorCache,
+		ctx, resultWriter, tree.Rows,
+		execCfg.RangeDescriptorCache,
 		params.p.Txn(),
-		params.ExecCfg().Clock,
+		execCfg.Clock,
 		params.p.extendedEvalCtx.Tracing,
-		params.p.ExecCfg().ContentionRegistry,
-		nil, /* testingPushCallback */
 	)
 	defer recv.Release()
 
+	plannerCopy := *params.p
+	plannerCopy.curPlan.planComponents = *plan
+	// "Pausable portal" execution model is only applicable to the outer
+	// statement since we actually need to execute all inner plans to completion
+	// before we can produce any "outer" rows to be returned to the client, so
+	// we make sure to unset pausablePortal field on the planner.
+	plannerCopy.pausablePortal = nil
+	// Avoid any possible metadata confusion by unsetting the
+	// routineMetadataForwarder (if there is a routine in the inner plan that
+	// needs it, then the plannerCopy will be updated during the inner plan
+	// setup).
+	plannerCopy.routineMetadataForwarder = nil
+
+	// planner object embeds the extended eval context, so we will modify that
+	// (which won't affect the outer planner's extended eval context), and we'll
+	// use it as the golden version going forward.
+	plannerCopy.extendedEvalCtx.Planner = &plannerCopy
+	plannerCopy.extendedEvalCtx.StreamManagerFactory = &plannerCopy
+	plannerCopy.extendedEvalCtx.RoutineSender = deferredRoutineSender
+	evalCtxFactory := plannerCopy.ExtendedEvalContextCopy
+
 	if len(plan.subqueryPlans) != 0 {
-		// We currently don't support cases when both the "inner" and the
-		// "outer" plans have subqueries due to limitations of how we're
-		// propagating the results of the subqueries.
-		if len(params.p.curPlan.subqueryPlans) != 0 {
-			return unimplemented.NewWithIssue(66447, `apply joins with subqueries in the "inner" and "outer" contexts are not supported`)
-		}
-		// Right now curPlan.subqueryPlans are the subqueries from the "outer"
-		// plan (and we know there are none given the check above). If parts of
-		// the "inner" plan refer to the subqueries, we know that they must
-		// refer to the "inner" subqueries. To allow for that to happen we have
-		// to manually replace the subqueries on the planner's curPlan and
-		// restore the original state before exiting.
-		oldSubqueries := params.p.curPlan.subqueryPlans
-		params.p.curPlan.subqueryPlans = plan.subqueryPlans
-		defer func() {
-			params.p.curPlan.subqueryPlans = oldSubqueries
-		}()
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
 		// return from this method (after the main query is executed).
-		subqueryResultMemAcc := params.p.EvalContext().Mon.MakeBoundAccount()
-		defer subqueryResultMemAcc.Close(params.ctx)
-		if !params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.PlanAndRunSubqueries(
-			params.ctx,
-			params.p,
-			params.extendedEvalCtx.copy,
+		subqueryResultMemAcc := params.p.ExecMon().MakeBoundAccount()
+		defer subqueryResultMemAcc.Close(ctx)
+		// Note that planAndRunSubquery updates recv.stats with top-level
+		// subquery stats.
+		if !execCfg.DistSQLPlanner.PlanAndRunSubqueries(
+			ctx,
+			&plannerCopy,
+			evalCtxFactory,
 			plan.subqueryPlans,
 			recv,
 			&subqueryResultMemAcc,
+			false, /* skipDistSQLDiagramGeneration */
+			params.p.innerPlansMustUseLeafTxn(),
 		) {
-			return resultWriter.Err()
+			return recv.stats, resultWriter.Err()
 		}
 	}
 
-	// Make a copy of the EvalContext so it can be safely modified.
-	evalCtx := params.p.ExtendedEvalContextCopy()
-	plannerCopy := *params.p
-	distributePlan := getPlanDistribution(
-		params.ctx, &plannerCopy, plannerCopy.execCfg.NodeID, plannerCopy.SessionData().DistSQLMode, plan.main,
-	)
-	planCtx := params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.NewPlanningCtx(
-		params.ctx, evalCtx, &plannerCopy, params.p.txn, distributePlan.WillDistribute(),
-	)
-	planCtx.planner.curPlan.planComponents = *plan
-	planCtx.ExtendedEvalCtx.Planner = &plannerCopy
+	distributePlan, blockers := plannerCopy.getPlanDistribution(ctx, plan.main, notPostquery)
+	distributeType := DistributionType(LocalDistribution)
+	if distributePlan.WillDistribute() {
+		distributeType = FullDistribution
+	}
+	evalCtx := evalCtxFactory()
+	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, &plannerCopy, plannerCopy.txn, distributeType)
+	planCtx.distSQLBlockers = blockers
 	planCtx.stmtType = recv.stmtType
+	if sqlStatsBuilder != nil && plannerCopy.instrumentation.ShouldSaveFlows() {
+		planCtx.collectExecStats = true
+		planCtx.saveFlows = getDefaultSaveFlowsFunc(ctx, &plannerCopy, planComponentTypeInner)
+		defer func() {
+			if ctx.Err() != nil {
+				// Skip populating ExecStats if we've been canceled.
+				return
+			}
+			sp := tracing.SpanFromContext(ctx)
+			recording := sp.GetRecording(tracingpb.RecordingStructured)
+			if recording.Len() == 0 {
+				return
+			}
 
-	params.p.extendedEvalCtx.ExecCfg.DistSQLPlanner.PlanAndRun(
-		params.ctx, evalCtx, planCtx, params.p.Txn(), plan.main, recv,
-	)()
-	return resultWriter.Err()
+			var flowsMetadata []*execstats.FlowsMetadata
+			for _, flowInfo := range plannerCopy.curPlan.distSQLFlowInfos {
+				flowsMetadata = append(flowsMetadata, flowInfo.flowsMetadata)
+			}
+			// TODO(yuzefovich): we might want to update
+			// queryLevelStats.MaxMemUsage with the exec mon's MaxMemUsage, but
+			// that would require having a separate exec monitor for the inner
+			// plan (currently plannerCopy.execMon is the same as used by the
+			// outer plan).
+			queryLevelStats, err := execstats.GetQueryLevelStats(recording, false /* deterministicExplainAnalyze */, flowsMetadata)
+			if err == nil {
+				sqlStatsBuilder.ExecStats(&queryLevelStats)
+			}
+		}()
+	}
+	if params.p.innerPlansMustUseLeafTxn() {
+		planCtx.flowConcurrency = distsql.ConcurrencyWithOuterPlan
+	}
+	planCtx.stmtForDistSQLDiagram = stmtForDistSQLDiagram
+
+	// Wrap PlanAndRun in a function call so that we clean up immediately.
+	func() {
+		finishedSetupFn, cleanup := getFinishedSetupFn(&plannerCopy)
+		defer cleanup()
+		execCfg.DistSQLPlanner.PlanAndRun(
+			ctx, evalCtx, planCtx, plannerCopy.Txn(), plan.main, recv, finishedSetupFn,
+		)
+	}()
+
+	// Check if there was an error interacting with the resultWriter.
+	if recv.commErr != nil {
+		return recv.stats, recv.commErr
+	}
+	if resultWriter.Err() != nil {
+		return recv.stats, resultWriter.Err()
+	}
+
+	plannerCopy.autoCommit = false
+	execCfg.DistSQLPlanner.PlanAndRunPostQueries(
+		ctx,
+		&plannerCopy,
+		func(usedConcurrently bool) *extendedEvalContext {
+			return evalCtxFactory()
+		},
+		&plannerCopy.curPlan.planComponents,
+		recv,
+	)
+	// We might have appended some cascades or checks to the plannerCopy, so we
+	// need to update the plan for cleanup purposes before proceeding.
+	*plan = plannerCopy.curPlan.planComponents
+	if recv.commErr != nil {
+		return recv.stats, recv.commErr
+	}
+
+	return recv.stats, resultWriter.Err()
 }
 
 func (a *applyJoinNode) Values() tree.Datums {
@@ -324,7 +418,7 @@ func (a *applyJoinNode) Values() tree.Datums {
 }
 
 func (a *applyJoinNode) Close(ctx context.Context) {
-	a.input.plan.Close(ctx)
+	a.input.Close(ctx)
 	a.run.rightRows.Close(ctx)
 	if a.run.rightRowsIterator != nil {
 		a.run.rightRowsIterator.Close()

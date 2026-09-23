@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package main
 
@@ -56,6 +51,19 @@ var boolAllowList = map[string]bool{
 	"all":               true,
 }
 
+var omitList = map[string][]string{
+	"Delete": {"Passthrough"},
+}
+
+func omitted(define, field string) bool {
+	for _, str := range omitList[define] {
+		if str == field {
+			return true
+		}
+	}
+	return false
+}
+
 func (g *execPlanGistGen) genPlanGistFactory() {
 	for _, define := range g.compiled.Defines {
 		g.w.write("\n")
@@ -73,6 +81,9 @@ func (g *execPlanGistGen) genPlanGistFactory() {
 			g.w.write("f.encodeDataSource(index.Table().ID(), index.Table().Name())\n")
 		}
 		for _, field := range define.Fields {
+			if omitted(string(define.Name), string(field.Name)) {
+				continue
+			}
 			// grab ids
 			var expr, encoder string
 			name := unTitle(string(field.Name))
@@ -121,7 +132,7 @@ func (g *execPlanGistGen) genPlanGistFactory() {
 
 func (g *execPlanGistGen) genPlanGistDecoder() {
 	g.w.write("\n")
-	g.w.nest("func (f *PlanGistFactory) decodeOperatorBody(op execOperator) (*Node, error) {\n")
+	g.w.nest("func (d *planGistDecoder) decodeOperatorBody(op execOperator) (*Node, error) {\n")
 	g.w.writeIndent("var _n *Node\n")
 	g.w.writeIndent("var reqOrdering exec.OutputOrdering\n")
 	g.w.writeIndent("var err error\n")
@@ -133,9 +144,12 @@ func (g *execPlanGistGen) genPlanGistDecoder() {
 		g.w.nestIndent("var args %sArgs\n", unTitle(string(define.Name)))
 		// table is implicit
 		if strings.HasPrefix(string(define.Name), "AlterTable") {
-			g.w.writeIndent("tbl := f.decodeTable()\n")
+			g.w.writeIndent("tbl := d.decodeTable()\n")
 		}
 		for f, field := range define.Fields {
+			if omitted(string(define.Name), string(field.Name)) {
+				continue
+			}
 			// grab ids
 			var argName, decoder, decoderArg, store string
 			name := unTitle(string(field.Name))
@@ -170,7 +184,7 @@ func (g *execPlanGistGen) genPlanGistDecoder() {
 			}
 
 			if len(decoder) > 0 {
-				g.w.writeIndent("args.%s = f.%s(%s)\n", argName, decoder, decoderArg)
+				g.w.writeIndent("args.%s = d.%s(%s)\n", argName, decoder, decoderArg)
 			}
 			if len(store) > 0 {
 				g.w.writeIndent("%s = args.%s\n", store, argName)
@@ -184,7 +198,7 @@ func (g *execPlanGistGen) genPlanGistDecoder() {
 
 		for i := len(childrenNames) - 1; i >= 0; i-- {
 			childrenNames[i] = "args." + childrenNames[i]
-			g.w.writeIndent("%s = f.popChild()\n", childrenNames[i])
+			g.w.writeIndent("%s = d.popChild()\n", childrenNames[i])
 		}
 
 		g.w.writeIndent("_n, err = newNode(op, &args, reqOrdering, %s)\n", strings.Join(childrenNames, ","))

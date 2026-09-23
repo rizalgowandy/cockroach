@@ -1,31 +1,28 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package indexrec
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
+	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/errors"
 )
 
 // hypotheticalIndex is a dummy implementation of cat.Index, used with
-// hypotheticalTable for index recommendations.
+// HypotheticalTable for index recommendations.
 type hypotheticalIndex struct {
-	tab  *hypotheticalTable
+	tab  *HypotheticalTable
 	name tree.Name
 
 	// cols stores the index columns, in order.
@@ -35,38 +32,73 @@ type hypotheticalIndex struct {
 	indexOrdinal int
 
 	// zone stores the table's zone.
-	zone *zonepb.ZoneConfig
+	zone cat.Zone
 
 	// suffixKeyColsOrdList contains all implicit column ordinals. Implicit
 	// columns are columns that are in the table's primary key but are not already
 	// in the index columns.
-	suffixKeyColsOrdList []int
+	suffixKeyCols []cat.IndexColumn
+
+	// storedCols contains all the table's column ordinals that are not key
+	// columns (neither index columns nor suffix key columns).
+	storedCols []cat.IndexColumn
+
+	// typ indicates the type of the index - forward, inverted, or vector.
+	typ idxtype.T
+
+	// vectorConfig stores the vector index configuration, including the distance
+	// metric. Only set for vector indexes.
+	vectorConfig *vecpb.Config
 }
 
 var _ cat.Index = &hypotheticalIndex{}
 
 func (hi *hypotheticalIndex) init(
-	tab *hypotheticalTable,
+	tab *HypotheticalTable,
 	name tree.Name,
 	cols []cat.IndexColumn,
 	indexOrd int,
-	zone *zonepb.ZoneConfig,
+	typ idxtype.T,
+	zone cat.Zone,
+	vecConfig *vecpb.Config,
 ) {
+	if typ == idxtype.VECTOR && vecConfig == nil {
+		panic(errors.AssertionFailedf("vector index requires non-nil vecConfig"))
+	}
+
 	hi.tab = tab
 	hi.name = name
 	hi.cols = cols
 	hi.indexOrdinal = indexOrd
+	hi.typ = typ
 	hi.zone = zone
+	hi.vectorConfig = vecConfig
 
 	// Build an index column ordinal set.
-	var colsOrdSet util.FastIntSet
+	var colsOrdSet intsets.Fast
 	for _, col := range hi.cols {
 		colsOrdSet.Add(col.Ordinal())
 	}
 
 	// Build the suffix key column list.
-	suffixKeyColsSet := hi.tab.primaryKeyColsOrdSet.Difference(colsOrdSet)
-	hi.suffixKeyColsOrdList = suffixKeyColsSet.Ordered()
+	pkColOrds := hi.tab.primaryKeyColsOrdSet
+	hi.suffixKeyCols = make([]cat.IndexColumn, 0, pkColOrds.Len())
+	for i, ok := pkColOrds.Next(0); ok; i, ok = pkColOrds.Next(i + 1) {
+		if !colsOrdSet.Contains(i) {
+			hi.suffixKeyCols = append(hi.suffixKeyCols, cat.IndexColumn{Column: hi.tab.Column(i)})
+		}
+	}
+
+	// Build the stored cols for forward indexes only.
+	if typ.SupportsStoring() {
+		keyColsOrds := colsOrdSet.Union(pkColOrds)
+		hi.storedCols = make([]cat.IndexColumn, 0, tab.ColumnCount())
+		for i, n := 0, tab.ColumnCount(); i < n; i++ {
+			if !keyColsOrds.Contains(i) {
+				hi.storedCols = append(hi.storedCols, cat.IndexColumn{Column: hi.tab.Column(i)})
+			}
+		}
+	}
 }
 
 // ID is part of the cat.Index interface.
@@ -86,18 +118,21 @@ func (hi *hypotheticalIndex) IsUnique() bool {
 	return false
 }
 
-// IsInverted is part of the cat.Index interface.
-func (hi *hypotheticalIndex) IsInverted() bool {
-	// Hypothetical indexes are not inverted.
-	// TODO(nehageorge): Add support for inverted index recommendations.
-	return false
+// Type is part of the cat.Index interface.
+func (hi *hypotheticalIndex) Type() idxtype.T {
+	return hi.typ
+}
+
+// GetInvisibility is part of the cat.Index interface.
+func (hi *hypotheticalIndex) GetInvisibility() float64 {
+	// A hypotheticalIndex should not be invisible because there is no motivation
+	// to recommend a not visible index.
+	return 0.0
 }
 
 // ColumnCount is part of the cat.Index interface.
 func (hi *hypotheticalIndex) ColumnCount() int {
-	// For now, this is the same as the KeyColumnCount, because there are no
-	// stored columns.
-	return len(hi.cols) + len(hi.suffixKeyColsOrdList)
+	return len(hi.cols) + len(hi.suffixKeyCols) + len(hi.storedCols)
 }
 
 // ExplicitColumnCount is part of the cat.Index interface.
@@ -110,7 +145,7 @@ func (hi *hypotheticalIndex) KeyColumnCount() int {
 	// Since hypothetical indexes are not unique, we build a key by including all
 	// the index key columns and then appending any primary key columns that are
 	// not already included.
-	return len(hi.cols) + len(hi.suffixKeyColsOrdList)
+	return len(hi.cols) + len(hi.suffixKeyCols)
 }
 
 // LaxKeyColumnCount is part of the cat.Index interface.
@@ -120,25 +155,43 @@ func (hi *hypotheticalIndex) LaxKeyColumnCount() int {
 	return hi.KeyColumnCount()
 }
 
-// NonInvertedPrefixColumnCount is part of the cat.Index interface.
-func (hi *hypotheticalIndex) NonInvertedPrefixColumnCount() int {
-	panic(errors.AssertionFailedf("hypothetical indexes are not inverted"))
+// PrefixColumnCount is part of the cat.Index interface.
+func (hi *hypotheticalIndex) PrefixColumnCount() int {
+	if !hi.Type().AllowsPrefixColumns() {
+		panic(errors.AssertionFailedf("only inverted and vector indexes have prefix columns"))
+	}
+	return len(hi.cols) - 1
 }
 
 // Column is part of the cat.Index interface.
 func (hi *hypotheticalIndex) Column(i int) cat.IndexColumn {
-	if i >= len(hi.cols) {
-		// The column is an added suffix primary key column. Construct the
-		// corresponding cat.Column.
-		suffixColOrd := hi.suffixKeyColsOrdList[i-len(hi.cols)]
-		return cat.IndexColumn{Column: hi.tab.Column(suffixColOrd)}
+	if i < len(hi.cols) {
+		// The column is an index column.
+		return hi.cols[i]
 	}
-	return hi.cols[i]
+	numKeyCols := len(hi.cols) + len(hi.suffixKeyCols)
+	if i < numKeyCols {
+		// The column is an implicit key column.
+		return hi.suffixKeyCols[i-len(hi.cols)]
+	}
+	// The column is a stored column.
+	return hi.storedCols[i-numKeyCols]
 }
 
 // InvertedColumn is part of the cat.Index interface.
 func (hi *hypotheticalIndex) InvertedColumn() cat.IndexColumn {
-	panic(errors.AssertionFailedf("hypothetical indexes are not inverted"))
+	if hi.Type() != idxtype.INVERTED {
+		panic(errors.AssertionFailedf("non-inverted indexes do not have inverted columns"))
+	}
+	return hi.cols[len(hi.cols)-1]
+}
+
+// VectorColumn is part of the cat.Index interface.
+func (hi *hypotheticalIndex) VectorColumn() cat.IndexColumn {
+	if hi.Type() != idxtype.VECTOR {
+		panic(errors.AssertionFailedf("non-vector indexes do not have vector columns"))
+	}
+	return hi.cols[len(hi.cols)-1]
 }
 
 // Predicate is part of the cat.Index interface.
@@ -162,8 +215,13 @@ func (hi *hypotheticalIndex) Table() cat.Table {
 }
 
 // Ordinal is part of the cat.Index interface.
-func (hi *hypotheticalIndex) Ordinal() int {
+func (hi *hypotheticalIndex) Ordinal() cat.IndexOrdinal {
 	return hi.indexOrdinal
+}
+
+// ImplicitColumnCount is part of the cat.Index interface.
+func (hi *hypotheticalIndex) ImplicitColumnCount() int {
+	return 0
 }
 
 // ImplicitPartitioningColumnCount is part of the cat.Index interface.
@@ -172,15 +230,30 @@ func (hi *hypotheticalIndex) ImplicitPartitioningColumnCount() int {
 }
 
 // GeoConfig is part of the cat.Index interface.
-func (hi *hypotheticalIndex) GeoConfig() *geoindex.Config {
-	return nil
+func (hi *hypotheticalIndex) GeoConfig() geopb.Config {
+	if hi.Type() == idxtype.INVERTED {
+		srcCol := hi.tab.Column(hi.InvertedColumn().InvertedSourceColumnOrdinal())
+		switch srcCol.DatumType().Family() {
+		case types.GeometryFamily:
+			return *geoindex.DefaultGeometryIndexConfig()
+		case types.GeographyFamily:
+			return *geoindex.DefaultGeographyIndexConfig()
+		}
+	}
+	return geopb.Config{}
+}
+
+// VecConfig is part of the cat.Index interface.
+func (hi *hypotheticalIndex) VecConfig() *vecpb.Config {
+	if hi.Type() != idxtype.VECTOR {
+		return nil
+	}
+	return hi.vectorConfig
 }
 
 // Version is part of the cat.Index interface.
 func (hi *hypotheticalIndex) Version() descpb.IndexDescriptorVersion {
-	// Return the latest version for non-primary indexes, since hypothetical
-	// indexes are not primary indexes.
-	return tabledesc.LatestNonPrimaryIndexDescriptorVersion
+	return descpb.LatestIndexDescriptorVersion
 }
 
 // PartitionCount is part of the cat.Index interface.
@@ -191,4 +264,61 @@ func (hi *hypotheticalIndex) PartitionCount() int {
 // Partition is part of the cat.Index interface.
 func (hi *hypotheticalIndex) Partition(i int) cat.Partition {
 	return nil
+}
+
+// IsTemporaryIndexForBackfill is part of the cat.Index interface.
+func (hi *hypotheticalIndex) IsTemporaryIndexForBackfill() bool {
+	return false
+}
+
+// isVecConfigCompatible returns true if the existing index has the same vector
+// configuration as the hypothetical index. For non-vector hypothetical indexes
+// this always returns true. For vector hypothetical indexes, the existing index
+// must also be a vector index with the same distance metric (e.g., an L2 index
+// is not interchangeable with a cosine index on the same column).
+func (hi *hypotheticalIndex) isVecConfigCompatible(existingIndex cat.Index) bool {
+	if hi.typ != idxtype.VECTOR || hi.vectorConfig == nil {
+		return true
+	}
+	return existingIndex.Type() == idxtype.VECTOR &&
+		existingIndex.VecConfig().DistanceMetric == hi.vectorConfig.DistanceMetric
+}
+
+// hasSameExplicitCols checks whether the given existing index has identical
+// explicit columns as the hypothetical index. To be identical, they need to
+// have the exact same list, length, and order. If the index is inverted, it
+// also checks to make sure that the inverted column has the same source column.
+// If so, it returns true.
+func (hi *hypotheticalIndex) hasSameExplicitCols(existingIndex cat.Index) bool {
+	indexCols := hi.cols
+	if existingIndex.ExplicitColumnCount() != len(indexCols) {
+		return false
+	}
+	return hi.hasPrefixOfExplicitCols(existingIndex)
+}
+
+// hasPrefixOfExplicitCols returns true if the explicit columns in the
+// hypothetical index are a prefix of the explicit columns in the given existing
+// index.
+func (hi *hypotheticalIndex) hasPrefixOfExplicitCols(existingIndex cat.Index) bool {
+	indexCols := hi.cols
+	if existingIndex.ExplicitColumnCount() < len(indexCols) {
+		return false
+	}
+	for j, m := 0, len(indexCols); j < m; j++ {
+		// Compare every existingIndex columns with indexCols.
+		existingIndexCol := existingIndex.Column(j)
+		indexCol := indexCols[j]
+
+		if indexCol.Kind() == cat.Inverted && existingIndexCol.Kind() == cat.Inverted {
+			// If the columns are inverted, compare their source columns.
+			if existingIndexCol.InvertedSourceColumnOrdinal() != indexCol.InvertedSourceColumnOrdinal() {
+				return false
+			}
+		} else if existingIndexCol != indexCol {
+			// Otherwise, compare every column directly.
+			return false
+		}
+	}
+	return true
 }

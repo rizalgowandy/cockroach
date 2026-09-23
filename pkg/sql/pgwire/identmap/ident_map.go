@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package identmap contains the code for parsing a pg_ident.conf file,
 // which allows a database operator to create some number of mappings
@@ -22,7 +17,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
 )
@@ -34,10 +29,10 @@ import (
 // The Conf supports being initialized from a file format that
 // is compatible with Postgres's pg_ident.conf file:
 //
-//   # Comments
-//   map-name system-identity    database-username
-//   # Convert "carl@example.com" ==> "example-carl"
-//   map-name /^(.*)@example.com$  example-\1
+//	# Comments
+//	map-name system-identity    database-username
+//	# Convert "carl@example.com" ==> "example-carl"
+//	map-name /^(.*)@example.com$  example-\1
 //
 // If the system-identity field starts with a slash, it will be
 // interpreted as a regular expression. The system-identity expression
@@ -90,9 +85,12 @@ func From(r io.Reader) (*Conf, error) {
 		var sysPattern *regexp.Regexp
 		var err error
 		if sysName := parts[2]; sysName[0] == '/' {
-			sysPattern, err = regexp.Compile(sysName[1:])
+			// Use case-insensitive matching since system identities (e.g., certificate CNs)
+			// are normalized to lowercase before being passed to the user map.
+			sysPattern, err = regexp.Compile("(?i)" + sysName[1:])
 		} else {
-			sysPattern, err = regexp.Compile("^" + regexp.QuoteMeta(sysName) + "$")
+			// Use case-insensitive matching for literal patterns as well.
+			sysPattern, err = regexp.Compile("(?i)^" + regexp.QuoteMeta(sysName) + "$")
 		}
 		if err != nil {
 			return nil, errors.Wrapf(err, "unable to parse line %d", lineNo)
@@ -125,7 +123,7 @@ func From(r io.Reader) (*Conf, error) {
 
 // Empty returns true if no mappings have been defined.
 func (c *Conf) Empty() bool {
-	return c.data == nil || len(c.data) == 0
+	return len(c.data) == 0
 }
 
 // Map returns the database usernames that a system identity maps to
@@ -135,30 +133,90 @@ func (c *Conf) Empty() bool {
 // are rules which generate identical mappings, only the first one will
 // be returned. That is, the returned list will be deduplicated,
 // preferring the first instance of any given username.
-func (c *Conf) Map(mapName, systemIdentity string) ([]security.SQLUsername, error) {
+// A boolean will be returned which indicates if there are any rows that
+// correspond to the given mapName.
+func (c *Conf) Map(mapName, systemIdentity string) ([]username.SQLUsername, bool, error) {
 	if c.data == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	elts := c.data[mapName]
 	if elts == nil {
-		return nil, nil
+		return nil, false, nil
 	}
-	var names []security.SQLUsername
+	var names []username.SQLUsername
 	seen := make(map[string]bool)
 	for _, elt := range elts {
-		if n := elt.substitute(systemIdentity); n != "" && !seen[n] {
+		if n := elt.substitute(systemIdentity); n != "" {
 			// We're returning this as a for-validation username since a
 			// pattern-based mapping could still result in invalid characters
 			// being incorporated into the input.
-			u, err := security.MakeSQLUsernameFromUserInput(n, security.UsernameValidation)
+			u, err := username.MakeSQLUsernameFromUserInput(n, username.PurposeValidation)
 			if err != nil {
-				return nil, err
+				return nil, true, err
 			}
-			names = append(names, u)
-			seen[n] = true
+			normalized := u.Normalized()
+			if !seen[normalized] {
+				names = append(names, u)
+				seen[normalized] = true
+			}
 		}
 	}
-	return names, nil
+	return names, true, nil
+}
+
+// IdentityMapping represents a system identity mapped to a database user
+type IdentityMapping struct {
+	SystemIdentity string               // The external identity (e.g., "SAN:DNS:example.com")
+	MappedUser     username.SQLUsername // The database user it maps to
+}
+
+// MapMultiple maps multiple system identities (e.g., multiple SANs) to database users.
+// It returns the association between each identity and its mapped user(s).
+// This allows callers to determine which specific identity was successfully mapped.
+// The mapping is done in order of the system identities provided, if there are rules
+// which generate identical mappings, only the first one will be returned,
+// the returned list will be deduplicated, preferring the first instance.
+// A boolean will be returned which indicates if there are any rows that
+// correspond to the given mapName.
+// The function implementation is very similar to Map,
+// primarily implemented for SAN but will slowly transition
+// to replace the Map function itself.
+func (c *Conf) MapMultiple(
+	mapName string, systemIdentities []string,
+) ([]IdentityMapping, bool, error) {
+	if c.data == nil {
+		return nil, false, nil
+	}
+	elts := c.data[mapName]
+	if elts == nil {
+		return nil, false, nil
+	}
+
+	var mappings []IdentityMapping
+	seen := make(map[string]bool)
+
+	for _, sysID := range systemIdentities {
+		for _, elt := range elts {
+			if n := elt.substitute(sysID); n != "" {
+				// We're returning this as a for-validation username since a
+				// pattern-based mapping could still result in invalid characters
+				// being incorporated into the input.
+				u, err := username.MakeSQLUsernameFromUserInput(n, username.PurposeValidation)
+				if err != nil {
+					return nil, true, err
+				}
+				normalized := u.Normalized()
+				if !seen[normalized] {
+					mappings = append(mappings, IdentityMapping{
+						SystemIdentity: sysID,
+						MappedUser:     u,
+					})
+					seen[normalized] = true
+				}
+			}
+		}
+	}
+	return mappings, true, nil
 }
 
 func (c *Conf) String() string {

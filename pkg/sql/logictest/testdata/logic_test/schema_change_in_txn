@@ -1,11 +1,17 @@
-# Disable automatic stats to avoid flakiness (sometimes causes retry errors).
-statement ok
-SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false
-
-
+# LogicTest: default-configs 3node-tenant !local-prepared
 # Skip the rest of the test if a retry occurs. They can happen and are fine
 # but there's no way to encapsulate that in logictests.
 skip_on_retry
+
+# This test file is focused specifically on testing schema changes in
+# transactions, so we disable autocommit behavior.
+statement ok
+SET autocommit_before_ddl = false
+
+# Also disable schema locked by default for these tests, since only
+# declarative can auto unset it.
+statement ok
+SET create_table_with_schema_locked = 'off';
 
 subtest create_and_add_fk_in_same_txn
 
@@ -34,8 +40,9 @@ COMMIT
 # constraint in the same transaction as CREATE TABLE.
 # TODO (lucy): Add a job to validate the table in this situation.
 query TTTTB
-SHOW CONSTRAINTS FROM test.child
+SELECT * FROM [SHOW CONSTRAINTS FROM test.child] ORDER BY constraint_name
 ----
+child  child_id_not_null   NOT NULL     NOT NULL                                                 true
 child  child_pkey          PRIMARY KEY  PRIMARY KEY (id ASC)                                     true
 child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID  false
 
@@ -43,8 +50,9 @@ statement ok
 ALTER TABLE test.child VALIDATE CONSTRAINT fk_child_parent_id
 
 query TTTTB
-SHOW CONSTRAINTS FROM test.child
+SELECT * FROM [SHOW CONSTRAINTS FROM test.child] ORDER BY constraint_name
 ----
+child  child_id_not_null   NOT NULL     NOT NULL                                       true
 child  child_pkey          PRIMARY KEY  PRIMARY KEY (id ASC)                           true
 child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES parent(id)  true
 
@@ -76,8 +84,9 @@ COMMIT
 
 # Verify that the constraint is validated.
 query TTTTB
-SHOW CONSTRAINTS FROM test.child
+SELECT * FROM [SHOW CONSTRAINTS FROM test.child] ORDER BY constraint_name
 ----
+child  child_id_not_null   NOT NULL     NOT NULL                                       true
 child  child_pkey          PRIMARY KEY  PRIMARY KEY (id ASC)                           true
 child  fk_child_parent_id  FOREIGN KEY  FOREIGN KEY (parent_id) REFERENCES parent(id)  true
 
@@ -262,7 +271,7 @@ subtest create_reference_to_create_outside_txn_17949
 statement ok
 BEGIN
 
-statement ok
+statement disable-cf-mutator ok
 CREATE TABLE b (parent_id INT REFERENCES parent(id));
 
 # schema changes are permitted on the table even though it's in the ADD state.
@@ -276,15 +285,14 @@ query TT
 SHOW CREATE TABLE b
 ----
 b  CREATE TABLE public.b (
-   parent_id INT8 NULL,
-   rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
-   d INT8 NULL DEFAULT 23:::INT8,
-   CONSTRAINT b_pkey PRIMARY KEY (rowid ASC),
-   CONSTRAINT b_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id),
-   INDEX foo (parent_id ASC),
-   UNIQUE INDEX bar (parent_id ASC),
-   FAMILY "primary" (parent_id, rowid, d)
-)
+     parent_id INT8 NULL,
+     rowid INT8 NOT VISIBLE NOT NULL DEFAULT unique_rowid(),
+     d INT8 NULL DEFAULT 23:::INT8,
+     CONSTRAINT b_pkey PRIMARY KEY (rowid ASC),
+     CONSTRAINT b_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.parent(id),
+     INDEX foo (parent_id ASC),
+     UNIQUE INDEX bar (parent_id ASC)
+   );
 
 # table b is not visible to the transaction #17949
 statement error pgcode 55000 table "b" is being added
@@ -689,6 +697,8 @@ subtest rollback_mutations
 statement ok
 INSERT INTO customers (k) VALUES ('z'), ('x')
 
+skip_on_retry
+
 statement ok
 BEGIN
 
@@ -722,6 +732,12 @@ CREATE UNIQUE INDEX i_idx ON customers (i)
 statement ok
 CREATE UNIQUE INDEX n_idx ON customers (n)
 
+# Validate that pending jobs show within a transactions before its committed.
+query TT
+SELECT status, job_type FROM crdb_internal.jobs WHERE status='pending'
+----
+pending    SCHEMA CHANGE
+
 statement error pgcode XXA00 violates unique constraint
 COMMIT
 
@@ -735,17 +751,17 @@ SELECT * FROM customers@j_idx
 
 query TT
 SELECT status,
-       regexp_replace(description, 'ROLL BACK JOB \d+.*', 'ROLL BACK JOB') as description
+       regexp_replace(description, 'ROLL BACK JOB \d+.*', 'ROLL BACK JOB') as desc
   FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE' ORDER BY job_id DESC LIMIT 1
 ----
-failed  ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT 5; ALTER TABLE test.public.customers ADD COLUMN j INT8 DEFAULT 4; ALTER TABLE test.public.customers ADD COLUMN l INT8 DEFAULT 3; ALTER TABLE test.public.customers ADD COLUMN m CHAR; ALTER TABLE test.public.customers ADD COLUMN n CHAR DEFAULT 'a'; CREATE INDEX j_idx ON test.public.customers (j); CREATE INDEX l_idx ON test.public.customers (l); CREATE INDEX m_idx ON test.public.customers (m); CREATE UNIQUE INDEX i_idx ON test.public.customers (i); CREATE UNIQUE INDEX n_idx ON test.public.customers (n)
+failed  ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT … ers (n)
 
-query TT
-SELECT status,
-       regexp_replace(description, 'ROLL BACK JOB \d+.*', 'ROLL BACK JOB') as description
-  FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' ORDER BY job_id DESC LIMIT 1
+query BT
+SELECT status ~ '(running)|(succeeded)',
+       regexp_replace(description, 'ROLL BACK JOB \d+.*', 'ROLL BACK JOB') as descr
+  FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' AND description LIKE 'GC for ROLL%' ORDER BY job_id DESC LIMIT 1
 ----
-running  GC for ROLLBACK of ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT 5; ALTER TABLE test.public.customers ADD COLUMN j INT8 DEFAULT 4; ALTER TABLE test.public.customers ADD COLUMN l INT8 DEFAULT 3; ALTER TABLE test.public.customers ADD COLUMN m CHAR; ALTER TABLE test.public.customers ADD COLUMN n CHAR DEFAULT 'a'; CREATE INDEX j_idx ON test.public.customers (j); CREATE INDEX l_idx ON test.public.customers (l); CREATE INDEX m_idx ON test.public.customers (m); CREATE UNIQUE INDEX i_idx ON test.public.customers (i); CREATE UNIQUE INDEX n_idx ON test.public.customers (n)
+true  GC for ROLLBACK of ALTER TABLE test.public.customers ADD CO … ers (n)
 
 subtest add_multiple_computed_elements
 
@@ -775,7 +791,7 @@ query TT
 SELECT status, description FROM [SHOW JOBS]
 WHERE job_type = 'SCHEMA CHANGE' ORDER BY job_id DESC LIMIT 1
 ----
-succeeded  ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT 5; ALTER TABLE test.public.customers ADD COLUMN j INT8 AS (i - 1) STORED; ALTER TABLE test.public.customers ADD COLUMN d INT8 DEFAULT 15, ADD COLUMN e INT8 AS (d + (i - 1)) STORED
+succeeded  ALTER TABLE test.public.customers ADD COLUMN i INT8 DEFAULT …  STORED
 
 # VALIDATE CONSTRAINT will not hang when executed in the same txn as
 # a schema change in the same txn #32118
@@ -911,11 +927,12 @@ statement ok
 COMMIT
 
 query TTTTB
-SHOW CONSTRAINTS FROM check_table
+SELECT * FROM [SHOW CONSTRAINTS FROM check_table] ORDER BY constraint_name
 ----
-check_table  c_0               CHECK        CHECK ((c > 0)) NOT VALID  false
-check_table  check_table_pkey  PRIMARY KEY  PRIMARY KEY (k ASC)        true
-check_table  d_0               CHECK        CHECK ((d > 0))            true
+check_table  c_0                     CHECK        CHECK ((c > 0)) NOT VALID  false
+check_table  check_table_k_not_null  NOT NULL     NOT NULL                   true
+check_table  check_table_pkey        PRIMARY KEY  PRIMARY KEY (k ASC)        true
+check_table  d_0                     CHECK        CHECK ((d > 0))            true
 
 statement ok
 BEGIN
@@ -944,19 +961,20 @@ COMMIT
 
 # Constraint e_0 was not added
 query TTTTB
-SHOW CONSTRAINTS FROM check_table
+SELECT * FROM [SHOW CONSTRAINTS FROM check_table] ORDER BY constraint_name
 ----
-check_table  c_0               CHECK        CHECK ((c > 0)) NOT VALID  false
-check_table  check_table_pkey  PRIMARY KEY  PRIMARY KEY (k ASC)        true
-check_table  d_0               CHECK        CHECK ((d > 0))            true
+check_table  c_0                     CHECK        CHECK ((c > 0)) NOT VALID  false
+check_table  check_table_k_not_null  NOT NULL     NOT NULL                   true
+check_table  check_table_pkey        PRIMARY KEY  PRIMARY KEY (k ASC)        true
+check_table  d_0                     CHECK        CHECK ((d > 0))            true
 
 # Adding column e was rolled back
-query TTBTTTB
+query TTBTTTB rowsort
 SHOW COLUMNS FROM check_table
 ----
-k  INT8  false  NULL      ·  {check_table_pkey}  false
-c  INT8  true   NULL      ·  {check_table_pkey}  false
-d  INT8  true   1:::INT8  ·  {check_table_pkey}  false
+k  INT8  false  NULL  ·  {check_table_pkey}  false
+c  INT8  true   NULL  ·  {check_table_pkey}  false
+d  INT8  true   1     ·  {check_table_pkey}  false
 
 statement ok
 DROP TABLE check_table
@@ -982,10 +1000,11 @@ ALTER TABLE check_table ADD CHECK (a >= 0)
 statement error pgcode XXA00 violates unique constraint "idx"
 COMMIT
 
-query TTTTB
+query TTTTB nosort
 SHOW CONSTRAINTS FROM check_table
 ----
-check_table  check_table_pkey  PRIMARY KEY  PRIMARY KEY (k ASC)  true
+check_table  check_table_k_not_null  NOT NULL     NOT NULL             true
+check_table  check_table_pkey        PRIMARY KEY  PRIMARY KEY (k ASC)  true
 
 statement ok
 BEGIN
@@ -999,10 +1018,11 @@ ALTER TABLE check_table ADD CHECK (a < 0)
 statement error pgcode XXA00 validation of CHECK \"a < 0:::INT8\" failed on row
 COMMIT
 
-query TTTTB
+query TTTTB nosort
 SHOW CONSTRAINTS FROM check_table
 ----
-check_table  check_table_pkey  PRIMARY KEY  PRIMARY KEY (k ASC)  true
+check_table  check_table_k_not_null  NOT NULL     NOT NULL             true
+check_table  check_table_pkey        PRIMARY KEY  PRIMARY KEY (k ASC)  true
 
 statement ok
 DROP TABLE check_table
@@ -1036,7 +1056,7 @@ ALTER TABLE check_table ADD g INT
 statement ok
 ALTER TABLE check_table ADD CONSTRAINT g_0 CHECK (g > 0)
 
-statement error unimplemented: constraint "g_0" in the middle of being added, try again later
+statement error pgcode 0A000 constraint "g_0" in the middle of being added, try again later
 ALTER TABLE check_table DROP COLUMN g
 
 statement ok
@@ -1129,11 +1149,13 @@ COMMIT
 
 # Verify that the constraints had been validated in the above txn
 query TTTTB
-SHOW CONSTRAINTS FROM check_table
+SELECT * FROM [SHOW CONSTRAINTS FROM check_table] ORDER BY constraint_name
 ----
-check_table  ck_a  CHECK  CHECK ((a = 0))  true
-check_table  ck_b  CHECK  CHECK ((b > 0))  true
-check_table  ck_c  CHECK  CHECK ((c > b))  true
+check_table  check_table_pkey            PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+check_table  check_table_rowid_not_null  NOT NULL     NOT NULL                 true
+check_table  ck_a                        CHECK        CHECK ((a = 0))          true
+check_table  ck_b                        CHECK        CHECK ((b > 0))          true
+check_table  ck_c                        CHECK        CHECK ((c > b))          true
 
 # Also test insert/update to ensure constraint was added in a valid state (with correct column IDs, etc.)
 
@@ -1431,7 +1453,7 @@ ALTER TABLE t ADD COLUMN c INT
 statement ok
 ALTER TABLE t ALTER COLUMN c SET NOT NULL
 
-statement error pgcode XXA00 validation of NOT NULL constraint failed: validation of CHECK "c IS NOT NULL" failed
+statement error pgcode XXA00 validation of column "c" NOT NULL failed
 COMMIT
 
 statement ok
@@ -1465,8 +1487,8 @@ COMMIT
 statement ok
 DROP TABLE t
 
-# Test that DROP INDEX on an index with dependent foreign keys is correctly
-# rolled back when there is an error
+# Test that DROP INDEX on an index with dependent foreign keys doesn't
+# leave table in inconsistent state.
 subtest 38733
 
 statement ok
@@ -1492,7 +1514,7 @@ BEGIN
 statement ok
 DROP INDEX y_b_idx CASCADE;
 
-# This will fail, causing the previous DROP INDEX to also be rolled back
+# This will fail, but DROP INDEX won't be rolled back
 statement ok
 CREATE UNIQUE INDEX ON y (b);
 
@@ -1502,10 +1524,11 @@ COMMIT
 # Verify that table y is in a consistent state (otherwise, SHOW CONSTRAINTS
 # would fail with an error)
 query TTTTB
-SHOW CONSTRAINTS FROM y
+SELECT * FROM [SHOW CONSTRAINTS FROM y] ORDER BY constraint_name
 ----
-y  y_b_fkey  FOREIGN KEY  FOREIGN KEY (b) REFERENCES x(b)  true
-y  y_pkey    PRIMARY KEY  PRIMARY KEY (a ASC)              true
+y  y_a_not_null  NOT NULL     NOT NULL                         true
+y  y_b_fkey      FOREIGN KEY  FOREIGN KEY (b) REFERENCES x(b)  true
+y  y_pkey        PRIMARY KEY  PRIMARY KEY (a ASC)              true
 
 # Also test dropping the index on the referenced side
 statement ok
@@ -1518,7 +1541,7 @@ BEGIN
 statement ok
 DROP INDEX x_b_key CASCADE;
 
-# This will fail, causing the previous DROP INDEX to also be rolled back
+# This will fail, but the previous DROP INDEX won't be rolled back
 statement ok
 CREATE UNIQUE INDEX ON x (c);
 
@@ -1527,11 +1550,20 @@ COMMIT
 
 # Verify that table x is in a consistent state (otherwise, SHOW CONSTRAINTS
 # would fail with an error).
-query TTTTB
+query TTTTB nosort
 SHOW CONSTRAINTS FROM x
 ----
-x  x_b_key  UNIQUE       UNIQUE (b ASC)       true
-x  x_pkey   PRIMARY KEY  PRIMARY KEY (a ASC)  true
+x  x_a_not_null  NOT NULL     NOT NULL             true
+x  x_pkey        PRIMARY KEY  PRIMARY KEY (a ASC)  true
+
+# Verify that table y is in a consistent state (otherwise, SHOW
+# CONSTRAINTS would fail with an error). The foreign constraint here
+# hasn't been rolled back because the index hasn't been rolled back.
+query TTTTB nosort
+SHOW CONSTRAINTS FROM y
+----
+y  y_a_not_null  NOT NULL     NOT NULL             true
+y  y_pkey        PRIMARY KEY  PRIMARY KEY (a ASC)  true
 
 statement ok
 DROP TABLE x, y
@@ -1593,11 +1625,9 @@ BEGIN
 statement ok
 ALTER TABLE t ALTER COLUMN a DROP NOT NULL
 
-# Since the non-null constraint is dropped in the schema changer after the
-# transaction commits, it's still enforced during the rest of the transaction.
-# The error is about a check constraint because we generate a check constraint
-# when dropping not-null constraints in the schema changer.
-statement error failed to satisfy CHECK constraint \(a IS NOT NULL\)
+# Since the non-null constraint is dropped with in the txn, it will no
+# long be enforced now.
+statement ok
 INSERT INTO t VALUES (NULL)
 
 statement ok
@@ -1811,7 +1841,7 @@ SELECT * FROM self_ref_fk
 
 # Check that the cascade delete takes effect and there are now no rows.
 
-statement ok
+statement count 1
 DELETE FROM self_ref_fk WHERE id = 1;
 
 query II rowsort
@@ -1840,10 +1870,19 @@ ALTER TABLE t_52501_valid ALTER COLUMN a SET NOT NULL
 statement ok
 COMMIT
 
+# The column should end up NOT NULL with no residual synthetic check
+# constraint. Regression test for #166612.
 query TTTTB
-SHOW CONSTRAINTS FROM t_52501_valid
+SELECT * FROM [SHOW CONSTRAINTS FROM t_52501_valid] ORDER BY constraint_name
 ----
-t_52501_valid  a_auto_not_null  CHECK  CHECK ((a IS NOT NULL))  true
+t_52501_valid  t_52501_valid_a_not_null      NOT NULL     NOT NULL                 true
+t_52501_valid  t_52501_valid_pkey            PRIMARY KEY  PRIMARY KEY (rowid ASC)  true
+t_52501_valid  t_52501_valid_rowid_not_null  NOT NULL     NOT NULL                 true
+
+query TB
+SELECT column_name, is_nullable FROM [SHOW COLUMNS FROM t_52501_valid] WHERE column_name = 'a'
+----
+a  false
 
 statement ok
 DROP TABLE t_52501_valid
@@ -1857,7 +1896,7 @@ CREATE TABLE t_52501_invalid(a INT)
 statement ok
 INSERT INTO t_52501_invalid VALUES (NULL)
 
-statement error pgcode 23514 validation of CHECK "a IS NOT NULL" failed
+statement error pgcode 23502 validation of column "a" NOT NULL failed on row: a=NULL, rowid=\d+
 ALTER TABLE t_52501_invalid ALTER COLUMN a SET NOT NULL
 
 statement ok
@@ -1883,9 +1922,11 @@ statement ok
 COMMIT
 
 query TTTTB
-SHOW CONSTRAINTS FROM child_54265
+SELECT * FROM [SHOW CONSTRAINTS FROM child_54265] ORDER BY constraint_name
 ----
-child_54265  child_54265_a_fkey  FOREIGN KEY  FOREIGN KEY (a) REFERENCES parent_54265(a) NOT VALID  false
+child_54265  child_54265_a_fkey          FOREIGN KEY  FOREIGN KEY (a) REFERENCES parent_54265(a) NOT VALID  false
+child_54265  child_54265_pkey            PRIMARY KEY  PRIMARY KEY (rowid ASC)                               true
+child_54265  child_54265_rowid_not_null  NOT NULL     NOT NULL                                              true
 
 # Test that dropping a unique index used by a foreign key reference causes the
 # foreign key addition to fail.
@@ -1911,3 +1952,199 @@ DROP INDEX t1_57592@idx;
 
 statement error pgcode XXA00 there is no unique constraint matching given keys for referenced table t1_57592
 COMMIT
+
+# Regression test for issue #87672 in which the lease manager would wait on
+# the wrong version to be released.
+subtest regression_87672
+
+statement ok
+CREATE DATABASE db_87672;
+
+statement ok
+USE db_87672;
+
+statement ok
+CREATE SCHEMA sc;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE SCHEMA sc2;
+
+statement ok
+SELECT * FROM crdb_internal.tables;
+
+statement ok
+DROP SCHEMA sc;
+
+# Prior to fixing this bug, this commit would hang indefinitely.
+statement ok
+COMMIT;
+
+# This is a regression test to handle the case where a newly created table or
+# a previously unleased table are referenced in a transaction involving
+# transactional constraint validation.
+subtest validate_constraint_referencing_modified_table
+
+statement ok
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+CREATE TABLE t2 (id STRING PRIMARY KEY);
+ALTER TABLE t1 ADD CONSTRAINT fk FOREIGN KEY (other_id) REFERENCES t2(id) NOT VALID;
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION PRIORITY HIGH;
+ALTER TABLE t2 RENAME TO t3;
+ALTER TABLE t1 VALIDATE CONSTRAINT fk;
+COMMIT;
+
+statement ok
+DROP TABLE t1, t3 CASCADE
+
+statement ok
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+CREATE TABLE t2 (id STRING PRIMARY KEY);
+ALTER TABLE t1 ADD CONSTRAINT fk FOREIGN KEY (other_id) REFERENCES t2(id) NOT VALID;
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION PRIORITY HIGH;
+ALTER TABLE t1 RENAME TO t3;
+ALTER TABLE t3 VALIDATE CONSTRAINT fk;
+COMMIT;
+
+statement ok
+DROP TABLE t2, t3 CASCADE
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+SET TRANSACTION PRIORITY HIGH;
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+CREATE TABLE t2 (id STRING PRIMARY KEY);
+ALTER TABLE t1 ADD CONSTRAINT fk FOREIGN KEY (other_id) REFERENCES t2(id);
+ALTER TABLE t1 VALIDATE CONSTRAINT fk;
+COMMIT;
+
+statement ok
+DROP TABLE t1, t2 CASCADE
+
+statement ok
+SET autocommit_before_ddl = true
+
+statement ok
+CREATE TABLE t1 (id STRING PRIMARY KEY, other_id STRING NOT NULL);
+
+statement ok
+BEGIN;
+SELECT 1;
+
+skipif config weak-iso-level-configs
+query T noticetrace
+ALTER TABLE t1 ADD COLUMN c INT DEFAULT 1
+----
+NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
+
+onlyif config weak-iso-level-configs
+query T noticetrace
+ALTER TABLE t1 ADD COLUMN c INT DEFAULT 1
+----
+NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
+NOTICE: setting transaction isolation level to SERIALIZABLE due to schema change
+
+query T noticetrace
+COMMIT
+----
+WARNING: there is no transaction in progress
+SQLSTATE: 25P01
+
+statement ok
+DROP TABLE t1
+
+# Test to confirm that with 'autocommit_before_ddl' enabled, all DDL operations
+# utilize the DSC where applicable.
+subtest drop_with_autocommit
+
+let $autocommit_orig
+SHOW autocommit_before_ddl
+
+statement ok
+set autocommit_before_ddl=on
+
+statement ok
+CREATE TABLE dropme_1();
+
+statement ok
+CREATE TABLE dropme_2();
+
+# This test must default to serializable isolation. Otherwise, with weaker
+# isolation levels, an extra NOTICE will appear, indicating that the
+# transaction isolation was upgraded due to the schema change.
+let $iso
+SHOW default_transaction_isolation;
+
+statement ok
+SET default_transaction_isolation = 'serializable';
+
+statement ok
+BEGIN
+
+# Drop the table. This will cause an autocommit because we are in an explicit transaction.
+query T noticetrace
+DROP TABLE dropme_1;
+----
+NOTICE: auto-committing transaction before processing DDL due to autocommit_before_ddl setting
+
+# Drop another table. This will be in an implicit transaction, so it doesn't need an autocommit.
+query T noticetrace
+DROP TABLE dropme_2;
+----
+
+# If not legacy schema changer, verify that the DSC was used for both drops.
+skipif config local-legacy-schema-changer
+query TT
+select job_type, description from [show jobs] where description like 'DROP TABLE%dropme%' ORDER BY description LIMIT 2
+----
+NEW SCHEMA CHANGE  DROP TABLE db_87672.public.dropme_1
+NEW SCHEMA CHANGE  DROP TABLE db_87672.public.dropme_2
+
+statement ok
+set autocommit_before_ddl = $autocommit_orig;
+
+statement ok
+set default_transaction_isolation = '$iso';
+
+# Redo the test with 'autocommit_before_ddl' disabled to ensure that we stick
+# with the legacy schema changer.
+statement ok
+CREATE TABLE dropme_3();
+
+statement ok
+CREATE TABLE dropme_4();
+
+statement ok
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+# Only turn off autocommit for the current transaction.
+statement ok
+SET LOCAL autocommit_before_ddl = false;
+
+query T noticetrace
+DROP TABLE dropme_3;
+----
+
+query T noticetrace
+DROP TABLE dropme_4;
+----
+
+# If not legacy schema changer, verify that the DSC was used for both drops.
+skipif config local-legacy-schema-changer
+query TT
+select job_type, description from [show jobs] where description like 'DROP TABLE%dropme%' ORDER BY description LIMIT 4
+----
+NEW SCHEMA CHANGE  DROP TABLE db_87672.public.dropme_1
+NEW SCHEMA CHANGE  DROP TABLE db_87672.public.dropme_2
+SCHEMA CHANGE      DROP TABLE db_87672.public.dropme_3
+SCHEMA CHANGE      DROP TABLE db_87672.public.dropme_4
+
+subtest end

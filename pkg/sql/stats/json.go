@@ -1,24 +1,21 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package stats
 
 import (
 	"context"
 	"fmt"
+	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 )
@@ -27,6 +24,7 @@ import (
 //
 // See TableStatistic for a description of the fields.
 type JSONStatistic struct {
+	ID            uint64   `json:"id,omitempty"`
 	Name          string   `json:"name,omitempty"`
 	CreatedAt     string   `json:"created_at"`
 	Columns       []string `json:"columns"`
@@ -40,6 +38,9 @@ type JSONStatistic struct {
 	HistogramColumnType string            `json:"histo_col_type"`
 	HistogramBuckets    []JSONHistoBucket `json:"histo_buckets,omitempty"`
 	HistogramVersion    HistogramVersion  `json:"histo_version,omitempty"`
+	PartialPredicate    string            `json:"partial_predicate,omitempty"`
+	FullStatisticID     uint64            `json:"full_statistic_id,omitempty"`
+	DelayDelete         bool              `json:"delay_delete"`
 }
 
 // JSONHistoBucket is a struct used for JSON marshaling and unmarshaling of
@@ -56,35 +57,31 @@ type JSONHistoBucket struct {
 }
 
 // SetHistogram fills in the HistogramColumnType and HistogramBuckets fields.
-func (js *JSONStatistic) SetHistogram(h *HistogramData) error {
+func (js *JSONStatistic) SetHistogram(ctx context.Context, h *HistogramData) error {
 	typ := h.ColumnType
 	if typ == nil {
 		return fmt.Errorf("histogram type is unset")
 	}
-	js.HistogramColumnType = typ.SQLString()
-	js.HistogramBuckets = make([]JSONHistoBucket, len(h.Buckets))
+	// Use the fully qualified type name in case this is part of injected stats
+	// done across databases. If it is a user-defined type, we need the type name
+	// resolution to be for the correct database.
+	js.HistogramColumnType = typ.SQLStringFullyQualified()
+	js.HistogramBuckets = make([]JSONHistoBucket, 0, len(h.Buckets))
 	js.HistogramVersion = h.Version
-	var a rowenc.DatumAlloc
-	for i := range h.Buckets {
-		b := &h.Buckets[i]
-		js.HistogramBuckets[i].NumEq = b.NumEq
-		js.HistogramBuckets[i].NumRange = b.NumRange
-		js.HistogramBuckets[i].DistinctRange = b.DistinctRange
 
-		if b.UpperBound == nil {
-			return fmt.Errorf("histogram bucket upper bound is unset")
-		}
-		datum, _, err := rowenc.DecodeTableKey(&a, typ, b.UpperBound, encoding.Ascending)
-		if err != nil {
-			return err
-		}
-
-		js.HistogramBuckets[i] = JSONHistoBucket{
-			NumEq:         b.NumEq,
-			NumRange:      b.NumRange,
+	decodedBuckets, distinctAdjustment, err := h.DecodeBuckets(ctx)
+	if err != nil {
+		return err
+	}
+	js.DistinctCount = uint64(math.Max(0, float64(js.DistinctCount)+distinctAdjustment))
+	for i := range decodedBuckets {
+		b := &decodedBuckets[i]
+		js.HistogramBuckets = append(js.HistogramBuckets, JSONHistoBucket{
+			NumEq:         int64(b.NumEq),
+			NumRange:      int64(b.NumRange),
 			DistinctRange: b.DistinctRange,
-			UpperBound:    tree.AsStringWithFlags(datum, tree.FmtExport),
-		}
+			UpperBound:    tree.AsStringWithFlags(b.UpperBound, tree.FmtExport|tree.FmtAlwaysQualifyUserDefinedTypeNames),
+		})
 	}
 	return nil
 }
@@ -121,14 +118,14 @@ func (js *JSONStatistic) DecodeAndSetHistogram(
 		}
 		h.ColumnType = typ
 	}
-	return js.SetHistogram(h)
+	return js.SetHistogram(ctx, h)
 }
 
 // GetHistogram converts the json histogram into HistogramData.
 func (js *JSONStatistic) GetHistogram(
-	semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
+	ctx context.Context, semaCtx *tree.SemaContext, evalCtx *eval.Context,
 ) (*HistogramData, error) {
-	if len(js.HistogramBuckets) == 0 {
+	if js.HistogramColumnType == "" {
 		return nil, nil
 	}
 	h := &HistogramData{}
@@ -136,7 +133,7 @@ func (js *JSONStatistic) GetHistogram(
 	if err != nil {
 		return nil, err
 	}
-	colType, err := tree.ResolveType(evalCtx.Context, colTypeRef, semaCtx.GetTypeResolver())
+	colType, err := tree.ResolveType(ctx, colTypeRef, semaCtx.GetTypeResolver())
 	if err != nil {
 		return nil, err
 	}
@@ -145,17 +142,39 @@ func (js *JSONStatistic) GetHistogram(
 	h.Buckets = make([]HistogramData_Bucket, len(js.HistogramBuckets))
 	for i := range h.Buckets {
 		hb := &js.HistogramBuckets[i]
-		upperVal, err := rowenc.ParseDatumStringAs(colType, hb.UpperBound, evalCtx)
+		upperVal, err := rowenc.ParseDatumStringAs(ctx, colType, hb.UpperBound, evalCtx, semaCtx)
 		if err != nil {
 			return nil, err
 		}
 		h.Buckets[i].NumEq = hb.NumEq
 		h.Buckets[i].NumRange = hb.NumRange
 		h.Buckets[i].DistinctRange = hb.DistinctRange
-		h.Buckets[i].UpperBound, err = rowenc.EncodeTableKey(nil, upperVal, encoding.Ascending)
+		h.Buckets[i].UpperBound, err = EncodeUpperBound(h.Version, upperVal)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return h, nil
+}
+
+// IsPartial returns true if this statistic was collected with USING EXTREMES
+// or with a WHERE clause.
+func (js *JSONStatistic) IsPartial() bool {
+	return js.PartialPredicate != ""
+}
+
+// IsMerged returns true if this statistic was created by merging a partial and
+// a full statistic.
+func (js *JSONStatistic) IsMerged() bool {
+	return js.Name == jobspb.MergedStatsName
+}
+
+// IsForecast returns true if this statistic was created by forecasting.
+func (js *JSONStatistic) IsForecast() bool {
+	return js.Name == jobspb.ForecastStatsName
+}
+
+// IsAuto returns true if this statistic was collected automatically.
+func (js *JSONStatistic) IsAuto() bool {
+	return js.Name == jobspb.AutoStatsName || js.Name == jobspb.AutoPartialStatsName
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -31,24 +26,31 @@ func PlanAndRunCTAS(
 	out execinfrapb.ProcessorCoreUnion,
 	recv *DistSQLReceiver,
 ) {
-	planCtx := dsp.NewPlanningCtx(ctx, planner.ExtendedEvalContext(), planner, txn, !isLocal)
+	distribute := DistributionType(LocalDistribution)
+	if !isLocal {
+		distribute = FullDistribution
+	}
+	planCtx := dsp.NewPlanningCtx(ctx, planner.ExtendedEvalContext(), planner,
+		txn, distribute)
 	planCtx.stmtType = tree.Rows
 
-	physPlan, cleanup, err := dsp.createPhysPlan(planCtx, in)
+	physPlan, cleanup, err := dsp.createPhysPlan(ctx, planCtx, in)
 	defer cleanup()
 	if err != nil {
 		recv.SetError(errors.Wrapf(err, "constructing distSQL plan"))
 		return
 	}
 	physPlan.AddNoGroupingStage(
-		out, execinfrapb.PostProcessSpec{}, rowexec.CTASPlanResultTypes, execinfrapb.Ordering{},
+		out, execinfrapb.PostProcessSpec{}, rowexec.CTASPlanResultTypes, execinfrapb.Ordering{}, nil, /* finalizeLastStageCb */
 	)
 
 	// The bulk row writers will emit a binary encoded BulkOpSummary.
 	physPlan.PlanToStreamColMap = []int{0}
 
-	// Make copy of evalCtx as Run might modify it.
-	evalCtxCopy := planner.ExtendedEvalContextCopy()
-	dsp.FinalizePlan(planCtx, physPlan)
-	dsp.Run(planCtx, txn, physPlan, recv, evalCtxCopy, nil /* finishedSetupFn */)()
+	FinalizePlan(ctx, planCtx, physPlan)
+	finishedSetupFn, cleanup := getFinishedSetupFn(planner)
+	defer cleanup()
+	// Copy the eval.Context, as dsp.Run() might change it.
+	evalCtxCopy := planner.ExtendedEvalContext().Context.Copy()
+	dsp.Run(ctx, planCtx, txn, physPlan, recv, evalCtxCopy, finishedSetupFn)
 }

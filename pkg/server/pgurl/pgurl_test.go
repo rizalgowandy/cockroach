@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package pgurl
 
@@ -14,15 +9,38 @@ import (
 	"bytes"
 	"fmt"
 	"net/url"
+	"os"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
 func TestURL(t *testing.T) {
-	datadriven.RunTest(t, "testdata/url", func(t *testing.T, td *datadriven.TestData) string {
+	// Create certificate files in a temporary directory for use with --inline.
+	tmpdir := t.TempDir()
+	oldWD, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(tmpdir))
+	t.Cleanup(func() {
+		require.NoError(t, os.Chdir(oldWD))
+	})
+	require.NoError(t, os.Mkdir("certs", 0755))
+	for _, f := range []struct {
+		name     string
+		contents string
+		perm     os.FileMode
+	}{
+		{"certs/ca.crt", "caCertContents", 0644},
+		{"certs/client.root.key", "clientKeyContents", 0600},
+		{"certs/client.root.crt", "clientCertContents", 0644},
+	} {
+		require.NoError(t, os.WriteFile(f.name, []byte(f.contents), f.perm))
+	}
+
+	datadriven.RunTest(t, datapathutils.TestDataPath(t, "url"), func(t *testing.T, td *datadriven.TestData) string {
 		var result bytes.Buffer
 
 		var u *URL
@@ -49,6 +67,11 @@ func TestURL(t *testing.T) {
 		fmt.Fprintf(&result, "pq URL: %s\n", u.ToPQ())
 		fmt.Fprintf(&result, "DSN:    %s\n", u.ToDSN())
 		fmt.Fprintf(&result, "JDBC:   %s\n", u.ToJDBC())
+		if crdbURL, err := u.ToCRDB(); err == nil {
+			fmt.Fprintf(&result, "CRDB:   %s\n", crdbURL)
+		} else {
+			fmt.Fprintf(&result, "CRDB:   (err: %s)\n", err)
+		}
 
 		u.
 			WithDefaultUsername("defaultuser").
@@ -59,6 +82,11 @@ func TestURL(t *testing.T) {
 		fmt.Fprintf(&result, "pq URL: %s\n", u.ToPQ())
 		fmt.Fprintf(&result, "DSN:    %s\n", u.ToDSN())
 		fmt.Fprintf(&result, "JDBC:   %s\n", u.ToJDBC())
+		if crdbURL, err := u.ToCRDB(); err == nil {
+			fmt.Fprintf(&result, "CRDB:   %s\n", crdbURL)
+		} else {
+			fmt.Fprintf(&result, "CRDB:   (err: %s)\n", err)
+		}
 
 		return result.String()
 	})
@@ -138,8 +166,66 @@ func TestOptions(t *testing.T) {
 	require.Equal(t, u.extraOptions["application_name"], []string{"baz"})
 }
 
+func TestClone(t *testing.T) {
+	u := New()
+	require.NoError(t, u.SetOption("user", "testuser"))
+	require.Equal(t, u.GetUsername(), "testuser")
+	require.NoError(t, u.SetOption("application_name", "testapp"))
+	require.Equal(t, []string{"testapp"}, u.extraOptions["application_name"])
+
+	u2 := u.Clone()
+	// u2 has initial values from u.
+	require.Equal(t, u2.GetUsername(), "testuser")
+	require.Equal(t, []string{"testapp"}, u2.extraOptions["application_name"])
+
+	// Modifications to u2 only impact u2.
+	require.NoError(t, u2.SetOption("user", "testuser2"))
+	require.NoError(t, u2.SetOption("application_name", "testapp2"))
+	require.Equal(t, u2.GetUsername(), "testuser2")
+	require.Equal(t, u.GetUsername(), "testuser")
+	require.Equal(t, []string{"testapp"}, u.extraOptions["application_name"])
+	require.Equal(t, []string{"testapp2"}, u2.extraOptions["application_name"])
+}
+
 // Silence the unused linter
 var _ = ProtoUndefined
 var _ = TLSVerifyCA
 var _ = TLSPrefer
 var _ = TLSAllow
+
+func TestParseExtendedOptions(t *testing.T) {
+	u, err := Parse("postgres://localhost?options= " +
+		"--user=test " +
+		"-c    search_path=public,testsp %20%09 " +
+		"--default-transaction-isolation=read\\ uncommitted   " +
+		"-capplication_name=test  " +
+		"--DateStyle=ymd\\ ,\\ iso\\  " +
+		"-c intervalstyle%3DISO_8601 " +
+		"-ccustom_option.custom_option=test2")
+	require.NoError(t, err)
+	opts := u.GetOption("options")
+	kvs, err := ParseExtendedOptions(opts)
+	require.NoError(t, err)
+	require.Equal(t, kvs.Get("user"), "test")
+	require.Equal(t, kvs.Get("search_path"), "public,testsp")
+	require.Equal(t, kvs.Get("default_transaction_isolation"), "read uncommitted")
+	require.Equal(t, kvs.Get("application_name"), "test")
+	require.Equal(t, kvs.Get("DateStyle"), "ymd , iso ")
+	require.Equal(t, kvs.Get("intervalstyle"), "ISO_8601")
+	require.Equal(t, kvs.Get("custom_option.custom_option"), "test2")
+}
+
+func TestEncodeExtendedOptions(t *testing.T) {
+	kvs := url.Values{}
+	kvs.Set("user", "test")
+	kvs.Set("a b", "test")
+	kvs.Set("test", "c d")
+	kvs.Set(`a\ b`, `c\d`)
+
+	opts := EncodeExtendedOptions(kvs)
+	require.Equal(t, `-ca\ b=test -ca\\\ b=c\\d -ctest=c\ d -cuser=test `, opts)
+
+	kv2, err := ParseExtendedOptions(opts)
+	require.NoError(t, err)
+	require.Equal(t, kvs, kv2)
+}

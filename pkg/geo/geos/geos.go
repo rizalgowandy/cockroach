@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // Package geos is a wrapper around the spatial data types between the geo
 // package and the GEOS C library. The GEOS library is dynamically loaded
@@ -15,16 +10,22 @@
 package geos
 
 import (
+	"fmt"
+	"maps"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 )
 
@@ -95,7 +96,7 @@ func ensureInit(
 		)
 	})
 	if geosOnce.err != nil && errDisplay == EnsureInitErrorDisplayPublic {
-		return nil, errors.Newf("geos: this operation is not available")
+		return nil, pgerror.Newf(pgcode.System, "geos: this operation is not available")
 	}
 	return geosOnce.geos, geosOnce.err
 }
@@ -122,26 +123,38 @@ func findLibraryDirectories(flagLibraryDirectoryValue string, crdbBinaryLoc stri
 	// Try path by trying to find all parenting paths and appending
 	// `lib/libgeos_c.<ext>` to the current working directory, as well
 	// as the directory in which the cockroach binary is initialized.
-	cwd, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
 	locs := []string{}
 	if flagLibraryDirectoryValue != "" {
 		locs = append(locs, flagLibraryDirectoryValue)
 	}
-	locs = append(
-		append(
-			locs,
-			findLibraryDirectoriesInParentingDirectories(crdbBinaryLoc)...,
-		),
-		findLibraryDirectoriesInParentingDirectories(cwd)...,
-	)
 	// Account for the libraries to be in a bazel runfile path.
 	if bazel.BuiltWithBazel() {
-		if p, err := bazel.Runfile(path.Join("c-deps", "libgeos", "lib")); err == nil {
-			locs = append(locs, p)
+		pathsToCheck := []string{
+			path.Join("c-deps", "libgeos_foreign", "lib"),
+			path.Join("external", "archived_cdep_libgeos_linux", "lib"),
+			path.Join("external", "archived_cdep_libgeos_linuxarm", "lib"),
+			path.Join("external", "archived_cdep_libgeos_macos", "lib"),
+			path.Join("external", "archived_cdep_libgeos_macosarm", "lib"),
+			path.Join("external", "archived_cdep_libgeos_windows", "bin"),
 		}
+		for _, path := range pathsToCheck {
+			if p, err := bazel.Runfile(path); err == nil {
+				locs = append(locs, p)
+			}
+		}
+	}
+	locs = append(
+		locs,
+		findLibraryDirectoriesInParentingDirectories(crdbBinaryLoc)...,
+	)
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot retrieve cwd: %v", err)
+	} else {
+		locs = append(
+			locs,
+			findLibraryDirectoriesInParentingDirectories(cwd)...,
+		)
 	}
 	return locs
 }
@@ -215,10 +228,13 @@ func wrapGEOSInitError(err error) error {
 	case "windows":
 		page = "windows"
 	}
-	return errors.WithHintf(
-		err,
-		"Ensure you have the spatial libraries installed as per the instructions in %s",
-		docs.URL("install-cockroachdb-"+page),
+	return pgerror.WithCandidateCode(
+		errors.WithHintf(
+			err,
+			"Ensure you have the spatial libraries installed as per the instructions in %s",
+			docs.URL("install-cockroachdb-"+page),
+		),
+		pgcode.ConfigFile,
 	)
 }
 
@@ -231,6 +247,26 @@ func goToCSlice(b []byte) C.CR_GEOS_Slice {
 		data: (*C.char)(unsafe.Pointer(&b[0])),
 		len:  C.size_t(len(b)),
 	}
+}
+
+// validateFloat64Params guards against any of the float64 parameters being NaN
+// or Inf.
+func validateFloat64Params(funcName string, params map[string]float64) error {
+	names := slices.Collect(maps.Keys(params))
+	slices.Sort(names)
+
+	for _, name := range names {
+		value := params[name]
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return pgerror.Newf(
+				pgcode.InvalidParameterValue,
+				"%s: parameter %s must be a finite value",
+				funcName,
+				name,
+			)
+		}
+	}
+	return nil
 }
 
 // cStringToUnsafeGoBytes convert a CR_GEOS_String to a Go
@@ -274,6 +310,18 @@ func statusToError(s C.CR_GEOS_Status) error {
 	return &Error{msg: string(cStringToSafeGoBytes(s))}
 }
 
+// Version returns the GEOS version used.
+func Version() (string, error) {
+	g, err := ensureInitInternal()
+	if err != nil {
+		return "", err
+	}
+	var version C.CR_GEOS_String
+	C.CR_GEOS_Version(g, &version)
+	// Returns a `const char*`, so we don't have to free anything.
+	return string(cStringToUnsafeGoBytes(version)), nil
+}
+
 // BufferParamsJoinStyle maps to the GEOSBufJoinStyles enum in geos_c.h.in.
 type BufferParamsJoinStyle int
 
@@ -305,6 +353,12 @@ type BufferParams struct {
 
 // Buffer buffers the given geometry by the given distance and params.
 func Buffer(ewkb geopb.EWKB, params BufferParams, distance float64) (geopb.EWKB, error) {
+	if err := validateFloat64Params("Buffer", map[string]float64{
+		"distance":   distance,
+		"mitreLimit": params.MitreLimit,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err
@@ -463,6 +517,11 @@ func ConvexHull(ewkb geopb.EWKB) (geopb.EWKB, error) {
 
 // Simplify returns an EWKB which returns the simplified EWKB.
 func Simplify(ewkb geopb.EWKB, tolerance float64) (geopb.EWKB, error) {
+	if err := validateFloat64Params("Simplify", map[string]float64{
+		"tolerance": tolerance,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err
@@ -479,6 +538,11 @@ func Simplify(ewkb geopb.EWKB, tolerance float64) (geopb.EWKB, error) {
 // TopologyPreserveSimplify returns an EWKB which returns the simplified EWKB
 // with the topology preserved.
 func TopologyPreserveSimplify(ewkb geopb.EWKB, tolerance float64) (geopb.EWKB, error) {
+	if err := validateFloat64Params("TopologyPreserveSimplify", map[string]float64{
+		"tolerance": tolerance,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err
@@ -565,6 +629,11 @@ func SymDifference(a geopb.EWKB, b geopb.EWKB) (geopb.EWKB, error) {
 // not appropriate as it combines all the LineString present in (MULTI)LineString,
 // considering all the corner points of LineString overlaps each other.
 func InterpolateLine(ewkb geopb.EWKB, distance float64) (geopb.EWKB, error) {
+	if err := validateFloat64Params("InterpolateLine", map[string]float64{
+		"distance": distance,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err
@@ -621,6 +690,14 @@ func MinimumClearanceLine(ewkb geopb.EWKB) (geopb.EWKB, error) {
 func ClipByRect(
 	ewkb geopb.EWKB, xMin float64, yMin float64, xMax float64, yMax float64,
 ) (geopb.EWKB, error) {
+	if err := validateFloat64Params("ClipByRect", map[string]float64{
+		"xMin": xMin,
+		"yMin": yMin,
+		"xMax": xMax,
+		"yMax": yMax,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err
@@ -654,11 +731,11 @@ func PrepareGeometry(a geopb.EWKB) (PreparedGeometry, error) {
 func PreparedGeomDestroy(a PreparedGeometry) {
 	g, err := ensureInitInternal()
 	if err != nil {
-		panic(errors.AssertionFailedf("trying to destroy PreparedGeometry with no GEOS: %v", err))
+		panic(errors.NewAssertionErrorWithWrappedErrf(err, "trying to destroy PreparedGeometry with no GEOS"))
 	}
 	ap := (*C.CR_GEOS_PreparedGeometry)(unsafe.Pointer(a))
 	if err := statusToError(C.CR_GEOS_PreparedGeometryDestroy(g, ap)); err != nil {
-		panic(errors.AssertionFailedf("PreparedGeometryDestroy returned an error: %v", err))
+		panic(errors.NewAssertionErrorWithWrappedErrf(err, "PreparedGeometryDestroy returned an error"))
 	}
 }
 
@@ -831,6 +908,11 @@ func FrechetDistance(a, b geopb.EWKB) (float64, error) {
 
 // FrechetDistanceDensify returns the Frechet distance between the geometries.
 func FrechetDistanceDensify(a, b geopb.EWKB, densifyFrac float64) (float64, error) {
+	if err := validateFloat64Params("FrechetDistanceDensify", map[string]float64{
+		"densifyFrac": densifyFrac,
+	}); err != nil {
+		return 0, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return 0, err
@@ -861,6 +943,11 @@ func HausdorffDistance(a, b geopb.EWKB) (float64, error) {
 
 // HausdorffDistanceDensify returns the Hausdorff distance between the geometries.
 func HausdorffDistanceDensify(a, b geopb.EWKB, densifyFrac float64) (float64, error) {
+	if err := validateFloat64Params("HausdorffDistanceDensify", map[string]float64{
+		"densifyFrac": densifyFrac,
+	}); err != nil {
+		return 0, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return 0, err
@@ -876,6 +963,11 @@ func HausdorffDistanceDensify(a, b geopb.EWKB, densifyFrac float64) (float64, er
 
 // EqualsExact returns whether two geometry objects are equal with some epsilon
 func EqualsExact(lhs, rhs geopb.EWKB, epsilon float64) (bool, error) {
+	if err := validateFloat64Params("EqualsExact", map[string]float64{
+		"epsilon": epsilon,
+	}); err != nil {
+		return false, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return false, err
@@ -1050,6 +1142,11 @@ func Node(a geopb.EWKB) (geopb.EWKB, error) {
 
 // VoronoiDiagram Computes the Voronoi Diagram from the vertices of the supplied EWKBs.
 func VoronoiDiagram(a, env geopb.EWKB, tolerance float64, onlyEdges bool) (geopb.EWKB, error) {
+	if err := validateFloat64Params("VoronoiDiagram", map[string]float64{
+		"tolerance": tolerance,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err
@@ -1086,6 +1183,11 @@ func MinimumRotatedRectangle(ewkb geopb.EWKB) (geopb.EWKB, error) {
 // EWKB. Tolerance is used to control where snapping is performed.
 // If no snapping occurs then the input geometry is returned unchanged.
 func Snap(input, target geopb.EWKB, tolerance float64) (geopb.EWKB, error) {
+	if err := validateFloat64Params("Snap", map[string]float64{
+		"tolerance": tolerance,
+	}); err != nil {
+		return nil, err
+	}
 	g, err := ensureInitInternal()
 	if err != nil {
 		return nil, err

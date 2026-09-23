@@ -1,16 +1,12 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package physicalplan
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/stretchr/testify/require"
 )
 
 func TestProjectionAndRendering(t *testing.T) {
@@ -46,6 +43,9 @@ func TestProjectionAndRendering(t *testing.T) {
 
 		// expected post-process spec of the last stage in the resulting plan.
 		expPost execinfrapb.PostProcessSpec
+		// If set, the expected post-process spec of second to last stage if
+		// action results in adding another processor stage.
+		expPrevPost *execinfrapb.PostProcessSpec
 		// expected result types, same format and strings as resultTypes.
 		expResultTypes string
 	}{
@@ -55,7 +55,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			resultTypes: "A,B,C,D",
 
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{1, 3, 2}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{1, 3, 2}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -69,7 +69,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			resultTypes: "A,B,C,D",
 
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{2}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{2}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -88,7 +88,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			resultTypes: "A,B,C,D",
 
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{3, 1}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{3, 1}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -105,12 +105,34 @@ func TestProjectionAndRendering(t *testing.T) {
 			},
 			resultTypes: "A,B,C",
 
+			// Every render expression is used.
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{2, 0}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{2, 0, 1}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
-				RenderExprs: []execinfrapb.Expression{{Expr: "@6"}, {Expr: "@5"}},
+				RenderExprs: []execinfrapb.Expression{{Expr: "@6"}, {Expr: "@5"}, {Expr: "@1 + @2"}},
+			},
+			expResultTypes: "C,A,B",
+		},
+		{
+			post: execinfrapb.PostProcessSpec{
+				RenderExprs: []execinfrapb.Expression{{Expr: "@5"}, {Expr: "@1 + @2"}, {Expr: "@6"}},
+			},
+			resultTypes: "A,B,C",
+
+			// Some render expressions aren't used which adds another processor
+			// stage.
+			action: func(p *PhysicalPlan) {
+				p.AddProjection([]uint32{2, 0}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
+			},
+
+			expPrevPost: &execinfrapb.PostProcessSpec{
+				RenderExprs: []execinfrapb.Expression{{Expr: "@5"}, {Expr: "@1 + @2"}, {Expr: "@6"}},
+			},
+			expPost: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{2, 0},
 			},
 			expResultTypes: "C,A",
 		},
@@ -122,6 +144,7 @@ func TestProjectionAndRendering(t *testing.T) {
 
 			action: func(p *PhysicalPlan) {
 				if err := p.AddRendering(
+					context.Background(),
 					[]tree.TypedExpr{
 						&tree.IndexedVar{Idx: 10},
 						&tree.IndexedVar{Idx: 11},
@@ -132,6 +155,8 @@ func TestProjectionAndRendering(t *testing.T) {
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3},
 					[]*types.T{strToType("A"), strToType("B"), strToType("C"), strToType("D")},
 					execinfrapb.Ordering{},
+					nil,   /* finalizeLastStageCb */
+					false, /* collectExecStats */
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -148,6 +173,7 @@ func TestProjectionAndRendering(t *testing.T) {
 
 			action: func(p *PhysicalPlan) {
 				if err := p.AddRendering(
+					context.Background(),
 					[]tree.TypedExpr{
 						&tree.IndexedVar{Idx: 11},
 						&tree.IndexedVar{Idx: 13},
@@ -157,10 +183,11 @@ func TestProjectionAndRendering(t *testing.T) {
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3},
 					[]*types.T{strToType("B"), strToType("D"), strToType("C")},
 					execinfrapb.Ordering{},
+					nil,   /* finalizeLastStageCb */
+					false, /* collectExecStats */
 				); err != nil {
 					t.Fatal(err)
 				}
-
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -168,6 +195,40 @@ func TestProjectionAndRendering(t *testing.T) {
 				OutputColumns: []uint32{1, 3, 2},
 			},
 			expResultTypes: "B,D,C",
+		},
+
+		// Rendering after projection.
+		{
+			post: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{3, 1, 4, 2},
+			},
+			resultTypes: "A,B,C,D",
+
+			action: func(p *PhysicalPlan) {
+				if err := p.AddRendering(
+					context.Background(),
+					[]tree.TypedExpr{
+						&tree.IndexedVar{Idx: 0},
+						&tree.IndexedVar{Idx: 1},
+						&tree.IndexedVar{Idx: 2},
+					},
+					fakeExprContext{},
+					[]int{2, 0, 3, 1},
+					[]*types.T{strToType("C"), strToType("A"), strToType("D")},
+					execinfrapb.Ordering{},
+					nil,   /* finalizeLastStageCb */
+					false, /* collectExecStats */
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+
+			expPost: execinfrapb.PostProcessSpec{
+				Projection:    true,
+				OutputColumns: []uint32{4, 3, 2},
+			},
+			expResultTypes: "C,A,D",
 		},
 	}
 
@@ -203,6 +264,17 @@ func TestProjectionAndRendering(t *testing.T) {
 		}
 		if !reflect.DeepEqual(post, tc.expPost) {
 			t.Errorf("%d: incorrect post:\n%s\nexpected:\n%s", testIdx, &post, &tc.expPost)
+		}
+		// Sanity check that the new stage of processors was only added when we
+		// expected.
+		if tc.expPrevPost != nil {
+			require.Equal(t, int32(1), p.stageCounter)
+			prevPost := p.Processors[0].Spec.Post
+			if !reflect.DeepEqual(prevPost, *tc.expPrevPost) {
+				t.Errorf("%d: incorrect prev post:\n%s\nexpected:\n%s", testIdx, &prevPost, tc.expPrevPost)
+			}
+		} else {
+			require.Equal(t, int32(0), p.stageCounter)
 		}
 		var resTypes []string
 		for _, t := range p.GetResultTypes() {

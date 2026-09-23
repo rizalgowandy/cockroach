@@ -1,16 +1,14 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scop
 
-import "github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+import (
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/redact"
+)
 
 //go:generate go run ./generate_visitor.go scop Backfill backfill.go backfill_visitor_generated.go
 
@@ -23,8 +21,25 @@ func (backfillOp) Type() Type { return BackfillType }
 // BackfillIndex specifies an index backfill operation.
 type BackfillIndex struct {
 	backfillOp
-	TableID descpb.ID
-	IndexID descpb.IndexID
+	TableID       descpb.ID
+	SourceIndexID descpb.IndexID
+	IndexID       descpb.IndexID
+}
+
+func (BackfillIndex) Description() redact.RedactableString {
+	return "Backfilling index"
+}
+
+// MergeIndex specifies an index merge operation.
+type MergeIndex struct {
+	backfillOp
+	TableID           descpb.ID
+	TemporaryIndexID  descpb.IndexID
+	BackfilledIndexID descpb.IndexID
+}
+
+func (MergeIndex) Description() redact.RedactableString {
+	return "Merging index"
 }
 
 // Make sure baseOp is used for linter.

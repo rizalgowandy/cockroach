@@ -1,32 +1,34 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cli
 
 import (
+	"bytes"
 	gohex "encoding/hex"
 	"fmt"
 	"math"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/storage/storageconfig"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/keysutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/cockroachdb/redact"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/spf13/pflag"
 )
@@ -155,7 +157,7 @@ func (k *mvccKey) Set(value string) error {
 		}
 		newK, err := storage.DecodeMVCCKey(b)
 		if err != nil {
-			encoded := gohex.EncodeToString(storage.EncodeKey(storage.MakeMVCCMetadataKey(roachpb.Key(b))))
+			encoded := gohex.EncodeToString(storage.EncodeMVCCKey(storage.MakeMVCCMetadataKey(roachpb.Key(b))))
 			return errors.Wrapf(err, "perhaps this is just a hex-encoded key; you need an "+
 				"encoded MVCCKey (i.e. with a timestamp component); here's one with a zero timestamp: %s",
 				encoded)
@@ -168,7 +170,7 @@ func (k *mvccKey) Set(value string) error {
 		}
 		*k = mvccKey(storage.MakeMVCCMetadataKey(roachpb.Key(unquoted)))
 	case human:
-		scanner := keysutil.MakePrettyScanner(nil /* tableParser */)
+		scanner := keysutil.MakePrettyScanner(nil /* tableParser */, nil /* tenantParser */)
 		key, err := scanner.Scan(keyStr)
 		if err != nil {
 			return err
@@ -207,25 +209,10 @@ const (
 	hex
 )
 
-// _keyTypes stores the names of all the possible key types.
-var _keyTypes []string
-
-// keyTypes computes and memoizes the names of all the possible key
-// types, based on the definitions produces by Go's stringer (see
-// keytype_string.go).
-func keyTypes() []string {
-	if _keyTypes == nil {
-		for i := 0; i+1 < len(_keyType_index); i++ {
-			_keyTypes = append(_keyTypes, _keyType_name[_keyType_index[i]:_keyType_index[i+1]])
-		}
-	}
-	return _keyTypes
-}
-
 func parseKeyType(value string) (keyType, error) {
-	for i, typ := range keyTypes() {
+	for typ, i := range _keyTypes {
 		if strings.EqualFold(value, typ) {
-			return keyType(i), nil
+			return i, nil
 		}
 	}
 	return 0, fmt.Errorf("unknown key type '%s'", value)
@@ -267,6 +254,47 @@ func (s *nodeDecommissionWaitType) Set(value string) error {
 	return nil
 }
 
+type nodeDecommissionCheckMode int
+
+const (
+	nodeDecommissionChecksSkip nodeDecommissionCheckMode = iota
+	nodeDecommissionChecksEnabled
+	nodeDecommissionChecksStrict
+)
+
+// Type implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) String() string {
+	switch *s {
+	case nodeDecommissionChecksSkip:
+		return "skip"
+	case nodeDecommissionChecksEnabled:
+		return "enabled"
+	case nodeDecommissionChecksStrict:
+		return "strict"
+	default:
+		panic("unexpected node decommission check mode (possible values: enabled, strict, skip)")
+	}
+}
+
+// Set implements the pflag.Value interface.
+func (s *nodeDecommissionCheckMode) Set(value string) error {
+	switch value {
+	case "skip":
+		*s = nodeDecommissionChecksSkip
+	case "enabled":
+		*s = nodeDecommissionChecksEnabled
+	case "strict":
+		*s = nodeDecommissionChecksStrict
+	default:
+		return fmt.Errorf("invalid node decommission parameter: %s "+
+			"(possible values: enabled, strict, skip)", value)
+	}
+	return nil
+}
+
 // bytesOrPercentageValue is a flag that accepts an integer value, an integer
 // plus a unit (e.g. 32GB or 32GiB) or a percentage (e.g. 32%). In all these
 // cases, it transforms the string flag input into an int64 value.
@@ -298,6 +326,9 @@ type bytesOrPercentageValue struct {
 	// memoryPercentResolver() and diskPercentResolverFactory().
 	percentResolver percentResolverFunc
 }
+
+var _ redact.SafeFormatter = (*bytesOrPercentageValue)(nil)
+
 type percentResolverFunc func(percent int) (int64, error)
 
 // memoryPercentResolver turns a percent into the respective fraction of the
@@ -330,15 +361,20 @@ func diskPercentResolverFactory(dir string) (percentResolverFunc, error) {
 	}, nil
 }
 
-// newBytesOrPercentageValue creates a bytesOrPercentageValue.
+// makeBytesOrPercentageValue creates a bytesOrPercentageValue.
 //
 // v and percentResolver can be nil (either they're both specified or they're
 // both nil). If they're nil, then Resolve() has to be called later to get the
 // passed-in value.
-func newBytesOrPercentageValue(
+//
+// When using this function, be sure to define the flag Value in a
+// context struct (in context.go) and place the call to
+// makeBytesOrPercentageValue() in one of the context init
+// functions. Do not use global-scope variables.
+func makeBytesOrPercentageValue(
 	v *int64, percentResolver func(percent int) (int64, error),
-) *bytesOrPercentageValue {
-	return &bytesOrPercentageValue{
+) bytesOrPercentageValue {
+	return bytesOrPercentageValue{
 		bval:            humanizeutil.NewBytesValue(v),
 		percentResolver: percentResolver,
 	}
@@ -400,10 +436,265 @@ func (b *bytesOrPercentageValue) Type() string {
 
 // String implements the pflag.Value interface.
 func (b *bytesOrPercentageValue) String() string {
-	return b.bval.String()
+	return redact.StringWithoutMarkers(b)
+}
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (b *bytesOrPercentageValue) SafeFormat(p redact.SafePrinter, _ rune) {
+	p.Print(b.bval)
 }
 
 // IsSet returns true iff Set has successfully been called.
 func (b *bytesOrPercentageValue) IsSet() bool {
 	return b.bval.IsSet()
+}
+
+// populateWithEncryptionOpts iterates through the encryptionSpecList and looks
+// for matching paths in the StoreSpecList and WAL failover config. Any
+// unmatched EncryptionSpec causes an error.
+func populateWithEncryptionOpts(
+	storeSpecs base.StoreSpecList,
+	walFailoverConfig *storageconfig.WALFailover,
+	encryptionSpecs encryptionSpecList,
+) error {
+	for _, es := range encryptionSpecs.Specs {
+		var storeMatched bool
+		for i := range storeSpecs.Specs {
+			if !es.PathMatches(storeSpecs.Specs[i].Path) {
+				continue
+			}
+
+			// Found a matching path.
+			if storeSpecs.Specs[i].EncryptionOptions != nil {
+				return fmt.Errorf("store with path %s already has an encryption setting",
+					storeSpecs.Specs[i].Path)
+			}
+
+			storeSpecs.Specs[i].EncryptionOptions = &es.Options
+			storeMatched = true
+			break
+		}
+		pathMatched, err := maybeSetExternalPathEncryption(&walFailoverConfig.Path, es)
+		if err != nil {
+			return err
+		}
+		prevPathMatched, err := maybeSetExternalPathEncryption(&walFailoverConfig.PrevPath, es)
+		if err != nil {
+			return err
+		}
+		if !storeMatched && !pathMatched && !prevPathMatched {
+			return fmt.Errorf("no usage of path %s found for encryption setting: %v", es.Path, es)
+		}
+	}
+	return nil
+}
+
+// maybeSetExternalPathEncryption updates an ExternalPath to contain the provided
+// encryption options if the path matches. The ExternalPath must not already have
+// an encryption setting.
+func maybeSetExternalPathEncryption(
+	externalPath *storageconfig.ExternalPath, es storeEncryptionSpec,
+) (found bool, err error) {
+	if !externalPath.IsSet() || !es.PathMatches(externalPath.Path) {
+		return false, nil
+	}
+	// NB: The external paths WALFailoverConfig.Path and
+	// WALFailoverConfig.PrevPath are only ever set in single-store
+	// configurations. In multi-store with among-stores failover mode, these
+	// will be empty (so we won't encounter the same path twice).
+	if externalPath.Encryption != nil {
+		return false, fmt.Errorf("WAL failover path %s already has an encryption setting",
+			externalPath.Path)
+	}
+	externalPath.Encryption = &es.Options
+	return true, nil
+}
+
+// storeEncryptionSpec contains the details that can be specified in the cli via
+// the --enterprise-encryption flag.
+type storeEncryptionSpec struct {
+	Options storageconfig.EncryptionOptions
+	Path    string
+}
+
+// String returns a fully parsable version of the encryption spec.
+func (es storeEncryptionSpec) String() string {
+	// All fields are set.
+	return fmt.Sprintf("path=%s,key=%s,old-key=%s,rotation-period=%s",
+		es.Path, es.Options.KeyFiles.CurrentKey, es.Options.KeyFiles.OldKey, es.Options.RotationPeriod,
+	)
+}
+
+// PathMatches returns true if this storeEncryptionSpec matches the given store path.
+func (es storeEncryptionSpec) PathMatches(path string) bool {
+	return es.Path == path || es.Path == "*"
+}
+
+// parseStoreEncryptionSpec parses the string passed in and returns a new
+// storeEncryptionSpec if parsing succeeds.
+// TODO(mberhault): we should share the parsing code with the StoreSpec.
+func parseStoreEncryptionSpec(value string) (storeEncryptionSpec, error) {
+	const pathField = "path"
+	var es storeEncryptionSpec
+	es.Options.KeyFiles = &storageconfig.EncryptionKeyFiles{}
+
+	used := make(map[string]struct{})
+	for _, split := range strings.Split(value, ",") {
+		if len(split) == 0 {
+			continue
+		}
+		subSplits := strings.SplitN(split, "=", 2)
+		if len(subSplits) == 1 {
+			return storeEncryptionSpec{}, fmt.Errorf("field not in the form <key>=<value>: %s", split)
+		}
+		field := strings.ToLower(subSplits[0])
+		value := subSplits[1]
+		if _, ok := used[field]; ok {
+			return storeEncryptionSpec{}, fmt.Errorf("%s field was used twice in encryption definition", field)
+		}
+		used[field] = struct{}{}
+
+		if len(field) == 0 {
+			return storeEncryptionSpec{}, fmt.Errorf("empty field")
+		}
+		if len(value) == 0 {
+			return storeEncryptionSpec{}, fmt.Errorf("no value specified for %s", field)
+		}
+
+		switch field {
+		case pathField:
+			if value == "*" {
+				es.Path = value
+			} else {
+				var err error
+				es.Path, err = getAbsoluteFSPath(pathField, value)
+				if err != nil {
+					return storeEncryptionSpec{}, err
+				}
+			}
+		case "key":
+			es.Options.KeyFiles.CurrentKey = value
+		case "old-key":
+			es.Options.KeyFiles.OldKey = value
+		case "rotation-period":
+			dur, err := time.ParseDuration(value)
+			if err != nil {
+				return storeEncryptionSpec{}, errors.Wrapf(err, "could not parse rotation-duration value: %s", value)
+			}
+			es.Options.RotationPeriod = dur
+		default:
+			return storeEncryptionSpec{}, fmt.Errorf("%s is not a valid enterprise-encryption field", field)
+		}
+	}
+
+	// Check that all fields are set.
+	if es.Path == "" {
+		return storeEncryptionSpec{}, fmt.Errorf("no path specified")
+	}
+	if err := es.Options.Validate(); err != nil {
+		return storeEncryptionSpec{}, err
+	}
+
+	return es, nil
+}
+
+// encryptionSpecList contains a slice of StoreEncryptionSpecs that implements pflag's value
+// interface.
+type encryptionSpecList struct {
+	Specs []storeEncryptionSpec
+}
+
+var _ pflag.Value = &encryptionSpecList{}
+
+// String returns a string representation of all the StoreEncryptionSpecs. This is part
+// of pflag's value interface.
+func (encl encryptionSpecList) String() string {
+	var buffer bytes.Buffer
+	for _, ss := range encl.Specs {
+		fmt.Fprintf(&buffer, "--%s=%s ", cliflags.EnterpriseEncryption.Name, ss)
+	}
+	// Trim the extra space from the end if it exists.
+	if l := buffer.Len(); l > 0 {
+		buffer.Truncate(l - 1)
+	}
+	return buffer.String()
+}
+
+// Type returns the underlying type in string form. This is part of pflag's
+// value interface.
+func (encl *encryptionSpecList) Type() string {
+	return "EncryptionSpec"
+}
+
+// Set adds a new value to the StoreEncryptionSpecValue. It is the important part of
+// pflag's value interface.
+func (encl *encryptionSpecList) Set(value string) error {
+	spec, err := parseStoreEncryptionSpec(value)
+	if err != nil {
+		return err
+	}
+	if encl.Specs == nil {
+		encl.Specs = []storeEncryptionSpec{spec}
+	} else {
+		encl.Specs = append(encl.Specs, spec)
+	}
+	return nil
+}
+
+// encryptionOptionsForStore takes a store directory and returns its EncryptionOptions
+// if a matching entry if found in the StoreEncryptionSpecList.
+func encryptionOptionsForStore(
+	dir string, encryptionSpecs encryptionSpecList,
+) (*storageconfig.EncryptionOptions, error) {
+	// We need an absolute path, but the input may have come in relative.
+	path, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not find absolute path for %s ", dir)
+	}
+	for _, es := range encryptionSpecs.Specs {
+		if es.PathMatches(path) {
+			return &es.Options, nil
+		}
+	}
+	return nil, nil
+}
+
+// getAbsoluteFSPath takes a (possibly relative) and returns the absolute path.
+// Returns an error if the path begins with '~' or Abs fails.
+// 'fieldName' is used in error strings.
+func getAbsoluteFSPath(fieldName string, p string) (string, error) {
+	if p[0] == '~' {
+		return "", fmt.Errorf("%s cannot start with '~': %s", fieldName, p)
+	}
+
+	ret, err := filepath.Abs(p)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not find absolute path for %s %s", fieldName, p)
+	}
+	return ret, nil
+}
+
+// walFailoverWrapper implements pflag.Value for the wal failover flag.
+type walFailoverWrapper struct {
+	cfg *storageconfig.WALFailover
+}
+
+var _ pflag.Value = (*walFailoverWrapper)(nil)
+
+// Type implements the pflag.Value interface.
+func (c *walFailoverWrapper) Type() string { return "string" }
+
+// String implements the pflag.Value interface.
+func (c *walFailoverWrapper) String() string {
+	return c.cfg.String()
+}
+
+// Set implements the pflag.Value interface.
+func (c *walFailoverWrapper) Set(s string) error {
+	cfg, err := storageconfig.ParseWALFailover(s)
+	if err != nil {
+		return err
+	}
+	*c.cfg = cfg
+	return nil
 }

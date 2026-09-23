@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rowexec
 
@@ -16,11 +11,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -34,17 +29,6 @@ type ProcessorTestConfig struct {
 
 	BeforeTestCase func(p execinfra.Processor, inputs []execinfra.RowSource, output execinfra.RowReceiver)
 	AfterTestCase  func(p execinfra.Processor, inputs []execinfra.RowSource, output execinfra.RowReceiver)
-}
-
-func DefaultProcessorTestConfig() ProcessorTestConfig {
-	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
-	return ProcessorTestConfig{
-		FlowCtx: &execinfra.FlowCtx{
-			Cfg:     &execinfra.ServerConfig{Settings: st},
-			EvalCtx: &evalCtx,
-		},
-	}
 }
 
 // ProcessorTestCaseRows is a number of rows of go values with an associated
@@ -74,11 +58,11 @@ func toEncDatum(datumType *types.T, v interface{}) rowenc.EncDatum {
 		}
 	}()
 	// Initialize both EncDatum.Datum, and EncDatum.encoded.
-	encoded, err := rowenc.EncodeTableKey(nil, d, encoding.Ascending)
+	encoded, err := keyside.Encode(nil, d, encoding.Ascending)
 	if err != nil {
 		panic(err)
 	}
-	encodedDatum := rowenc.EncDatumFromEncoded(descpb.DatumEncoding_ASCENDING_KEY, encoded)
+	encodedDatum := rowenc.EncDatumFromEncoded(catenumpb.DatumEncoding_ASCENDING_KEY, encoded)
 	encodedDatum.Datum = d
 	return encodedDatum
 }
@@ -155,10 +139,10 @@ func (p *ProcessorTest) RunTestCases(
 			ctx,
 			p.config.FlowCtx,
 			processorID,
+			0, /* stageID */
 			&tc.ProcessorCore,
 			&tc.Post,
 			inputs,
-			[]execinfra.RowReceiver{output},
 			nil, /* localProcessors */
 		)
 		if err != nil {
@@ -170,7 +154,7 @@ func (p *ProcessorTest) RunTestCases(
 			p.config.BeforeTestCase(processor, inputs, output)
 		}
 
-		processor.Run(ctx)
+		processor.Run(ctx, output)
 
 		if p.config.AfterTestCase != nil {
 			p.config.AfterTestCase(processor, inputs, output)

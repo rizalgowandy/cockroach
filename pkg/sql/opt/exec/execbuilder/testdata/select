@@ -5,7 +5,13 @@
 # TODO(yuzefovich): clean up the tracing in the vectorized engine and remove
 # adjustment of vectorize mode (#55821).
 statement ok
-SET vectorize=off; SET tracing = on; BEGIN; SELECT 1; COMMIT; SELECT 2; SET tracing = off; RESET vectorize
+SET vectorize=off; SET tracing = on
+
+statement ok
+BEGIN; SELECT 1; COMMIT; SELECT 2
+
+statement ok
+SET tracing = off; RESET vectorize
 
 # Inspect the trace: we exclude messages containing newlines as these
 # may contain non-deterministic txn object descriptions.
@@ -15,34 +21,49 @@ SET vectorize=off; SET tracing = on; BEGIN; SELECT 1; COMMIT; SELECT 2; SET trac
 # how many commands we ran in the session.
 query ITT
 SELECT
-  span, regexp_replace(message, 'pos:[0-9]*', 'pos:?'), operation
+  span,
+  CASE WHEN message LIKE '=== operation:%'
+    THEN regexp_replace(
+      regexp_replace(message, ' statement:.*?( _| $)', '\1'),
+      ' (gid|node|client|user|txn|cockroach\.\w+|implicit|_unfinished):\S*| hostssl:\S*',
+      '', 'g')
+    ELSE regexp_replace(message, 'pos:[0-9]*', 'pos:?')
+  END,
+  operation
 FROM [SHOW TRACE FOR SESSION]
-WHERE message LIKE '%SPAN START%' OR message LIKE '%pos%executing%';
+WHERE message LIKE '%=== operation:%' OR message LIKE '%pos%executing%';
 ----
-0   === SPAN START: session recording ===                session recording
-1   === SPAN START: exec stmt ===                        exec stmt
-1   [NoTxn pos:?] executing ExecStmt: BEGIN TRANSACTION  exec stmt
-2   === SPAN START: sql txn ===                          sql txn
-3   === SPAN START: exec stmt ===                        exec stmt
-3   [Open pos:?] executing ExecStmt: SELECT 1            exec stmt
-4   === SPAN START: consuming rows ===                   consuming rows
-5   === SPAN START: flow ===                             flow
-6   === SPAN START: exec stmt ===                        exec stmt
-6   [Open pos:?] executing ExecStmt: COMMIT TRANSACTION  exec stmt
-7   === SPAN START: exec stmt ===                        exec stmt
-7   [NoTxn pos:?] executing ExecStmt: SELECT 2           exec stmt
-8   === SPAN START: sql txn ===                          sql txn
-9   === SPAN START: exec stmt ===                        exec stmt
-9   [Open pos:?] executing ExecStmt: SELECT 2            exec stmt
-10  === SPAN START: consuming rows ===                   consuming rows
-11  === SPAN START: flow ===                             flow
-12  === SPAN START: exec stmt ===                        exec stmt
-12  [NoTxn pos:?] executing ExecStmt: SET TRACING = off  exec stmt
+0   === operation:session recording _verbose:1                session recording
+1   === operation:session tracing _verbose:1                  session tracing
+1   [Open pos:?] executing Sync                               session tracing
+2   === operation:commit sql txn _verbose:1                   commit sql txn
+0   [NoTxn pos:?] executing ExecStmt: BEGIN TRANSACTION       session recording
+3   === operation:sql txn _verbose:1                          sql txn
+3   [Open pos:?] executing ExecStmt: SELECT 1                 sql txn
+4   === operation:sql query _verbose:1 statement:SELECT 1     sql query
+5   === operation:optimizer _verbose:1                        optimizer
+6   === operation:consuming rows _verbose:1                   consuming rows
+7   === operation:flow _verbose:1                             flow
+8   === operation:values _verbose:1                           values
+3   [Open pos:?] executing ExecStmt: COMMIT TRANSACTION       sql txn
+9   === operation:sql query _verbose:1 statement:COMMIT       sql query
+10  === operation:commit sql txn _verbose:1                   commit sql txn
+0   [NoTxn pos:?] executing ExecStmt: SELECT 2                session recording
+11  === operation:sql txn _verbose:1                          sql txn
+11  [Open pos:?] executing ExecStmt: SELECT 2                 sql txn
+12  === operation:sql query _verbose:1 statement:SELECT 2     sql query
+13  === operation:optimizer _verbose:1                        optimizer
+14  === operation:consuming rows _verbose:1                   consuming rows
+15  === operation:flow _verbose:1                             flow
+16  === operation:values _verbose:1                           values
+17  === operation:commit sql txn _verbose:1                   commit sql txn
+0   [NoTxn pos:?] executing Sync                              session recording
+0   [NoTxn pos:?] executing ExecStmt: SET TRACING = off       session recording
 
 statement ok
 CREATE TABLE num_ref (a INT PRIMARY KEY, xx INT, b INT, c INT, INDEX bc (b,c))
 
-let $t_id 
+let $t_id
 SELECT id FROM system.namespace WHERE name='num_ref'
 
 statement ok
@@ -180,8 +201,18 @@ vectorized: true
   table: num_ref@bc
   spans: FULL SCAN
 
+let $num_ref_bc
+SELECT index_id
+  FROM crdb_internal.table_indexes
+ WHERE descriptor_id = $t_id AND index_name = 'bc';
+
+let $num_ref_pkey
+SELECT index_id
+  FROM crdb_internal.table_indexes
+ WHERE descriptor_id = $t_id AND index_name = 'num_ref_pkey';
+
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[$num_ref_pkey]
 ----
 distribution: local
 vectorized: true
@@ -193,7 +224,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]@[$num_ref_bc]
 ----
 distribution: local
 vectorized: true
@@ -205,7 +236,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[$num_ref_pkey]
 ----
 distribution: local
 vectorized: true
@@ -217,7 +248,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(3) AS num_ref_alias]@[$num_ref_bc]
 ----
 distribution: local
 vectorized: true
@@ -229,7 +260,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[1]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[$num_ref_pkey]
 ----
 distribution: local
 vectorized: true
@@ -241,7 +272,7 @@ vectorized: true
   spans: FULL SCAN
 
 query T
-EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[2]
+EXPLAIN (VERBOSE) SELECT * FROM [$t_id(4) AS num_ref_alias]@[$num_ref_bc]
 ----
 distribution: local
 vectorized: true
@@ -306,7 +337,7 @@ EXPLAIN (VERBOSE) SELECT 1 FROM [$t_id() as num_ref_alias]
 statement ok
 DROP TABLE num_ref
 
-query error pq: \[\d+\(1\) AS num_ref_alias\]: descriptor is being dropped
+query error pq: \[\d+\(1\) AS num_ref_alias\]: relation "num_ref" is being dropped: descriptor is being dropped
 EXPLAIN (VERBOSE) SELECT * FROM [$t_id(1) AS num_ref_alias]
 
 # ------------------------------------------------------------------------------
@@ -381,7 +412,6 @@ vectorized: true
 ·
 • render
 │ columns: (r)
-│ estimated row count: 1,000 (missing stats)
 │ render r: x + 1
 │
 └── • scan
@@ -398,7 +428,6 @@ vectorized: true
 ·
 • render
 │ columns: (a, b, y, c, d)
-│ estimated row count: 1,000 (missing stats)
 │ render b: x + 1
 │ render c: y + 1
 │ render d: x + y
@@ -419,12 +448,10 @@ vectorized: true
 ·
 • render
 │ columns: (r)
-│ estimated row count: 1,000 (missing stats)
 │ render r: "?column?" + ("?column?" * "?column?")
 │
 └── • render
     │ columns: ("?column?", "?column?")
-    │ estimated row count: 1,000 (missing stats)
     │ render ?column?: x + 3
     │ render ?column?: y + 10
     │
@@ -457,7 +484,6 @@ vectorized: true
 ·
 • render
 │ columns: (a, b)
-│ estimated row count: 333 (missing stats)
 │ render a: x + 1
 │ render b: x + y
 │
@@ -522,22 +548,22 @@ CREATE TABLE t (
   FAMILY (a, b, c, d)
 )
 
-query TTBITTBB colnames
+query TTBITTTBBBF colnames,rowsort
 SHOW INDEXES FROM t
 ----
-table_name  index_name  non_unique  seq_in_index  column_name  direction  storing  implicit
-t           b_idx       true        1             b            ASC        false    false
-t           b_idx       true        2             c            N/A        true     false
-t           b_idx       true        3             d            N/A        true     false
-t           b_idx       true        4             a            ASC        false    true
-t           c_idx       false       1             c            ASC        false    false
-t           c_idx       false       2             b            N/A        true     false
-t           c_idx       false       3             d            N/A        true     false
-t           c_idx       false       4             a            ASC        false    true
-t           t_pkey      false       1             a            ASC        false    false
-t           t_pkey      false       2             b            N/A        true     false
-t           t_pkey      false       3             c            N/A        true     false
-t           t_pkey      false       4             d            N/A        true     false
+table_name  index_name  non_unique  seq_in_index  column_name  definition  direction  storing  implicit  visible  visibility
+t           b_idx       true        1             b            b           ASC        false    false     true     1
+t           b_idx       true        2             c            c           N/A        true     false     true     1
+t           b_idx       true        3             d            d           N/A        true     false     true     1
+t           b_idx       true        4             a            a           ASC        false    true      true     1
+t           c_idx       false       1             c            c           ASC        false    false     true     1
+t           c_idx       false       2             b            b           N/A        true     false     true     1
+t           c_idx       false       3             d            d           N/A        true     false     true     1
+t           c_idx       false       4             a            a           ASC        true     true      true     1
+t           t_pkey      false       1             a            a           ASC        false    false     true     1
+t           t_pkey      false       2             b            b           N/A        true     false     true     1
+t           t_pkey      false       3             c            c           N/A        true     false     true     1
+t           t_pkey      false       4             d            d           N/A        true     false     true     1
 
 statement ok
 INSERT INTO t VALUES (1, 2, 3, 4)
@@ -609,8 +635,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /t/b_idx/NULL/2 -> NULL
-fetched: /t/b_idx/NULL/3 -> NULL
+fetched: /t/b_idx/NULL/2 -> <undecoded>
+fetched: /t/b_idx/NULL/3 -> <undecoded>
 fetched: /t/b_idx/2/1/c/d -> /3/4
 output row: [2 NULL NULL NULL]
 output row: [3 NULL NULL NULL]
@@ -628,7 +654,6 @@ query T
 EXPLAIN SELECT a FROM t14601 ORDER BY a
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -654,7 +679,6 @@ query T
 EXPLAIN SELECT a, b FROM t14601a ORDER BY a
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -671,7 +695,6 @@ query T
 EXPLAIN SELECT a, b FROM t14601a ORDER BY a
 ----
 distribution: local
-vectorized: true
 ·
 • scan
   missing stats
@@ -716,7 +739,6 @@ vectorized: true
 ·
 • render
 │ columns: (a)
-│ estimated row count: 1,000 (missing stats)
 │ render a: 1
 │
 └── • scan
@@ -826,9 +848,9 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453' -> NULL
-fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453'/b -> '2015-08-25'
-fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453'/c -> '02:45:02.234'
+fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453':cf=0 -> <undecoded>
+fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453'/b:cf=1 -> '2015-08-25'
+fetched: /dt/dt_pkey/'2015-08-25 04:45:45.53453'/c:cf=2 -> '02:45:02.234'
 output row: ['2015-08-25 04:45:45.53453' '2015-08-25' '02:45:02.234']
 
 statement ok
@@ -839,7 +861,7 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /dt/dt_b_key/'2015-08-25' -> /'2015-08-25 04:45:45.53453'
+fetched: /dt/dt_b_key/'2015-08-25' -> /?
 output row: ['2015-08-25']
 
 statement ok
@@ -850,8 +872,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /dt/dt_c_key/'02:45:02.234' -> /'2015-08-25 04:45:45.53453'
-fetched: /dt/dt_c_key/'34:00:02' -> /'2015-08-30 03:34:45.34567'
+fetched: /dt/dt_c_key/'02:45:02.234' -> /?
+fetched: /dt/dt_c_key/'34:00:02' -> /?
 output row: ['02:45:02.234']
 output row: ['34:00:02']
 
@@ -947,8 +969,8 @@ SELECT message FROM [SHOW KV TRACE FOR SESSION] WITH ORDINALITY
  WHERE message LIKE 'fetched:%' OR message LIKE 'output row%'
  ORDER BY message LIKE 'fetched:%' DESC, ordinality ASC
 ----
-fetched: /c/b_idx/NULL/2 -> NULL
-fetched: /c/b_idx/NULL/3 -> NULL
+fetched: /c/b_idx/NULL/2 -> <undecoded>
+fetched: /c/b_idx/NULL/3 -> <undecoded>
 fetched: /c/b_idx/0.4/1/b -> /0.40
 output row: [2 NULL]
 output row: [3 NULL]
@@ -1333,7 +1355,6 @@ vectorized: true
 └── • render
     │ columns: ("?column?", a)
     │ ordering: +a
-    │ estimated row count: 1,000 (missing stats)
     │ render ?column?: a + (b + c)
     │ render a: a
     │
@@ -1355,13 +1376,11 @@ vectorized: true
 │
 └── • sort
     │ columns: ("?column?", b)
-    │ ordering: +b
     │ estimated row count: 1,000 (missing stats)
     │ order: +b
     │
     └── • render
         │ columns: ("?column?", b)
-        │ estimated row count: 1,000 (missing stats)
         │ render ?column?: a + (c + (a + b))
         │ render b: b
         │
@@ -1384,7 +1403,6 @@ vectorized: true
 └── • render
     │ columns: ("?column?", a, b)
     │ ordering: -a,-b
-    │ estimated row count: 1,000 (missing stats)
     │ render ?column?: a + (c + (a + b))
     │ render a: a
     │ render b: b
@@ -1422,22 +1440,18 @@ EXPLAIN (VERBOSE) SELECT * FROM abcd WHERE a > b ORDER BY a DESC, b DESC
 distribution: local
 vectorized: true
 ·
-• sort
+• filter
 │ columns: (a, b, c, d)
 │ ordering: -a,-b
 │ estimated row count: 333 (missing stats)
-│ order: -a,-b
+│ filter: a > b
 │
-└── • filter
-    │ columns: (a, b, c, d)
-    │ estimated row count: 333 (missing stats)
-    │ filter: a > b
-    │
-    └── • scan
-          columns: (a, b, c, d)
-          estimated row count: 1,000 (missing stats)
-          table: abcd@abcd_pkey
-          spans: FULL SCAN
+└── • revscan
+      columns: (a, b, c, d)
+      ordering: -a,-b
+      estimated row count: 1,000 (missing stats)
+      table: abcd@abcd_pkey
+      spans: FULL SCAN
 
 query T
 EXPLAIN (VERBOSE) SELECT * FROM (SELECT a, b FROM abcd LIMIT 10) WHERE a > b ORDER BY a
@@ -1468,7 +1482,6 @@ vectorized: true
 • render
 │ columns: (a, x)
 │ ordering: +a
-│ estimated row count: 3 (missing stats)
 │ render x: c + (a + b)
 │ render a: a
 │
@@ -1521,142 +1534,173 @@ CREATE TABLE b (a INT, b INT, c INT NULL, d INT NULL, PRIMARY KEY (a, b), FAMILY
 
 # No parallel line printed out for single-span selects.
 query T
-EXPLAIN SELECT * FROM a WHERE a = 10
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a = 10
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 1 (missing stats)
   table: a@a_pkey
-  spans: [/10 - /10]
+  spans: /10/0
 
 query T
-EXPLAIN SELECT * FROM a WHERE a = 10 OR a = 20
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a = 10 OR a = 20
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 2 (missing stats)
   table: a@a_pkey
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10/0 /20/0
+  parallel
 
 query T
-EXPLAIN SELECT * FROM a WHERE a IN (10, 20)
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a IN (10, 20)
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 2 (missing stats)
   table: a@a_pkey
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10/0 /20/0
+  parallel
 
 # Verify that consolidated point spans are still parallelized.
 query T
-EXPLAIN SELECT * FROM a WHERE a in (10, 11)
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a in (10, 11)
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 2 (missing stats)
   table: a@a_pkey
-  spans: [/10 - /11]
+  spans: /10-/12
+  parallel
 
 query T
-EXPLAIN SELECT * FROM a WHERE a > 10 AND a < 20
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a > 10 AND a < 20
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 9 (missing stats)
   table: a@a_pkey
-  spans: [/11 - /19]
+  spans: /11-/20
+  parallel
 
 # This ticks all the boxes for parallelization apart from the fact that there
 # is no end key in the span.
 query T
-EXPLAIN SELECT * FROM a WHERE a > 10
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a > 10
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 333 (missing stats)
   table: a@a_pkey
-  spans: [/11 - ]
+  spans: /11-
 
 # Test non-int types.
 
 # Point queries on non-int types are parallel.
 query T
-EXPLAIN SELECT price FROM a WHERE item IN ('sock', 'ball')
+EXPLAIN (VERBOSE) SELECT price FROM a WHERE item IN ('sock', 'ball')
 ----
 distribution: local
 vectorized: true
 ·
-• index join
-│ table: a@a_pkey
+• project
+│ columns: (price)
 │
-└── • scan
-      missing stats
-      table: a@item
-      spans: [/'ball' - /'ball'] [/'sock' - /'sock']
+└── • index join
+    │ columns: (item, price)
+    │ estimated row count: 2 (missing stats)
+    │ table: a@a_pkey
+    │ key columns: a
+    │ parallel
+    │
+    └── • scan
+          columns: (a, item)
+          estimated row count: 2 (missing stats)
+          table: a@item
+          spans: /"ball"/0 /"sock"/0
+          parallel
 
 # Range queries on non-int types are not parallel due to unbounded number of
 # results.
 query T
-EXPLAIN SELECT item FROM a WHERE price > 5 AND price < 10 OR price > 20 AND price < 40
+EXPLAIN (VERBOSE) SELECT item FROM a WHERE price > 5 AND price < 10 OR price > 20 AND price < 40
 ----
 distribution: local
 vectorized: true
 ·
-• index join
-│ table: a@a_pkey
+• project
+│ columns: (item)
 │
-└── • scan
-      missing stats
-      table: a@p
-      spans: [/5.000000000000001 - /9.999999999999998] [/20.000000000000004 - /39.99999999999999]
+└── • index join
+    │ columns: (item, price)
+    │ estimated row count: 110 (missing stats)
+    │ table: a@a_pkey
+    │ key columns: a
+    │ parallel
+    │
+    └── • scan
+          columns: (a, price)
+          estimated row count: 110 (missing stats)
+          table: a@p
+          spans: /5.000000000000001-/9.999999999999998/PrefixEnd /20.000000000000004-/39.99999999999999/PrefixEnd
 
 query T
-EXPLAIN SELECT * FROM b WHERE (a = 10 AND b = 10) OR (a = 20 AND b = 20)
+EXPLAIN (VERBOSE) SELECT * FROM b WHERE (a = 10 AND b = 10) OR (a = 20 AND b = 20)
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, b, c, d)
+  estimated row count: 1 (missing stats)
   table: b@b_pkey
-  spans: [/10/10 - /10/10] [/20/20 - /20/20]
+  spans: /10/10/0 /20/20/0
+  parallel
 
 # This one isn't parallelizable because it's not a point lookup - only part of
 # the primary key is specified.
 query T
-EXPLAIN SELECT * FROM b WHERE a = 10 OR a = 20
+EXPLAIN (VERBOSE) SELECT * FROM b WHERE a = 10 OR a = 20
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, b, c, d)
+  estimated row count: 20 (missing stats)
   table: b@b_pkey
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10-/11 /20-/21
 
 # This one isn't parallelizable because it has a LIMIT clause.
 query T
-EXPLAIN SELECT * FROM a WHERE a = 10 OR a = 20 LIMIT 1
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a = 10 OR a = 20 LIMIT 1
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (a, item, price)
+  estimated row count: 1 (missing stats)
   table: a@a_pkey
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10/0 /20/0
   limit: 1
 
 statement ok
@@ -1664,15 +1708,16 @@ CREATE INDEX on b(b) STORING (c)
 
 # This one isn't parallelizable because its index isn't unique.
 query T
-EXPLAIN SELECT b FROM b WHERE b = 10 OR b = 20
+EXPLAIN (VERBOSE) SELECT b FROM b WHERE b = 10 OR b = 20
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (b)
+  estimated row count: 20 (missing stats)
   table: b@b_b_idx
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10-/11 /20-/21
 
 statement ok
 CREATE UNIQUE INDEX on b(c)
@@ -1680,26 +1725,29 @@ CREATE UNIQUE INDEX on b(c)
 # If the index has nullable values, parallelize only when the spans do not
 # specify any nulls.
 query T
-EXPLAIN SELECT c FROM b WHERE c = 10 OR c = 20
+EXPLAIN (VERBOSE) SELECT c FROM b WHERE c = 10 OR c = 20
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (c)
+  estimated row count: 2 (missing stats)
   table: b@b_c_key
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10/0 /20/0
+  parallel
 
 query T
-EXPLAIN SELECT c FROM b WHERE c = 10 OR c < 2
+EXPLAIN (VERBOSE) SELECT c FROM b WHERE c = 10 OR c < 2
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (c)
+  estimated row count: 330 (missing stats)
   table: b@b_c_key
-  spans: (/NULL - /1] [/10 - /10]
+  spans: /!NULL-/2 /10/0
 
 statement ok
 CREATE UNIQUE INDEX on b(d DESC)
@@ -1707,15 +1755,16 @@ CREATE UNIQUE INDEX on b(d DESC)
 # This scan is not parallelizable because the second span has a null in its end
 # key.
 query T
-EXPLAIN SELECT d FROM b WHERE d = 10 OR d < 2
+EXPLAIN (VERBOSE) SELECT d FROM b WHERE d = 10 OR d < 2
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (d)
+  estimated row count: 330 (missing stats)
   table: b@b_d_key
-  spans: [/10 - /10] [/1 - /NULL)
+  spans: /10/0 /1-/NULL
 
 statement ok
 CREATE UNIQUE INDEX ON b(c, d)
@@ -1723,15 +1772,19 @@ CREATE UNIQUE INDEX ON b(c, d)
 # This scan is not parallelizable because although the second column is
 # constrained, the first column is null.
 query T
-EXPLAIN SELECT d FROM b WHERE c = 10 AND d = 10 OR c IS NULL AND d > 0 AND d < 2
+EXPLAIN (VERBOSE) SELECT d FROM b WHERE c = 10 AND d = 10 OR c IS NULL AND d > 0 AND d < 2
 ----
 distribution: local
 vectorized: true
 ·
-• scan
-  missing stats
-  table: b@b_c_d_key
-  spans: [/NULL/1 - /NULL/1] [/10/10 - /10/10]
+• project
+│ columns: (d)
+│
+└── • scan
+      columns: (c, d)
+      estimated row count: 1 (missing stats)
+      table: b@b_c_d_key
+      spans: /NULL/1-/NULL/2 /10/10/0
 
 statement ok
 DROP INDEX b_b_idx
@@ -1741,15 +1794,135 @@ CREATE UNIQUE INDEX on b(b) STORING (c)
 
 # This one is parallelizable because its index is unique and non-null.
 query T
-EXPLAIN SELECT b FROM b WHERE b = 10 OR b = 20
+EXPLAIN (VERBOSE) SELECT b FROM b WHERE b = 10 OR b = 20
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  missing stats
+  columns: (b)
+  estimated row count: 2 (missing stats)
   table: b@b_b_key
-  spans: [/10 - /10] [/20 - /20]
+  spans: /10/0 /20/0
+  parallel
+
+# Now verify that if 'unbounded_parallel_scans' is 'true', then the scans are
+# parallelized even when we don't have a small upper bound.
+
+statement ok
+SET unbounded_parallel_scans = true
+
+# No end key in the span.
+query T
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a > 10
+----
+distribution: local
+vectorized: true
+·
+• scan
+  columns: (a, item, price)
+  estimated row count: 333 (missing stats)
+  table: a@a_pkey
+  spans: /11-
+  parallel
+
+# Range queries have unbounded number of results.
+query T
+EXPLAIN (VERBOSE) SELECT item FROM a WHERE price > 5 AND price < 10 OR price > 20 AND price < 40
+----
+distribution: local
+vectorized: true
+·
+• project
+│ columns: (item)
+│
+└── • index join
+    │ columns: (item, price)
+    │ estimated row count: 110 (missing stats)
+    │ table: a@a_pkey
+    │ key columns: a
+    │ parallel
+    │
+    └── • scan
+          columns: (a, price)
+          estimated row count: 110 (missing stats)
+          table: a@p
+          spans: /5.000000000000001-/9.999999999999998/PrefixEnd /20.000000000000004-/39.99999999999999/PrefixEnd
+          parallel
+
+# Only part of the primary key is specified.
+query T
+EXPLAIN (VERBOSE) SELECT * FROM b WHERE a = 10 OR a = 20
+----
+distribution: local
+vectorized: true
+·
+• scan
+  columns: (a, b, c, d)
+  estimated row count: 20 (missing stats)
+  table: b@b_pkey
+  spans: /10-/11 /20-/21
+  parallel
+
+# Still not parallelizable because it has a LIMIT clause.
+query T
+EXPLAIN (VERBOSE) SELECT * FROM a WHERE a = 10 OR a = 20 LIMIT 1
+----
+distribution: local
+vectorized: true
+·
+• scan
+  columns: (a, item, price)
+  estimated row count: 1 (missing stats)
+  table: a@a_pkey
+  spans: /10/0 /20/0
+  limit: 1
+
+# NULLs at the span boundaries prevent us from putting a bound on the row count.
+query T
+EXPLAIN (VERBOSE) SELECT c FROM b WHERE c = 10 OR c < 2
+----
+distribution: local
+vectorized: true
+·
+• scan
+  columns: (c)
+  estimated row count: 330 (missing stats)
+  table: b@b_c_key
+  spans: /!NULL-/2 /10/0
+  parallel
+
+query T
+EXPLAIN (VERBOSE) SELECT d FROM b WHERE d = 10 OR d < 2
+----
+distribution: local
+vectorized: true
+·
+• scan
+  columns: (d)
+  estimated row count: 330 (missing stats)
+  table: b@b_d_key
+  spans: /10/0 /1-/NULL
+  parallel
+
+query T
+EXPLAIN (VERBOSE) SELECT d FROM b WHERE c = 10 AND d = 10 OR c IS NULL AND d > 0 AND d < 2
+----
+distribution: local
+vectorized: true
+·
+• project
+│ columns: (d)
+│
+└── • scan
+      columns: (c, d)
+      estimated row count: 1 (missing stats)
+      table: b@b_c_d_key
+      spans: /NULL/1-/NULL/2 /10/10/0
+      parallel
+
+statement ok
+SET unbounded_parallel_scans = false
 
 statement ok
 ALTER TABLE a SPLIT AT VALUES(5)
@@ -1767,22 +1940,32 @@ SELECT id FROM system.namespace WHERE name='a'
 
 # The span "sending partial batch" means that the scan was parallelized. We're
 # seeing duplicate "querying next range" entries because we first use the range
-# cache to try to partition the spans in order to have parallel TableReaders (we
-# end up with a single partition though), and then we have a single TableReader
-# performing the scan of two spans in parallel.
+# cache to count the number of ranges affected and then to try to partition the
+# spans in order to have parallel TableReaders (we end up with a single
+# partition though). Then we have a single TableReader performing the scan of
+# two spans in parallel.
 # If this test is failing and doesn't have that span, it means that the scanNode
 # was improperly configured to add a limit to the ScanRequest batch.
 # See #30943 for more details.
 query T
-SELECT message FROM [SHOW TRACE FOR SESSION]
+SELECT CASE WHEN message LIKE '=== operation:%'
+    THEN regexp_replace(
+      message,
+      ' (gid|node|client|user|txn|cockroach\.\w+|implicit|_unfinished):\S*| hostssl:\S*',
+      '', 'g')
+    ELSE message
+  END
+FROM [SHOW TRACE FOR SESSION]
 WHERE message LIKE 'querying next range at /Table/$t_id3/1%' OR
-      message = '=== SPAN START: kv.DistSender: sending partial batch ==='
+      message LIKE '=== operation:kv.DistSender: sending partial batch%'
 ----
-querying next range at /Table/77/1/0/0
-querying next range at /Table/77/1/10/0
-querying next range at /Table/77/1/0/0
-=== SPAN START: kv.DistSender: sending partial batch ===
-querying next range at /Table/77/1/10/0
+querying next range at /Table/127/1/0/0
+querying next range at /Table/127/1/10/0
+querying next range at /Table/127/1/0/0
+querying next range at /Table/127/1/10/0
+querying next range at /Table/127/1/0/0
+=== operation:kv.DistSender: sending partial batch _verbose:1
+querying next range at /Table/127/1/10/0
 
 # Test for 42202 -- ensure filters can get pushed down through project-set.
 statement ok
@@ -1793,7 +1976,6 @@ query T
 EXPLAIN SELECT e.z, s.z, n FROM e, s, generate_series(0, s.z, 1000) as n WHERE e.y = s.y ORDER BY s.z LIMIT 10
 ----
 distribution: local
-vectorized: true
 ·
 • top-k
 │ order: +z
@@ -1818,6 +2000,8 @@ vectorized: true
 # values.
 statement ok
 CREATE TABLE nulls (x INT, y INT);
+
+statement ok
 ALTER TABLE nulls INJECT STATISTICS '[
     {
         "columns": [

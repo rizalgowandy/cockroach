@@ -1,149 +1,113 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scdeps
 
 import (
 	"context"
+	"fmt"
+	"math"
 
+	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/backfill"
+	"github.com/cockroachdb/cockroach/pkg/sql/bulkutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/backfiller"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 )
-
-// NewTxnRunDependencies constructs dependencies for use planning and running a
-// phase of a schema change during transaction execution.
-func NewTxnRunDependencies(
-	execDependencies scexec.Dependencies, phase scop.Phase, knobs *scrun.TestingKnobs,
-) scrun.TxnRunDependencies {
-	return &runDeps{
-		execDeps:     execDependencies,
-		phase:        phase,
-		testingKnobs: knobs,
-	}
-}
-
-type runDeps struct {
-	execDeps scexec.Dependencies
-
-	phase        scop.Phase
-	testingKnobs *scrun.TestingKnobs
-}
-
-func (d *runDeps) ExecutorDependencies() scexec.Dependencies {
-	return d.execDeps
-}
-
-func (d *runDeps) Phase() scop.Phase {
-	return d.phase
-}
-
-var _ scrun.TxnRunDependencies = (*runDeps)(nil)
-
-// NewJobCreationDependencies returns an
-// scexec.SchemaChangeJobCreationDependencies implementation built from the
-// given arguments.
-func NewJobCreationDependencies(
-	execDeps scexec.Dependencies, user security.SQLUsername,
-) scrun.SchemaChangeJobCreationDependencies {
-	return &jobCreationDeps{
-		execDeps: execDeps,
-		user:     user,
-	}
-}
-
-type jobCreationDeps struct {
-	execDeps scexec.Dependencies
-	user     security.SQLUsername
-}
-
-var _ scrun.SchemaChangeJobCreationDependencies = (*jobCreationDeps)(nil)
-
-// Catalog implements the scrun.SchemaChangeJobCreationDependencies interface.
-func (d *jobCreationDeps) Catalog() scexec.Catalog {
-	return d.execDeps.Catalog()
-}
-
-// TransactionalJobCreator implements the scrun.SchemaChangeJobCreationDependencies interface.
-func (d *jobCreationDeps) TransactionalJobCreator() scexec.TransactionalJobCreator {
-	return d.execDeps.TransactionalJobCreator()
-}
-
-// User implements the scrun.SchemaChangeJobCreationDependencies interface.
-func (d *jobCreationDeps) User() security.SQLUsername {
-	return d.user
-}
-
-// Statements implements the scrun.SchemaChangeJobCreationDependencies interface.
-func (d *jobCreationDeps) Statements() []string {
-	return d.execDeps.Statements()
-}
 
 // NewJobRunDependencies returns an scrun.JobRunDependencies implementation built from the
 // given arguments.
 func NewJobRunDependencies(
 	collectionFactory *descs.CollectionFactory,
-	db *kv.DB,
-	internalExecutor sqlutil.InternalExecutor,
-	indexBackfiller scexec.IndexBackfiller,
-	logEventFn LogEventCallback,
+	db descs.DB,
+	backfiller scexec.Backfiller,
+	spanSplitter scexec.IndexSpanSplitter,
+	merger scexec.Merger,
+	rangeCounter backfiller.RangeCounter,
+	eventLoggerFactory func(isql.Txn) scrun.EventLogger,
 	jobRegistry *jobs.Registry,
 	job *jobs.Job,
 	codec keys.SQLCodec,
 	settings *cluster.Settings,
-	indexValidator scexec.IndexValidator,
-	cclCallbacks scexec.Partitioner,
-	testingKnobs *scrun.TestingKnobs,
+	indexValidator scexec.Validator,
+	metadataUpdaterFactory MetadataUpdaterFactory,
+	statsRefresher scexec.StatsRefresher,
+	tableStatsCache *stats.TableStatisticsCache,
+	testingKnobs *scexec.TestingKnobs,
 	statements []string,
+	sessionData *sessiondata.SessionData,
+	kvTrace bool,
+	externalStorageFactory cloud.ExternalStorageFromURIFactory,
 ) scrun.JobRunDependencies {
 	return &jobExecutionDeps{
-		collectionFactory: collectionFactory,
-		db:                db,
-		internalExecutor:  internalExecutor,
-		indexBackfiller:   indexBackfiller,
-		logEventFn:        logEventFn,
-		jobRegistry:       jobRegistry,
-		job:               job,
-		codec:             codec,
-		settings:          settings,
-		testingKnobs:      testingKnobs,
-		statements:        statements,
-		indexValidator:    indexValidator,
-		partitioner:       cclCallbacks,
+		collectionFactory:      collectionFactory,
+		db:                     db,
+		backfiller:             backfiller,
+		spanSplitter:           spanSplitter,
+		merger:                 merger,
+		rangeCounter:           rangeCounter,
+		eventLoggerFactory:     eventLoggerFactory,
+		jobRegistry:            jobRegistry,
+		job:                    job,
+		codec:                  codec,
+		settings:               settings,
+		testingKnobs:           testingKnobs,
+		statements:             statements,
+		indexValidator:         indexValidator,
+		commentUpdaterFactory:  metadataUpdaterFactory,
+		sessionData:            sessionData,
+		kvTrace:                kvTrace,
+		statsRefresher:         statsRefresher,
+		tableStatsCache:        tableStatsCache,
+		externalStorageFactory: externalStorageFactory,
 	}
 }
 
 type jobExecutionDeps struct {
-	collectionFactory *descs.CollectionFactory
-	db                *kv.DB
-	internalExecutor  sqlutil.InternalExecutor
-	indexBackfiller   scexec.IndexBackfiller
-	logEventFn        LogEventCallback
-	jobRegistry       *jobs.Registry
-	job               *jobs.Job
+	collectionFactory      *descs.CollectionFactory
+	db                     descs.DB
+	statsRefresher         scexec.StatsRefresher
+	tableStatsCache        *stats.TableStatisticsCache
+	backfiller             scexec.Backfiller
+	spanSplitter           scexec.IndexSpanSplitter
+	merger                 scexec.Merger
+	commentUpdaterFactory  MetadataUpdaterFactory
+	rangeCounter           backfiller.RangeCounter
+	eventLoggerFactory     func(isql.Txn) scrun.EventLogger
+	jobRegistry            *jobs.Registry
+	job                    *jobs.Job
+	kvTrace                bool
+	externalStorageFactory cloud.ExternalStorageFromURIFactory
 
-	indexValidator scexec.IndexValidator
-	partitioner    scexec.Partitioner
+	indexValidator scexec.Validator
 
 	codec        keys.SQLCodec
 	settings     *cluster.Settings
-	testingKnobs *scrun.TestingKnobs
+	testingKnobs *scexec.TestingKnobs
 	statements   []string
+	sessionData  *sessiondata.SessionData
+
+	mu struct {
+		syncutil.Mutex
+		explainOutput string
+	}
 }
 
 var _ scrun.JobRunDependencies = (*jobExecutionDeps)(nil)
@@ -154,62 +118,150 @@ func (d *jobExecutionDeps) ClusterSettings() *cluster.Settings {
 }
 
 // WithTxnInJob implements the scrun.JobRunDependencies interface.
-func (d *jobExecutionDeps) WithTxnInJob(
-	ctx context.Context, fn func(ctx context.Context, txndeps scrun.JobTxnRunDependencies) error,
-) error {
-	err := d.collectionFactory.Txn(ctx, d.internalExecutor, d.db, func(
-		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
+func (d *jobExecutionDeps) WithTxnInJob(ctx context.Context, fn scrun.JobTxnFunc) error {
+	var createdJobs []jobspb.JobID
+	var tableStatsToRefresh []descpb.ID
+	// Create cleaner if external storage factory is available.
+	var cleaner *bulkutil.BulkJobCleaner
+	if d.externalStorageFactory != nil {
+		cleaner = bulkutil.NewBulkJobCleaner(d.externalStorageFactory, username.NodeUserName())
+		defer func() {
+			if err := cleaner.Close(); err != nil {
+				log.Dev.Warningf(ctx, "error closing bulk job cleaner: %v", err)
+			}
+		}()
+	}
+
+	err := d.db.DescsTxn(ctx, func(
+		ctx context.Context, txn descs.Txn,
 	) error {
-		return fn(ctx, &jobExecutionTxnDeps{
-			jobExecutionDeps: *d,
+		pl := d.job.Payload()
+
+		// Read SST manifests from job info keys. Each backfill progress
+		// entry may have manifests stored separately to avoid bloating
+		// the job payload proto.
+		sc := pl.GetNewSchemaChange()
+		var manifestsMap map[backfiller.BackfillManifestKey][]jobspb.BulkSSTManifest
+		for _, bp := range sc.BackfillProgress {
+			infoKey := backfiller.BackfillSSTManifestsInfoKey(bp.TableID, bp.SourceIndexID)
+			data, err := jobs.ReadChunkedFileToJobInfo(
+				ctx, infoKey, txn, d.job.ID(),
+			)
+			if err != nil {
+				return err
+			}
+			if len(data) > 0 {
+				var stored jobspb.BulkSSTManifests
+				if err := protoutil.Unmarshal(data, &stored); err != nil {
+					return err
+				}
+				if manifestsMap == nil {
+					manifestsMap = make(map[backfiller.BackfillManifestKey][]jobspb.BulkSSTManifest)
+				}
+				key := backfiller.BackfillManifestKey{
+					TableID:       bp.TableID,
+					SourceIndexID: bp.SourceIndexID,
+				}
+				manifestsMap[key] = backfill.AddTenantPrefixToSSTManifests(
+					d.codec, stored.Manifests,
+				)
+			}
+		}
+
+		ed := &execDeps{
 			txnDeps: txnDeps{
-				txn:             txn,
-				codec:           d.codec,
-				descsCollection: descriptors,
-				jobRegistry:     d.jobRegistry,
-				indexValidator:  d.indexValidator,
-				partitioner:     d.partitioner,
-				eventLogWriter:  newEventLogWriter(txn, d.logEventFn),
+				txn:                txn,
+				codec:              d.codec,
+				descsCollection:    txn.Descriptors(),
+				jobRegistry:        d.jobRegistry,
+				validator:          d.indexValidator,
+				statsRefresher:     d.statsRefresher,
+				tableStatsCache:    d.tableStatsCache,
+				schemaChangerJobID: d.job.ID(),
+				schemaChangerJob:   d.job,
+				kvTrace:            d.kvTrace,
+				settings:           d.settings,
 			},
-		})
+			backfiller:   d.backfiller,
+			merger:       d.merger,
+			spanSplitter: d.spanSplitter,
+			backfillerTracker: backfiller.NewTracker(
+				d.codec,
+				d.rangeCounter,
+				d.job,
+				d.db,
+				sc.BackfillProgress,
+				sc.MergeProgress,
+				cleaner,
+				manifestsMap,
+			),
+			periodicProgressFlusher: backfiller.NewPeriodicProgressFlusherForIndexBackfill(d.settings),
+			statements:              d.statements,
+			user:                    pl.UsernameProto.Decode(),
+			clock:                   NewConstantClock(timeutil.FromUnixMicros(pl.StartedMicros)),
+			metadataUpdater:         d.commentUpdaterFactory(ctx, txn.Descriptors(), txn),
+			sessionData:             d.sessionData,
+			testingKnobs:            d.testingKnobs,
+		}
+		if err := fn(ctx, ed, d.eventLoggerFactory(txn)); err != nil {
+			return err
+		}
+		createdJobs = ed.CreatedJobs()
+		tableStatsToRefresh = ed.tableStatsToRefresh
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	d.jobRegistry.NotifyToAdoptJobs(ctx)
+	if len(createdJobs) > 0 {
+		d.jobRegistry.NotifyToResume(ctx, createdJobs...)
+	}
+	if len(tableStatsToRefresh) > 0 {
+		err := d.db.DescsTxn(ctx, func(
+			ctx context.Context, txn descs.Txn,
+		) error {
+			for _, id := range tableStatsToRefresh {
+				tbl, err := txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, id)
+				if err != nil {
+					return err
+				}
+				d.statsRefresher.NotifyMutation(ctx, tbl, math.MaxInt32)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-type jobExecutionTxnDeps struct {
-	jobExecutionDeps
-	txnDeps
+// GetExplain returns the previously saved explain output.
+func (d *jobExecutionDeps) GetExplain() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mu.explainOutput
 }
 
-func (d *jobExecutionTxnDeps) Phase() scop.Phase {
-	return scop.PostCommitPhase
-}
-
-func (d *jobExecutionTxnDeps) TestingKnobs() *scrun.TestingKnobs {
-	return d.testingKnobs
-}
-
-var _ scrun.JobTxnRunDependencies = (*jobExecutionTxnDeps)(nil)
-
-// UpdateState implements the scrun.JobTxnRunDependencies interface.
-func (d *jobExecutionTxnDeps) UpdateState(ctx context.Context, state scpb.State) error {
-	return d.job.Update(ctx, d.txn, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-		pg := md.Progress.GetNewSchemaChange()
-		pg.States = state.Statuses()
-		ju.UpdateProgress(md.Progress)
-		return nil
-	})
-}
-
-// ExecutorDependencies implements the scrun.JobTxnRunDependencies interface.
-func (d *jobExecutionTxnDeps) ExecutorDependencies() scexec.Dependencies {
-	return &execDeps{
-		txnDeps:         d.txnDeps,
-		indexBackfiller: d.indexBackfiller,
-		statements:      d.statements,
+// SetExplain is a setter to store explain output for later retrieval.
+//
+// The parameters are meant to be the return variables from Plan.ExplainCompact().
+// We do error checking of ExplainCompact() here as we don't want that to impact
+// the schema change. If there is an error, we will record the error in the
+// explain output and then ignore it.
+//
+// We could have called ExplainCompact() right in the getter and not even store
+// the explain output. But that would require saving the Plan somewhere. It
+// seemed easier to just save the explain output.
+func (d *jobExecutionDeps) SetExplain(op string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err != nil {
+		// The explain output is just for debugging and shouldn't impact the actual
+		// schema change. We will log the error message, then ignore the error.
+		d.mu.explainOutput = fmt.Sprintf("failed to get explain output: %s", err)
+		return
 	}
+	// The explain output is taken We opted store the explain output here, rather than
+	d.mu.explainOutput = op
 }

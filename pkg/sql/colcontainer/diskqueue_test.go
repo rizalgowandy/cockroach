@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 package colcontainer_test
 
 import (
@@ -28,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
@@ -68,7 +64,7 @@ func TestDiskQueue(t *testing.T) {
 					prefix, diskQueueCacheMode, alwaysCompress, suffix, numBatches), func(t *testing.T) {
 					// Create random input.
 					batches := make([]coldata.Batch, 0, numBatches)
-					op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
+					op, typs := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 						NumBatches: cap(batches),
 						BatchSize:  1 + rng.Intn(coldata.BatchSize()),
 						Nulls:      true,
@@ -77,7 +73,6 @@ func TestDiskQueue(t *testing.T) {
 						},
 					})
 					op.Init(ctx)
-					typs := op.Typs()
 
 					queueCfg.SetCacheMode(diskQueueCacheMode)
 					if !rewindable {
@@ -94,9 +89,9 @@ func TestDiskQueue(t *testing.T) {
 						err error
 					)
 					if rewindable {
-						q, err = colcontainer.NewRewindableDiskQueue(ctx, typs, queueCfg, testDiskAcc)
+						q, err = colcontainer.NewRewindableDiskQueue(ctx, typs, queueCfg, testDiskAcc, testMemAcc)
 					} else {
-						q, err = colcontainer.NewDiskQueue(ctx, typs, queueCfg, testDiskAcc)
+						q, err = colcontainer.NewDiskQueue(ctx, typs, queueCfg, testDiskAcc, testMemAcc)
 					}
 					require.NoError(t, err)
 
@@ -109,7 +104,7 @@ func TestDiskQueue(t *testing.T) {
 					// since that is the common pattern.
 					dest := coldata.NewMemBatch(typs, testColumnFactory)
 					for {
-						src := op.Next()
+						src := colexecop.NextNoMeta(op)
 						require.NoError(t, q.Enqueue(ctx, src))
 						if src.Length() == 0 {
 							break
@@ -155,7 +150,7 @@ func TestDiskQueue(t *testing.T) {
 						}
 
 						if rewindable {
-							require.NoError(t, q.(colcontainer.RewindableQueue).Rewind())
+							require.NoError(t, q.(colcontainer.RewindableQueue).Rewind(ctx))
 						}
 					}
 
@@ -179,25 +174,47 @@ func TestDiskQueueCloseOnErr(t *testing.T) {
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
 
-	serverCfg := &execinfra.ServerConfig{}
-	serverCfg.TestingKnobs.ForceDiskSpill = true
-	diskMon := execinfra.NewLimitedMonitorNoFlowCtx(ctx, testDiskMonitor, serverCfg, nil /* sd */, t.Name())
-	defer diskMon.Stop(ctx)
-	diskAcc := diskMon.MakeBoundAccount()
-	defer diskAcc.Close(ctx)
+	// Some hard-coded limits assume default batch size.
+	require.NoError(t, coldata.SetBatchSizeForTests(coldata.DefaultColdataBatchSize))
 
-	typs := []*types.T{types.Int}
-	q, err := colcontainer.NewDiskQueue(ctx, typs, queueCfg, &diskAcc)
-	require.NoError(t, err)
+	rng, _ := randutil.NewTestRand()
+	args := coldatatestutils.RandomVecArgs{Rand: rng}
+	batch := coldatatestutils.RandomBatch(testAllocator, args, types.OneIntCol, coldata.BatchSize(), coldata.BatchSize())
 
-	b := coldata.NewMemBatch(typs, coldata.StandardColumnFactory)
+	// Ensure that each batch is written to a separate file.
+	queueCfg.MaxFileSizeBytes = 1
 
-	err = q.Enqueue(ctx, b)
-	require.Error(t, err, "expected Enqueue to produce an error given a disk limit of one byte")
-	require.Equal(t, pgerror.GetPGCode(err), pgcode.DiskFull, "unexpected pg code")
+	for _, diskLimit := range []int64{
+		2,                             // Disk budget will be exceeded after the first batch.
+		mon.DefaultPoolAllocationSize, // Disk budget will be exceeded after the second batch.
+	} {
+		t.Run(fmt.Sprintf("diskLimit=%s", humanizeutil.IBytes(diskLimit)), func(t *testing.T) {
+			serverCfg := &execinfra.ServerConfig{}
+			serverCfg.TestingKnobs.MemoryLimitBytes = diskLimit
+			diskMon := execinfra.NewLimitedMonitorNoFlowCtx(ctx, testDiskMonitor, serverCfg,
+				nil /* sd */, mon.MakeName("test-disk"))
+			defer diskMon.Stop(ctx)
+			diskAcc := diskMon.MakeBoundAccount()
+			defer diskAcc.Close(ctx)
 
-	// Now Close the queue, this should be successful.
-	require.NoError(t, q.Close(ctx))
+			typs := []*types.T{types.Int}
+			q, err := colcontainer.NewDiskQueue(ctx, typs, queueCfg, &diskAcc, testMemAcc)
+			require.NoError(t, err)
+
+			err = q.Enqueue(ctx, batch)
+			if diskLimit > 2 {
+				// If we have large disk limit, then enqueuing the first batch
+				// should succeed, but we should get an error on the second one.
+				require.NoError(t, err)
+				err = q.Enqueue(ctx, batch)
+			}
+			require.Error(t, err, "expected Enqueue to produce an error")
+			require.Equal(t, pgerror.GetPGCode(err), pgcode.DiskFull, "unexpected pg code")
+
+			// Now Close the queue, this should be successful.
+			require.NoError(t, q.Close(ctx))
+		})
+	}
 }
 
 // Flags for BenchmarkQueue.
@@ -233,15 +250,16 @@ func BenchmarkDiskQueue(b *testing.B) {
 
 	rng, _ := randutil.NewTestRand()
 	typs := []*types.T{types.Int}
-	batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0, 0)
+	args := coldatatestutils.RandomVecArgs{Rand: rng}
+	batch := coldatatestutils.RandomBatch(testAllocator, args, typs, coldata.BatchSize(), 0 /* length */)
 	op := colexecop.NewRepeatableBatchSource(testAllocator, batch, typs)
 	ctx := context.Background()
 	for i := 0; i < b.N; i++ {
 		op.ResetBatchesToReturn(numBatches)
-		q, err := colcontainer.NewDiskQueue(ctx, typs, queueCfg, testDiskAcc)
+		q, err := colcontainer.NewDiskQueue(ctx, typs, queueCfg, testDiskAcc, testMemAcc)
 		require.NoError(b, err)
 		for {
-			batchToEnqueue := op.Next()
+			batchToEnqueue := colexecop.NextNoMeta(op)
 			if err := q.Enqueue(ctx, batchToEnqueue); err != nil {
 				b.Fatal(err)
 			}

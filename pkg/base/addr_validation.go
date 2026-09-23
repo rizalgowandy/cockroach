@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package base
 
@@ -15,21 +10,23 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/errors"
 )
 
 // ValidateAddrs controls the address fields in the Config object
 // and "fills in" the blanks:
-// - the host part of Addr and HTTPAddr is resolved to an IP address
-//   if specified (it stays blank if blank to mean "all addresses").
-// - the host part of AdvertiseAddr is filled in if blank, either
-//   from Addr if non-empty or os.Hostname(). It is also checked
-//   for resolvability.
-// - non-numeric port numbers are resolved to numeric.
+//   - the host part of Addr and HTTPAddr is resolved to an IP address
+//     if specified (it stays blank if blank to mean "all addresses").
+//   - the host part of AdvertiseAddr is filled in if blank, either
+//     from Addr if non-empty or os.Hostname(). It is also checked
+//     for resolvability.
+//   - non-numeric port numbers are resolved to numeric.
 //
 // The addresses fields must be guaranteed by the caller to either be
 // completely empty, or have both a host part and a port part
@@ -38,7 +35,7 @@ import (
 func (cfg *Config) ValidateAddrs(ctx context.Context) error {
 	// Validate the advertise address.
 	advHost, advPort, err := validateAdvertiseAddr(ctx,
-		cfg.AdvertiseAddr, cfg.Addr, "", cliflags.ListenAddr)
+		cfg.AdvertiseAddr, cfg.Addr, "", cliflags.ListenAddr, cfg.Insecure)
 	if err != nil {
 		return invalidFlagErr(err, cliflags.AdvertiseAddr)
 	}
@@ -54,7 +51,7 @@ func (cfg *Config) ValidateAddrs(ctx context.Context) error {
 	// Validate the SQL advertise address. Use the provided advertise
 	// addr as default.
 	advSQLHost, advSQLPort, err := validateAdvertiseAddr(ctx,
-		cfg.SQLAdvertiseAddr, cfg.SQLAddr, advHost, cliflags.ListenSQLAddr)
+		cfg.SQLAdvertiseAddr, cfg.SQLAddr, advHost, cliflags.ListenSQLAddr, cfg.Insecure)
 	if err != nil {
 		return invalidFlagErr(err, cliflags.SQLAdvertiseAddr)
 	}
@@ -70,7 +67,7 @@ func (cfg *Config) ValidateAddrs(ctx context.Context) error {
 	// Validate the HTTP advertise address. Use the provided advertise
 	// addr as default.
 	advHTTPHost, advHTTPPort, err := validateAdvertiseAddr(ctx,
-		cfg.HTTPAdvertiseAddr, cfg.HTTPAddr, advHost, cliflags.ListenHTTPAddr)
+		cfg.HTTPAdvertiseAddr, cfg.HTTPAddr, advHost, cliflags.ListenHTTPAddr, cfg.Insecure)
 	if err != nil {
 		return errors.Wrap(err, "cannot compute public HTTP address")
 	}
@@ -83,47 +80,7 @@ func (cfg *Config) ValidateAddrs(ctx context.Context) error {
 		return invalidFlagErr(err, cliflags.ListenHTTPAddr)
 	}
 	cfg.HTTPAddr = net.JoinHostPort(httpHost, httpPort)
-	return nil
-}
 
-// UpdateAddrs updates the listen and advertise port numbers with
-// those found during the call to net.Listen().
-//
-// After ValidateAddrs() the actual listen addr should be equal to the
-// one requested; only the port number can change because of
-// auto-allocation. We do check this equality here and report a
-// warning if any discrepancy is found.
-func UpdateAddrs(ctx context.Context, addr, advAddr *string, ln net.Addr) error {
-	desiredHost, _, err := net.SplitHostPort(*addr)
-	if err != nil {
-		return err
-	}
-
-	// Update the listen port number and check the actual listen addr is
-	// the one requested.
-	lnAddr := ln.String()
-	lnHost, lnPort, err := net.SplitHostPort(lnAddr)
-	if err != nil {
-		return err
-	}
-	requestedAll := (desiredHost == "" || desiredHost == "0.0.0.0" || desiredHost == "::")
-	listenedAll := (lnHost == "" || lnHost == "0.0.0.0" || lnHost == "::")
-	if (requestedAll && !listenedAll) || (!requestedAll && desiredHost != lnHost) {
-		log.Warningf(ctx, "requested to listen on %q, actually listening on %q", desiredHost, lnHost)
-	}
-	*addr = net.JoinHostPort(lnHost, lnPort)
-
-	// Update the advertised port number if it wasn't set to start
-	// with. We don't touch the advertised host, as this may have
-	// nothing to do with the listen address.
-	advHost, advPort, err := net.SplitHostPort(*advAddr)
-	if err != nil {
-		return err
-	}
-	if advPort == "" || advPort == "0" {
-		advPort = lnPort
-	}
-	*advAddr = net.JoinHostPort(advHost, advPort)
 	return nil
 }
 
@@ -132,7 +89,10 @@ func UpdateAddrs(ctx context.Context, addr, advAddr *string, ln net.Addr) error 
 // that if the "host" part is empty, it gets filled in with
 // the configured listen address if any, or the canonical host name.
 func validateAdvertiseAddr(
-	ctx context.Context, advAddr, listenAddr, defaultHost string, listenFlag cliflags.FlagInfo,
+	ctx context.Context,
+	advAddr, listenAddr, defaultHost string,
+	listenFlag cliflags.FlagInfo,
+	insecure bool,
 ) (string, string, error) {
 	listenHost, listenPort, err := getListenAddr(listenAddr, defaultHost)
 	if err != nil {
@@ -178,7 +138,12 @@ func validateAdvertiseAddr(
 			// locally but not elsewhere) but at least it prevents typos.
 			_, err = net.DefaultResolver.LookupIPAddr(ctx, advHost)
 			if err != nil {
-				return "", "", err
+				// Host resolution failed. Don't error out when running on Mac with `--insecure`.
+				if runtime.GOOS == "darwin" && insecure {
+					log.Ops.Shoutf(ctx, severity.WARNING, "Unable to resolve `hostname` due to %v\n", err)
+				} else {
+					return "", "", err
+				}
 			}
 		}
 	}

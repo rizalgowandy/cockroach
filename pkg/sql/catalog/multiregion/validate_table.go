@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package multiregion
 
@@ -14,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -63,9 +59,18 @@ func ValidateTableLocalityConfig(
 	if err != nil {
 		return err
 	}
-	regionsEnumDesc, err := vdg.GetTypeDescriptor(regionsEnumID)
+	typeDesc, err := vdg.GetTypeDescriptor(regionsEnumID)
 	if err != nil {
 		return errors.Wrapf(err, "multi-region enum with ID %d does not exist", regionsEnumID)
+	}
+	regionsEnumDesc := typeDesc.AsRegionEnumTypeDescriptor()
+	if regionsEnumDesc == nil {
+		return errors.AssertionFailedf("expected region enum type, not %s for type %q (%d)",
+			typeDesc.GetKind(), typeDesc.GetName(), typeDesc.GetID())
+	}
+	if regionsEnumDesc.Dropped() {
+		return errors.AssertionFailedf("multi-region enum type %q (%d) is dropped",
+			regionsEnumDesc.GetName(), regionsEnumDesc.GetID())
 	}
 
 	// Check non-table items have a correctly set locality.
@@ -112,11 +117,27 @@ func ValidateTableLocalityConfig(
 			break
 		}
 	}
-	columnTypesTypeIDs := catalog.MakeDescriptorIDSet(typeIDsReferencedByColumns...)
+	// Build a set of type IDs that are referenced by non-locality-config
+	// sources: columns, triggers, and policies. The region enum ID may appear
+	// in the full typeIDs set due to any of these, and all are legitimate.
+	nonLocalityTypeIDs := catalog.MakeDescriptorIDSet(typeIDsReferencedByColumns...)
+	for _, trigger := range desc.GetTriggers() {
+		for _, id := range trigger.DependsOnTypes {
+			nonLocalityTypeIDs.Add(id)
+		}
+	}
+	for _, policy := range desc.GetPolicies() {
+		for _, id := range policy.DependsOnTypes {
+			nonLocalityTypeIDs.Add(id)
+		}
+	}
 	switch lc := lc.Locality.(type) {
-	case *descpb.TableDescriptor_LocalityConfig_Global_:
+	case *catpb.LocalityConfig_Global_:
 		if regionEnumIDReferenced {
-			if !columnTypesTypeIDs.Contains(regionsEnumID) {
+			// The region enum may be referenced by a column type, trigger, or
+			// policy. We also omit views since they may reference the
+			// multi-region enum type of the base table.
+			if !nonLocalityTypeIDs.Contains(regionsEnumID) && !desc.IsView() {
 				return errors.AssertionFailedf(
 					"expected no region Enum ID to be referenced by a GLOBAL TABLE: %q"+
 						" but found: %d",
@@ -125,7 +146,7 @@ func ValidateTableLocalityConfig(
 				)
 			}
 		}
-	case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+	case *catpb.LocalityConfig_RegionalByRow_:
 		if !desc.IsPartitionAllBy() {
 			return errors.AssertionFailedf("expected REGIONAL BY ROW table to have PartitionAllBy set")
 		}
@@ -134,26 +155,23 @@ func ValidateTableLocalityConfig(
 		// and each transitioning region name to possibly have a partition.
 		// We do validation that ensures all index partitions are the same on
 		// PARTITION ALL BY.
-		regions, err := regionsEnumDesc.RegionNames()
-		if err != nil {
-			return err
-		}
-		regionNames := make(map[descpb.RegionName]struct{}, len(regions))
-		for _, region := range regions {
-			regionNames[region] = struct{}{}
-		}
-		transitioningRegions, err := regionsEnumDesc.TransitioningRegionNames()
-		if err != nil {
-			return err
-		}
-		transitioningRegionNames := make(map[descpb.RegionName]struct{}, len(regions))
-		for _, region := range transitioningRegions {
-			transitioningRegionNames[region] = struct{}{}
-		}
+		var regions, transitioningRegions catpb.RegionNames
+		regionNames := make(map[catpb.RegionName]struct{})
+		transitioningRegionNames := make(map[catpb.RegionName]struct{}, len(regions))
+		_ = regionsEnumDesc.ForEachRegion(func(name catpb.RegionName, transition descpb.TypeDescriptor_EnumMember_Direction) error {
+			if transition == descpb.TypeDescriptor_EnumMember_NONE {
+				regions = append(regions, name)
+				regionNames[name] = struct{}{}
+			} else {
+				transitioningRegions = append(transitioningRegions, name)
+				transitioningRegionNames[name] = struct{}{}
+			}
+			return nil
+		})
 
 		part := desc.GetPrimaryIndex().GetPartitioning()
 		err = part.ForEachList(func(name string, _ [][]byte, _ catalog.Partitioning) error {
-			regionName := descpb.RegionName(name)
+			regionName := catpb.RegionName(name)
 			// Any transitioning region names may exist.
 			if _, ok := transitioningRegionNames[regionName]; ok {
 				return nil
@@ -183,15 +201,24 @@ func ValidateTableLocalityConfig(
 			)
 		}
 
-	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
+	case *catpb.LocalityConfig_RegionalByTable_:
 
 		// Table is homed in an explicit (non-primary) region.
 		if lc.RegionalByTable.Region != nil {
 			foundRegion := false
-			regions, err := regionsEnumDesc.RegionNamesForValidation()
-			if err != nil {
-				return err
-			}
+			var regions catpb.RegionNames
+			_ = regionsEnumDesc.ForEachRegion(func(name catpb.RegionName, transition descpb.TypeDescriptor_EnumMember_Direction) error {
+				// Since the partitions and zone configs are only updated when a transaction
+				// commits, this must ignore all regions being added (since they will not be
+				// reflected in the zone configuration yet), but it must include all region
+				// being dropped (since they will not be dropped from the zone configuration
+				// until they are fully removed from the type descriptor, again, at the end
+				// of the transaction).
+				if transition != descpb.TypeDescriptor_EnumMember_ADD {
+					regions = append(regions, name)
+				}
+				return nil
+			})
 			for _, r := range regions {
 				if *lc.RegionalByTable.Region == r {
 					foundRegion = true
@@ -220,10 +247,11 @@ func ValidateTableLocalityConfig(
 			}
 		} else {
 			if regionEnumIDReferenced {
-				// It may be the case that the multi-region type descriptor is used
-				// as the type of the table column. Validations should only fail if
-				// that is not the case.
-				if !columnTypesTypeIDs.Contains(regionsEnumID) {
+				// The region enum may be referenced by a column type, trigger, or
+				// policy on this table. Validations should only fail if none of
+				// those are the source of the reference. We also omit views since
+				// they may reference the multi-region enum type of the base table.
+				if !nonLocalityTypeIDs.Contains(regionsEnumID) && !desc.IsView() {
 					return errors.AssertionFailedf(
 						"expected no region Enum ID to be referenced by a REGIONAL BY TABLE: %q homed in the "+
 							"primary region, but found: %d",
@@ -244,11 +272,11 @@ func ValidateTableLocalityConfig(
 }
 
 // FormatTableLocalityConfig formats the table locality.
-func FormatTableLocalityConfig(c *descpb.TableDescriptor_LocalityConfig, f *tree.FmtCtx) error {
+func FormatTableLocalityConfig(c *catpb.LocalityConfig, f *tree.FmtCtx) error {
 	switch v := c.Locality.(type) {
-	case *descpb.TableDescriptor_LocalityConfig_Global_:
+	case *catpb.LocalityConfig_Global_:
 		f.WriteString("GLOBAL")
-	case *descpb.TableDescriptor_LocalityConfig_RegionalByTable_:
+	case *catpb.LocalityConfig_RegionalByTable_:
 		f.WriteString("REGIONAL BY TABLE IN ")
 		if v.RegionalByTable.Region != nil {
 			region := tree.Name(*v.RegionalByTable.Region)
@@ -256,7 +284,7 @@ func FormatTableLocalityConfig(c *descpb.TableDescriptor_LocalityConfig, f *tree
 		} else {
 			f.WriteString("PRIMARY REGION")
 		}
-	case *descpb.TableDescriptor_LocalityConfig_RegionalByRow_:
+	case *catpb.LocalityConfig_RegionalByRow_:
 		f.WriteString("REGIONAL BY ROW")
 		if v.RegionalByRow.As != nil {
 			f.WriteString(" AS ")

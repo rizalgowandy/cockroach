@@ -1,19 +1,16 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package movr
 
 import (
+	"context"
 	gosql "database/sql"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -24,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/workload/faker"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
-	"golang.org/x/exp/rand"
 )
 
 // maybeFormatWithCity formats %[1]s with `city,` and %[2]s with `vehicle_city`
@@ -174,11 +170,12 @@ var cities = []struct {
 	{city: "rome", region: "europe-west1"},
 }
 
+var RandomSeed = workload.NewUint64RandomSeed()
+
 type movr struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
-	seed                              uint64
 	users, vehicles, rides, histories cityDistributor
 	numPromoCodes                     int
 	numUserPromoCodes                 int
@@ -199,14 +196,13 @@ func init() {
 }
 
 var movrMeta = workload.Meta{
-	Name:         `movr`,
-	Description:  `MovR is a fictional vehicle sharing company`,
-	Version:      `1.0.0`,
-	PublicFacing: true,
+	Name:        `movr`,
+	Description: `MovR is a fictional vehicle sharing company`,
+	Version:     `1.0.0`,
+	RandomSeed:  RandomSeed,
 	New: func() workload.Generator {
 		g := &movr{}
 		g.flags.FlagSet = pflag.NewFlagSet(`movr`, pflag.ContinueOnError)
-		g.flags.Uint64Var(&g.seed, `seed`, 1, `Key hash seed.`)
 		g.flags.IntVar(&g.users.numRows, `num-users`, 50, `Initial number of users.`)
 		g.flags.IntVar(&g.vehicles.numRows, `num-vehicles`, 15, `Initial number of vehicles.`)
 		g.flags.IntVar(&g.rides.numRows, `num-rides`, 500, `Initial number of rides.`)
@@ -234,6 +230,7 @@ Otherwise defaults to the gateway_region.`,
 		g.flags.IntVar(&g.numPromoCodes, `num-promo-codes`, 1000, `Initial number of promo codes.`)
 		g.flags.IntVar(&g.numUserPromoCodes, `num-user-promos`, 5, `Initial number of promo codes in use.`)
 		g.flags.IntVar(&g.ranges, `num-ranges`, 9, `Initial number of ranges to break the tables into`)
+		RandomSeed.AddFlag(&g.flags)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		g.creationTime = time.Date(2019, 1, 2, 3, 4, 5, 6, time.UTC)
 		return g
@@ -245,6 +242,9 @@ func (*movr) Meta() workload.Meta { return movrMeta }
 
 // Flags implements the Flagser interface.
 func (g *movr) Flags() workload.Flags { return g.flags }
+
+// ConnFlags implements the ConnFlagser interface.
+func (g *movr) ConnFlags() *workload.ConnFlags { return g.connFlags }
 
 // Hooks implements the Hookser interface.
 func (g *movr) Hooks() workload.Hooks {
@@ -267,7 +267,7 @@ func (g *movr) Hooks() workload.Hooks {
 			}
 			return nil
 		},
-		PostLoad: func(db *gosql.DB) error {
+		PostLoad: func(_ context.Context, db *gosql.DB) error {
 			fkStmts := []string{
 				g.maybeFormatWithCity(
 					`ALTER TABLE vehicles ADD FOREIGN KEY
@@ -295,7 +295,7 @@ func (g *movr) Hooks() workload.Hooks {
 				if _, err := db.Exec(fkStmt); err != nil {
 					// If the statement failed because the fk already exists,
 					// ignore it. Return the error for any other reason.
-					const duplicateFKErr = "columns cannot be used by multiple foreign key constraints"
+					const duplicateFKErr = "duplicate constraint name"
 					if !strings.Contains(err.Error(), duplicateFKErr) {
 						return err
 					}
@@ -316,7 +316,7 @@ func (g *movr) Hooks() workload.Hooks {
 				default:
 					return errors.Errorf("unsupported survival goal: %s", g.survivalGoal)
 				}
-				q := fmt.Sprintf(
+				qs := fmt.Sprintf(
 					`
 ALTER DATABASE %[1]s SET PRIMARY REGION "us-east1";
 ALTER DATABASE %[1]s ADD REGION "us-west1";
@@ -326,8 +326,10 @@ ALTER DATABASE %[1]s SURVIVE %s FAILURE
 					g.Meta().Name,
 					survivalGoal,
 				)
-				if _, err := db.Exec(q); err != nil {
-					return err
+				for _, q := range strings.Split(qs, ";") {
+					if _, err := db.Exec(q); err != nil {
+						return err
+					}
 				}
 				for _, rbrTable := range rbrTables {
 					if g.inferCRDBRegionColumn {
@@ -347,6 +349,9 @@ ALTER DATABASE %[1]s SURVIVE %s FAILURE
 							)
 						}
 						sort.Strings(cityClauses)
+						if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s SET (schema_locked = false)", rbrTable)); err != nil {
+							return err
+						}
 						if _, err := db.Exec(
 							fmt.Sprintf(
 								`ALTER TABLE %s ADD COLUMN crdb_region crdb_internal_region NOT NULL AS (
@@ -369,8 +374,14 @@ ALTER DATABASE %[1]s SURVIVE %s FAILURE
 					); err != nil {
 						return err
 					}
+					if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s RESET (schema_locked)", rbrTable)); err != nil {
+						return err
+					}
 				}
 				for _, globalTable := range globalTables {
+					if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s SET (schema_locked = false)", globalTable)); err != nil {
+						return err
+					}
 					if _, err := db.Exec(
 						fmt.Sprintf(
 							`ALTER TABLE %s SET LOCALITY GLOBAL`,
@@ -379,109 +390,99 @@ ALTER DATABASE %[1]s SURVIVE %s FAILURE
 					); err != nil {
 						return err
 					}
+					if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s RESET (schema_locked)", globalTable)); err != nil {
+						return err
+					}
 				}
 
 				return nil
 			}
 
-			// Create us-west, us-east and europe-west partitions.
-			q := `
-		ALTER TABLE users PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER TABLE vehicles PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER INDEX vehicles_auto_index_fk_city_ref_users PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER TABLE rides PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER INDEX rides_auto_index_fk_city_ref_users PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER INDEX rides_auto_index_fk_vehicle_city_ref_vehicles PARTITION BY LIST (vehicle_city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER TABLE user_promo_codes PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-		ALTER TABLE vehicle_location_histories PARTITION BY LIST (city) (
-			PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
-			PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
-			PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
-		);
-	`
-			if _, err := db.Exec(q); err != nil {
-				return err
+			qs := []string{
+				// Create us-west, us-east and europe-west partitions.
+				`ALTER TABLE users PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER TABLE vehicles PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER INDEX vehicles_auto_index_fk_city_ref_users PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER TABLE rides PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER INDEX rides_auto_index_fk_city_ref_users PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER INDEX rides_auto_index_fk_vehicle_city_ref_vehicles PARTITION BY LIST (vehicle_city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER TABLE user_promo_codes PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+				`ALTER TABLE vehicle_location_histories PARTITION BY LIST (city) (
+					PARTITION us_west VALUES IN ('seattle', 'san francisco', 'los angeles'),
+					PARTITION us_east VALUES IN ('new york', 'boston', 'washington dc'),
+					PARTITION europe_west VALUES IN ('amsterdam', 'paris', 'rome')
+				);`,
+
+				// Alter the partitions to place replicas in the appropriate zones.
+				`ALTER PARTITION us_west OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';`,
+				`ALTER PARTITION us_east OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';`,
+				`ALTER PARTITION europe_west OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';`,
+
+				`ALTER PARTITION us_west OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';`,
+				`ALTER PARTITION us_east OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';`,
+				`ALTER PARTITION europe_west OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';`,
+
+				`ALTER PARTITION us_west OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';`,
+				`ALTER PARTITION us_east OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';`,
+				`ALTER PARTITION europe_west OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';`,
+
+				`ALTER PARTITION us_west OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';`,
+				`ALTER PARTITION us_east OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';`,
+				`ALTER PARTITION europe_west OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';`,
+
+				`ALTER PARTITION us_west OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';`,
+				`ALTER PARTITION us_east OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';`,
+				`ALTER PARTITION europe_west OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';`,
+
+				// Create some duplicate indexes for the promo_codes table.
+				`CREATE INDEX promo_codes_idx_us_west ON promo_codes (code) STORING (description, creation_time,expiration_time, rules);`,
+				`CREATE INDEX promo_codes_idx_europe_west ON promo_codes (code) STORING (description, creation_time, expiration_time, rules);`,
+
+				// Apply configurations to the index for fast reads.
+				`ALTER TABLE promo_codes CONFIGURE ZONE USING num_replicas = 3,
+					constraints = '{"+region=us-east1": 1}',
+					lease_preferences = '[[+region=us-east1]]';`,
+				`ALTER INDEX promo_codes@promo_codes_idx_us_west CONFIGURE ZONE USING
+					num_replicas = 3,
+					constraints = '{"+region=us-west1": 1}',
+					lease_preferences = '[[+region=us-west1]]';`,
+				`ALTER INDEX promo_codes@promo_codes_idx_europe_west CONFIGURE ZONE USING
+					num_replicas = 3,
+					constraints = '{"+region=europe-west1": 1}',
+					lease_preferences = '[[+region=europe-west1]]';`,
 			}
-
-			// Alter the partitions to place replicas in the appropriate zones.
-			q = `
-		ALTER PARTITION us_west OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
-		ALTER PARTITION us_east OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
-		ALTER PARTITION europe_west OF INDEX users@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
-
-		ALTER PARTITION us_west OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
-		ALTER PARTITION us_east OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
-		ALTER PARTITION europe_west OF INDEX vehicles@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
-
-		ALTER PARTITION us_west OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
-		ALTER PARTITION us_east OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
-		ALTER PARTITION europe_west OF INDEX rides@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
-
-		ALTER PARTITION us_west OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
-		ALTER PARTITION us_east OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
-		ALTER PARTITION europe_west OF INDEX user_promo_codes@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
-
-		ALTER PARTITION us_west OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-west1"]';
-		ALTER PARTITION us_east OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=us-east1"]';
-		ALTER PARTITION europe_west OF INDEX vehicle_location_histories@* CONFIGURE ZONE USING CONSTRAINTS='["+region=europe-west1"]';
-	`
-			if _, err := db.Exec(q); err != nil {
-				return err
-			}
-
-			// Create some duplicate indexes for the promo_codes table.
-			q = `
-		CREATE INDEX promo_codes_idx_us_west ON promo_codes (code) STORING (description, creation_time, expiration_time, rules);
-		CREATE INDEX promo_codes_idx_europe_west ON promo_codes (code) STORING (description, creation_time, expiration_time, rules);
-	`
-			if _, err := db.Exec(q); err != nil {
-				return err
-			}
-
-			// Apply configurations to the index for fast reads.
-			q = `
-		ALTER TABLE promo_codes CONFIGURE ZONE USING num_replicas = 3,
-			constraints = '{"+region=us-east1": 1}',
-			lease_preferences = '[[+region=us-east1]]';
-		ALTER INDEX promo_codes@promo_codes_idx_us_west CONFIGURE ZONE USING
-			num_replicas = 3,
-			constraints = '{"+region=us-west1": 1}',
-			lease_preferences = '[[+region=us-west1]]';
-		ALTER INDEX promo_codes@promo_codes_idx_europe_west CONFIGURE ZONE USING
-			num_replicas = 3,
-			constraints = '{"+region=europe-west1": 1}',
-			lease_preferences = '[[+region=europe-west1]]';
-	`
-			if _, err := db.Exec(q); err != nil {
-				return err
+			for _, q := range qs {
+				if _, err := db.Exec(q); err != nil {
+					return err
+				}
 			}
 			return nil
 		},
@@ -613,11 +614,11 @@ func (d cityDistributor) rowsForCity(cityIdx int) (min, max int) {
 
 func (d cityDistributor) randRowInCity(rng *rand.Rand, cityIdx int) int {
 	min, max := d.rowsForCity(cityIdx)
-	return min + rng.Intn(max-min)
+	return min + rng.IntN(max-min)
 }
 
 func (g *movr) movrUsersInitialRow(rowIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
+	rng := rand.New(rand.NewPCG(RandomSeed.Seed(), uint64(rowIdx)))
 	cityIdx := g.users.cityForRow(rowIdx)
 	city := cities[cityIdx]
 
@@ -635,7 +636,7 @@ func (g *movr) movrUsersInitialRow(rowIdx int) []interface{} {
 }
 
 func (g *movr) movrVehiclesInitialRow(rowIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
+	rng := rand.New(rand.NewPCG(RandomSeed.Seed(), uint64(rowIdx)))
 	cityIdx := g.vehicles.cityForRow(rowIdx)
 	city := cities[cityIdx]
 
@@ -660,7 +661,7 @@ func (g *movr) movrVehiclesInitialRow(rowIdx int) []interface{} {
 }
 
 func (g *movr) movrRidesInitialRow(rowIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
+	rng := rand.New(rand.NewPCG(RandomSeed.Seed(), uint64(rowIdx)))
 	cityIdx := g.rides.cityForRow(rowIdx)
 	city := cities[cityIdx]
 
@@ -672,8 +673,8 @@ func (g *movr) movrRidesInitialRow(rowIdx int) []interface{} {
 	riderID := g.movrUsersInitialRow(riderRowIdx)[0]
 	vehicleRowIdx := g.vehicles.randRowInCity(rng, cityIdx)
 	vehicleID := g.movrVehiclesInitialRow(vehicleRowIdx)[0]
-	startTime := g.creationTime.Add(-time.Duration(rng.Intn(30)) * 24 * time.Hour)
-	endTime := startTime.Add(time.Duration(rng.Intn(60)) * time.Hour)
+	startTime := g.creationTime.Add(-time.Duration(rng.IntN(30)) * 24 * time.Hour)
+	endTime := startTime.Add(time.Duration(rng.IntN(60)) * time.Hour)
 
 	return []interface{}{
 		id.String(),                       // id
@@ -685,12 +686,12 @@ func (g *movr) movrRidesInitialRow(rowIdx int) []interface{} {
 		g.faker.StreetAddress(rng),        // end_address
 		startTime.Format(timestampFormat), // start_time
 		endTime.Format(timestampFormat),   // end_time
-		rng.Intn(100),                     // revenue
+		rng.IntN(100),                     // revenue
 	}
 }
 
 func (g *movr) movrVehicleLocationHistoriesInitialRow(rowIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
+	rng := rand.New(rand.NewPCG(RandomSeed.Seed(), uint64(rowIdx)))
 	cityIdx := g.histories.cityForRow(rowIdx)
 	city := cities[cityIdx]
 
@@ -709,13 +710,13 @@ func (g *movr) movrVehicleLocationHistoriesInitialRow(rowIdx int) []interface{} 
 }
 
 func (g *movr) movrPromoCodesInitialRow(rowIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
+	rng := rand.New(rand.NewPCG(RandomSeed.Seed(), uint64(rowIdx)))
 	code := strings.ToLower(strings.Join(g.faker.Words(rng, 3), `_`))
 	code = fmt.Sprintf("%d_%s", rowIdx, code)
 	description := g.faker.Paragraph(rng)
-	expirationTime := g.creationTime.Add(time.Duration(rng.Intn(30)) * 24 * time.Hour)
+	expirationTime := g.creationTime.Add(time.Duration(rng.IntN(30)) * 24 * time.Hour)
 	// TODO(dan): This is nil in the reference impl, is that intentional?
-	creationTime := expirationTime.Add(-time.Duration(rng.Intn(30)) * 24 * time.Hour)
+	creationTime := expirationTime.Add(-time.Duration(rng.IntN(30)) * 24 * time.Hour)
 	const rulesJSON = `{"type": "percent_discount", "value": "10%"}`
 
 	return []interface{}{
@@ -728,7 +729,7 @@ func (g *movr) movrPromoCodesInitialRow(rowIdx int) []interface{} {
 }
 
 func (g *movr) movrUserPromoCodesInitialRow(rowIdx int) []interface{} {
-	rng := rand.New(rand.NewSource(g.seed + uint64(rowIdx)))
+	rng := rand.New(rand.NewPCG(RandomSeed.Seed(), uint64(rowIdx)))
 	// Make evenly-spaced UUIDs sorted in the same order as the rows.
 	var id uuid.UUID
 	id.DeterministicV4(uint64(rowIdx), uint64(g.users.numRows))
@@ -742,6 +743,6 @@ func (g *movr) movrUserPromoCodesInitialRow(rowIdx int) []interface{} {
 		id.String(),                  // user_id
 		code,                         // code
 		time.Format(timestampFormat), // timestamp
-		rng.Intn(20),                 // usage_count
+		rng.IntN(20),                 // usage_count
 	}
 }

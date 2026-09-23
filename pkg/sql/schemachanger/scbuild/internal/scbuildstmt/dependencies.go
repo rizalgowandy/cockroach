@@ -1,26 +1,34 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package scbuildstmt
 
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdecomp"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 )
 
 // BuildCtx wraps BuilderState and exposes various convenience methods for the
@@ -30,101 +38,99 @@ import (
 // explicitly returning errors.
 type BuildCtx interface {
 	context.Context
-	Dependencies
+	ClusterAndSessionInfo
+	SchemaFeatureChecker
+	TemporarySchemaProvider
 	BuilderState
 	EventLogState
-
+	TreeAnnotator
 	TreeContextBuilder
-	PrivilegeChecker
-	DescriptorReader
-	NameResolver
-	NodeEnqueuerAndChecker
-	TableElementIDGenerator
+	Telemetry
+	NodeStatusInfo
+	RegionProvider
+	ZoneConfigProvider
+
+	// Add adds an absent element to the BuilderState, targeting PUBLIC.
+	Add(element scpb.Element)
+
+	// AddTransient adds an absent element to the BuilderState, targeting
+	// TRANSIENT_ABSENT.
+	AddTransient(element scpb.Element)
+
+	// DropTransient adds a public element to the BuilderState state targeting
+	// TRANSIENT_PUBLIC.
+	DropTransient(element scpb.Element)
+
+	// Drop sets the ABSENT target on an existing element in the BuilderState.
+	Drop(element scpb.Element)
+
+	// Replace replaces an existing PUBLIC element's content while preserving
+	// its key. It sets initial=ABSENT, current=ABSENT, target=ToPublic so
+	// the planner emits "add" operations that update the already-existing
+	// descriptor.
+	// Note: When the element keys match, Drop/Add is preferred over Replace since
+	// it is idempotent.
+	Replace(element scpb.Element)
 
 	// WithNewSourceElementID wraps BuilderStateWithNewSourceElementID in a
 	// BuildCtx return type.
 	WithNewSourceElementID() BuildCtx
+
+	// Codec returns the codec for the current tenant.
+	Codec() keys.SQLCodec
 }
 
-// Dependencies contains all the external dependencies required by the scbuild
-// package and its children.
-type Dependencies interface {
-	CatalogReader() CatalogReader
-	AuthorizationAccessor() AuthorizationAccessor
-
-	// Codec returns the current session data, as in execCfg.
-	// So far this is used only to build a tree.EvalContext.
-	Codec() keys.SQLCodec
-
-	// SessionData returns the current session data, as in execCtx.
-	SessionData() *sessiondata.SessionData
+// ClusterAndSessionInfo provides general cluster and session info.
+type ClusterAndSessionInfo interface {
 
 	// ClusterSettings returns the current cluster settings, as in execCfg.
 	ClusterSettings() *cluster.Settings
 
-	// Statements returns the statements behind this schema change.
-	Statements() []string
-}
-
-// CatalogReader should implement descriptor resolution, namespace lookups, and
-// all such catalog read operations for the builder. The following contract must
-// apply:
-// - errors are panicked;
-// - caches are avoided at all times, we read straight from storage;
-// - MayResolve* methods return zero values if nothing could be found;
-// - MayResolve* methods ignore dropped or offline descriptors;
-// - MustReadDescriptor does not;
-// - MustReadDescriptor panics if the descriptor was not found.
-type CatalogReader interface {
-	tree.TypeReferenceResolver
-	tree.QualifiedNameResolver
-
-	// MayResolveDatabase looks up a database by name.
-	MayResolveDatabase(ctx context.Context, name tree.Name) catalog.DatabaseDescriptor
-
-	// MayResolveSchema looks up a schema by name.
-	MayResolveSchema(ctx context.Context, name tree.ObjectNamePrefix) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
-
-	// MayResolveTable looks up a table by name.
-	MayResolveTable(ctx context.Context, name tree.UnresolvedObjectName) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
-
-	// MayResolveType looks up a type by name.
-	MayResolveType(ctx context.Context, name tree.UnresolvedObjectName) (catalog.ResolvedObjectPrefix, catalog.TypeDescriptor)
-
-	// ReadObjectNamesAndIDs looks up the namespace entries for a schema.
-	ReadObjectNamesAndIDs(ctx context.Context, db catalog.DatabaseDescriptor, schema catalog.SchemaDescriptor) (tree.TableNames, descpb.IDs)
-
-	// MustReadDescriptor looks up a descriptor by ID.
-	MustReadDescriptor(ctx context.Context, id descpb.ID) catalog.Descriptor
-}
-
-// AuthorizationAccessor for checking authorization (e.g. desc privileges).
-type AuthorizationAccessor interface {
-
-	// CheckPrivilege verifies that the current user has `privilege` on
-	// `descriptor`.
-	CheckPrivilege(
-		ctx context.Context, descriptor catalog.Descriptor, privilege privilege.Kind,
-	) error
-
-	// HasAdminRole verifies if a user has an admin role.
-	HasAdminRole(ctx context.Context) (bool, error)
-
-	// HasOwnership returns true iff the role, or any role the role is a member
-	// of, has ownership privilege of the desc.
-	HasOwnership(ctx context.Context, descriptor catalog.Descriptor) (bool, error)
+	// SessionData returns the current session data, as in execCtx.
+	SessionData() *sessiondata.SessionData
 }
 
 // BuilderState encapsulates the state of the planned schema changes, hiding
 // its internal state to anything that ends up using it and only allowing
 // state changes via the provided methods.
 type BuilderState interface {
+	ElementReferences
+	NameResolver
+	PrivilegeChecker
+	TableHelpers
+	TypeHelpers
+	FunctionHelpers
+	SchemaHelpers
 
-	// AddNode adds a node into the NodeAccumulator.
-	AddNode(dir scpb.Target_Direction, elem scpb.Element, meta scpb.TargetMetadata)
+	// QueryByID returns all elements sharing the given descriptor ID.
+	QueryByID(descID catid.DescID) ElementResultSet
 
-	// ForEachNode iterates over the accumulated notes in the NodeAccumulator.
-	ForEachNode(fn func(status scpb.Status, dir scpb.Target_Direction, elem scpb.Element))
+	// Ensure ensures the presence of the given element in the BuilderState with
+	// the given target status and metadata.
+	Ensure(elem scpb.Element, target scpb.TargetStatus, meta scpb.TargetMetadata)
+
+	// LogEventForExistingTarget tells the builder to write an entry in the event
+	// log for the existing target corresponding to the provided element.
+	// An error is thrown if no such target exists.
+	LogEventForExistingTarget(element scpb.Element)
+
+	// LogEventForExistingPayload is like LogEventForExistingTarget, but it allows
+	// the caller to provide additional details of the payload.
+	LogEventForExistingPayload(element scpb.Element, payload logpb.EventPayload)
+
+	// GenerateUniqueDescID returns the next available descriptor id for a new
+	// descriptor and mark the new id as being used for new descriptor, so that
+	// the builder knows to avoid loading existing descriptor for decomposition.
+	GenerateUniqueDescID() catid.DescID
+
+	// BuildUserPrivilegesFromDefaultPrivileges generates owner and user
+	// privileges elements from default privileges of the given database
+	// and schemas for the given descriptor and object type.
+	// `sc` can be nil if this is for building the schema itself (`descID` will
+	// be the schema ID then).
+	BuildUserPrivilegesFromDefaultPrivileges(
+		db *scpb.Database, sc *scpb.Schema, descID descpb.ID, objType privilege.TargetObjectType, owner username.SQLUsername,
+	) (*scpb.Owner, []*scpb.UserPrivileges)
 }
 
 // EventLogState encapsulates the state of the metadata to decorate the eventlog
@@ -150,31 +156,250 @@ type TreeContextBuilder interface {
 	// SemaCtx returns a new tree.SemaContext.
 	SemaCtx() *tree.SemaContext
 
-	// EvalCtx returns a new tree.EvalContext.
-	EvalCtx() *tree.EvalContext
+	// EvalCtx returns a new eval.Context.
+	EvalCtx() *eval.Context
 }
 
-// PrivilegeChecker exposes convenient privilege-checking methods.
+// TreeAnnotator provides interfaces to be able to modify the AST safely,
+// by providing a copy and support for adding annotations.
+type TreeAnnotator interface {
+
+	// SetUnresolvedNameAnnotation sets an annotation on an unresolved object name.
+	SetUnresolvedNameAnnotation(unresolvedName *tree.UnresolvedObjectName, ann interface{})
+
+	// MarkNameAsNonExistent indicates that a table name is non-existent
+	// in the AST, which will cause it to skip full namespace resolution
+	// validation.
+	MarkNameAsNonExistent(name *tree.TableName)
+}
+
+// Telemetry allows incrementing schema change telemetry counters.
+type Telemetry interface {
+
+	// IncrementSchemaChangeCreateCounter increments the selected CREATE telemetry
+	// counter.
+	IncrementSchemaChangeCreateCounter(counterType string)
+
+	// IncrementSchemaChangeAlterCounter increments the selected ALTER telemetry
+	// counter.
+	IncrementSchemaChangeAlterCounter(counterType string, extra ...string)
+
+	// IncrementSchemaChangeDropCounter increments the selected DROP telemetry
+	// counter.
+	IncrementSchemaChangeDropCounter(counterType string)
+
+	// IncrementSchemaChangeAddColumnTypeCounter increments telemetry counters for
+	// different types added as columns.
+	IncrementSchemaChangeAddColumnTypeCounter(typeName string)
+
+	// IncrementSchemaChangeAddColumnQualificationCounter increments telemetry
+	// counters for different qualifications (default expressions) on a newly
+	// added column.
+	IncrementSchemaChangeAddColumnQualificationCounter(qualification string)
+
+	// IncrementUserDefinedSchemaCounter increments the selected user-defined
+	// schema telemetry counter.
+	IncrementUserDefinedSchemaCounter(counterType sqltelemetry.UserDefinedSchemaTelemetryType)
+
+	// IncrementEnumCounter increments the selected enum telemetry counter.
+	IncrementEnumCounter(counterType sqltelemetry.EnumTelemetryType)
+
+	// IncrementDropOwnedByCounter increments the DROP OWNED BY telemetry counter.
+	IncrementDropOwnedByCounter()
+
+	// IncrementSchemaChangeIndexCounter schema change counters related to index
+	// features during creation.
+	IncrementSchemaChangeIndexCounter(counterType string)
+
+	// IncrementAlterTableLocalityCounter increments the selected ALTER TABLE LOCALITY
+	// counter
+	IncrementAlterTableLocalityCounter(counterTypeFrom, counterTypeTo string)
+}
+
+// SchemaFeatureChecker checks if a schema change feature is allowed by the
+// database administrator.
+type SchemaFeatureChecker interface {
+	// CheckFeature returns if the feature name specified is allowed or disallowed,
+	// by the database administrator.
+	CheckFeature(ctx context.Context, featureName tree.SchemaFeatureName) error
+
+	// CanPerformDropOwnedBy returns if we can do DROP OWNED BY for the
+	// given role.
+	CanPerformDropOwnedBy(
+		ctx context.Context, role username.SQLUsername,
+	) (bool, error)
+
+	// CanCreateCrossDBSequenceOwnerRef returns if cross database sequence
+	// owner references are allowed.
+	CanCreateCrossDBSequenceOwnerRef() error
+
+	// CanCreateCrossDBSequenceRef returns if cross database sequence
+	// references are allowed.
+	CanCreateCrossDBSequenceRef() error
+}
+
+// PrivilegeChecker checks an element's privileges.
 type PrivilegeChecker interface {
 
-	// MustOwn panics if the descriptor is not owned by the current user.
-	MustOwn(desc catalog.Descriptor)
+	// HasOwnership returns true iff the current user owns the element.
+	HasOwnership(e scpb.Element) bool
+
+	// CheckPrivilege panics if the current user does not have the specified
+	// privilege for the element.
+	//
+	// Note: This function is written on the assumption that privileges are tied
+	// to descriptors. However, privileges can also live in the
+	// `system.privileges` table (i.e. system-level privileges) and checking those
+	// global privileges are done by the CheckGlobalPrivilege method below.
+	CheckPrivilege(e scpb.Element, privileges ...privilege.Kind) error
+
+	// CheckGlobalPrivilege panics if the current user does not have the specified
+	// global privilege.
+	CheckGlobalPrivilege(privilege privilege.Kind) error
+
+	// HasGlobalPrivilegeOrRoleOption returns a bool representing whether the current user
+	// has a global privilege or the corresponding legacy role option.
+	HasGlobalPrivilegeOrRoleOption(ctx context.Context, privilege privilege.Kind) (bool, error)
+
+	// CurrentUserHasAdminOrIsMemberOf returns true iff the current user is (1)
+	// an admin or (2) has membership in the specified role.
+	CurrentUserHasAdminOrIsMemberOf(role username.SQLUsername) bool
+
+	// CurrentUser returns the user of current session.
+	CurrentUser() username.SQLUsername
+
+	// CheckPrivilegeForUser checks that the specified user has the given
+	// privilege on the element's descriptor.
+	CheckPrivilegeForUser(
+		e scpb.Element, priv privilege.Kind, user username.SQLUsername,
+	) error
+
+	// CheckRoleExists returns nil if `role` exists.
+	CheckRoleExists(ctx context.Context, role username.SQLUsername) error
 }
 
-// DescriptorReader exposes convenient descriptor read methods.
-type DescriptorReader interface {
+// TableHelpers has methods useful for creating new table elements.
+type TableHelpers interface {
 
-	// MustReadDatabase returns the database descriptor for the given ID or panics.
-	MustReadDatabase(id descpb.ID) catalog.DatabaseDescriptor
+	// NextTableColumnID returns the ID that should be used for any new column
+	// added to this table.
+	NextTableColumnID(table *scpb.Table) catid.ColumnID
 
-	// MustReadSchema returns the schema descriptor for the given ID or panics.
-	MustReadSchema(id descpb.ID) catalog.SchemaDescriptor
+	// NextColumnFamilyID returns the ID that should be used for any new column
+	// family added to this table.
+	NextColumnFamilyID(table *scpb.Table) catid.FamilyID
 
-	// MustReadTable returns the table descriptor for the given ID or panics.
-	MustReadTable(id descpb.ID) catalog.TableDescriptor
+	// NextTableIndexID returns the ID that should be used for any new index added
+	// to this table.
+	NextTableIndexID(tableID catid.DescID) catid.IndexID
 
-	// MustReadType returns the type descriptor for the given ID or panics.
-	MustReadType(id descpb.ID) catalog.TypeDescriptor
+	// NextViewIndexID returns the ID that should be used for any new index added
+	// to this materialized view.
+	NextViewIndexID(view *scpb.View) catid.IndexID
+
+	// NextTableConstraintID returns the ID that should be used for any new constraint
+	// added to this table.
+	NextTableConstraintID(tableID catid.DescID) catid.ConstraintID
+
+	// NextTableTriggerID returns the ID that should be used for any new trigger
+	// added to this table.
+	NextTableTriggerID(tableID catid.DescID) catid.TriggerID
+
+	// NextTablePolicyID returns the ID that should be used for any new row-level
+	// security policies added to this table.
+	NextTablePolicyID(tableID catid.DescID) catid.PolicyID
+
+	// NextTableTentativeIndexID returns the tentative ID, starting from
+	// scbuild.TABLE_TENTATIVE_IDS_START, that should be used for any new index added to
+	// this table.
+	NextTableTentativeIndexID(tableID catid.DescID) catid.IndexID
+
+	// NextTableTentativeConstraintID parallels NextTableTentativeIndexID and
+	// returns tentative constraint ID, starting from scbuild.TABLE_TENTATIVE_IDS_START,
+	// that should be used for any new index added to this table.
+	NextTableTentativeConstraintID(tableID catid.DescID) catid.ConstraintID
+
+	// IndexPartitioningDescriptor creates a new partitioning descriptor
+	// for the secondary index element, or panics.
+	IndexPartitioningDescriptor(indexName string,
+		index *scpb.Index, keyColumns []*scpb.IndexColumn,
+		partBy *tree.PartitionBy) catpb.PartitioningDescriptor
+
+	// ResolveTypeRef resolves a type reference.
+	ResolveTypeRef(typeref tree.ResolvableTypeReference) scpb.TypeT
+
+	// WrapExpression constructs an expression wrapper given an AST.
+	WrapExpression(parentID catid.DescID, expr tree.Expr) *scpb.Expression
+
+	// ComputedColumnExpression returns a validated computed column expression
+	// and its type.
+	// TODO(postamar): make this more low-level instead of consuming an AST
+	ComputedColumnExpression(
+		tbl *scpb.Table, d *tree.ColumnTableDef, exprContext tree.SchemaExprContext,
+		getAllNonDropColumnsFn func() colinfo.ResultColumns,
+		columnLookupByNameFn schemaexpr.ColumnLookupFn,
+	) (tree.Expr, *types.T)
+
+	// PartialIndexPredicateExpression returns a validated partial predicate
+	// wrapped expression
+	PartialIndexPredicateExpression(
+		tableID catid.DescID, expr tree.Expr,
+	) tree.Expr
+
+	// IsTableEmpty returns if the table is empty or not.
+	IsTableEmpty(tbl *scpb.Table) bool
+
+	// TTLExpirationExpression returns a validated TTL expiration expression for
+	// a table's row-level TTL configuration. It verifies that the expression:
+	// - type-checks as a TIMESTAMPTZ.
+	// - is not volatile.
+	// - references valid columns in the table.
+	TTLExpirationExpression(
+		tableID catid.DescID,
+		ttl *catpb.RowLevelTTL,
+		getAllNonDropColumnsFn func() colinfo.ResultColumns,
+		columnLookupByNameFn schemaexpr.ColumnLookupFn,
+	) tree.Expr
+}
+
+type FunctionHelpers interface {
+	BuildReferenceProvider(stmt tree.Statement) ReferenceProvider
+	WrapFunctionBody(fnID descpb.ID, bodyStr string, lang catpb.Function_Language,
+		lazilyEvalSQL bool, provider ReferenceProvider) *scpb.FunctionBody
+	ReplaceSeqTypeNamesInStatements(queryStr string, lang catpb.Function_Language) string
+}
+
+type SchemaHelpers interface {
+	ResolveDatabasePrefix(schemaPrefix *tree.ObjectNamePrefix)
+}
+
+// TypeHelpers exposes builder operations that are specific to user-defined
+// type descriptors (enums, composites, domains).
+type TypeHelpers interface {
+
+	// NextDomainConstraintID returns the ID that should be used for any new
+	// constraint (NOT NULL or CHECK) added to this domain type. The returned ID
+	// is monotonically increasing across the lifetime of the descriptor.
+	NextDomainConstraintID(typeID catid.DescID) catid.ConstraintID
+
+	// DomainConstraintNames returns the set of constraint names currently in
+	// use on the given domain, as recorded in the persisted descriptor.
+	DomainConstraintNames(typeID catid.DescID) []string
+}
+
+type ElementResultSet = *scpb.ElementCollection[scpb.Element]
+
+// ElementReferences looks up an element's forward and backward references.
+type ElementReferences interface {
+
+	// ForwardReferences returns the set of elements to which we have forward
+	// references in the given element. This includes the current element.
+	ForwardReferences(e scpb.Element) ElementResultSet
+
+	// BackReferences finds all descriptors with a back-reference to descriptor `id`
+	// and return all elements that belong to them. Back-references also include
+	// children, in the case of databases and schemas.
+	BackReferences(id catid.DescID) ElementResultSet
 }
 
 // ResolveParams specifies the behavior of the methods in the
@@ -187,84 +412,153 @@ type ResolveParams struct {
 
 	// RequiredPrivilege defines the privilege required for the resolved
 	// descriptor.
+	// If 0, no privilege checking is performed.
 	RequiredPrivilege privilege.Kind
+
+	// RequireOwnership if set to true, requires current user be the owner of the
+	// resolved descriptor. It preempts RequiredPrivilege.
+	RequireOwnership bool
+
+	// WithOffline, if set, instructs the catalog reader to include offline
+	// descriptors.
+	WithOffline bool
+
+	// ResolveTypes if set, instructs the catalog reader to resolve types
+	// and not just tables, sequences, and views.
+	ResolveTypes bool
+
+	// InDropContext, if set, indicates that overload resolution is being
+	// performed in the DROP routine context.
+	InDropContext bool
 }
 
-// NameResolver exposes convenient catalog name resolution methods.
+// NameResolver looks up elements in the catalog by name, and vice-versa.
 type NameResolver interface {
 
-	// ResolveDatabase retrieves a database descriptor by name.
-	ResolveDatabase(name tree.Name, p ResolveParams) catalog.DatabaseDescriptor
+	// NamePrefix returns the name prefix for the descriptor backing the given
+	// element. This is constructed on a best-effort basis.
+	NamePrefix(e scpb.Element) tree.ObjectNamePrefix
 
-	// ResolveSchema retrieves a schema descriptor by name, along with its
-	// parent database descriptor.
-	ResolveSchema(name tree.ObjectNamePrefix, p ResolveParams) (catalog.DatabaseDescriptor, catalog.SchemaDescriptor)
+	// ResolveDatabase retrieves a database by name and returns its elements.
+	ResolveDatabase(name tree.Name, p ResolveParams) ElementResultSet
 
-	// ResolveType retrieves a type descriptor by name.
-	ResolveType(name *tree.UnresolvedObjectName, p ResolveParams) (catalog.ResolvedObjectPrefix, catalog.TypeDescriptor)
+	// ResolveSchema retrieves a schema by name and returns its elements.
+	ResolveSchema(name tree.ObjectNamePrefix, p ResolveParams) ElementResultSet
 
-	// ResolveRelation retrieves a table descriptor by name.
-	ResolveRelation(name *tree.UnresolvedObjectName, p ResolveParams) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
+	// ResolveTargetObject retrieves database and schema given the unresolved
+	// object name. The requested schema must exist and current user must have the
+	// required privilege.
+	ResolveTargetObject(prefix *tree.UnresolvedObjectName, requiredSchemaPriv privilege.Kind) (dbElts ElementResultSet, scElts ElementResultSet)
 
-	// ResolveTable retrieves a table descriptor by name, checking that it is a
-	// table and not a view or anything else.
-	ResolveTable(name *tree.UnresolvedObjectName, p ResolveParams) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
+	// ResolveUserDefinedTypeType retrieves a type by name and returns its elements.
+	ResolveUserDefinedTypeType(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
 
-	// ResolveSequence retrieves a table descriptor by name, checking that it is a
-	// sequence.
-	ResolveSequence(name *tree.UnresolvedObjectName, p ResolveParams) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
+	// ResolveRelation retrieves a relation by name and returns its elements.
+	ResolveRelation(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
 
-	// ResolveView retrieves a table descriptor by name, checking that it is a view.
-	ResolveView(name *tree.UnresolvedObjectName, p ResolveParams) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor)
+	// ResolveTable retrieves a table by name and returns its elements.
+	ResolveTable(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
 
-	// ResolveIndex retrieves an index by name.
-	ResolveIndex(
-		relationName *tree.UnresolvedObjectName,
-		indexName tree.Name,
-		p ResolveParams,
-	) (catalog.ResolvedObjectPrefix, catalog.TableDescriptor, catalog.Index)
+	// ResolvePhysicalTable retrieves a table, materialized view, or sequence
+	// by name and returns its elements.
+	ResolvePhysicalTable(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
+
+	// ResolveSequence retrieves a sequence by name and returns its elements.
+	ResolveSequence(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
+
+	// ResolveView retrieves a view by name and returns its elements.
+	ResolveView(name *tree.UnresolvedObjectName, p ResolveParams) ElementResultSet
+
+	// ResolveIndex retrieves an index by name and returns its elements.
+	ResolveIndex(relationID catid.DescID, indexName tree.Name, p ResolveParams) ElementResultSet
+
+	// ResolveRoutine retrieves a user defined function or a stored procedure
+	// and returns its elements.
+	ResolveRoutine(routineObj *tree.RoutineObj, p ResolveParams, routineType tree.RoutineType) ElementResultSet
+
+	// ResolveIndexByName retrieves a table which contains the target
+	// index and returns its elements. Name of database, schema or table may be
+	// missing.
+	// If index is not found, it returns nil if p.IsExistenceOptional or panic if !p.IsExistenceOptional.
+	ResolveIndexByName(tableIndexName *tree.TableIndexName, p ResolveParams) ElementResultSet
+
+	// ResolveColumn retrieves a column by name and returns its elements.
+	// N.B. Column target statuses should be handled outside of this logic (ex. resolving a column by name that is in the
+	// dropping state shouldn't prevent a column of the same name being added).
+	ResolveColumn(relationID catid.DescID, columnName tree.Name, p ResolveParams) ElementResultSet
+
+	// ResolveConstraint retrieves a constraint by name and returns its elements.
+	ResolveConstraint(relationID catid.DescID, constraintName tree.Name, p ResolveParams) ElementResultSet
+
+	// ResolveTrigger retrieves a trigger by name and returns its elements.
+	ResolveTrigger(relationID catid.DescID, triggerName tree.Name, p ResolveParams) ElementResultSet
+
+	// ResolvePolicy retrieves a policy by name and returns its elements.
+	ResolvePolicy(relationID catid.DescID, policyName tree.Name, p ResolveParams) ElementResultSet
 }
 
-// NodeEnqueuerAndChecker exposes convenient methods for enqueuing and checking
-// nodes in the NodeAccumulator.
-type NodeEnqueuerAndChecker interface {
-	// EnqueueAdd adds a target node in the ADD target direction.
-	// Panics if the element is already present.
-	EnqueueAdd(elem scpb.Element)
-
-	// EnqueueDrop adds a target node in the DROP direction.
-	// Panics if the element is already present.
-	EnqueueDrop(elem scpb.Element)
-
-	// EnqueueDropIfNotExists is like EnqueueDrop but does nothing instead of
-	// panicking if the element is already present.
-	EnqueueDropIfNotExists(elem scpb.Element)
-
-	// HasNode returns true iff the builder state has a node matching the provided
-	// filter function.
-	HasNode(filter func(status scpb.Status, dir scpb.Target_Direction, elem scpb.Element) bool) bool
-
-	// HasTarget returns true iff the builder state has a node with an equal element
-	// and the same target direction, regardless of node status.
-	HasTarget(dir scpb.Target_Direction, elem scpb.Element) bool
-
-	// HasElement returns true iff the builder state has a node with an equal
-	// element regardless of target direction or node status.
-	HasElement(elem scpb.Element) bool
+// ReferenceProvider provides all referenced objects with in current DDL
+// statement. For example, CREATE VIEW and CREATE FUNCTION both could reference
+// other objects, and cross-references need to probably tracked.
+type ReferenceProvider interface {
+	// ForEachTableReference iterate through all referenced tables and the
+	// reference details with the given function.
+	ForEachTableReference(f func(tblID descpb.ID, idxID descpb.IndexID, colIDs descpb.ColumnIDs) error) error
+	// ForEachViewReference iterate through all referenced views and the reference
+	// details with the given function.
+	ForEachViewReference(f func(viewID descpb.ID, colIDs descpb.ColumnIDs) error) error
+	// ForEachFunctionReference iterates through all referenced functions for each
+	// function.
+	ForEachFunctionReference(f func(id descpb.ID) error) error
+	// ReferencedSequences returns all referenced sequence IDs
+	ReferencedSequences() catalog.DescriptorIDSet
+	// ReferencedTypes returns all referenced type IDs (not including implicit
+	// table types)
+	ReferencedTypes() catalog.DescriptorIDSet
+	// ReferencedRelationIDs Returns all referenced relation IDs.
+	ReferencedRelationIDs() catalog.DescriptorIDSet
+	// ReferencedRoutines returns all referenced routine IDs.
+	ReferencedRoutines() catalog.DescriptorIDSet
 }
 
-// TableElementIDGenerator exposes convenient ID generation methods for table
-// elements.
-type TableElementIDGenerator interface {
-	// NextColumnID returns the ID that should be used for any new column added to
-	// this table descriptor.
-	NextColumnID(tbl catalog.TableDescriptor) descpb.ColumnID
+// TemporarySchemaProvider provides functions needed to help support
+// temporary schemas.
+type TemporarySchemaProvider interface {
+	// TemporarySchemaName gets the name of the temporary schema for the current
+	// session.
+	TemporarySchemaName() string
+}
 
-	// NextColumnFamilyID returns the ID that should be used for any new column
-	// family added to this table descriptor.
-	NextColumnFamilyID(tbl catalog.TableDescriptor) descpb.FamilyID
+// NodeStatusInfo provides access to observe node descriptors.
+type NodeStatusInfo interface {
 
-	// NextIndexID returns the ID that should be used for any new index added to
-	// this table descriptor.
-	NextIndexID(tbl catalog.TableDescriptor) descpb.IndexID
+	// NodesStatusServer gives access to the NodesStatus service and is only
+	// available when running as a system tenant.
+	NodesStatusServer() *serverpb.OptionalNodesStatusServer
+}
+
+// RegionProvider abstracts the lookup of regions. It is used to implement
+// crdb_internal.regions, which ultimately drives `SHOW REGIONS` and the
+// logic in the commands to manipulate multi-region features.
+type RegionProvider interface {
+	// GetRegions provides access to the set of regions available to the
+	// current tenant.
+	GetRegions(ctx context.Context) (*serverpb.RegionsResponse, error)
+
+	// SynthesizeRegionConfig returns a RegionConfig that describes the
+	// multiregion setup for the given database ID.
+	SynthesizeRegionConfig(
+		ctx context.Context,
+		dbID descpb.ID,
+		opts ...multiregion.SynthesizeRegionConfigOption,
+	) (multiregion.RegionConfig, error)
+}
+
+type ZoneConfigProvider interface {
+	// ZoneConfigGetter returns the zone config getter.
+	ZoneConfigGetter() scdecomp.ZoneConfigGetter
+
+	// GetDefaultZoneConfig is used to get the default zone config inside the
+	// server.
+	GetDefaultZoneConfig() *zonepb.ZoneConfig
 }

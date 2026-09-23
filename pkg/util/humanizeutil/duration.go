@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package humanizeutil
 
@@ -21,11 +16,11 @@ import (
 // and the granularity is no smaller than microseconds.
 //
 // Examples:
-//   0              ->  "0µs"
-//   123456ns       ->  "123µs"
-//   12345678ns     ->  "12ms"
-//   12345678912ns  ->  "1.2s"
 //
+//	0              ->  "0µs"
+//	123456ns       ->  "123µs"
+//	12345678ns     ->  "12ms"
+//	12345678912ns  ->  "1.2s"
 func Duration(val time.Duration) redact.SafeString {
 	val = val.Round(time.Microsecond)
 	if val == 0 {
@@ -54,12 +49,12 @@ func Duration(val time.Duration) redact.SafeString {
 // the granularity is no smaller than seconds.
 //
 // Examples:
-//  - 0 seconds
-//  - 1 second
-//  - 3 minutes
-//  - 1 hour
-//  - 5 days
-//  - 1000 days
+//   - 0 seconds
+//   - 1 second
+//   - 3 minutes
+//   - 1 hour
+//   - 5 days
+//   - 1000 days
 func LongDuration(val time.Duration) redact.SafeString {
 	var round time.Duration
 	var unit string

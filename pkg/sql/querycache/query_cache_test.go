@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package querycache
 
@@ -17,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/prep"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 )
@@ -45,17 +41,17 @@ func expect(t *testing.T, c *C, exp string) {
 }
 
 func data(sql string, mem *memo.Memo, memEstimate int64) *CachedData {
-	cd := &CachedData{SQL: sql, Memo: mem, PrepareMetadata: &PrepareMetadata{}}
+	cd := &CachedData{SQL: sql, Memo: mem, Metadata: &prep.Metadata{}}
 	n := memEstimate - cd.memoryEstimate()
 	if n < 0 {
-		panic(errors.AssertionFailedf("size %d too small", memEstimate))
+		panic(errors.AssertionFailedf("size %d too small %d", memEstimate, cd.memoryEstimate()))
 	}
 	// Add characters to AnonymizedStr which should increase the estimate.
 	s := make([]byte, n)
 	for i := range s {
 		s[i] = 'x'
 	}
-	cd.PrepareMetadata.StatementNoConstants = string(s)
+	cd.Metadata.StatementNoConstants = string(s)
 	if cd.memoryEstimate() != memEstimate {
 		panic(errors.AssertionFailedf("failed to create CachedData of size %d", memEstimate))
 	}
@@ -206,7 +202,7 @@ func TestSynchronization(t *testing.T) {
 					c.Purge(sql)
 				case r <= 35:
 					// 25% of the time, add an entry.
-					c.Add(&s, data(sql, &memo.Memo{}, int64(256+rng.Intn(10*avgCachedSize))))
+					c.Add(&s, data(sql, &memo.Memo{}, int64(299+rng.Intn(10*avgCachedSize))))
 				default:
 					// The rest of the time, find an entry.
 					_, _ = c.Find(&s, sql)
@@ -278,7 +274,7 @@ func BenchmarkWorstCase(b *testing.B) {
 					wg.Add(numWorkers)
 					for i := 0; i < numWorkers; i++ {
 						workerID := i
-						go func() {
+						go func(mitigation bool) {
 							var s Session
 							s.Init()
 							cd := CachedData{Memo: &memo.Memo{}}
@@ -295,7 +291,7 @@ func BenchmarkWorstCase(b *testing.B) {
 								c.Add(&s, &cd)
 							}
 							wg.Done()
-						}()
+						}(mitigation)
 					}
 					wg.Wait()
 				})

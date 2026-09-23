@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rttanalysis
 
@@ -28,18 +23,21 @@ type testingB interface {
 
 	// logScope is used to wrap log.Scope and make it available only in
 	// appropriate contexts.
-	logScope() func()
+	logScope() (getDirectory func() string, close func())
+	isBenchmark() bool
 }
 
 type bShim struct {
 	*testing.B
 }
 
+func (b bShim) isBenchmark() bool { return true }
+
 var _ testingB = bShim{}
 
-func (b bShim) logScope() func() {
+func (b bShim) logScope() (getDirectory func() string, close func()) {
 	sc := log.Scope(b)
-	return func() { sc.Close(b) }
+	return sc.GetDirectory, func() { sc.Close(b) }
 }
 func (b bShim) N() int { return b.B.N }
 func (b bShim) Run(name string, f func(b testingB)) {
@@ -54,15 +52,21 @@ func (b bShim) Run(name string, f func(b testingB)) {
 // execution.
 type tShim struct {
 	*testing.T
+	scope   *log.TestLogScope
 	results *resultSet
 }
 
+func (ts tShim) isBenchmark() bool { return false }
+
 var _ testingB = tShim{}
 
-func (ts tShim) logScope() func() {
-	return func() {}
+func (ts tShim) logScope() (getDirectory func() string, close func()) {
+	return ts.scope.GetDirectory, func() {}
 }
-func (ts tShim) N() int      { return 1 }
+func (ts tShim) GetDirectory() string {
+	return ts.scope.GetDirectory()
+}
+func (ts tShim) N() int      { return 2 }
 func (ts tShim) ResetTimer() {}
 func (ts tShim) StopTimer()  {}
 func (ts tShim) StartTimer() {}
@@ -81,6 +85,6 @@ func (ts tShim) Name() string {
 }
 func (ts tShim) Run(s string, f func(testingB)) {
 	ts.T.Run(s, func(t *testing.T) {
-		f(tShim{results: ts.results, T: t})
+		f(tShim{results: ts.results, T: t, scope: ts.scope})
 	})
 }

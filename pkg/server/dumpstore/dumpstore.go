@@ -1,18 +1,12 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package dumpstore
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -20,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/errors/oserror"
 )
 
 // DumpStore represents a store for dump files.
@@ -64,10 +59,10 @@ type Dumper interface {
 	//
 	// There may be files not owned by this dumper in the files array;
 	// these should be ignored.
-	PreFilter(ctx context.Context, files []os.FileInfo, cleanupFn func(fileName string) error) (preserved map[int]bool, err error)
+	PreFilter(ctx context.Context, files []os.DirEntry, cleanupFn func(fileName string) error) (preserved map[int]bool, err error)
 
 	// CheckOwnsFile returns true iff the dumper owns the given file.
-	CheckOwnsFile(ctx context.Context, fi os.FileInfo) bool
+	CheckOwnsFile(ctx context.Context, fi os.DirEntry) bool
 }
 
 // NewStore creates a new DumpStore.
@@ -88,11 +83,11 @@ func (s *DumpStore) GetFullPath(fileName string) string {
 
 // GC runs the GC policy on this store.
 func (s *DumpStore) GC(ctx context.Context, now time.Time, dumper Dumper) {
-	// NB: ioutil.ReadDir sorts the file names in ascending order.
+	// NB: os.ReadDir sorts the file names in ascending order.
 	// This brings the oldest files first.
-	files, err := ioutil.ReadDir(s.dir)
+	files, err := os.ReadDir(s.dir)
 	if err != nil {
-		log.Warningf(ctx, "%v", err)
+		log.Dev.Warningf(ctx, "%v", err)
 		return
 	}
 
@@ -107,7 +102,7 @@ func (s *DumpStore) GC(ctx context.Context, now time.Time, dumper Dumper) {
 	// to keep.
 	preserved, err := dumper.PreFilter(ctx, files, cleanupFn)
 	if err != nil {
-		log.Warningf(ctx, "%v", err)
+		log.Dev.Warningf(ctx, "%v", err)
 		return
 	}
 
@@ -125,7 +120,7 @@ func (s *DumpStore) GC(ctx context.Context, now time.Time, dumper Dumper) {
 func removeOldAndTooBigExcept(
 	ctx context.Context,
 	dumper Dumper,
-	files []os.FileInfo,
+	files []os.DirEntry,
 	now time.Time,
 	maxS int64,
 	preserved map[int]bool,
@@ -140,8 +135,16 @@ func removeOldAndTooBigExcept(
 			continue
 		}
 
+		info, err := fi.Info()
+		if err != nil {
+			if !oserror.IsNotExist(err) {
+				log.Dev.Warningf(ctx, "%v", err)
+			}
+			continue
+		}
+
 		// Note: we are counting preserved files against the maximum.
-		actualSize += fi.Size()
+		actualSize += info.Size()
 
 		// Ignore all the preserved entries, even if they are "too old".
 		if preserved[i] {
@@ -152,7 +155,7 @@ func removeOldAndTooBigExcept(
 		if actualSize > maxS {
 			// Yes: pass it to the closure.
 			if err := fn(fi.Name()); err != nil {
-				log.Warningf(ctx, "cannot remove file %s: %v", fi.Name(), err)
+				log.Dev.Warningf(ctx, "cannot remove file %s: %v", fi.Name(), err)
 			}
 		}
 	}

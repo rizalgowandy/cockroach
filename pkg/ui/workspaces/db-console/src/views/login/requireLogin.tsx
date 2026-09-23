@@ -1,62 +1,37 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
-import { RouteComponentProps, withRouter } from "react-router-dom";
-import { connect } from "react-redux";
+import React, { useEffect } from "react";
+import { useSelector } from "react-redux";
+import { useHistory, useLocation } from "react-router-dom";
 
+import { selectLoginState, getLoginPage } from "src/redux/login";
 import { AdminUIState } from "src/redux/state";
-import { selectLoginState, LoginState, getLoginPage } from "src/redux/login";
 
-interface RequireLoginProps {
-  loginState: LoginState;
-}
+const RequireLogin: React.FC<{ children?: React.ReactNode }> = ({
+  children,
+}) => {
+  const loginState = useSelector((state: AdminUIState) =>
+    selectLoginState(state),
+  );
+  const history = useHistory();
+  const location = useLocation();
 
-class RequireLogin extends React.Component<
-  RouteComponentProps & RequireLoginProps
-> {
-  componentDidMount() {
-    this.checkLogin();
-  }
+  const shouldHideLoginPage = loginState.hideLoginPage();
 
-  componentDidUpdate() {
-    this.checkLogin();
-  }
-
-  checkLogin() {
-    const { location, history } = this.props;
-
-    if (!this.hideLoginPage()) {
+  useEffect(() => {
+    if (!shouldHideLoginPage) {
       history.push(getLoginPage(location));
     }
+  }, [shouldHideLoginPage, history, location]);
+
+  if (!shouldHideLoginPage) {
+    return null;
   }
 
-  hideLoginPage() {
-    return this.props.loginState.hideLoginPage();
-  }
+  return <>{children}</>;
+};
 
-  render() {
-    if (!this.hideLoginPage()) {
-      return null;
-    }
-
-    return this.props.children;
-  }
-}
-
-const RequireLoginConnected = withRouter(
-  connect((state: AdminUIState) => {
-    return {
-      loginState: selectLoginState(state),
-    };
-  })(RequireLogin),
-);
-
-export default RequireLoginConnected;
+export default RequireLogin;

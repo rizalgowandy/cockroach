@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
@@ -17,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -24,13 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // lookupFlow returns the registered flow with the given ID. If no such flow is
@@ -68,7 +64,6 @@ func lookupStreamInfo(
 
 func TestFlowRegistry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 	reg := NewFlowRegistry()
 
 	id1 := execinfrapb.FlowID{UUID: uuid.MakeV4()}
@@ -208,7 +203,6 @@ func TestFlowRegistry(t *testing.T) {
 // are propagated to their consumers and future attempts to connect them fail.
 func TestStreamConnectionTimeout(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 	reg := NewFlowRegistry()
 
 	jiffy := time.Nanosecond
@@ -217,12 +211,14 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	// to connect a stream, but it'll be too late.
 	id1 := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	f1 := &FlowBase{}
+	f1.mu.ctxCancel = func() {}
 	streamID1 := execinfrapb.StreamID(1)
+	producerID := base.SQLInstanceID(1)
 	consumer := &distsqlutils.RowBuffer{}
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	inboundStreams := map[execinfrapb.StreamID]*InboundStreamInfo{
-		streamID1: {receiver: RowInboundStreamHandler{consumer}, onFinish: wg.Done},
+		streamID1: {receiver: RowInboundStreamHandler{consumer, nil /* types */}, onFinish: wg.Done},
 	}
 	if err := reg.RegisterFlow(
 		context.Background(), id1, f1, inboundStreams, jiffy,
@@ -251,13 +247,10 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	})
 
 	// Create a dummy server stream to pass to ConnectInboundStream.
-	serverStream, _ /* clientStream */, cleanup, err := createDummyStream()
-	if err != nil {
-		t.Fatal(err)
-	}
+	serverStream, _ /* clientStream */, cleanup := createDummyStream(t)
 	defer cleanup()
 
-	_, _, _, err = reg.ConnectInboundStream(context.Background(), id1, streamID1, serverStream, jiffy)
+	_, _, _, err := reg.ConnectInboundStream(context.Background(), id1, streamID1, producerID, serverStream, jiffy)
 	if !testutils.IsError(err, "came too late") {
 		t.Fatalf("expected %q, got: %v", "came too late", err)
 	}
@@ -265,7 +258,7 @@ func TestStreamConnectionTimeout(t *testing.T) {
 	// Unregister the flow. Subsequent attempts to connect a stream should result
 	// in a different error than before.
 	reg.UnregisterFlow(id1)
-	_, _, _, err = reg.ConnectInboundStream(context.Background(), id1, streamID1, serverStream, jiffy)
+	_, _, _, err = reg.ConnectInboundStream(context.Background(), id1, streamID1, producerID, serverStream, jiffy)
 	if !testutils.IsError(err, "not found") {
 		t.Fatalf("expected %q, got: %v", "not found", err)
 	}
@@ -278,7 +271,6 @@ func TestStreamConnectionTimeout(t *testing.T) {
 // - once the consumer connects, another Handshake message is sent.
 func TestHandshake(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 
 	reg := NewFlowRegistry()
 
@@ -299,11 +291,9 @@ func TestHandshake(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 			streamID := execinfrapb.StreamID(1)
+			producerID := base.SQLInstanceID(1)
 
-			serverStream, clientStream, cleanup, err := createDummyStream()
-			if err != nil {
-				t.Fatal(err)
-			}
+			serverStream, clientStream, cleanup := createDummyStream(t)
 			defer cleanup()
 
 			connectProducer := func() {
@@ -311,7 +301,7 @@ func TestHandshake(t *testing.T) {
 				// async because the consumer is not yet there and ConnectInboundStream
 				// is blocking.
 				if _, _, _, err := reg.ConnectInboundStream(
-					context.Background(), flowID, streamID, serverStream, time.Hour,
+					context.Background(), flowID, streamID, producerID, serverStream, time.Hour,
 				); err != nil {
 					t.Error(err)
 				}
@@ -322,7 +312,7 @@ func TestHandshake(t *testing.T) {
 				wg := &sync.WaitGroup{}
 				wg.Add(1)
 				inboundStreams := map[execinfrapb.StreamID]*InboundStreamInfo{
-					streamID: {receiver: RowInboundStreamHandler{consumer}, onFinish: wg.Done},
+					streamID: {receiver: RowInboundStreamHandler{consumer, nil /* types */}, onFinish: wg.Done},
 				}
 				if err := reg.RegisterFlow(
 					context.Background(), flowID, f1, inboundStreams, time.Hour, /* timeout */
@@ -383,6 +373,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 	reg := NewFlowRegistry()
 
 	flow := &FlowBase{}
+	flow.mu.ctxCancel = func() {}
 	id := execinfrapb.FlowID{UUID: uuid.MakeV4()}
 	registerFlow := func(t *testing.T, id execinfrapb.FlowID) {
 		t.Helper()
@@ -406,7 +397,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		time.Sleep(time.Microsecond)
 		reg.UnregisterFlow(id)
 		<-drainDone
-		reg.Undrain()
+		reg.undrain()
 	})
 
 	// DrainTimeout verifies that Drain returns once the timeout expires.
@@ -414,7 +405,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		registerFlow(t, id)
 		reg.Drain(0 /* flowDrainWait */, 0 /* minFlowDrainWait */, nil /* reporter */)
 		reg.UnregisterFlow(id)
-		reg.Undrain()
+		reg.undrain()
 	})
 
 	// AcceptNewFlow verifies that a FlowRegistry continues accepting flows
@@ -444,7 +435,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		); !testutils.IsError(err, "draining") {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		reg.Undrain()
+		reg.undrain()
 	})
 
 	// MinFlowWait verifies that the FlowRegistry waits a minimum amount of time
@@ -474,7 +465,7 @@ func TestFlowRegistryDrain(t *testing.T) {
 		}
 		reg.UnregisterFlow(id)
 		<-drainDone
-		reg.Undrain()
+		reg.undrain()
 
 		// Case in which a running flow finishes before the minimum wait time. We
 		// attempt to register another flow after the completion of the first flow
@@ -514,7 +505,55 @@ func TestFlowRegistryDrain(t *testing.T) {
 		reg.UnregisterFlow(id)
 		<-drainDone
 
-		reg.Undrain()
+		reg.undrain()
+	})
+
+	// StaleFlowEntry verifies that the Drain doesn't get stuck forever due to a
+	// stale flowEntry in the registry that was created by ConnectInboundStream
+	// which failed its initial handshake. If such entry remains in the
+	// registry, then the Drain process will be stuck forever (#100710).
+	t.Run("StaleFlowEntry", func(t *testing.T) {
+		serverStream, _ /* clientStream */, cleanup := createDummyStream(t)
+		defer cleanup()
+
+		// Create a gRPC stream where we inject an error on each Send call.
+		//
+		// We don't need to delay the RPC call.
+		delayCh := make(chan struct{})
+		close(delayCh)
+		injectedErr := errors.New("injected error")
+		serverStream = &delayedErrorServerStream{
+			RPCDistSQL_FlowStreamStream: serverStream,
+			// Make rpcCalledCh a buffered channel so that the RPC is not
+			// blocked.
+			rpcCalledCh: make(chan struct{}, 1),
+			delayCh:     delayCh,
+			err:         injectedErr,
+		}
+
+		// Attempt to connect an inbound stream for which there is no flow in
+		// the registry. In such case we attempt to send a handshake message
+		// which should fail with the injected error.
+		producerID := base.SQLInstanceID(1)
+		_, _, _, err := reg.ConnectInboundStream(
+			ctx, id, execinfrapb.StreamID(0), producerID, serverStream, 0, /* timeout */
+		)
+		if !errors.Is(err, injectedErr) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Now, the crux of the test: attempt to drain the registry and verify
+		// that there were no flows to drain. If we do see some, then it means
+		// that we have a stale flowEntry that will never get cleaned up.
+		var remaining int
+		reporter := func(r int, _ redact.SafeString) {
+			remaining += r
+		}
+		reg.Drain(0 /* flowDrainWait */, 0 /* minFlowDrainWait */, reporter)
+		reg.undrain()
+		if remaining != 0 {
+			t.Fatalf("expected zero flows reported, found %d", remaining)
+		}
 	})
 }
 
@@ -531,7 +570,7 @@ func TestInboundStreamTimeoutIsRetryable(t *testing.T) {
 	rc.InitWithBufSizeAndNumSenders(types.OneIntCol, 1 /* chanBufSize */, 1 /* numSenders */)
 	inboundStreams := map[execinfrapb.StreamID]*InboundStreamInfo{
 		0: {
-			receiver: RowInboundStreamHandler{rc},
+			receiver: RowInboundStreamHandler{rc, types.OneIntCol},
 			onFinish: wg.Done,
 		},
 	}
@@ -553,8 +592,6 @@ func TestInboundStreamTimeoutIsRetryable(t *testing.T) {
 // error, we are still able to register flows while Pushing the error (#34041).
 func TestTimeoutPushDoesntBlockRegister(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 73419, "flaky test")
-	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	fr := NewFlowRegistry()
@@ -576,7 +613,7 @@ func TestTimeoutPushDoesntBlockRegister(t *testing.T) {
 	wg.Add(1)
 	inboundStreams := map[execinfrapb.StreamID]*InboundStreamInfo{
 		0: {
-			receiver: RowInboundStreamHandler{rc},
+			receiver: RowInboundStreamHandler{rc, types.OneIntCol},
 			onFinish: wg.Done,
 		},
 	}
@@ -610,7 +647,6 @@ func TestTimeoutPushDoesntBlockRegister(t *testing.T) {
 // into a flow even if one of the inbound streams are blocked (#35859).
 func TestFlowCancelPartiallyBlocked(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	fr := NewFlowRegistry()
@@ -625,11 +661,11 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 	wgRight.Add(1)
 	inboundStreams := map[execinfrapb.StreamID]*InboundStreamInfo{
 		0: {
-			receiver: RowInboundStreamHandler{left},
+			receiver: RowInboundStreamHandler{left, nil /* types */},
 			onFinish: wgLeft.Done,
 		},
 		1: {
-			receiver: RowInboundStreamHandler{right},
+			receiver: RowInboundStreamHandler{right, nil /* types */},
 			onFinish: wgRight.Done,
 		},
 	}
@@ -640,7 +676,7 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 	// RegisterFlow with an immediate timeout.
 	flow := &FlowBase{
 		FlowCtx: execinfra.FlowCtx{
-			ID: execinfrapb.FlowID{UUID: uuid.FastMakeV4()},
+			ID: execinfrapb.FlowID{UUID: uuid.MakeV4()},
 		},
 		inboundStreams: inboundStreams,
 		flowRegistry:   fr,
@@ -668,5 +704,147 @@ func TestFlowCancelPartiallyBlocked(t *testing.T) {
 	_, meta = left.Next()
 	if !errors.Is(meta.Err, cancelchecker.QueryCanceledError) {
 		t.Fatal("expected query canceled, found", meta.Err)
+	}
+}
+
+// delayedErrorServerStream is a light wrapper around the server stream that
+// allows to block (on delayCh) Send() calls which always result in the
+// provided error.
+type delayedErrorServerStream struct {
+	execinfrapb.RPCDistSQL_FlowStreamStream
+	// rpcCalledCh is sent on in the very beginning of every Send() call.
+	rpcCalledCh chan<- struct{}
+	delayCh     <-chan struct{}
+	err         error
+}
+
+func (s *delayedErrorServerStream) Send(*execinfrapb.ConsumerSignal) error {
+	s.rpcCalledCh <- struct{}{}
+	<-s.delayCh
+	return s.err
+}
+
+// TestErrorOnSlowHandshake is a regression test for #94113. In particular, it
+// verifies that the flow infra is shut down correctly when the inbound stream
+// times out while the handshake message is being sent to the producer and later
+// results in an error.
+//
+// Here is a more detailed sequence of events:
+//   - the flow, which has a single inbound stream, is registered with the flow
+//     registry; the flow is given some timeout (2s in the test) for that
+//     inbound stream to arrive
+//   - the inbound stream arrives, finds the flow in the registry and sends a
+//     handshake message
+//   - for whatever reason this "handshake" RPC is slow (in the test it is
+//     blocked, but in production it could be due to overloaded node), so the
+//     inbound stream timeout is reached
+//   - that timeout "cancels" the single pending flow; this cancellation results
+//     in the flow being marked as "canceled" and the wait group being
+//     decremented (as well as calling Timeout() on the receiver)
+//   - after the flow cancellation is performed, the "handshake" RPC results in
+//     an error which results in flow being properly canceled (by calling
+//     FlowBase.ctxCancel).
+//
+// Before #94113 was fixed, the flow would be incorrectly marked as "connected"
+// before the "handshake" RPC was issued, so the inbound stream timeout would
+// not actually call Timeout() on the receiver and the wait group would never be
+// decremented. Also, the flow wouldn't be properly canceled either, so this
+// setup could result in a deadlock.
+func TestErrorOnSlowHandshake(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	reg := NewFlowRegistry()
+	flowID := execinfrapb.FlowID{UUID: uuid.MakeV4()}
+	streamID := execinfrapb.StreamID(1)
+	producerID := base.SQLInstanceID(1)
+	cancelCh := make(chan struct{})
+	f := &FlowBase{}
+	f.mu.ctxCancel = func() {
+		cancelCh <- struct{}{}
+	}
+
+	serverStream, _ /* clientStream */, cleanup := createDummyStream(t)
+	defer cleanup()
+
+	rpcCalledCh, delayCh := make(chan struct{}), make(chan struct{})
+	serverStream = &delayedErrorServerStream{
+		RPCDistSQL_FlowStreamStream: serverStream,
+		rpcCalledCh:                 rpcCalledCh,
+		delayCh:                     delayCh,
+		err:                         errors.New("dummy error"),
+	}
+
+	receiver := &distsqlutils.RowBuffer{}
+	var wg sync.WaitGroup
+	streamInfo := &InboundStreamInfo{
+		receiver: RowInboundStreamHandler{receiver, nil /* types */},
+		onFinish: wg.Done,
+	}
+	wg.Add(1)
+	inboundStreams := map[execinfrapb.StreamID]*InboundStreamInfo{
+		streamID: streamInfo,
+	}
+	inboundStreamTimeout := 2 * time.Second
+	if err := reg.RegisterFlow(
+		context.Background(), flowID, f, inboundStreams, inboundStreamTimeout,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		if _, _, _, err := reg.ConnectInboundStream(
+			// timeout here doesn't matter since the flow is already present in
+			// the registry.
+			context.Background(), flowID, streamID, producerID, serverStream, 0, /* timeout */
+		); err != nil {
+			errCh <- err
+		}
+	}()
+
+	// Wait for the concurrent goroutine to issue the first RPC (which is a
+	// handshake).
+	<-rpcCalledCh
+	// Wait out the inbound stream timeout.
+	time.Sleep(inboundStreamTimeout + time.Second)
+	// At this point we expect the inbound stream is canceled by
+	// flowEntry.streamTimer, so we can unblock the handshake RPC. (Note that
+	// we added an extra second to the sleep above in order to make it more
+	// likely that the timer fired.)
+	delayCh <- struct{}{}
+
+	// Make sure that the wait group is properly decremented (this must have
+	// been done by flowEntry.streamTimer too).
+	wg.Wait()
+	// Since the RPC resulted in an error, we expect that the flow is canceled.
+	<-cancelCh
+	err := <-errCh
+	if err == nil {
+		t.Fatal("expected ConnectInboundStream to result in an error")
+	}
+	if !testutils.IsError(err, "came too late") && !testutils.IsError(err, "dummy error") {
+		// Generally speaking, we expect the "came too late" error which
+		// indicates that the inbound stream was canceled while performing the
+		// RPC. However, under stress it might be possible for the injected
+		// error to be returned. This is acceptable since the main goal of the
+		// test is to ensure that no deadlocks happen, and we don't care that
+		// much about which particular error was returned.
+		t.Fatalf("unexpected error from ConnectInboundStream: %v", err)
+	}
+	// We expect that "no inbound stream connection" error is pushed into the
+	// receiver. That error is pushed in a separate goroutine, so we block until
+	// the push occurs, within a timeout.
+	var record distsqlutils.BufferedRecord
+	testutils.SucceedsSoon(t, func() error {
+		receiver.Mu.Lock()
+		defer receiver.Mu.Unlock()
+		if len(receiver.Mu.Records) != 1 {
+			return errors.Newf("expected a single meta object with an error, got %v", receiver.Mu.Records)
+		}
+		record = receiver.Mu.Records[0]
+		return nil
+	})
+	if !IsNoInboundStreamConnectionError(record.Meta.Err) {
+		t.Fatalf("unexpected record: %v", record)
 	}
 }

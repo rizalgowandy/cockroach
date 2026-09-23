@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package util
 
@@ -15,11 +10,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/crlib/crtime"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEveryN(t *testing.T) {
-	start := timeutil.Now()
-	en := EveryN{N: time.Minute}
 	testCases := []struct {
 		t        time.Duration // time since start
 		expected bool
@@ -36,9 +31,18 @@ func TestEveryN(t *testing.T) {
 		{10*time.Minute + 59*time.Second, false},
 		{11 * time.Minute, true},
 	}
-	for _, tc := range testCases {
-		if a, e := en.ShouldProcess(start.Add(tc.t)), tc.expected; a != e {
-			t.Errorf("ShouldProcess(%v) got %v, want %v", tc.t, a, e)
+	t.Run("time.Time", func(t *testing.T) {
+		start := timeutil.Now()
+		en := Every(time.Minute)
+		for _, tc := range testCases {
+			require.Equal(t, tc.expected, en.ShouldProcess(start.Add(tc.t)))
 		}
-	}
+	})
+	t.Run("crtime.NowMono", func(t *testing.T) {
+		start := crtime.NowMono()
+		en := EveryMono(time.Minute)
+		for _, tc := range testCases {
+			require.Equal(t, tc.expected, en.ShouldProcess(start.Add(tc.t)))
+		}
+	})
 }

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package coldata
 
@@ -22,8 +17,9 @@ import (
 // testingT is a private interface that mirrors the testing.TB methods used.
 // testing.TB cannot be used directly since testing is an illegal import.
 // TODO(asubiotto): Remove AssertEquivalentBatches' dependency on testing.TB by
-//  checking for equality and returning a diff string instead of operating on
-//  testing.TB.
+//
+//	checking for equality and returning a diff string instead of operating on
+//	testing.TB.
 type testingT interface {
 	Helper()
 	Errorf(format string, args ...interface{})
@@ -64,9 +60,6 @@ func AssertEquivalentBatches(t testingT, expected, actual Batch) {
 		expectedNulls := expectedVec.Nulls()
 		actualNulls := actualVec.Nulls()
 		oldExpMaybeHasNulls, oldActMaybeHasNulls := expectedNulls.maybeHasNulls, actualNulls.maybeHasNulls
-		defer func() {
-			expectedNulls.maybeHasNulls, actualNulls.maybeHasNulls = oldExpMaybeHasNulls, oldActMaybeHasNulls
-		}()
 		expectedNulls.maybeHasNulls = expectedNulls.maybeHasNulls || actualNulls.maybeHasNulls
 		actualNulls.maybeHasNulls = expectedNulls.maybeHasNulls || actualNulls.maybeHasNulls
 		require.Equal(t, expectedNulls.Slice(0, expected.Length()), actualNulls.Slice(0, actual.Length()))
@@ -151,5 +144,6 @@ func AssertEquivalentBatches(t testingT, expected, actual Batch) {
 				actualVec.Window(0, actual.Length()),
 			)
 		}
+		expectedNulls.maybeHasNulls, actualNulls.maybeHasNulls = oldExpMaybeHasNulls, oldActMaybeHasNulls
 	}
 }

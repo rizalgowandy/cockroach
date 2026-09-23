@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colrpc
 
@@ -20,9 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -31,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
@@ -40,7 +39,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
@@ -117,24 +115,9 @@ func makeMockFlowStreamRPCLayer() mockFlowStreamRPCLayer {
 func handleStream(
 	ctx context.Context, inbox *Inbox, stream flowStreamServer, doneFn func(),
 ) chan error {
-	return handleStreamWithFlowCtxDone(ctx, inbox, stream, nil /* flowCtxDone */, doneFn)
-}
-
-// handleStreamWithFlowCtxDone is the same as handleStream but also takes in
-// an optional Done channel for the flow context of the inbox host.
-func handleStreamWithFlowCtxDone(
-	ctx context.Context,
-	inbox *Inbox,
-	stream flowStreamServer,
-	flowCtxDone <-chan struct{},
-	doneFn func(),
-) chan error {
 	handleStreamErrCh := make(chan error, 1)
-	if flowCtxDone == nil {
-		flowCtxDone = make(<-chan struct{})
-	}
 	go func() {
-		handleStreamErrCh <- inbox.RunWithStream(ctx, stream, flowCtxDone)
+		handleStreamErrCh <- inbox.RunWithStream(ctx, stream, nil /* header */)
 		if doneFn != nil {
 			doneFn()
 		}
@@ -145,12 +128,13 @@ func handleStreamWithFlowCtxDone(
 func TestOutboxInbox(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	ctx := context.Background()
 	// Set up the RPC layer.
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
+	clock := hlc.NewClockForTesting(nil)
+	_, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	require.NoError(t, err)
 
 	// Generate a random cancellation scenario.
@@ -163,9 +147,12 @@ func TestOutboxInbox(t *testing.T) {
 		// streamCtxCancel models a scenario in which the Outbox host cancels
 		// the flow.
 		streamCtxCancel
-		// readerCtxCancel models a scenario in which the Inbox host cancels the
-		// flow. This is considered a graceful termination, and the flow context
-		// isn't canceled.
+		// flowCtxCancel models a scenario in which the flow context of the
+		// Inbox host is canceled which is an ungraceful shutdown.
+		flowCtxCancel
+		// readerCtxCancel models a scenario in which the consumer of the Inbox
+		// cancels the context while the host's flow context is not canceled.
+		// This is considered a graceful termination.
 		readerCtxCancel
 		// transportBreaks models a scenario in which the transport breaks.
 		transportBreaks
@@ -175,20 +162,24 @@ func TestOutboxInbox(t *testing.T) {
 		cancellationScenarioName string
 	)
 	switch randVal := rng.Float64(); {
-	case randVal <= 0.25:
+	case randVal <= 0.2:
 		cancellationScenario = noCancel
 		cancellationScenarioName = "noCancel"
-	case randVal <= 0.50:
+	case randVal <= 0.4:
 		cancellationScenario = streamCtxCancel
 		cancellationScenarioName = "streamCtxCancel"
-	case randVal <= 0.75:
+	case randVal <= 0.6:
+		cancellationScenario = flowCtxCancel
+		cancellationScenarioName = "flowCtxCancel"
+	case randVal <= 0.8:
 		cancellationScenario = readerCtxCancel
 		cancellationScenarioName = "readerCtxCancel"
-	case randVal <= 1:
+	default:
 		cancellationScenario = transportBreaks
 		cancellationScenarioName = "transportBreaks"
 	}
 
+	//lint:ignore SA1019 grpc.WithInsecure is deprecated
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(t, err)
 	if cancellationScenario != transportBreaks {
@@ -198,8 +189,8 @@ func TestOutboxInbox(t *testing.T) {
 		}()
 	}
 
-	streamCtx, streamCancelFn := context.WithCancel(context.Background())
-	client := execinfrapb.NewDistSQLClient(conn)
+	streamCtx, streamCancelFn := context.WithCancel(ctx)
+	client := execinfrapb.NewGRPCDistSQLClientAdapter(conn)
 	clientStream, err := client.FlowStream(streamCtx)
 	require.NoError(t, err)
 
@@ -213,10 +204,10 @@ func TestOutboxInbox(t *testing.T) {
 			inputBuffer = colexecop.NewBatchBuffer()
 			// Generate some random behavior before passing the random number
 			// generator to be used in the Outbox goroutine (to avoid races).
-			// These sleep variables enable a sleep for up to half a millisecond
-			// with a .25 probability before cancellation.
-			sleepBeforeCancellation = rng.Float64() <= 0.25
-			sleepTime               = time.Microsecond * time.Duration(rng.Intn(500))
+			// These sleep variables enable a sleep for up to five milliseconds
+			// with a .5 probability before cancellation.
+			sleepBeforeCancellation = rng.Float64() <= 0.5
+			sleepTime               = time.Microsecond * time.Duration(rng.Intn(5000))
 			// stopwatch is used to measure how long it takes for the outbox to
 			// exit once the transport broke.
 			stopwatch                    = timeutil.NewStopWatch()
@@ -264,7 +255,7 @@ func TestOutboxInbox(t *testing.T) {
 		)
 		wg.Add(1)
 		go func() {
-			flowCtx, flowCtxCancelFn := context.WithCancel(context.Background())
+			flowCtx, flowCtxCancelFn := context.WithCancel(ctx)
 			flowCtxCancel := func() {
 				atomic.StoreUint32(&flowCtxCanceled, 1)
 				flowCtxCancelFn()
@@ -277,14 +268,20 @@ func TestOutboxInbox(t *testing.T) {
 
 			inputMemAcc := testMemMonitor.MakeBoundAccount()
 			defer inputMemAcc.Close(outboxCtx)
-			input := coldatatestutils.NewRandomDataOp(
+			input, _ := coldatatestutils.NewRandomDataOp(
 				colmem.NewAllocator(outboxCtx, &inputMemAcc, coldata.StandardColumnFactory), rng, args,
 			)
 			outboxMemAcc := testMemMonitor.MakeBoundAccount()
 			defer outboxMemAcc.Close(outboxCtx)
+			outboxConverterMemAcc := testMemMonitor.MakeBoundAccount()
+			defer outboxConverterMemAcc.Close(ctx)
+			var nodeid base.NodeIDContainer
+			nodeid.Set(ctx, roachpb.NodeID(7))
 			outbox, err := NewOutbox(
+				&execinfra.FlowCtx{NodeID: base.NewSQLIDContainerForNode(&nodeid), Gateway: false},
+				0, /* processorID */
 				colmem.NewAllocator(outboxCtx, &outboxMemAcc, coldata.StandardColumnFactory),
-				colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
+				&outboxConverterMemAcc, colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
 			)
 			require.NoError(t, err)
 
@@ -299,7 +296,8 @@ func TestOutboxInbox(t *testing.T) {
 			wg.Done()
 		}()
 
-		readerCtx, readerCancelFn := context.WithCancel(context.Background())
+		inboxFlowCtx, inboxFlowCtxCancelFn := context.WithCancel(ctx)
+		readerCtx, readerCancelFn := context.WithCancel(inboxFlowCtx)
 		wg.Add(1)
 		go func() {
 			if sleepBeforeCancellation {
@@ -309,6 +307,8 @@ func TestOutboxInbox(t *testing.T) {
 			case noCancel:
 			case streamCtxCancel:
 				streamCancelFn()
+			case flowCtxCancel:
+				inboxFlowCtxCancelFn()
 			case readerCtxCancel:
 				readerCancelFn()
 			case transportBreaks:
@@ -321,7 +321,10 @@ func TestOutboxInbox(t *testing.T) {
 
 		inboxMemAcc := testMemMonitor.MakeBoundAccount()
 		defer inboxMemAcc.Close(readerCtx)
-		inbox, err := NewInbox(colmem.NewAllocator(readerCtx, &inboxMemAcc, coldata.StandardColumnFactory), typs, execinfrapb.StreamID(0))
+		inbox, err := NewInboxWithFlowCtxDone(
+			colmem.NewAllocator(readerCtx, &inboxMemAcc, coldata.StandardColumnFactory),
+			typs, execinfrapb.StreamID(0), inboxFlowCtx.Done(),
+		)
 		require.NoError(t, err)
 
 		streamHandlerErrCh := handleStream(serverStream.Context(), inbox, serverStream, func() { close(serverStreamNotification.Donec) })
@@ -342,7 +345,7 @@ func TestOutboxInbox(t *testing.T) {
 				// Note that it is ok that we call Init on every iteration - it
 				// is a noop every time except for the first one.
 				inbox.Init(readerCtx)
-				outputBatch = inbox.Next()
+				outputBatch = colexecop.NextNoMeta(inbox)
 			}); err != nil {
 				readerErr = err
 				break
@@ -393,8 +396,8 @@ func TestOutboxInbox(t *testing.T) {
 			// If no cancellation happened, the output can be fully verified
 			// against the input.
 			for batchNum := 0; ; batchNum++ {
-				outputBatch := outputBatches.Next()
-				inputBatch := inputBatches.Next()
+				outputBatch := colexecop.NextNoMeta(outputBatches)
+				inputBatch := colexecop.NextNoMeta(inputBatches)
 				require.Equal(t, outputBatch.Length(), inputBatch.Length())
 				if outputBatch.Length() == 0 {
 					break
@@ -420,10 +423,38 @@ func TestOutboxInbox(t *testing.T) {
 			// which prompts the watchdog goroutine of the outbox to cancel the
 			// flow.
 			require.True(t, atomic.LoadUint32(&flowCtxCanceled) == 1)
+		case flowCtxCancel:
+			// If the flow context of the Inbox host gets canceled, it is
+			// treated as an ungraceful termination of the stream, so we expect
+			// an error from the stream handler.
+			require.True(t, errors.Is(streamHandlerErr, cancelchecker.QueryCanceledError))
+			// The Inbox propagates this cancellation on its host. Depending on
+			// when the cancellation is noticed by the reader, a different error
+			// is used, so we allow for both of them.
+			//
+			// QueryCanceledError is used when the flow ctx cancellation is
+			// observed before the stream arrived whereas wrapped
+			// context.Canceled error is used when the inbox handler goroutine
+			// notices the cancellation first and ungracefully shuts down the
+			// stream.
+			ok := errors.Is(readerErr, cancelchecker.QueryCanceledError) ||
+				testutils.IsError(readerErr, "context canceled")
+			require.True(t, ok, readerErr)
+
+			// In the production setup, the watchdog goroutine of the outbox
+			// would receive non-io.EOF error indicating an ungraceful
+			// completion of the FlowStream RPC call which would prompt the
+			// outbox to cancel the whole flow.
+			//
+			// However, because we're using a mock server, the propagation
+			// doesn't take place, so the flow context on the outbox side should
+			// not be canceled.
+			require.True(t, atomic.LoadUint32(&flowCtxCanceled) == 0)
+			require.True(t, atomic.LoadUint32(&outboxCtxCanceled) == 1)
 		case readerCtxCancel:
-			// If the reader context gets canceled, it is treated as a graceful
-			// termination of the stream, so we expect no error from the stream
-			// handler.
+			// If the reader context gets canceled while the inbox's host flow
+			// context doesn't, it is treated as a graceful termination of the
+			// stream, so we expect no error from the stream handler.
 			require.Nil(t, streamHandlerErr)
 			// The Inbox should still propagate this error upwards.
 			require.True(t, testutils.IsError(readerErr, "context canceled"), readerErr)
@@ -454,15 +485,17 @@ func TestOutboxInbox(t *testing.T) {
 func TestInboxHostCtxCancellation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	ctx := context.Background()
 	// Set up the RPC layer.
 	stopper := stop.NewStopper()
-	defer stopper.Stop(context.Background())
+	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(clock, stopper, execinfra.StaticNodeID)
+	clock := hlc.NewClockForTesting(nil)
+	_, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	require.NoError(t, err)
 
 	rng, _ := randutil.NewTestRand()
+	//lint:ignore SA1019 grpc.WithInsecure is deprecated
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(t, err)
 	defer func() {
@@ -471,13 +504,13 @@ func TestInboxHostCtxCancellation(t *testing.T) {
 	}()
 
 	// Simulate the "remote" node with a separate context.
-	outboxHostCtx, outboxHostCtxCancel := context.WithCancel(context.Background())
+	outboxHostCtx, outboxHostCtxCancel := context.WithCancel(ctx)
 	// Derive a separate context for the outbox itself (this is what is done in
 	// Outbox.Run).
 	outboxCtx, outboxCtxCancel := context.WithCancel(outboxHostCtx)
 
 	// Initiate the FlowStream RPC from the outbox.
-	client := execinfrapb.NewDistSQLClient(conn)
+	client := execinfrapb.NewGRPCDistSQLClientAdapter(conn)
 	clientStream, err := client.FlowStream(outboxCtx)
 	require.NoError(t, err)
 
@@ -489,9 +522,13 @@ func TestInboxHostCtxCancellation(t *testing.T) {
 	outboxInput := colexecutils.NewFixedNumTuplesNoInputOp(testAllocator, 1 /* numTuples */, nil /* opToInitialize */)
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(outboxHostCtx)
+	var nodeid base.NodeIDContainer
+	nodeid.Set(ctx, roachpb.NodeID(7))
 	outbox, err := NewOutbox(
+		&execinfra.FlowCtx{NodeID: base.NewSQLIDContainerForNode(&nodeid), Gateway: false},
+		0, /* processorID */
 		colmem.NewAllocator(outboxHostCtx, &outboxMemAcc, coldata.StandardColumnFactory),
-		colexecargs.OpWithMetaInfo{Root: outboxInput}, typs, nil, /* getStats */
+		testMemAcc, colexecargs.OpWithMetaInfo{Root: outboxInput}, typs, nil, /* getStats */
 	)
 	require.NoError(t, err)
 	var wg sync.WaitGroup
@@ -502,20 +539,20 @@ func TestInboxHostCtxCancellation(t *testing.T) {
 	}()
 
 	// Create the inbox on the "local" node (simulated by a separate context).
-	inboxHostCtx, inboxHostCtxCancel := context.WithCancel(context.Background())
+	inboxHostCtx, inboxHostCtxCancel := context.WithCancel(ctx)
 	inboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer inboxMemAcc.Close(inboxHostCtx)
-	inbox, err := NewInbox(colmem.NewAllocator(inboxHostCtx, &inboxMemAcc, coldata.StandardColumnFactory), typs, execinfrapb.StreamID(0))
+	inbox, err := NewInboxWithFlowCtxDone(
+		colmem.NewAllocator(inboxHostCtx, &inboxMemAcc, coldata.StandardColumnFactory),
+		typs, execinfrapb.StreamID(0), inboxHostCtx.Done(),
+	)
 	require.NoError(t, err)
 
 	// Spawn up the stream handler (a separate goroutine) for the server side
 	// of the FlowStream RPC.
 	serverStreamNotification := <-mockServer.InboundStreams
 	serverStream := serverStreamNotification.Stream
-	streamHandlerErrCh := handleStreamWithFlowCtxDone(
-		serverStream.Context(), inbox, serverStream,
-		inboxHostCtx.Done(), func() { close(serverStreamNotification.Donec) },
-	)
+	streamHandlerErrCh := handleStream(serverStream.Context(), inbox, serverStream, func() { close(serverStreamNotification.Donec) })
 
 	// Here is the meat of the test - the inbox is never initialized, and,
 	// instead, the inbox host's flow context is canceled after some delay.
@@ -544,11 +581,12 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+	_, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
 
+	//lint:ignore SA1019 grpc.WithInsecure is deprecated
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(t, err)
 	defer func() {
@@ -585,12 +623,16 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 			// from being finished when it receives a DrainRequest.
 			numBatches: math.MaxInt64,
 			test: func(ctx context.Context, inbox *Inbox) []execinfrapb.ProducerMetadata {
+				var streamingMeta []execinfrapb.ProducerMetadata
 				// Simulate the inbox flow calling Next an arbitrary amount of times
 				// (including none).
 				for i := 0; i < numNextsBeforeDrain; i++ {
-					inbox.Next()
+					_, meta := inbox.Next()
+					if meta != nil {
+						streamingMeta = append(streamingMeta, *meta)
+					}
 				}
-				return inbox.DrainMeta()
+				return append(streamingMeta, inbox.DrainMeta()...)
 			},
 		},
 		{
@@ -599,13 +641,18 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 			name:       "AfterSuccessfulCompletion",
 			numBatches: 4,
 			test: func(ctx context.Context, inbox *Inbox) []execinfrapb.ProducerMetadata {
+				var streamingMeta []execinfrapb.ProducerMetadata
 				for {
-					b := inbox.Next()
+					b, meta := inbox.Next()
+					if meta != nil {
+						streamingMeta = append(streamingMeta, *meta)
+						continue
+					}
 					if b.Length() == 0 {
 						break
 					}
 				}
-				return inbox.DrainMeta()
+				return append(streamingMeta, inbox.DrainMeta()...)
 			},
 		},
 		{
@@ -618,10 +665,19 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 				return len(meta) == 1 && errors.Is(meta[0].Err, expectedError)
 			},
 			test: func(ctx context.Context, inbox *Inbox) []execinfrapb.ProducerMetadata {
+				defer func() {
+					// Make sure that the error is not propagated for the second
+					// time.
+					//
+					// We still need to drain to simulate what happens in
+					// production - there, the consumer of the inbox would
+					// transition into draining upon receiving the error.
+					require.True(t, len(inbox.DrainMeta()) == 0)
+				}()
 				for {
 					var b coldata.Batch
 					if err := colexecerror.CatchVectorizedRuntimeError(func() {
-						b = inbox.Next()
+						b = colexecop.NextNoMeta(inbox)
 					}); err != nil {
 						return []execinfrapb.ProducerMetadata{{Err: err}}
 					}
@@ -635,7 +691,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := execinfrapb.NewDistSQLClient(conn)
+			client := execinfrapb.NewGRPCDistSQLClientAdapter(conn)
 			clientStream, err := client.FlowStream(ctx)
 			require.NoError(t, err)
 
@@ -643,7 +699,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 				serverStreamNotification = <-mockServer.InboundStreams
 				serverStream             = serverStreamNotification.Stream
 				typs                     = []*types.T{types.Int}
-				input                    = coldatatestutils.NewRandomDataOp(
+				input, _                 = coldatatestutils.NewRandomDataOp(
 					testAllocator,
 					rng,
 					coldatatestutils.RandomDataOpArgs{
@@ -660,8 +716,13 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 			if tc.overrideExpectedMetadata != nil {
 				expectedMetadata = tc.overrideExpectedMetadata
 			}
+			var nodeid base.NodeIDContainer
+			nodeid.Set(ctx, roachpb.NodeID(7))
 			outbox, err := NewOutbox(
+				&execinfra.FlowCtx{NodeID: base.NewSQLIDContainerForNode(&nodeid), Gateway: false},
+				0, /* processorID */
 				colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
+				testMemAcc,
 				colexecargs.OpWithMetaInfo{
 					Root: input,
 					MetadataSources: []colexecop.MetadataSource{
@@ -726,11 +787,12 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+	_, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(b, err)
 
+	//lint:ignore SA1019 grpc.WithInsecure is deprecated
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(b, err)
 	defer func() {
@@ -738,7 +800,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 		require.NoError(b, err)
 	}()
 
-	client := execinfrapb.NewDistSQLClient(conn)
+	client := execinfrapb.NewGRPCDistSQLClientAdapter(conn)
 	clientStream, err := client.FlowStream(ctx)
 	require.NoError(b, err)
 
@@ -754,9 +816,13 @@ func BenchmarkOutboxInbox(b *testing.B) {
 
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(ctx)
+	var nodeid base.NodeIDContainer
+	nodeid.Set(ctx, roachpb.NodeID(7))
 	outbox, err := NewOutbox(
+		&execinfra.FlowCtx{NodeID: base.NewSQLIDContainerForNode(&nodeid), Gateway: false},
+		0, /* processorID */
 		colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-		colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
+		testMemAcc, colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
 	)
 	require.NoError(b, err)
 
@@ -778,7 +844,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	b.SetBytes(8 * int64(coldata.BatchSize()))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		inbox.Next()
+		colexecop.NextNoMeta(inbox)
 	}
 	b.StopTimer()
 
@@ -798,11 +864,11 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+	_, mockServer, addr, err := flowinfra.StartMockDistSQLServer(ctx,
+		hlc.NewClockForTesting(nil), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
-	dialer := &execinfrapb.MockDialer{Addr: addr}
+	dialer := &flowinfra.MockDialer{Addr: addr}
 	defer dialer.Close()
 
 	typs := []*types.T{types.Int}
@@ -819,9 +885,20 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 
 	outboxMemAcc := testMemMonitor.MakeBoundAccount()
 	defer outboxMemAcc.Close(ctx)
+	var nodeid base.NodeIDContainer
+	nodeid.Set(ctx, roachpb.NodeID(7))
 	outbox, err := NewOutbox(
+		&execinfra.FlowCtx{
+			NodeID:  base.NewSQLIDContainerForNode(&nodeid),
+			Gateway: false,
+			Cfg: &execinfra.ServerConfig{
+				Settings:   cluster.MakeTestingClusterSettings(),
+				RPCContext: &rpc.Context{ContextOptions: rpc.ContextOptions{}},
+			},
+		},
+		0, /* processorID */
 		colmem.NewAllocator(ctx, &outboxMemAcc, coldata.StandardColumnFactory),
-		colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
+		testMemAcc, colexecargs.OpWithMetaInfo{Root: input}, typs, nil, /* getStats */
 	)
 	require.NoError(t, err)
 
@@ -830,8 +907,7 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 		outbox.Run(
 			ctx,
 			dialer,
-			roachpb.NodeID(0),
-			execinfrapb.FlowID{UUID: uuid.MakeV4()},
+			base.SQLInstanceID(0),
 			outboxStreamID,
 			nil, /* flowCtxCancel */
 			0,   /* connectionTimeout */
@@ -868,7 +944,7 @@ func TestInboxCtxStreamIDTagging(t *testing.T) {
 			// CtxTaggedInNext verifies that Next adds StreamID to the Context in maybeInit.
 			name: "CtxTaggedInNext",
 			test: func(inbox *Inbox) {
-				inbox.Next()
+				colexecop.NextNoMeta(inbox)
 			},
 		},
 		{
@@ -902,11 +978,11 @@ func TestInboxCtxStreamIDTagging(t *testing.T) {
 			}, nil)
 
 			inboxTested := make(chan struct{})
-			go func() {
+			go func(tester func(*Inbox)) {
 				inbox.Init(ctx)
-				tc.test(inbox)
+				tester(inbox)
 				inboxTested <- struct{}{}
-			}()
+			}(tc.test)
 
 			<-ctxExtract
 			require.NoError(t, rpcLayer.client.CloseSend())

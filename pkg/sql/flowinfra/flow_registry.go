@@ -1,23 +1,17 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package flowinfra
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -25,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
+	"github.com/gogo/protobuf/proto"
 )
 
 // errNoInboundStreamConnection is the error propagated through the flow when
@@ -40,10 +35,11 @@ func IsNoInboundStreamConnectionError(err error) bool {
 // SettingFlowStreamTimeout is a cluster setting that sets the default flow
 // stream timeout.
 var SettingFlowStreamTimeout = settings.RegisterDurationSetting(
+	settings.ApplicationLevel,
 	"sql.distsql.flow_stream_timeout",
 	"amount of time incoming streams wait for a flow to be set up before erroring out",
 	10*time.Second,
-	settings.NonNegativeDuration,
+	settings.WithName("sql.distsql.flow_stream.timeout"),
 )
 
 // expectedConnectionTime is the expected time taken by a flow to connect to its
@@ -89,31 +85,6 @@ func NewInboundStreamInfo(
 	}
 }
 
-// connect marks s as connected. It is an error if s was already marked either
-// as connected or canceled. It should be called without holding any mutexes.
-func (s *InboundStreamInfo) connect(
-	flowID execinfrapb.FlowID, streamID execinfrapb.StreamID,
-) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.mu.connected {
-		return errors.Errorf("flow %s: inbound stream %d already connected", flowID, streamID)
-	}
-	if s.mu.canceled {
-		return errors.Errorf("flow %s: inbound stream %d came too late", flowID, streamID)
-	}
-	s.mu.connected = true
-	return nil
-}
-
-// disconnect marks s as not connected. It should be called without holding any
-// mutexes.
-func (s *InboundStreamInfo) disconnect() {
-	s.mu.Lock()
-	s.mu.connected = false
-	s.mu.Unlock()
-}
-
 // finishLocked marks s as finished and calls onFinish. The mutex of s must be
 // held when calling this method.
 func (s *InboundStreamInfo) finishLocked() {
@@ -123,22 +94,33 @@ func (s *InboundStreamInfo) finishLocked() {
 	if s.mu.finished {
 		panic("double finish")
 	}
-
 	s.mu.finished = true
 	s.onFinish()
 }
 
 // cancelIfNotConnected cancels and finishes s if it's not marked as connected,
-// finished, or canceled, and returns the pending receiver if so.
-func (s *InboundStreamInfo) cancelIfNotConnected() InboundStreamHandler {
+// finished, or canceled, and sends the provided error to the pending receiver
+// if so. A boolean indicating whether s is canceled is returned.
+func (s *InboundStreamInfo) cancelIfNotConnected(err error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mu.connected || s.mu.finished || s.mu.canceled {
-		return nil
+		return false
 	}
+	s.cancelLocked(err)
+	return true
+}
+
+// cancelLocked marks s as canceled, finishes it, and sends the given error to
+// the receiver. The mutex of s must be held when calling this method.
+func (s *InboundStreamInfo) cancelLocked(err error) {
+	s.mu.AssertHeld()
 	s.mu.canceled = true
 	s.finishLocked()
-	return s.receiver
+	// Since Timeout might block, we must send the error in a new goroutine.
+	go func() {
+		s.receiver.Timeout(err)
+	}()
 }
 
 // finish is the same as finishLocked when the mutex of s is not held already.
@@ -238,8 +220,20 @@ type flowRetryableError struct {
 	cause error
 }
 
-func (e *flowRetryableError) Error() string {
-	return fmt.Sprintf("flow retryable error: %+v", e.cause)
+var _ errors.Wrapper = &flowRetryableError{}
+
+func (e *flowRetryableError) Error() string { return e.cause.Error() }
+func (e *flowRetryableError) Cause() error  { return e.cause }
+func (e *flowRetryableError) Unwrap() error { return e.Cause() }
+
+func decodeFlowRetryableError(
+	_ context.Context, cause error, _ string, _ []string, _ proto.Message,
+) error {
+	return &flowRetryableError{cause: cause}
+}
+
+func init() {
+	errors.RegisterWrapperDecoder(errors.GetTypeKey((*flowRetryableError)(nil)), decodeFlowRetryableError)
 }
 
 // IsFlowRetryableError returns true if an error represents a retryable
@@ -288,8 +282,7 @@ func (fr *FlowRegistry) RegisterFlow(
 
 	if draining {
 		return &flowRetryableError{cause: errors.Errorf(
-			"could not register flowID %d because the registry is draining",
-			id,
+			"could not register flow because the registry is draining",
 		)}
 	}
 	entry := fr.getEntryLocked(id)
@@ -320,7 +313,7 @@ func (fr *FlowRegistry) RegisterFlow(
 				// principle, we could ForkSpan() beforehand, but we don't want to
 				// create the extra span every time.
 				timeoutCtx := tracing.ContextWithSpan(ctx, nil)
-				log.Errorf(
+				log.Dev.Errorf(
 					timeoutCtx,
 					"flow id:%s : %d inbound streams timed out after %s; propagated error throughout flow",
 					id,
@@ -357,12 +350,8 @@ func (fr *FlowRegistry) cancelPendingStreams(
 	for _, is := range inboundStreams {
 		// Connected, non-finished inbound streams will get an error returned in
 		// ProcessInboundStream(). Handle non-connected streams here.
-		pendingReceiver := is.cancelIfNotConnected()
-		if pendingReceiver != nil {
+		if is.cancelIfNotConnected(pendingReceiverErr) {
 			numTimedOutReceivers++
-			go func(receiver InboundStreamHandler) {
-				receiver.Timeout(pendingReceiverErr)
-			}(pendingReceiver)
 		}
 	}
 	return numTimedOutReceivers
@@ -372,13 +361,13 @@ func (fr *FlowRegistry) cancelPendingStreams(
 // ConnectInboundStream calls for the flow will fail to find it and time out.
 func (fr *FlowRegistry) UnregisterFlow(id execinfrapb.FlowID) {
 	fr.Lock()
+	defer fr.Unlock()
 	entry := fr.flows[id]
 	if entry.streamTimer != nil {
 		entry.streamTimer.Stop()
 		entry.streamTimer = nil
 	}
 	fr.releaseEntryLocked(id)
-	fr.Unlock()
 }
 
 // waitForFlow waits until the flow with the given id gets registered - up to
@@ -406,7 +395,6 @@ func (fr *FlowRegistry) waitForFlow(
 		waitCh = make(chan struct{})
 		entry.waitCh = waitCh
 	}
-	entry.refCount++
 	fr.Unlock()
 
 	select {
@@ -416,7 +404,6 @@ func (fr *FlowRegistry) waitForFlow(
 	}
 
 	fr.Lock()
-	fr.releaseEntryLocked(id)
 	return entry.flow
 }
 
@@ -425,7 +412,9 @@ func (fr *FlowRegistry) waitForFlow(
 // are still flows active after flowDrainWait, Drain waits an extra
 // expectedConnectionTime so that any flows that were registered at the end of
 // the time window have a reasonable amount of time to connect to their
-// consumers, thus unblocking them.
+// consumers, thus unblocking them. All flows that are still running at this
+// point are canceled.
+//
 // The FlowRegistry rejects any new flows once it has finished draining.
 //
 // Note that since local flows are not added to the registry, they are not
@@ -466,6 +455,15 @@ func (fr *FlowRegistry) Drain(
 			fr.Unlock()
 			time.Sleep(expectedConnectionTime)
 			fr.Lock()
+		}
+		// Now cancel all still running flows.
+		for _, f := range fr.flows {
+			if f.flow != nil {
+				// f.flow might be nil when ConnectInboundStream() was
+				// called, but the consumer of that inbound stream hasn't
+				// been scheduled yet.
+				f.flow.Cancel()
+			}
 		}
 		fr.Unlock()
 	}()
@@ -518,8 +516,8 @@ func (fr *FlowRegistry) Drain(
 	allFlowsDone <- struct{}{}
 }
 
-// Undrain causes the FlowRegistry to start accepting flows again.
-func (fr *FlowRegistry) Undrain() {
+// undrain causes the FlowRegistry to start accepting flows again.
+func (fr *FlowRegistry) undrain() {
 	fr.Lock()
 	fr.draining = false
 	fr.Unlock()
@@ -544,13 +542,25 @@ func (fr *FlowRegistry) ConnectInboundStream(
 	ctx context.Context,
 	flowID execinfrapb.FlowID,
 	streamID execinfrapb.StreamID,
-	stream execinfrapb.DistSQL_FlowStreamServer,
+	producer base.SQLInstanceID,
+	stream execinfrapb.RPCDistSQL_FlowStreamStream,
 	timeout time.Duration,
-) (*FlowBase, InboundStreamHandler, func(), error) {
+) (_ *FlowBase, _ InboundStreamHandler, cleanup func(), retErr error) {
 	fr.Lock()
 	entry := fr.getEntryLocked(flowID)
 	flow := entry.flow
+	// Take a reference that is always released at the end of this method. In
+	// the happy case (when we end up returning a flow that we connected to),
+	// that flow also took reference in RegisterFlow, so the ref count won't go
+	// below one; in all other cases we want to make sure to delete the entry
+	// from the registry if we're holding the only reference.
+	entry.refCount++
 	fr.Unlock()
+	defer func() {
+		fr.Lock()
+		defer fr.Unlock()
+		fr.releaseEntryLocked(flowID)
+	}()
 	if flow == nil {
 		// Send the handshake message informing the producer that the consumer has
 		// not been scheduled yet. Another handshake will be sent below once the
@@ -560,17 +570,8 @@ func (fr *FlowRegistry) ConnectInboundStream(
 			Handshake: &execinfrapb.ConsumerHandshake{
 				ConsumerScheduled:        false,
 				ConsumerScheduleDeadline: &deadline,
-				Version:                  execinfra.Version,
-				MinAcceptedVersion:       execinfra.MinAcceptedVersion,
 			},
 		}); err != nil {
-			// TODO(andrei): We failed to send a message to the producer; we'll return
-			// an error and leave this stream with connected == false so it times out
-			// later. We could call finishInboundStreamLocked() now so that the flow
-			// doesn't wait for the timeout and we could remember the error for the
-			// consumer if the consumer comes later, but I'm not sure what the best
-			// way to do that is. Similarly for the 2nd handshake message below,
-			// except there we already have the consumer and we can push the error.
 			return nil, nil, nil, err
 		}
 		flow = fr.waitForFlow(ctx, flowID, timeout)
@@ -579,30 +580,55 @@ func (fr *FlowRegistry) ConnectInboundStream(
 		}
 	}
 
+	defer func() {
+		if retErr != nil {
+			// If any error is encountered below, we know that the distributed
+			// query execution will fail, so we cancel the flow on this node. If
+			// this node is the gateway, this might actually be required for
+			// proper shutdown of the whole distributed plan.
+			flow.Cancel()
+		}
+	}()
+
 	// entry.inboundStreams is safe to access without holding the mutex since
 	// the map is not modified after Flow.Setup.
 	s, ok := entry.inboundStreams[streamID]
 	if !ok {
-		return nil, nil, nil, errors.Errorf("flow %s: no inbound stream %d", flowID, streamID)
-	}
-	// We now mark the stream as connected but, if an error happens later
-	// because the handshake fails, we reset the state; we want the stream to be
-	// considered timed out when the moment comes just as if this connection
-	// attempt never happened.
-	if err := s.connect(flowID, streamID); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, errors.Errorf(
+			"flow %s: no inbound stream %d from %d", flowID, streamID, producer,
+		)
 	}
 
-	if err := stream.Send(&execinfrapb.ConsumerSignal{
+	// Don't mark s as connected until after the handshake succeeds.
+	handshakeErr := stream.Send(&execinfrapb.ConsumerSignal{
 		Handshake: &execinfrapb.ConsumerHandshake{
-			ConsumerScheduled:  true,
-			Version:            execinfra.Version,
-			MinAcceptedVersion: execinfra.MinAcceptedVersion,
+			ConsumerScheduled: true,
 		},
-	}); err != nil {
-		s.disconnect()
-		return nil, nil, nil, err
-	}
+	})
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mu.canceled {
+		// Regardless of whether the handshake succeeded or not, this inbound
+		// stream has already been canceled and properly finished.
+		return nil, nil, nil, errors.Errorf(
+			"flow %s: inbound stream %d from %d came too late", flowID, streamID, producer,
+		)
+	}
+	if handshakeErr != nil {
+		// The handshake failed, so we're canceling this stream.
+		s.cancelLocked(handshakeErr)
+		return nil, nil, nil, handshakeErr
+	}
+	if s.mu.connected {
+		// This is unexpected - the FlowStream RPC was issued twice by the
+		// outboxes for the same stream. We are processing the second RPC call
+		// right now, so there is another goroutine that will handle the
+		// cleanup, so we defer the cleanup to that goroutine.
+		return nil, nil, nil, errors.AssertionFailedf(
+			"flow %s: inbound stream %d from %d already connected", flowID, streamID, producer,
+		)
+	}
+	s.mu.connected = true
 	return flow, s.receiver, s.finish, nil
 }

@@ -1,6 +1,14 @@
 # LogicTest: local
 
 statement ok
+CREATE TABLE mn (
+  k INT PRIMARY KEY,
+  m INT,
+  n STRING,
+  FAMILY (k, m, n)
+)
+
+statement ok
 CREATE TABLE t (
   k INT PRIMARY KEY,
   a INT,
@@ -23,7 +31,6 @@ SELECT * FROM [
   EXPLAIN SELECT * FROM t@t_a_plus_b_idx WHERE a + b = 110
 ] OFFSET 2
 ----
-·
 • index join
 │ table: t@t_pkey
 │
@@ -37,7 +44,6 @@ SELECT * FROM [
   EXPLAIN SELECT * FROM t@t_a_plus_b_idx WHERE (a + b) > 110
 ] OFFSET 2
 ----
-·
 • index join
 │ table: t@t_pkey
 │
@@ -51,7 +57,6 @@ SELECT * FROM [
   EXPLAIN SELECT * FROM t@t_lower_c_idx WHERE lower(c) = 'foo'
 ] OFFSET 2
 ----
-·
 • index join
 │ table: t@t_pkey
 │
@@ -65,7 +70,6 @@ SELECT * FROM [
   EXPLAIN SELECT * FROM t@t_lower_c_idx WHERE lower(c) LIKE 'foo%'
 ] OFFSET 2
 ----
-·
 • index join
 │ table: t@t_pkey
 │
@@ -79,7 +83,6 @@ SELECT * FROM [
   EXPLAIN SELECT * FROM t@t_lower_c_a_plus_b_idx WHERE lower(c) = 'foo' AND a + b > 110
 ] OFFSET 2
 ----
-·
 • index join
 │ table: t@t_pkey
 │
@@ -87,3 +90,44 @@ SELECT * FROM [
       missing stats
       table: t@t_lower_c_a_plus_b_idx
       spans: [/'foo'/111 - /'foo']
+
+
+# Lookup joins can be planned on expression indexes.
+
+query T
+SELECT * FROM [
+  EXPLAIN SELECT * FROM mn INNER LOOKUP JOIN t ON n = lower(c)
+] OFFSET 2
+----
+• lookup join
+│ table: t@t_pkey
+│ equality: (k) = (k)
+│ equality cols are key
+│
+└── • lookup join
+    │ table: t@t_lower_c_idx
+    │ equality: (n) = (crdb_internal_idx_expr_1)
+    │
+    └── • scan
+          missing stats
+          table: mn@mn_pkey
+          spans: FULL SCAN
+
+query T
+SELECT * FROM [
+  EXPLAIN SELECT * FROM mn INNER LOOKUP JOIN t ON m = a + b AND n = lower(c)
+] OFFSET 2
+----
+• lookup join
+│ table: t@t_pkey
+│ equality: (k) = (k)
+│ equality cols are key
+│
+└── • lookup join
+    │ table: t@t_lower_c_a_plus_b_idx
+    │ equality: (n, m) = (crdb_internal_idx_expr_1, crdb_internal_idx_expr)
+    │
+    └── • scan
+          missing stats
+          table: mn@mn_pkey
+          spans: FULL SCAN

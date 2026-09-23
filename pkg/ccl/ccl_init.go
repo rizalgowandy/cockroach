@@ -1,10 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ccl
 
@@ -12,24 +9,38 @@ package ccl
 // import of this package enables building a binary with CCL features.
 
 import (
-	// ccl init hooks. Don't include cliccl here, it pulls in pkg/cli, which
-	// does weird things at init time.
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/backupccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/buildccl"
+	_ "github.com/cockroachdb/cockroach/pkg/backup"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/cliccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/gssapiccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/importccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/kvccl"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/multitenantccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/oidcccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/storageccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingest"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamingutils"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streamproducer"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/workloadccl"
+	// TODO(ssd): Many test packages require this implicitly but have failed to
+	// import it, instead depending on the implicit dependency tree of pkg/ccl to
+	// include it.
+	_ "github.com/cockroachdb/cockroach/pkg/cloud/impl"
+	_ "github.com/cockroachdb/cockroach/pkg/crosscluster/logical"
+	_ "github.com/cockroachdb/cockroach/pkg/crosscluster/physical"
+	_ "github.com/cockroachdb/cockroach/pkg/crosscluster/producer"
+	_ "github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostclient"
+	_ "github.com/cockroachdb/cockroach/pkg/multitenant/tenantcostserver"
+	// TODO(ssd): gssapiauth is no longer CCL; relocate this blank import out
+	// of ccl_init.go to a more appropriate place (e.g. a server-level init
+	// point).
+	_ "github.com/cockroachdb/cockroach/pkg/security/gssapiauth"
 )
+
+// TestingEnableEnterprise is a no-op. It was deprecated when the core license
+// was removed. We no longer distinguish between features enabled only for
+// enterprise. All features are enabled, and if a license policy is violated,
+// we throttle connections. Callers can safely remove any reference to this
+// function.
+//
+// Deprecated
+func TestingEnableEnterprise() func() {
+	return func() {}
+}
+
+// TestingDisableEnterprise is a no-op. See TestingEnableEnterprise.
+//
+// Deprecated
+func TestingDisableEnterprise() func() {
+	return func() {}
+}

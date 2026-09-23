@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gossip
 
@@ -17,26 +12,33 @@ import (
 	"sync"
 	"time"
 
-	circuit "github.com/cockroachdb/circuitbreaker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc"
+	drpc "storj.io/drpc"
 )
 
 // client is a client-side RPC connection to a gossip peer node.
 type client struct {
 	log.AmbientContext
 
-	createdAt             time.Time
-	peerID                roachpb.NodeID           // Peer node ID; 0 until first gossip response
+	createdAt time.Time
+	// peerID is the node ID of the peer we're connected to. This is set when we
+	// receive a response from the peer. The gossip mu should be held when
+	// accessing.
+	peerID                roachpb.NodeID
 	resolvedPlaceholder   bool                     // Whether we've resolved the nodeSet's placeholder for this client
 	addr                  net.Addr                 // Peer node network address
+	locality              roachpb.Locality         // Peer node locality (if known)
 	forwardAddr           *util.UnresolvedAddr     // Set if disconnected with an alternate addr
+	prevHighWaterStamps   map[roachpb.NodeID]int64 // Last high water timestamps sent to remote server
 	remoteHighWaterStamps map[roachpb.NodeID]int64 // Remote server's high water timestamps
 	closer                chan struct{}            // Client shutdown channel
 	clientMetrics         Metrics
@@ -53,11 +55,14 @@ func extractKeys(delta map[string]*Info) string {
 }
 
 // newClient creates and returns a client struct.
-func newClient(ambient log.AmbientContext, addr net.Addr, nodeMetrics Metrics) *client {
+func newClient(
+	ambient log.AmbientContext, addr net.Addr, locality roachpb.Locality, nodeMetrics Metrics,
+) *client {
 	return &client{
 		AmbientContext:        ambient,
 		createdAt:             timeutil.Now(),
 		addr:                  addr,
+		locality:              locality,
 		remoteHighWaterStamps: map[roachpb.NodeID]int64{},
 		closer:                make(chan struct{}),
 		clientMetrics:         makeMetrics(),
@@ -65,15 +70,13 @@ func newClient(ambient log.AmbientContext, addr net.Addr, nodeMetrics Metrics) *
 	}
 }
 
+var logFailedStartEvery = log.Every(5 * time.Second)
+
 // start dials the remote addr and commences gossip once connected. Upon exit,
 // the client is sent on the disconnected channel. This method starts client
 // processing in a goroutine and returns immediately.
 func (c *client) startLocked(
-	g *Gossip,
-	disconnected chan *client,
-	rpcCtx *rpc.Context,
-	stopper *stop.Stopper,
-	breaker *circuit.Breaker,
+	g *Gossip, disconnected chan *client, rpcCtx *rpc.Context, stopper *stop.Stopper,
 ) {
 	// Add a placeholder for the new outgoing connection because we may not know
 	// the ID of the node we're connecting to yet. This will be resolved in
@@ -98,39 +101,42 @@ func (c *client) startLocked(
 			disconnected <- c
 		}()
 
-		consecFailures := breaker.ConsecFailures()
-		var stream Gossip_GossipClient
-		if err := breaker.Call(func() error {
-			// Note: avoid using `grpc.WithBlock` here. This code is already
-			// asynchronous from the caller's perspective, so the only effect of
-			// `WithBlock` here is blocking shutdown - at the time of this writing,
-			// that ends ups up making `kv` tests take twice as long.
-			conn, err := rpcCtx.GRPCUnvalidatedDial(c.addr.String()).Connect(ctx)
+		stream, err := func() (RPCGossip_GossipClient, error) {
+			gc, err := c.dialGossipClient(ctx, rpcCtx)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			if stream, err = NewGossipClient(conn).Gossip(ctx); err != nil {
-				return err
+
+			stream, err := gc.Gossip(ctx)
+			if err != nil {
+				return nil, err
 			}
-			return c.requestGossip(g, stream)
-		}, 0); err != nil {
-			if consecFailures == 0 {
-				log.Warningf(ctx, "failed to start gossip client to %s: %s", c.addr, err)
+			if err := c.requestGossip(g, stream); err != nil {
+				return nil, err
+			}
+			return stream, nil
+		}()
+		if err != nil {
+			if logFailedStartEvery.ShouldLog() {
+				log.Dev.Warningf(ctx, "failed to start gossip client to %s: %s", c.addr, err)
 			}
 			return
 		}
 
 		// Start gossiping.
-		log.Infof(ctx, "started gossip client to n%d (%s)", c.peerID, c.addr)
+		log.Dev.Infof(ctx, "started gossip client to n%d (%s)", c.peerID, c.addr)
 		if err := c.gossip(ctx, g, stream, stopper, &wg); err != nil {
 			if !grpcutil.IsClosedConnection(err) {
-				g.mu.RLock()
-				if c.peerID != 0 {
-					log.Infof(ctx, "closing client to n%d (%s): %s", c.peerID, c.addr, err)
+				peerID, addr := func() (roachpb.NodeID, net.Addr) {
+					g.mu.RLock()
+					defer g.mu.RUnlock()
+					return c.peerID, c.addr
+				}()
+				if peerID != 0 {
+					log.Dev.Infof(ctx, "closing client to n%d (%s): %s", peerID, addr, err)
 				} else {
-					log.Infof(ctx, "closing client to %s: %s", c.addr, err)
+					log.Dev.Infof(ctx, "closing client to %s: %s", addr, err)
 				}
-				g.mu.RUnlock()
 			}
 		}
 	}); err != nil {
@@ -150,26 +156,30 @@ func (c *client) close() {
 // requestGossip requests the latest gossip from the remote server by
 // supplying a map of this node's knowledge of other nodes' high water
 // timestamps.
-func (c *client) requestGossip(g *Gossip, stream Gossip_GossipClient) error {
-	g.mu.RLock()
+func (c *client) requestGossip(g *Gossip, stream RPCGossip_GossipClient) error {
+	nodeAddr, highWaterStamps := func() (util.UnresolvedAddr, map[roachpb.NodeID]int64) {
+		g.mu.RLock()
+		defer g.mu.RUnlock()
+		return g.mu.is.NodeAddr, g.mu.is.getHighWaterStamps()
+	}()
 	args := &Request{
 		NodeID:          g.NodeID.Get(),
-		Addr:            g.mu.is.NodeAddr,
-		HighWaterStamps: g.mu.is.getHighWaterStamps(),
+		Addr:            nodeAddr,
+		HighWaterStamps: highWaterStamps,
 		ClusterID:       g.clusterID.Get(),
 	}
-	g.mu.RUnlock()
 
 	bytesSent := int64(args.Size())
 	c.clientMetrics.BytesSent.Inc(bytesSent)
 	c.nodeMetrics.BytesSent.Inc(bytesSent)
+	c.prevHighWaterStamps = args.HighWaterStamps
 
 	return stream.Send(args)
 }
 
 // sendGossip sends the latest gossip to the remote server, based on
 // the remote server's notion of other nodes' high water timestamps.
-func (c *client) sendGossip(g *Gossip, stream Gossip_GossipClient, firstReq bool) error {
+func (c *client) sendGossip(g *Gossip, stream RPCGossip_GossipClient, firstReq bool) error {
 	g.mu.Lock()
 	delta := g.mu.is.delta(c.remoteHighWaterStamps)
 	if firstReq {
@@ -183,11 +193,16 @@ func (c *client) sendGossip(g *Gossip, stream Gossip_GossipClient, firstReq bool
 			ratchetHighWaterStamp(c.remoteHighWaterStamps, i.NodeID, i.OrigStamp)
 		}
 
+		// Only send the high water stamps that are different from the previously
+		// sent high water stamps.
+		var diffStamps map[roachpb.NodeID]int64
+		c.prevHighWaterStamps, diffStamps = g.mu.is.getHighWaterStampsWithDiff(c.prevHighWaterStamps)
+
 		args := Request{
 			NodeID:          g.NodeID.Get(),
 			Addr:            g.mu.is.NodeAddr,
 			Delta:           delta,
-			HighWaterStamps: g.mu.is.getHighWaterStamps(),
+			HighWaterStamps: diffStamps,
 			ClusterID:       g.clusterID.Get(),
 		}
 
@@ -195,18 +210,19 @@ func (c *client) sendGossip(g *Gossip, stream Gossip_GossipClient, firstReq bool
 		infosSent := int64(len(delta))
 		c.clientMetrics.BytesSent.Inc(bytesSent)
 		c.clientMetrics.InfosSent.Inc(infosSent)
+		c.clientMetrics.MessagesSent.Inc(1)
 		c.nodeMetrics.BytesSent.Inc(bytesSent)
 		c.nodeMetrics.InfosSent.Inc(infosSent)
+		c.nodeMetrics.MessagesSent.Inc(1)
 
 		if log.V(1) {
 			ctx := c.AnnotateCtx(stream.Context())
 			if c.peerID != 0 {
-				log.Infof(ctx, "sending %s to n%d (%s)", extractKeys(args.Delta), c.peerID, c.addr)
+				log.Dev.Infof(ctx, "sending %s to n%d (%s)", extractKeys(args.Delta), c.peerID, c.addr)
 			} else {
-				log.Infof(ctx, "sending %s to %s", extractKeys(args.Delta), c.addr)
+				log.Dev.Infof(ctx, "sending %s to %s", extractKeys(args.Delta), c.addr)
 			}
 		}
-
 		g.mu.Unlock()
 		return stream.Send(&args)
 	}
@@ -224,18 +240,20 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 	infosReceived := int64(len(reply.Delta))
 	c.clientMetrics.BytesReceived.Inc(bytesReceived)
 	c.clientMetrics.InfosReceived.Inc(infosReceived)
+	c.clientMetrics.MessagesReceived.Inc(1)
 	c.nodeMetrics.BytesReceived.Inc(bytesReceived)
 	c.nodeMetrics.InfosReceived.Inc(infosReceived)
+	c.nodeMetrics.MessagesReceived.Inc(1)
 
 	// Combine remote node's infostore delta with ours.
 	if reply.Delta != nil {
 		freshCount, err := g.mu.is.combine(reply.Delta, reply.NodeID)
 		if err != nil {
-			log.Warningf(ctx, "failed to fully combine delta from n%d: %s", reply.NodeID, err)
+			log.Dev.Warningf(ctx, "failed to fully combine delta from n%d: %s", reply.NodeID, err)
 		}
 		if infoCount := len(reply.Delta); infoCount > 0 {
 			if log.V(1) {
-				log.Infof(ctx, "received %s from n%d (%d fresh)", extractKeys(reply.Delta), reply.NodeID, freshCount)
+				log.Dev.Infof(ctx, "received %s from n%d (%d fresh)", extractKeys(reply.Delta), reply.NodeID, freshCount)
 			}
 		}
 		g.maybeTightenLocked()
@@ -258,13 +276,6 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 			return errors.Errorf(
 				"received forward from n%d to n%d (%s); already have active connection, skipping",
 				reply.NodeID, reply.AlternateNodeID, reply.AlternateAddr)
-		}
-		// We try to resolve the address, but don't actually use the result.
-		// The certificates (if any) may only be valid for the unresolved
-		// address.
-		if _, err := reply.AlternateAddr.Resolve(); err != nil {
-			return errors.Errorf("unable to resolve alternate address %s for n%d: %s",
-				reply.AlternateAddr, reply.AlternateNodeID, err)
 		}
 		c.forwardAddr = reply.AlternateAddr
 		return errors.Errorf("received forward from n%d to n%d (%s)",
@@ -294,14 +305,14 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 func (c *client) gossip(
 	ctx context.Context,
 	g *Gossip,
-	stream Gossip_GossipClient,
+	stream RPCGossip_GossipClient,
 	stopper *stop.Stopper,
 	wg *sync.WaitGroup,
 ) error {
 	sendGossipChan := make(chan struct{}, 1)
 
 	// Register a callback for gossip updates.
-	updateCallback := func(_ string, _ roachpb.Value) {
+	updateCallback := func(_ string, _ roachpb.Value, _ int64) {
 		select {
 		case sendGossipChan <- struct{}{}:
 		default:
@@ -310,6 +321,7 @@ func (c *client) gossip(
 
 	errCh := make(chan error, 1)
 	initCh := make(chan struct{}, 1)
+
 	// This wait group is used to allow the caller to wait until gossip
 	// processing is terminated.
 	wg.Add(1)
@@ -317,8 +329,6 @@ func (c *client) gossip(
 		defer wg.Done()
 
 		errCh <- func() error {
-			var peerID roachpb.NodeID
-
 			initCh := initCh
 			for init := true; ; init = false {
 				reply, err := stream.Recv()
@@ -330,10 +340,6 @@ func (c *client) gossip(
 				}
 				if init {
 					initCh <- struct{}{}
-				}
-				if peerID == 0 && c.peerID != 0 {
-					peerID = c.peerID
-					g.updateClients()
 				}
 			}
 		}()
@@ -380,10 +386,67 @@ func (c *client) gossip(
 		case <-initTimer.C:
 			maybeRegister()
 		case <-sendGossipChan:
+			// We need to send the gossip delta to the remote server. Wait a bit to
+			// batch the updates in one message.
+			batchAndConsume(sendGossipChan, infosBatchDelay)
 			if err := c.sendGossip(g, stream, count == 0); err != nil {
 				return err
 			}
 			count++
 		}
 	}
+}
+
+// dials the peer node and returns a gRPC connection to the peer node.
+func (c *client) dial(ctx context.Context, rpcCtx *rpc.Context) (*grpc.ClientConn, error) {
+	// Note: avoid using `grpc.WithBlock` here. This code is already
+	// asynchronous from the caller's perspective, so the only effect of
+	// `WithBlock` here is blocking shutdown - at the time of this writing,
+	// that ends ups up making `kv` tests take twice as long.
+	var conn *rpc.GRPCConnection
+	if c.peerID != 0 {
+		conn = rpcCtx.GRPCDialNode(c.addr.String(), c.peerID, c.locality, rpcbase.SystemClass)
+	} else {
+		// TODO(baptist): Use this as a temporary connection for getting
+		// onto gossip and then replace with a validated connection.
+		log.Dev.Infof(ctx, "unvalidated bootstrap gossip dial to %s", c.addr)
+		conn = rpcCtx.GRPCUnvalidatedDial(c.addr.String(), c.locality)
+	}
+
+	return conn.Connect(ctx)
+}
+
+// dials the peer node and returns a DRPC connection to the peer node.
+func (c *client) drpcDial(ctx context.Context, rpcCtx *rpc.Context) (drpc.Conn, error) {
+	var conn *rpc.DRPCConnection
+	if c.peerID != 0 {
+		conn = rpcCtx.DRPCDialNode(c.addr.String(), c.peerID, c.locality, rpcbase.SystemClass)
+	} else {
+		// TODO(baptist): Use this as a temporary connection for getting
+		// onto gossip and then replace with a validated connection.
+		log.Dev.Infof(ctx, "unvalidated bootstrap gossip dial to %s", c.addr)
+		conn = rpcCtx.DRPCUnvalidatedDial(c.addr.String(), c.locality)
+	}
+
+	return conn.Connect(ctx)
+}
+
+// dialGossipClient establishes a DRPC connection if enabled; otherwise,
+// it falls back to gRPC. The established connection is used to create a
+// RPCGossipClient.
+func (c *client) dialGossipClient(
+	ctx context.Context, rpcCtx *rpc.Context,
+) (RPCGossipClient, error) {
+	if !rpcCtx.UseDRPC {
+		conn, err := c.dial(ctx, rpcCtx)
+		if err != nil {
+			return nil, err
+		}
+		return NewGRPCGossipClientAdapter(conn), nil
+	}
+	conn, err := c.drpcDial(ctx, rpcCtx)
+	if err != nil {
+		return nil, err
+	}
+	return NewDRPCGossipClientAdapter(conn), nil
 }

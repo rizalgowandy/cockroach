@@ -1,23 +1,17 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 import { Location } from "history";
-import _ from "lodash";
+import compact from "lodash/compact";
+import isNull from "lodash/isNull";
+import isUndefined from "lodash/isUndefined";
+import map from "lodash/map";
 import { match as Match } from "react-router-dom";
 
 interface ParamsObj {
   [key: string]: string;
-}
-
-interface URLSearchParamsWithKeys extends URLSearchParams {
-  keys: () => string;
 }
 
 // propsToQueryString is a helper function that converts a set of object
@@ -25,9 +19,9 @@ interface URLSearchParamsWithKeys extends URLSearchParams {
 // - keys with null or undefined values will be skipped
 // - non-string values will be toString'd
 export function propsToQueryString(props: { [k: string]: any }): string {
-  return _.compact(
-    _.map(props, (v: any, k: string) =>
-      !_.isNull(v) && !_.isUndefined(v)
+  return compact(
+    map(props, (v: any, k: string) =>
+      !isNull(v) && !isUndefined(v)
         ? `${encodeURIComponent(k)}=${encodeURIComponent(v.toString())}`
         : null,
     ),
@@ -35,9 +29,7 @@ export function propsToQueryString(props: { [k: string]: any }): string {
 }
 
 export function queryToObj(location: Location, key: string, value: string) {
-  const params = new URLSearchParams(
-    location.search,
-  ) as URLSearchParamsWithKeys;
+  const params = new URLSearchParams(location.search);
   const paramObj: ParamsObj = {};
   for (const data of params.keys()) {
     paramObj[data] = params.get(data);

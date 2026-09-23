@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package distsql
 
@@ -15,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
@@ -23,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/stretchr/testify/require"
 )
@@ -35,24 +31,30 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg:     &execinfra.ServerConfig{Settings: cluster.MakeTestingClusterSettings()},
+		NodeID:  base.TestingIDContainer,
 	}
 	base := flowinfra.NewFlowBase(
 		flowCtx,
+		nil, /* sp */
 		nil, /* flowReg */
 		nil, /* rowSyncFlowConsumer */
 		nil, /* batchSyncFlowConsumer */
 		nil, /* localProcessors */
+		nil, /* localVectorProcessors */
 		nil, /* onFlowCleanup */
+		"",  /* statementSQL */
 	)
 	flow := colflow.NewVectorizedFlow(base)
 
 	mat := colexec.NewMaterializer(
+		nil, /* streamingMemAcc */
 		&flowCtx,
 		0, /* processorID */
 		colexecargs.OpWithMetaInfo{Root: &colexecop.CallbackOperator{
@@ -66,7 +68,7 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 	ctx, _, err := base.Setup(ctx, nil, flowinfra.FuseAggressively)
 	require.NoError(t, err)
 
-	base.SetProcessors([]execinfra.Processor{mat})
+	require.NoError(t, base.SetProcessorsAndOutputs([]execinfra.Processor{mat}, []execinfra.RowReceiver{nil}))
 	// This test specifically verifies that a flow doesn't get stuck in Wait for
 	// asynchronous components that haven't been signaled to exit. To simulate
 	// this we just create a mock startable.
@@ -81,5 +83,5 @@ func TestNonVectorizedPanicDoesntHangServer(t *testing.T) {
 		}),
 	)
 
-	require.Panics(t, func() { flow.Run(ctx, nil) })
+	require.Panics(t, func() { flow.Run(ctx, false /* noWait */) })
 }

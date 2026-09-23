@@ -1,18 +1,14 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
-import React from "react";
 import { Drawer, Button, Divider } from "antd";
-import { Link } from "react-router-dom";
 import classNames from "classnames/bind";
-import styles from "./drawer.module.styl";
+import React from "react";
+import { Link } from "react-router-dom";
+
+import styles from "./drawer.module.scss";
 
 const cx = classNames.bind(styles);
 
@@ -25,11 +21,7 @@ interface IDrawerProps {
 }
 
 const openDetails = (data: any) => {
-  const base =
-    data.app && data.app.length > 0
-      ? `/statements/${data.app}/${data.implicitTxn}`
-      : `/statement/${data.implicitTxn}`;
-  const link = `${base}/${encodeURIComponent(data.statement)}`;
+  const link = `/statement/${encodeURIComponent(data.statement)}`;
   return <Link to={link}>View statement details</Link>;
 };
 
@@ -58,9 +50,8 @@ export const DrawerComponent = ({
     placement="bottom"
     closable={false}
     onClose={onClose}
-    visible={visible}
-    className={cx("drawer--preset-black")}
-    // getContainer={false}
+    open={visible}
+    rootClassName={cx("drawer--preset-black")}
     {...props}
   >
     {children}

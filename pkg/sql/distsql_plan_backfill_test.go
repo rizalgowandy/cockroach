@@ -1,12 +1,7 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -16,8 +11,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -44,7 +38,7 @@ func TestDistBackfill(t *testing.T) {
 	}
 	const numNodes = 5
 
-	tc := serverutils.StartNewTestCluster(t, numNodes,
+	tc := serverutils.StartCluster(t, numNodes,
 		base.TestClusterArgs{
 			ReplicationMode: base.ReplicationManual,
 			ServerArgs: base.TestServerArgs{
@@ -60,10 +54,11 @@ func TestDistBackfill(t *testing.T) {
 			},
 		})
 	defer tc.Stopper().Stop(context.Background())
-	cdb := tc.Server(0).DB()
+	s := tc.ApplicationLayer(0)
+	conn, cdb := s.SQLConn(t, serverutils.DBName("test")), s.DB()
 
 	sqlutils.CreateTable(
-		t, tc.ServerConn(0), "numtosquare", "x INT PRIMARY KEY, xsquared INT",
+		t, conn, "numtosquare", "x INT PRIMARY KEY, xsquared INT",
 		n,
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, func(row int) tree.Datum {
 			return tree.NewDInt(tree.DInt(row * row))
@@ -71,24 +66,23 @@ func TestDistBackfill(t *testing.T) {
 	)
 
 	sqlutils.CreateTable(
-		t, tc.ServerConn(0), "numtostr", "y INT PRIMARY KEY, str STRING",
+		t, conn, "numtostr", "y INT PRIMARY KEY, str STRING",
 		n*n,
 		sqlutils.ToRowFn(sqlutils.RowIdxFn, sqlutils.RowEnglishFn),
 	)
 	// Split the table into multiple ranges.
-	descNumToStr := catalogkv.TestingGetTableDescriptor(cdb, keys.SystemSQLCodec, "test", "numtostr")
-	var sps []SplitPoint
-	//for i := 1; i <= numNodes-1; i++ {
+	descNumToStr := desctestutils.TestingGetPublicTableDescriptor(cdb, s.Codec(), "test", "numtostr")
+	var sps []serverutils.SplitPoint
+	// for i := 1; i <= numNodes-1; i++ {
 	for i := numNodes - 1; i > 0; i-- {
-		sps = append(sps, SplitPoint{i, []interface{}{n * n / numNodes * i}})
+		sps = append(sps, serverutils.SplitPoint{TargetNodeIdx: i, Vals: []interface{}{n * n / numNodes * i}})
 	}
-	SplitTable(t, tc, descNumToStr, sps)
+	tc.SplitTable(t, descNumToStr, sps)
 
-	db := tc.ServerConn(0)
-	db.SetMaxOpenConns(1)
-	r := sqlutils.MakeSQLRunner(db)
+	conn.SetMaxOpenConns(1)
+	r := sqlutils.MakeSQLRunner(conn)
 	r.Exec(t, "SET DISTSQL = OFF")
-	if _, err := tc.ServerConn(0).Exec(`CREATE INDEX foo ON numtostr (str)`); err != nil {
+	if _, err := conn.Exec(`CREATE INDEX foo ON numtostr (str)`); err != nil {
 		t.Fatal(err)
 	}
 	r.Exec(t, "SET DISTSQL = ALWAYS")

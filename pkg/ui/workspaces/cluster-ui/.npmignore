@@ -8,7 +8,6 @@
 src/
 .jest
 .storybook
-enzyme.setup.js
 .eslintrc.json
 
 # source maps
@@ -21,3 +20,6 @@ enzyme.setup.js
 # project configs
 *.config.js
 tsconfig.json
+
+# bazel module mappings
+*.module_mappings.json

@@ -1,32 +1,42 @@
 // Copyright 2015 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package server
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/base/serverident"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/disk"
+	"github.com/cockroachdb/cockroach/pkg/storage/storageconfig"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
+	"github.com/cockroachdb/crlib/crstrings"
+	"github.com/cockroachdb/datadriven"
+	"github.com/cockroachdb/pebble/vfs"
+	"github.com/ghemawat/stream"
 	"github.com/kr/pretty"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,7 +45,10 @@ func TestParseInitNodeAttributes(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
 	cfg.Attrs = "attr1=val1::attr2=val2"
-	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
+	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{
+		InMemory: true,
+		Size:     storageconfig.BytesSize(storageconfig.MinimumStoreSize * 100),
+	}}}
 	engines, err := cfg.CreateEngines(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
@@ -50,6 +63,36 @@ func TestParseInitNodeAttributes(t *testing.T) {
 	}
 }
 
+// TestCreateEnginesWithMultipleStores creates multiple engines and verifies
+// that the correct number of vfs.DiskWriteStatsCollector were initialized.
+func TestCreateEnginesWithMultipleStores(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
+	// Override with TestStatsManager
+	cfg.DiskWriteStats = disk.NewTestingStatsManager(vfs.Default)
+	tmpDir1, cleanup := testutils.TempDir(t)
+	defer cleanup()
+	tmpDir2, cleanup2 := testutils.TempDir(t)
+	defer cleanup2()
+	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{
+		{Size: storageconfig.BytesSize(storageconfig.MinimumStoreSize), Path: tmpDir1},
+		{Size: storageconfig.BytesSize(storageconfig.MinimumStoreSize), Path: tmpDir2},
+		{InMemory: true, Size: storageconfig.BytesSize(storageconfig.MinimumStoreSize * 100)},
+	}}
+	engines, err := cfg.CreateEngines(context.Background())
+	if err != nil {
+		t.Fatalf("Failed to initialize stores: %s", err)
+	}
+	defer engines.Close()
+	if err := cfg.InitNode(context.Background()); err != nil {
+		t.Fatalf("Failed to initialize node: %s", err)
+	}
+	// In-memory stores should not create a stats collector.
+	require.Len(t, cfg.DiskWriteStats.GetAllStatsCollectors(), 2,
+		"Incorrect number of stats collectors")
+}
+
 // TestParseJoinUsingAddrs verifies that JoinList is parsed
 // correctly.
 func TestParseJoinUsingAddrs(t *testing.T) {
@@ -61,7 +104,10 @@ func TestParseJoinUsingAddrs(t *testing.T) {
 
 	cfg := MakeConfig(context.Background(), cluster.MakeTestingClusterSettings())
 	cfg.JoinList = []string{"localhost:12345", "[::1]:23456", "f00f::1234", ":34567", ":0", ":", "", "localhost"}
-	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{InMemory: true, Size: base.SizeSpec{InBytes: base.MinimumStoreSize * 100}}}}
+	cfg.Stores = base.StoreSpecList{Specs: []base.StoreSpec{{
+		InMemory: true,
+		Size:     storageconfig.BytesSize(storageconfig.MinimumStoreSize * 100),
+	}}}
 	engines, err := cfg.CreateEngines(context.Background())
 	if err != nil {
 		t.Fatalf("Failed to initialize stores: %s", err)
@@ -95,9 +141,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 		if err := os.Unsetenv("COCKROACH_EXPERIMENTAL_LINEARIZABLE"); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Unsetenv("COCKROACH_EXPERIMENTAL_SPAN_CONFIGS"); err != nil {
-			t.Fatal(err)
-		}
 		if err := os.Unsetenv("COCKROACH_SCAN_INTERVAL"); err != nil {
 			t.Fatal(err)
 		}
@@ -118,17 +161,28 @@ func TestReadEnvironmentVariables(t *testing.T) {
 	// Makes sure no values are set when no environment variables are set.
 	cfg := MakeConfig(context.Background(), st)
 	cfgExpected := MakeConfig(context.Background(), st)
-
 	resetEnvVar()
 	cfg.readEnvironmentVariables()
+
+	// Tracers store their stack trace in NewTracer, and this wouldn't match.
+	cfg.Tracer = nil
+	cfg.AmbientCtx.Tracer = nil
+	cfgExpected.Tracer = nil
+	cfgExpected.AmbientCtx.Tracer = nil
+	cfg.CidrLookup = nil
+	cfgExpected.CidrLookup = nil
+	cfg.EarlyBootExternalStorageAccessor = nil
+	cfgExpected.EarlyBootExternalStorageAccessor = nil
+	// Temp storage disk monitors will have slightly different names, so we
+	// override them to point to the same one.
+	cfgExpected.TempStorageConfig.Mon = cfg.TempStorageConfig.Mon
+	// The LicenseEnforcer initializes a start time, which can vary between runs,
+	// so we ensure they are the same for comparison.
+	cfgExpected.LicenseEnforcer = cfg.LicenseEnforcer
 	require.Equal(t, cfgExpected, cfg)
 
 	// Set all the environment variables to valid values and ensure they are set
 	// correctly.
-	if err := os.Setenv("COCKROACH_EXPERIMENTAL_SPAN_CONFIGS", "true"); err != nil {
-		t.Fatal(err)
-	}
-	cfgExpected.SpanConfigsEnabled = true
 	if err := os.Setenv("COCKROACH_EXPERIMENTAL_LINEARIZABLE", "true"); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +207,6 @@ func TestReadEnvironmentVariables(t *testing.T) {
 	}
 
 	for _, envVar := range []string{
-		"COCKROACH_EXPERIMENTAL_SPAN_CONFIGS",
 		"COCKROACH_EXPERIMENTAL_LINEARIZABLE",
 		"COCKROACH_SCAN_INTERVAL",
 		"COCKROACH_SCAN_MIN_IDLE_TIME",
@@ -259,4 +312,144 @@ func TestParseBootstrapResolvers(t *testing.T) {
 			t.Errorf("expected name %q, got %q", expectedName, host)
 		}
 	})
+}
+
+func TestIdProviderServerIdentityString(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	type fields struct {
+		clusterID  *base.ClusterIDContainer
+		clusterStr atomic.Value
+		tenantID   roachpb.TenantID
+		tenantStr  atomic.Value
+		serverID   *base.NodeIDContainer
+		serverStr  atomic.Value
+	}
+	type args struct {
+		key serverident.ServerIdentificationKey
+	}
+
+	nodeID := &base.NodeIDContainer{}
+	nodeID.Set(context.Background(), roachpb.NodeID(123))
+
+	tenID, err := roachpb.MakeTenantID(2)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   string
+	}{
+		{
+			"system tenant shows nodeID",
+			fields{tenantID: roachpb.SystemTenantID, serverID: nodeID},
+			args{key: serverident.IdentifyKVNodeID},
+			"123",
+		},
+		{
+			"system tenant shows tenID",
+			fields{tenantID: roachpb.SystemTenantID, serverID: nodeID},
+			args{key: serverident.IdentifyTenantID},
+			"1",
+		},
+		{
+			"application tenant hides nodeID",
+			fields{tenantID: tenID, serverID: nodeID},
+			args{key: serverident.IdentifyKVNodeID},
+			"",
+		},
+		{
+			"application tenant shows tenID",
+			fields{tenantID: tenID, serverID: nodeID},
+			args{key: serverident.IdentifyTenantID},
+			"2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &idProvider{
+				clusterID:  tt.fields.clusterID,
+				clusterStr: tt.fields.clusterStr,
+				tenantID:   tt.fields.tenantID,
+				tenantStr:  tt.fields.tenantStr,
+				serverID:   tt.fields.serverID,
+				serverStr:  tt.fields.serverStr,
+			}
+			assert.Equalf(t, tt.want, s.ServerIdentityString(tt.args.key), "ServerIdentityString(%v)", tt.args.key)
+		})
+	}
+}
+
+func TestCreateEngines(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	specs := map[string]base.StoreSpec{}
+
+	datadriven.RunTest(t, "testdata/create_engines", func(t *testing.T, d *datadriven.TestData) string {
+		switch d.Cmd {
+		case "store-spec":
+			var name string
+			d.ScanArgs(t, "name", &name)
+			spec := base.StoreSpec{}
+			spec.Path = name
+			for _, line := range crstrings.Lines(d.Input) {
+				parts := strings.SplitN(line, "=", 2)
+				switch parts[0] {
+				case "in-memory":
+					spec.InMemory = true
+				case "attrs":
+					spec.Attributes = strings.Split(parts[1], ":")
+				default:
+					return fmt.Sprintf("unknown field: %q", parts[0])
+				}
+			}
+			specs[name] = spec
+			return ""
+		case "create-engines":
+			var cfg Config
+			cfg.Settings = cluster.MakeTestingClusterSettings()
+
+			var pattern string
+			d.ScanArgs(t, "pattern", &pattern)
+			var specNames []string
+			d.ScanArgs(t, "specs", &specNames)
+			for _, specName := range specNames {
+				spec, ok := specs[specName]
+				if !ok {
+					return fmt.Sprintf("unknown store: %q", specName)
+				}
+				cfg.Stores.Specs = append(cfg.Stores.Specs, spec)
+			}
+			d.MaybeScanArgs(t, "CacheSize", &cfg.CacheSize)
+
+			engines, err := cfg.CreateEngines(context.Background())
+			require.NoError(t, err, "failed to create engines")
+			defer engines.Close()
+
+			var buf bytes.Buffer
+			for _, e := range engines {
+				require.False(t, e.Separated(), "not supported by this test")
+				buf.WriteString(strings.TrimSpace(e.Engine().GetPebbleOptions().String()))
+				buf.WriteString("\n")
+			}
+			return grepStr(&buf, pattern)
+		default:
+			return fmt.Sprintf("unknown command: %q", d.Cmd)
+		}
+	})
+}
+
+func grepStr(r io.Reader, pattern string) string {
+	var buf bytes.Buffer
+	if err := stream.Run(stream.Sequence(
+		stream.ReadLines(r),
+		stream.Grep(pattern),
+		stream.WriteLines(&buf),
+	)); err != nil {
+		return err.Error()
+	}
+	return buf.String()
 }

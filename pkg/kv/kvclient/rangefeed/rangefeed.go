@@ -1,52 +1,66 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rangefeed
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
-//go:generate mockgen -package=rangefeed -source rangefeed.go -destination=mocks_generated.go .
+//go:generate mockgen -destination=mocks_generated_test.go --package=rangefeed . DB
 
 // TODO(ajwerner): Expose hooks for metrics.
 // TODO(ajwerner): Expose access to checkpoints and the frontier.
 // TODO(ajwerner): Expose better control over how the exponential backoff gets
 // reset when the feed has been running successfully for a while.
+// TODO(yevgeniy): Instead of rolling our own logic to parallelize scans, we should
+// use streamer API instead (https://github.com/cockroachdb/cockroach/pull/68430)
 
-// kvDB is an adapter to the underlying KV store.
-type kvDB interface {
+// DB is an adapter to the underlying KV store.
+type DB interface {
 
 	// RangeFeed runs a rangefeed on a given span with the given arguments.
 	// It encapsulates the RangeFeed method on roachpb.Internal.
 	RangeFeed(
 		ctx context.Context,
-		span roachpb.Span,
+		spans []roachpb.Span,
 		startFrom hlc.Timestamp,
-		withDiff bool,
-		eventC chan<- *roachpb.RangeFeedEvent,
+		eventC chan<- kvcoord.RangeFeedMessage,
+		opts ...kvcoord.RangeFeedOption,
+	) error
+
+	// RangefeedFromFrontier runs a rangefeed on the frontier's spans, and
+	// starting at each span's associated timestamp.
+	RangeFeedFromFrontier(
+		ctx context.Context,
+		frontier span.Frontier,
+		eventC chan<- kvcoord.RangeFeedMessage,
+		opts ...kvcoord.RangeFeedOption,
 	) error
 
 	// Scan encapsulates scanning a key span at a given point in time. The method
@@ -55,16 +69,18 @@ type kvDB interface {
 	// parallelism.
 	Scan(
 		ctx context.Context,
-		span roachpb.Span,
+		spans []roachpb.Span,
 		asOf hlc.Timestamp,
 		rowFn func(value roachpb.KeyValue),
+		rowsFn func([]kvpb.RangeFeedValue),
+		cfg scanConfig,
 	) error
 }
 
 // Factory is used to construct RangeFeeds.
 type Factory struct {
 	stopper *stop.Stopper
-	client  kvDB
+	client  DB
 	knobs   *TestingKnobs
 }
 
@@ -73,23 +89,31 @@ type TestingKnobs struct {
 
 	// OnRangefeedRestart is called when a rangefeed restarts.
 	OnRangefeedRestart func()
+
+	// IgnoreOnDeleteRangeError will ignore any errors where a DeleteRange event
+	// is emitted without an OnDeleteRange handler. This can be used e.g. with
+	// StoreTestingKnobs.GlobalMVCCRangeTombstone, to prevent the global tombstone
+	// causing rangefeed errors for consumers who don't expect it.
+	IgnoreOnDeleteRangeError bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
-func (t TestingKnobs) ModuleTestingKnobs() {}
+func (*TestingKnobs) ModuleTestingKnobs() {}
 
 var _ base.ModuleTestingKnobs = (*TestingKnobs)(nil)
 
 // NewFactory constructs a new Factory.
-func NewFactory(stopper *stop.Stopper, db *kv.DB, knobs *TestingKnobs) (*Factory, error) {
-	kvDB, err := newDBAdapter(db)
+func NewFactory(
+	stopper *stop.Stopper, db *kv.DB, st *cluster.Settings, knobs *TestingKnobs,
+) (*Factory, error) {
+	kvDB, err := newDBAdapter(db, st)
 	if err != nil {
 		return nil, err
 	}
 	return newFactory(stopper, kvDB, knobs), nil
 }
 
-func newFactory(stopper *stop.Stopper, client kvDB, knobs *TestingKnobs) *Factory {
+func newFactory(stopper *stop.Stopper, client DB, knobs *TestingKnobs) *Factory {
 	return &Factory{
 		stopper: stopper,
 		client:  client,
@@ -100,20 +124,27 @@ func newFactory(stopper *stop.Stopper, client kvDB, knobs *TestingKnobs) *Factor
 // RangeFeed constructs a new rangefeed and runs it in an async task.
 //
 // The rangefeed can be stopped via Close(); otherwise, it will stop when the
-// server shuts down.
+// server shuts down. The only error which can be returned will indicate that
+// the server is being shut down.
 //
-// The only error which can be returned will indicate that the server is being
-// shut down.
+// Rangefeeds do not support inline (unversioned) values, and may omit them or
+// error on them. Similarly, rangefeeds will error if MVCC history is mutated
+// via e.g. ClearRange. Do not use rangefeeds across such key spans.
+//
+// NB: for the rangefeed itself, initialTimestamp is exclusive, i.e. the first
+// possible event emitted by the server (including the catchup scan) is at
+// initialTimestamp.Next(). This follows from the gRPC API semantics. However,
+// the initial scan (if any) is run at initialTimestamp.
 func (f *Factory) RangeFeed(
 	ctx context.Context,
 	name string,
-	sp roachpb.Span,
+	spans []roachpb.Span,
 	initialTimestamp hlc.Timestamp,
 	onValue OnValue,
 	options ...Option,
 ) (_ *RangeFeed, err error) {
-	r := f.New(name, sp, initialTimestamp, onValue, options...)
-	if err := r.Start(ctx); err != nil {
+	r := f.New(name, initialTimestamp, onValue, options...)
+	if err := r.Start(ctx, spans); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -121,7 +152,7 @@ func (f *Factory) RangeFeed(
 
 // New constructs a new RangeFeed (without running it).
 func (f *Factory) New(
-	name string, sp roachpb.Span, initialTimestamp hlc.Timestamp, onValue OnValue, options ...Option,
+	name string, initialTimestamp hlc.Timestamp, onValue OnValue, options ...Option,
 ) *RangeFeed {
 	r := RangeFeed{
 		client:  f.client,
@@ -130,64 +161,124 @@ func (f *Factory) New(
 
 		initialTimestamp: initialTimestamp,
 		name:             name,
-		span:             sp,
 		onValue:          onValue,
-
-		stopped: make(chan struct{}),
 	}
 	initConfig(&r.config, options)
 	return &r
 }
 
 // OnValue is called for each rangefeed value.
-type OnValue func(ctx context.Context, value *roachpb.RangeFeedValue)
+type OnValue func(ctx context.Context, value *kvpb.RangeFeedValue)
+
+// OnValues is called for a batch of rangefeed values.
+type OnValues func(ctx context.Context, values []kvpb.RangeFeedValue)
 
 // RangeFeed represents a running RangeFeed.
 type RangeFeed struct {
 	config
 	name    string
-	client  kvDB
+	client  DB
 	stopper *stop.Stopper
 	knobs   *TestingKnobs
 
 	initialTimestamp hlc.Timestamp
+	spans            []roachpb.Span
+	spansDebugStr    string // Debug string describing spans
 
-	span    roachpb.Span
 	onValue OnValue
 
-	closeOnce sync.Once
-	cancel    context.CancelFunc
-	stopped   chan struct{}
-
+	cancel  context.CancelFunc
+	running sync.WaitGroup
 	started int32 // accessed atomically
 }
 
 // Start kicks off the rangefeed in an async task, it can only be invoked once.
 // All the installed callbacks (OnValue, OnCheckpoint, OnFrontierAdvance,
 // OnInitialScanDone) are called in said async task in a single thread.
-func (f *RangeFeed) Start(ctx context.Context) error {
-	if !atomic.CompareAndSwapInt32(&f.started, 0, 1) {
-		return errors.AssertionFailedf("rangefeed already started")
+func (f *RangeFeed) Start(ctx context.Context, spans []roachpb.Span) error {
+	if len(spans) == 0 {
+		return errors.AssertionFailedf("expected at least 1 span, got none")
 	}
 
 	// Maintain a frontier in order to resume at a reasonable timestamp.
 	// TODO(ajwerner): Consider exposing the frontier through a RangeFeed method.
 	// Doing so would require some synchronization.
-	frontier, err := span.MakeFrontier(f.span)
+	frontier, err := span.MakeFrontier(spans...)
 	if err != nil {
 		return err
 	}
-	if _, err := frontier.Forward(f.span, f.initialTimestamp); err != nil {
-		return err
+	return f.start(ctx, frontier, true, false)
+}
+
+// StartFromFrontier is like Start but allows passing a frontier containing the
+// spans on which to create the feed, which can reflect any previous progress,
+// unlike passing just the spans to Start().
+//
+// The rangefeed takes ownership of the passed frontier until it is closed; the
+// caller must not interact with it until Close returns. The caller remains
+// responsible for releasing the frontier thereafter however.
+func (f *RangeFeed) StartFromFrontier(ctx context.Context, frontier span.Frontier) error {
+	return f.start(ctx, frontier, false, true)
+}
+
+func (f *RangeFeed) start(
+	ctx context.Context, frontier span.Frontier, ownsFrontier bool, resumeFromFrontier bool,
+) error {
+	if !atomic.CompareAndSwapInt32(&f.started, 0, 1) {
+		return errors.AssertionFailedf("rangefeed already started")
 	}
+
+	// Frontier merges and de-dups passed in spans.  So, use frontier to initialize
+	// sorted list of spans.
+	for sp := range frontier.Entries() {
+		f.spans = append(f.spans, sp)
+	}
+
 	runWithFrontier := func(ctx context.Context) {
-		f.run(ctx, frontier)
+		if ownsFrontier {
+			defer frontier.Release()
+		}
+		// pprof.Do function does exactly what we do here, but it also results in
+		// pprof.Do function showing up in the stack traces -- so, just set and reset
+		// labels manually.
+		ctx, reset := pprofutil.SetProfilerLabels(
+			ctx, append(f.extraPProfLabels, "rangefeed", f.name)...,
+		)
+		defer reset()
+
+		if f.invoker != nil {
+			_ = f.invoker(func() error {
+				f.run(ctx, frontier, resumeFromFrontier)
+				return nil
+			})
+			return
+		}
+		f.run(ctx, frontier, resumeFromFrontier)
+	}
+
+	if l := frontier.Len(); l == 1 {
+		f.spansDebugStr = frontier.PeekFrontierSpan().String()
+	} else {
+		var buf strings.Builder
+		for sp := range frontier.Entries() {
+			if buf.Len() > 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(sp.String())
+			if buf.Len() >= 400 {
+				fmt.Fprintf(&buf, "… [%d spans]", l)
+				break
+			}
+		}
+		f.spansDebugStr = buf.String()
 	}
 
 	ctx = logtags.AddTag(ctx, "rangefeed", f.name)
 	ctx, f.cancel = f.stopper.WithCancelOnQuiesce(ctx)
+	f.running.Add(1)
 	if err := f.stopper.RunAsyncTask(ctx, "rangefeed", runWithFrontier); err != nil {
 		f.cancel()
+		f.running.Done()
 		return err
 	}
 	return nil
@@ -197,10 +288,8 @@ func (f *RangeFeed) Start(ctx context.Context) error {
 // idempotently. It waits for the currently running handler, if any, to complete
 // and guarantees that no future handlers will be invoked after this point.
 func (f *RangeFeed) Close() {
-	f.closeOnce.Do(func() {
-		f.cancel()
-		<-f.stopped
-	})
+	f.cancel()
+	f.running.Wait()
 }
 
 // Run the rangefeed in a loop in the case of failure, likely due to node
@@ -212,13 +301,27 @@ func (f *RangeFeed) Close() {
 const resetThreshold = 30 * time.Second
 
 // run will run the RangeFeed until the context is canceled or if the client
-// indicates that an initial scan error is non-recoverable.
-func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
-	defer close(f.stopped)
+// indicates that an initial scan error is non-recoverable. The
+// resumeWithFrontier arg enables the client to resume the rangefeed using the
+// span frontier instead of from the frontier's low water mark.
+func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithFrontier bool) {
+	defer f.running.Done()
 	r := retry.StartWithCtx(ctx, f.retryOptions)
 	restartLogEvery := log.Every(10 * time.Second)
-	if done := f.maybeRunInitialScan(ctx, &restartLogEvery, &r); done {
-		return
+
+	if f.withInitialScan {
+		if failed := f.runInitialScan(ctx, &restartLogEvery, &r, frontier); failed {
+			return
+		}
+	} else if !resumeWithFrontier {
+		for _, sp := range f.spans {
+			if _, err := frontier.Forward(sp, f.initialTimestamp); err != nil {
+				if fn := f.onUnrecoverableError; fn != nil {
+					fn(ctx, err)
+				}
+				return
+			}
+		}
 	}
 
 	// Check the context before kicking off a rangefeed.
@@ -228,46 +331,91 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 
 	// TODO(ajwerner): Consider adding event buffering. Doing so would require
 	// draining when the rangefeed fails.
-	eventCh := make(chan *roachpb.RangeFeedEvent)
-	errCh := make(chan error)
+	eventCh := make(chan kvcoord.RangeFeedMessage)
+
+	var rangefeedOpts []kvcoord.RangeFeedOption
+	// We can unconditionally enable bulk-delivery from the server at least as far
+	// as to this client; if an onValues is configured we can also bulk-process
+	// values, but even if it isn't we know how to unwrap a bulk delivery and pass
+	// each event to the caller's individual event handlers.
+	rangefeedOpts = append(rangefeedOpts, kvcoord.WithBulkDelivery())
+
+	if f.scanConfig.overSystemTable {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithSystemTablePriority())
+	}
+	if f.withDiff {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithDiff())
+	}
+	if f.withFiltering {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithFiltering())
+	}
+	if len(f.withMatchingOriginIDs) != 0 {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithMatchingOriginIDs(f.withMatchingOriginIDs...))
+	}
+	if f.onMetadata != nil {
+		rangefeedOpts = append(rangefeedOpts, kvcoord.WithMetadata())
+	}
+	rangefeedOpts = append(rangefeedOpts, kvcoord.WithConsumerID(f.consumerID))
 
 	for i := 0; r.Next(); i++ {
 		ts := frontier.Frontier()
-		log.VEventf(ctx, 1, "starting rangefeed from %v on %v", ts, f.span)
-		start := timeutil.Now()
-
-		// Note that the below channel send will not block forever because
-		// processEvents will wait for the worker to send. RunWorker is safe here
-		// because processEvents is guaranteed to consume the error before
-		// returning.
-		if err := f.stopper.RunAsyncTask(ctx, "rangefeed", func(ctx context.Context) {
-			errCh <- f.client.RangeFeed(ctx, f.span, ts, f.withDiff, eventCh)
-		}); err != nil {
-			log.VEventf(ctx, 1, "exiting rangefeed due to stopper")
-			return
+		if log.ExpensiveLogEnabled(ctx, 1) {
+			log.Eventf(ctx, "starting rangefeed from %v on %v", ts, f.spansDebugStr)
 		}
 
-		err := f.processEvents(ctx, frontier, eventCh, errCh)
-		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) {
+		start := crtime.NowMono()
+
+		rangeFeedTask := func(ctx context.Context) error {
+			if f.invoker == nil {
+				return f.client.RangeFeed(ctx, f.spans, ts, eventCh, rangefeedOpts...)
+			}
+			return f.invoker(func() error {
+				return f.client.RangeFeed(ctx, f.spans, ts, eventCh, rangefeedOpts...)
+			})
+		}
+
+		if resumeWithFrontier {
+			rangeFeedTask = func(ctx context.Context) error {
+				if f.invoker == nil {
+					return f.client.RangeFeedFromFrontier(ctx, frontier, eventCh, rangefeedOpts...)
+				}
+				return f.invoker(func() error {
+					return f.client.RangeFeedFromFrontier(ctx, frontier, eventCh, rangefeedOpts...)
+				})
+			}
+		}
+		processEventsTask := func(ctx context.Context) error {
+			if f.invoker != nil {
+				return f.invoker(func() error {
+					return f.processEvents(ctx, frontier, eventCh)
+				})
+			}
+			return f.processEvents(ctx, frontier, eventCh)
+		}
+
+		err := ctxgroup.GoAndWait(ctx, rangeFeedTask, processEventsTask)
+		if errors.HasType(err, &kvpb.BatchTimestampBeforeGCError{}) ||
+			errors.HasType(err, &kvpb.MVCCHistoryMutationError{}) {
 			if errCallback := f.onUnrecoverableError; errCallback != nil {
 				errCallback(ctx, err)
+				log.VEventf(ctx, 1, "exiting rangefeed due to internal error: %v", err)
+			} else {
+				log.Dev.Warningf(ctx, "exiting rangefeed because of internal error with no OnInternalError callback: %s", err.Error())
 			}
-
-			log.VEventf(ctx, 1, "exiting rangefeed due to internal error: %v", err)
 			return
 		}
 		if err != nil && ctx.Err() == nil && restartLogEvery.ShouldLog() {
-			log.Warningf(ctx, "rangefeed failed %d times, restarting: %v",
-				log.Safe(i), err)
+			log.Dev.Warningf(ctx, "rangefeed failed %d times, restarting: %v",
+				redact.Safe(i), err)
 		}
 		if ctx.Err() != nil {
 			log.VEventf(ctx, 1, "exiting rangefeed")
 			return
 		}
 
-		ranFor := timeutil.Since(start)
+		ranFor := start.Elapsed()
 		log.VEventf(ctx, 1, "restarting rangefeed for %v after %v",
-			log.Safe(f.span), ranFor)
+			f.spansDebugStr, ranFor)
 		if f.knobs != nil && f.knobs.OnRangefeedRestart != nil {
 			f.knobs.OnRangefeedRestart()
 		}
@@ -281,96 +429,102 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 	}
 }
 
-// maybeRunInitialScan will attempt to perform an initial data scan if one was
-// requested. It will retry in the face of errors and will only return upon
-// success, context cancellation, or an error handling function which indicates
-// that an error is unrecoverable. The return value will be true if the context
-// was canceled or if the OnInitialScanError function indicated that the
-// RangeFeed should stop.
-func (f *RangeFeed) maybeRunInitialScan(
-	ctx context.Context, n *log.EveryN, r *retry.Retry,
-) (canceled bool) {
-	if !f.withInitialScan {
-		return false // canceled
-	}
-	scan := func(kv roachpb.KeyValue) {
-		v := roachpb.RangeFeedValue{
-			Key:   kv.Key,
-			Value: kv.Value,
-		}
-
-		// Mark the data as occurring at the initial timestamp, which is the
-		// timestamp at which it was read.
-		v.Value.Timestamp = f.initialTimestamp
-
-		// Supply the value from the scan as also the previous value to avoid
-		// indicating that the value was previously deleted.
-		if f.withDiff {
-			v.PrevValue = v.Value
-			v.PrevValue.Timestamp = hlc.Timestamp{}
-		}
-
-		// It's something of a bummer that we must allocate a new value for each
-		// of these but the contract doesn't indicate that the value cannot be
-		// retained so we have to assume that the callback may retain the value.
-		f.onValue(ctx, &v)
-	}
-	for r.Next() {
-		if err := f.client.Scan(ctx, f.span, f.initialTimestamp, scan); err != nil {
-			if f.onInitialScanError != nil {
-				if shouldStop := f.onInitialScanError(ctx, err); shouldStop {
-					log.VEventf(ctx, 1, "stopping due to error: %v", err)
-					return true
-				}
-			}
-			if n.ShouldLog() {
-				log.Warningf(ctx, "failed to perform initial scan: %v", err)
-			}
-		} else /* err == nil */ {
-			if f.onInitialScanDone != nil {
-				f.onInitialScanDone(ctx)
-			}
-			break
-		}
-	}
-	return ctx.Err() != nil // canceled
-}
-
-// processEvents processes events sent by the rangefeed on the eventCh. It waits
-// for the rangefeed to signal that it has exited by sending on errCh.
+// processEvents processes events sent by the rangefeed on the eventCh.
 func (f *RangeFeed) processEvents(
-	ctx context.Context,
-	frontier *span.Frontier,
-	eventCh <-chan *roachpb.RangeFeedEvent,
-	errCh <-chan error,
+	ctx context.Context, frontier span.Frontier, eventCh <-chan kvcoord.RangeFeedMessage,
 ) error {
 	for {
 		select {
 		case ev := <-eventCh:
-			switch {
-			case ev.Val != nil:
-				f.onValue(ctx, ev.Val)
-			case ev.Checkpoint != nil:
-				advanced, err := frontier.Forward(ev.Checkpoint.Span, ev.Checkpoint.ResolvedTS)
-				if err != nil {
-					return err
-				}
-				if f.onCheckpoint != nil {
-					f.onCheckpoint(ctx, ev.Checkpoint)
-				}
-				if advanced && f.onFrontierAdvance != nil {
-					f.onFrontierAdvance(ctx, frontier.Frontier())
-				}
-			case ev.Error != nil:
-				// Intentionally do nothing, we'll get an error returned from the
-				// call to RangeFeed.
+			if err := f.processEvent(ctx, frontier, ev.RangeFeedEvent, ev.RegisteredSpan); err != nil {
+				return err
 			}
 		case <-ctx.Done():
-			// Ensure that the RangeFeed goroutine stops.
-			<-errCh
 			return ctx.Err()
-		case err := <-errCh:
-			return err
 		}
 	}
+}
+
+func (f *RangeFeed) processEvent(
+	ctx context.Context, frontier span.Frontier, ev *kvpb.RangeFeedEvent, registeredSpan roachpb.Span,
+) error {
+	switch {
+	case ev.Val != nil:
+		f.onValue(ctx, ev.Val)
+	case ev.Checkpoint != nil:
+		ts := ev.Checkpoint.ResolvedTS
+		if f.frontierQuantize != 0 {
+			ts.Logical = 0
+			ts.WallTime -= ts.WallTime % int64(f.frontierQuantize)
+		}
+		result, err := frontier.Forward(ev.Checkpoint.Span, ts)
+		if err != nil {
+			return err
+		}
+		if f.onCheckpoint != nil {
+			f.onCheckpoint(ctx, ev.Checkpoint)
+		}
+		if result.FrontierForwarded() && f.onFrontierAdvance != nil {
+			f.onFrontierAdvance(ctx, frontier.Frontier())
+		}
+		if f.frontierVisitor != nil {
+			f.frontierVisitor(ctx, result.FrontierForwarded(), frontier)
+		}
+	case ev.SST != nil:
+		if f.onSSTable == nil {
+			return errors.AssertionFailedf(
+				"received unexpected rangefeed SST event with no OnSSTable handler")
+		}
+		f.onSSTable(ctx, ev.SST, registeredSpan)
+	case ev.DeleteRange != nil:
+		if f.onDeleteRange == nil {
+			if f.knobs != nil && f.knobs.IgnoreOnDeleteRangeError {
+				return nil
+			}
+			return errors.AssertionFailedf(
+				"received unexpected rangefeed DeleteRange event with no OnDeleteRange handler: %s", ev)
+		}
+		f.onDeleteRange(ctx, ev.DeleteRange)
+	case ev.Metadata != nil:
+		if f.onMetadata == nil {
+			return errors.AssertionFailedf("received unexpected metadata event with no OnMetadata handler")
+		}
+		f.onMetadata(ctx, ev.Metadata)
+	case ev.Error != nil:
+		// Intentionally do nothing, we'll get an error returned from the
+		// call to RangeFeed.
+	case ev.BulkEvents != nil:
+		if f.onValues != nil {
+			// We can optimistically assume the bulk event consists of all value
+			// events, and allocate a buffer for them to be passed to onValues. In the
+			// rare case we hit a non-value event (it would have to be a range key as
+			// only a catch-up scan currently produces bulk events), we will throw out
+			// this buffer and any events we might have copied to it so far and just
+			// fallback to to processing each event, but this should be so uncommon it
+			// is not worth worrying about the potential wasted work.
+			allValues := true
+			buf := make([]kvpb.RangeFeedValue, len(ev.BulkEvents.Events))
+			for i := range ev.BulkEvents.Events {
+				if ev.BulkEvents.Events[i].Val != nil {
+					buf[i] = *ev.BulkEvents.Events[i].Val
+				} else {
+					allValues = false
+					break
+				}
+			}
+			if allValues {
+				f.onValues(ctx, buf)
+				return nil
+			}
+		}
+		// Either the bulk event contains non-value events or a onValues handler is
+		// not configured, so process each event individually.
+		for _, e := range ev.BulkEvents.Events {
+			if err := f.processEvent(ctx, frontier, e, registeredSpan); err != nil {
+				return err
+			}
+		}
+
+	}
+	return nil
 }

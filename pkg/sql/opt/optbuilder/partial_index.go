@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package optbuilder
 
@@ -23,25 +18,26 @@ import (
 // addPartialIndexPredicatesForTable finds all partial indexes in the table and
 // adds their predicates to the table metadata (see
 // TableMeta.partialIndexPredicates). The predicates are converted from strings
-// to ScalarExprs here.
-//
-// The predicates are used as "known truths" about table data. Any predicates
-// containing non-immutable operators are omitted.
+// to ScalarExprs here. The predicates are used as known truths about table
+// data. If any predicates contain non-immutable expressions, this function
+// panics.
 //
 // scan is an optional argument that is a Scan expression on the table. If scan
 // outputs all the ordinary columns in the table, we avoid constructing a new
 // scan. A scan and its logical properties are required in order to fully
 // normalize the partial index predicates.
 func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, scan memo.RelExpr) {
-	// We do not want to track view deps here, otherwise a view depending
-	// on a table with a partial index predicate using an UDT will result in a
-	// type dependency being added between the view and the UDT.
-	if b.trackViewDeps {
-		b.trackViewDeps = false
-		defer func() {
-			b.trackViewDeps = true
-		}()
+	if !b.evalCtx.SessionData().UseImprovedRoutineDepsTriggersAndComputedCols {
+		// We do not want to track view/function deps here, otherwise a
+		// view/function depending on a table with a partial index predicate using
+		// a UDT will result in a type dependency being added between the
+		// view/function and the UDT.
+		//
+		// This is the legacy path; with the session setting on, we will disable
+		// dependency tracking in buildPartialIndexPredicate below.
+		defer b.DisableSchemaDepTracking()()
 	}
+
 	tab := tabMeta.Table
 	numIndexes := tab.DeletableIndexCount()
 
@@ -62,7 +58,7 @@ func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, scan
 	// Construct a scan as the tableScope expr so that logical properties of the
 	// scan can be used to fully normalize the index predicate.
 	tableScope := b.allocScope()
-	tableScope.appendOrdinaryColumnsFromTable(tabMeta, &tabMeta.Alias)
+	b.appendOrdinaryColumnsFromTable(tableScope, tabMeta, &tabMeta.Alias)
 
 	// If the optional scan argument was provided and it outputs all of the
 	// ordinary table columns, we use it as tableScope.expr. Otherwise, we must
@@ -125,7 +121,15 @@ func (b *Builder) addPartialIndexPredicatesForTable(tabMeta *opt.TableMeta, scan
 func (b *Builder) buildPartialIndexPredicate(
 	tabMeta *opt.TableMeta, tableScope *scope, expr tree.Expr, context string,
 ) (memo.FiltersExpr, error) {
-	texpr := resolvePartialIndexPredicate(tableScope, expr)
+	if b.evalCtx.SessionData().UseImprovedRoutineDepsTriggersAndComputedCols {
+		// We do not want to track view/function deps here, otherwise a view/function
+		// depending on a table with a partial index predicate will add transitive
+		// dependencies on any UDTs or columns referenced by the predicate. The
+		// partial index will already prevent dropping such UDTs or columns.
+		defer b.DisableSchemaDepTracking()()
+	}
+
+	texpr := tableScope.resolveAndRequireType(expr, types.Bool)
 
 	var scalar opt.ScalarExpr
 	b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
@@ -202,17 +206,4 @@ func (b *Builder) buildPartialIndexPredicate(
 		// Panic rather than return an incorrect predicate.
 		panic(errors.AssertionFailedf("unexpected expression during partial index normalization: %T", t))
 	}
-}
-
-// resolvePartialIndexPredicate attempts to resolve the type of expr as a
-// boolean and return a tree.TypedExpr if successful. It asserts that no errors
-// occur during resolution because the predicate should always be valid within
-// this context. If an error occurs, it is likely due to a bug in the optimizer.
-func resolvePartialIndexPredicate(tableScope *scope, expr tree.Expr) tree.TypedExpr {
-	defer func() {
-		if r := recover(); r != nil {
-			panic(errors.AssertionFailedf("unexpected error during partial index predicate type resolution: %v", r))
-		}
-	}()
-	return tableScope.resolveAndRequireType(expr, types.Bool)
 }

@@ -3,6 +3,7 @@
 source [file join [file dirname $argv0] common.tcl]
 
 set storedir "encryption_store"
+set failoverdir "wal_failover"
 set keydir "$storedir/keys"
 
 spawn /bin/bash
@@ -44,36 +45,32 @@ end_test
 start_test "Start normal node."
 send "$argv start-single-node --insecure --store=$storedir\r"
 eexpect "node starting"
-interrupt
-eexpect "shutdown completed"
+interrupt_and_wait
 send "$argv debug encryption-status $storedir\r"
 eexpect ""
 end_test
 
 start_test "Run pebble debug tool."
-send "$argv debug pebble db lsm $storedir --store=$storedir\r"
-eexpect "__level_____count____size___score______in__ingest(sz_cnt)____move(sz_cnt)___write(sz_cnt)____read___r-amp___w-amp\r"
+send "$argv debug pebble db lsm $storedir\r"
+eexpect "LSM"
 end_test
 
 start_test "Restart with plaintext."
 send "$argv start-single-node --insecure --store=$storedir --enterprise-encryption=path=$storedir,key=plain,old-key=plain\r"
 eexpect "node starting"
-interrupt
-eexpect "shutdown completed"
+interrupt_and_wait
 send "$argv debug encryption-status $storedir --enterprise-encryption=path=$storedir,key=plain,old-key=plain\r"
 eexpect "    \"Active\": true,\r\n    \"Type\": \"Plaintext\","
 # Try starting without the encryption flag.
 send "$argv start-single-node --insecure --store=$storedir\r"
 eexpect "node starting"
-interrupt
-eexpect "shutdown completed"
+interrupt_and_wait
 end_test
 
 start_test "Restart with AES-128."
 send "$argv start-single-node --insecure --store=$storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-128.key,old-key=plain\r"
 eexpect "node starting"
-interrupt
-eexpect "shutdown completed"
+interrupt_and_wait
 file_not_exists "$storedir/COCKROACHDB_REGISTRY"
 send "$argv debug encryption-status $storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-128.key,old-key=plain\r"
 eexpect "    \"Active\": true,\r\n    \"Type\": \"AES128_CTR\","
@@ -88,14 +85,13 @@ end_test
 start_test "Restart with AES-256."
 send "$argv start-single-node --insecure --store=$storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-256.key,old-key=$keydir/aes-128.key\r"
 eexpect "node starting"
-interrupt
-eexpect "shutdown completed"
+interrupt_and_wait
 send "$argv debug encryption-status $storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-256.key,old-key=plain\r"
 eexpect "    \"Active\": true,\r\n    \"Type\": \"AES256_CTR\","
 # Startup again, but don't specify the old key, it's no longer in use.
 send "$argv start-single-node --insecure --store=$storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-256.key,old-key=plain\r"
 eexpect "node starting"
-interrupt
+interrupt_and_wait
 # Try starting without the encryption flag.
 send "$argv start-single-node --insecure --store=$storedir\r"
 eexpect "encryption was used on this store before, but no encryption flags specified."
@@ -105,9 +101,15 @@ eexpect "store key ID * was not found"
 end_test
 
 start_test "Run pebble debug tool with AES-256."
-send "$argv debug pebble db lsm $storedir --store=$storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-256.key,old-key=$keydir/aes-256.key\r"
-eexpect "__level_____count____size___score______in__ingest(sz_cnt)____move(sz_cnt)___write(sz_cnt)____read___r-amp___w-amp\r"
+send "$argv debug pebble db lsm $storedir --enterprise-encryption=path=$storedir,key=$keydir/aes-256.key,old-key=$keydir/aes-256.key\r"
+eexpect "LSM"
 # Try running without the encryption flag.
-send "$argv debug pebble db lsm $storedir --store=$storedir\r"
-eexpect "encryption was used on this store before, but no encryption flags specified."
+send "$argv debug pebble db lsm $storedir\r"
+eexpect "If this is an encrypted store, make sure the correct encryption key is set."
+end_test
+
+start_test "Run with WAL failover path."
+send "$argv start-single-node --insecure --store=$storedir --wal-failover=path=$failoverdir --enterprise-encryption=path=$storedir,key=$keydir/aes-256.key,old-key=$keydir/aes-128.key --enterprise-encryption=path=$failoverdir,key=$keydir/aes-256.key,old-key=$keydir/aes-128.key\r"
+eexpect "node starting"
+interrupt_and_wait
 end_test

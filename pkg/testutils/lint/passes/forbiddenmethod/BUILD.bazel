@@ -35,10 +35,12 @@ go_test(
         ":testdata",
         "@go_sdk//:files",
     ],
+    exec_properties = {"test.Pool": "large"},
+    tags = ["cpu:2"],
     deps = [
         ":forbiddenmethod",
         "//pkg/build/bazel",
-        "//pkg/testutils",
+        "//pkg/testutils/datapathutils",
         "//pkg/testutils/skip",
         "@org_golang_x_tools//go/analysis/analysistest",
     ],

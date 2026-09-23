@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package ts
 
@@ -165,23 +160,27 @@ func (db *DB) rollupTimeSeries(
 		// For each row, generate a rollup datapoint and add it to the correct
 		// rollupData object.
 		rollupDataMap := make(map[string]rollupData)
+		if err := func() error {
+			account := qmc.workerMonitor.MakeBoundAccount()
+			defer account.Close(ctx)
 
-		account := qmc.workerMonitor.MakeBoundAccount()
-		defer account.Close(ctx)
-
-		childQmc := QueryMemoryContext{
-			workerMonitor:      qmc.workerMonitor,
-			resultAccount:      &account,
-			QueryMemoryOptions: qmc.QueryMemoryOptions,
-		}
-		for querySpan := targetSpan; querySpan.Valid(); {
-			var err error
-			querySpan, err = db.queryAndComputeRollupsForSpan(
-				ctx, timeSeries, querySpan, targetResolution, rollupDataMap, childQmc,
-			)
-			if err != nil {
-				return err
+			childQmc := QueryMemoryContext{
+				workerMonitor:      qmc.workerMonitor,
+				resultAccount:      &account,
+				QueryMemoryOptions: qmc.QueryMemoryOptions,
 			}
+			for querySpan := targetSpan; querySpan.Valid(); {
+				var err error
+				querySpan, err = db.queryAndComputeRollupsForSpan(
+					ctx, timeSeries, querySpan, targetResolution, rollupDataMap, childQmc,
+				)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		}(); err != nil {
+			return err
 		}
 
 		// Write computed rollupDataMap to disk

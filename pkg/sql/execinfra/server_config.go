@@ -1,45 +1,48 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 // This file lives here instead of sql/distsql to avoid an import cycle.
 
 package execinfra
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/diskmap"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
-	"github.com/cockroachdb/cockroach/pkg/sql/row"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
-	"github.com/cockroachdb/cockroach/pkg/storage/fs"
+	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/limit"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/marusama/semaphore"
 )
 
@@ -51,10 +54,16 @@ type ServerConfig struct {
 	Settings     *cluster.Settings
 	RuntimeStats RuntimeStats
 
-	ClusterID   *base.ClusterIDContainer
+	// LogicalClusterID is the logical cluster ID for this tenant.
+	LogicalClusterID *base.ClusterIDContainer
+
+	// ClusterName is the security string used to protect the RPC layer
+	// against connections to the wrong cluster.
 	ClusterName string
 
-	// NodeID is the id of the node on which this Server is running.
+	// NodeID is either the KV node ID or the SQL instance ID, depending
+	// on circumstances.
+	// TODO(knz,radu): Split this into different fields.
 	NodeID *base.SQLIDContainer
 
 	// Locality is the locality of the node on which this Server is running.
@@ -64,11 +73,7 @@ type ServerConfig struct {
 	Codec keys.SQLCodec
 
 	// DB is a handle to the cluster.
-	DB *kv.DB
-	// Executor can be used to run "internal queries". Note that Flows also have
-	// access to an executor in the EvalContext. That one is "session bound"
-	// whereas this one isn't.
-	Executor sqlutil.InternalExecutor
+	DB descs.DB
 
 	RPCContext   *rpc.Context
 	Stopper      *stop.Stopper
@@ -88,7 +93,7 @@ type ServerConfig struct {
 
 	// TempFS is used by the vectorized execution engine to store columns when the
 	// working set is larger than can be stored in memory.
-	TempFS fs.FS
+	TempFS vfs.FS
 
 	// VecFDSemaphore is a weighted semaphore that restricts the number of open
 	// file descriptors in the vectorized engine.
@@ -101,6 +106,28 @@ type ServerConfig struct {
 	// used by the column and index backfillers.
 	BackfillerMonitor *mon.BytesMonitor
 
+	// Child monitor of the bulk monitor which will be used to monitor the memory
+	// used during backup.
+	BackupMonitor *mon.BytesMonitor
+
+	// Child monitor of the bulk monitor which will be used to monitor the memory
+	// used during restore.
+	RestoreMonitor *mon.BytesMonitor
+
+	// BulkMonitor is the parent bulk memory monitor. It is used to monitor memory
+	// for bulk operations that don't have a dedicated child monitor.
+	BulkMonitor *mon.BytesMonitor
+
+	// ChangefeedMonitor is the parent monitor for all CDC DistSQL flows.
+	ChangefeedMonitor *mon.BytesMonitor
+
+	// BulkSenderLimiter is the concurrency limiter that is shared across all of
+	// the processes in a given sql server when sending bulk ingest (AddSST) reqs.
+	BulkSenderLimiter limit.ConcurrentRequestLimiter
+
+	// BulkMergeMetrics tracks distributed merge operation metrics.
+	BulkMergeMetrics *BulkMergeMetrics
+
 	// ParentDiskMonitor is normally the root disk monitor. It should only be used
 	// when setting up a server, a child monitor (usually belonging to a sql
 	// execution flow), or in tests. It is used to monitor temporary storage disk
@@ -109,11 +136,16 @@ type ServerConfig struct {
 	ParentDiskMonitor *mon.BytesMonitor
 
 	Metrics            *DistSQLMetrics
-	RowMetrics         *row.Metrics
-	InternalRowMetrics *row.Metrics
+	RowMetrics         *rowinfra.Metrics
+	InternalRowMetrics *rowinfra.Metrics
+	KVStreamerMetrics  *kvstreamer.Metrics
 
 	// SQLLivenessReader provides access to reading the liveness of sessions.
 	SQLLivenessReader sqlliveness.Reader
+	// BlockingSQLLivenessReader is a sqlliveness.Reader that synchronously
+	// blocks to determine the status of a session which it does not know about or
+	// thinks might be expired.
+	BlockingSQLLivenessReader sqlliveness.Reader
 
 	// JobRegistry manages jobs being used by this Server.
 	JobRegistry *jobs.Registry
@@ -126,20 +158,17 @@ type ServerConfig struct {
 	// draining state.
 	Gossip gossip.OptionalGossip
 
-	NodeDialer *nodedialer.Dialer
-
-	// SessionBoundInternalExecutorFactory is used to construct session-bound
-	// executors. The idea is that a higher-layer binds some of the arguments
-	// required, so that users of ServerConfig don't have to care about them.
-	SessionBoundInternalExecutorFactory sqlutil.SessionBoundInternalExecutorFactory
+	// Dialer for communication between SQL instances.
+	SQLInstanceDialer *nodedialer.Dialer
 
 	ExternalStorage        cloud.ExternalStorageFactory
 	ExternalStorageFromURI cloud.ExternalStorageFromURIFactory
 
 	// ProtectedTimestampProvider maintains the state of the protected timestamp
-	// subsystem. It is queried during the GC process and in the handling of
-	// AdminVerifyProtectedTimestampRequest.
+	// subsystem. It is queried during the GC process.
 	ProtectedTimestampProvider protectedts.Provider
+
+	DistSender *kvcoord.DistSender
 
 	// RangeCache is used by processors that were supposed to have been planned on
 	// the leaseholders of the data ranges that they're consuming. These
@@ -149,11 +178,15 @@ type ServerConfig struct {
 
 	// SQLStatsController is an interface used to reset SQL stats without the need to
 	// introduce dependency on the sql package.
-	SQLStatsController tree.SQLStatsController
+	SQLStatsController eval.SQLStatsController
+
+	// SchemaTelemetryController is an interface used by the builtins to create a
+	// job schedule for schema telemetry jobs.
+	SchemaTelemetryController eval.SchemaTelemetryController
 
 	// IndexUsageStatsController is an interface used to reset index usage stats without
 	// the need to introduce dependency on the sql package.
-	IndexUsageStatsController tree.IndexUsageStatsController
+	IndexUsageStatsController eval.IndexUsageStatsController
 
 	// SQLSQLResponseAdmissionQ is the admission queue to use for
 	// SQLSQLResponseWork.
@@ -161,6 +194,37 @@ type ServerConfig struct {
 
 	// CollectionFactory is used to construct descs.Collections.
 	CollectionFactory *descs.CollectionFactory
+
+	// ExternalIORecorder is used to record reads and writes from
+	// external services (such as external storage)
+	ExternalIORecorder multitenant.TenantSideExternalIORecorder
+
+	// TenantCostController is used to measure and record RU consumption.
+	TenantCostController multitenant.TenantSideCostController
+
+	// RangeStatsFetcher is used to fetch range stats for keys.
+	RangeStatsFetcher eval.RangeStatsFetcher
+
+	// AdmissionPacerFactory is used to integrate CPU-intensive work
+	// with elastic CPU control.
+	AdmissionPacerFactory admission.PacerFactory
+
+	SQLCPUProvider admission.SQLCPUProvider
+
+	// Allow mutation operations to trigger stats refresh.
+	StatsRefresher *stats.Refresher
+
+	// *sql.ExecutorConfig exposed as an interface (due to dependency cycles).
+	ExecutorConfig interface{}
+
+	// RootSQLMemoryPoolSize is the size in bytes of the root SQL memory
+	// monitor.
+	RootSQLMemoryPoolSize int64
+
+	// VecIndexManager allows SQL processors to access the vecindex.VectorIndex
+	// for operations on a vector index. It's stored as an `interface{}` due to
+	// package dependency cycles
+	VecIndexManager interface{}
 }
 
 // RuntimeStats is an interface through which the rowexec layer can get
@@ -188,6 +252,20 @@ type TestingKnobs struct {
 	// function returns an error, or if the table has already been dropped.
 	RunAfterBackfillChunk func()
 
+	// RunBeforeIndexBackfillProgressUpdate is called before updating the
+	// progress for a single index backfill.
+	RunBeforeIndexBackfillProgressUpdate func(ctx context.Context, completed []roachpb.Span)
+
+	// AfterDistributedMergeMapPhase is called after the map phase of a distributed
+	// merge index backfill completes, before any merge iterations begin. It receives
+	// the SST manifests produced by the map phase.
+	AfterDistributedMergeMapPhase func(ctx context.Context, manifests []jobspb.BulkSSTManifest)
+
+	// AfterDistributedMergeIteration is called after each iteration of a
+	// distributed merge during index backfill. It receives the iteration number
+	// and the current SST manifests.
+	AfterDistributedMergeIteration func(ctx context.Context, iteration int, manifests []jobspb.BulkSSTManifest)
+
 	// SerializeIndexBackfillCreationAndIngestion ensures that every index batch
 	// created during an index backfill is also ingested before moving on to the
 	// next batch or returning.
@@ -200,6 +278,10 @@ type TestingKnobs struct {
 	// processor pushes the spans for which it has successfully backfilled the
 	// indexes.
 	IndexBackfillProgressReportInterval time.Duration
+
+	// RunDuringReencodeVectorIndexEntry is called during vector index entry backfill to
+	// simulate a transaction error.
+	RunDuringReencodeVectorIndexEntry func(txn *kv.Txn) error
 
 	// ForceDiskSpill forces any processors/operators that can fall back to disk
 	// to fall back to disk immediately.
@@ -217,6 +299,11 @@ type TestingKnobs struct {
 	// Cannot be set together with ForceDiskSpill.
 	MemoryLimitBytes int64
 
+	// VecFDsToAcquire, if positive, indicates the number of file descriptors
+	// that should be acquired by a single disk-spilling operator in the
+	// vectorized engine.
+	VecFDsToAcquire int
+
 	// TableReaderBatchBytesLimit, if not 0, overrides the limit that the
 	// TableReader will set on the size of results it wants to get for individual
 	// requests.
@@ -231,13 +318,11 @@ type TestingKnobs struct {
 	// to incoming flows to register.
 	DrainFast bool
 
-	// MetadataTestLevel controls whether or not additional metadata test
-	// processors are planned, which send additional "RowNum" metadata that is
-	// checked by a test receiver on the gateway.
-	MetadataTestLevel MetadataTestLevel
-
 	// Changefeed contains testing knobs specific to the changefeed system.
 	Changefeed base.ModuleTestingKnobs
+
+	// Export contains testing knobs for `EXPORT INTO ...`.
+	Export base.ModuleTestingKnobs
 
 	// Flowinfra contains testing knobs specific to the flowinfra system
 	Flowinfra base.ModuleTestingKnobs
@@ -253,21 +338,41 @@ type TestingKnobs struct {
 
 	// StreamingTestingKnobs are backup and restore specific testing knobs.
 	StreamingTestingKnobs base.ModuleTestingKnobs
+
+	// IndexBackfillMergerTestingKnobs are the index backfill merger specific
+	// testing knobs.
+	IndexBackfillMergerTestingKnobs base.ModuleTestingKnobs
+
+	// BulkMergeTestingKnobs are specific to the distributed merge pipeline.
+	BulkMergeTestingKnobs base.ModuleTestingKnobs
+
+	// ProcessorNoTracingSpan is used to disable the creation of a tracing span
+	// in ProcessorBase.StartInternal if the tracing is enabled.
+	ProcessorNoTracingSpan bool
+
+	// SetupFlowCb, when non-nil, is called by the execinfrapb.DistSQLServer
+	// when responding to SetupFlow RPCs, after the flow is set up but before it
+	// is started.
+	SetupFlowCb func(context.Context, base.SQLInstanceID, *execinfrapb.SetupFlowRequest) error
+
+	// RunBeforeCascadeAndChecks is run before any cascade or check queries are
+	// run. The associated transaction ID of the statement performing the cascade
+	// or check query is passed in as an argument.
+	RunBeforeCascadesAndChecks func(txnID uuid.UUID)
+
+	// MinimumNumberOfGatewayPartitions is the minimum number of partitions that
+	// will be assigned to the gateway before we start assigning partitions to
+	// other nodes.
+	MinimumNumberOfGatewayPartitions int
+
+	// TableReaderStartScanCb, when non-nil, will be called whenever the
+	// TableReader processor starts its scan.
+	TableReaderStartScanCb func()
+
+	// SampleAggregatorTestingKnobRowHook, if non-nil, is called for each row
+	// processed by the sample aggregator. Used for testing, e.g., to inject panics.
+	SampleAggregatorTestingKnobRowHook func()
 }
-
-// MetadataTestLevel represents the types of queries where metadata test
-// processors are planned.
-type MetadataTestLevel int
-
-const (
-	// Off represents that no metadata test processors are planned.
-	Off MetadataTestLevel = iota
-	// NoExplain represents that metadata test processors are planned for all
-	// queries except EXPLAIN (DISTSQL) statements.
-	NoExplain
-	// On represents that metadata test processors are planned for all queries.
-	On
-)
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
 func (*TestingKnobs) ModuleTestingKnobs() {}
@@ -295,9 +400,9 @@ func GetWorkMemLimit(flowCtx *FlowCtx) int64 {
 	return flowCtx.EvalCtx.SessionData().WorkMemLimit
 }
 
-// GetRowMetrics returns the proper RowMetrics for either internal or user
+// GetRowMetrics returns the proper rowinfra.Metrics for either internal or user
 // queries.
-func (flowCtx *FlowCtx) GetRowMetrics() *row.Metrics {
+func (flowCtx *FlowCtx) GetRowMetrics() *rowinfra.Metrics {
 	if flowCtx.EvalCtx.SessionData().Internal {
 		return flowCtx.Cfg.InternalRowMetrics
 	}

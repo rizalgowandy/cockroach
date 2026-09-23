@@ -10,7 +10,6 @@ query T
 EXPLAIN SELECT v FROM uniontest UNION SELECT k FROM uniontest
 ----
 distribution: local
-vectorized: true
 ·
 • union
 │
@@ -28,7 +27,6 @@ query T
 EXPLAIN SELECT v FROM uniontest UNION ALL SELECT k FROM uniontest
 ----
 distribution: local
-vectorized: true
 ·
 • union all
 │
@@ -47,7 +45,6 @@ query T
 EXPLAIN SELECT node_id FROM crdb_internal.node_build_info UNION VALUES(123)
 ----
 distribution: local
-vectorized: true
 ·
 • union
 │
@@ -68,7 +65,6 @@ vectorized: true
 ·
 • sort
 │ columns: (a)
-│ ordering: +a
 │ estimated row count: 100 (missing stats)
 │ order: +a
 │
@@ -103,7 +99,6 @@ vectorized: true
 ·
 • project
 │ columns: (a)
-│ estimated row count: 1
 │
 └── • except all
     │ columns: (a, a)
@@ -134,7 +129,6 @@ vectorized: true
 ·
 • render
 │ columns: ("?column?", "?column?", "?column?")
-│ estimated row count: 1
 │ render ?column?: column1
 │ render ?column?: column2
 │ render ?column?: column3
